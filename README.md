@@ -1,32 +1,66 @@
 # Adaptive Delivery
 
-让 Codex 按项目风险选择最小够用的工程方法，并把需求、设计、开发、测试、验收和发布连接成可验证的交付过程。
+让 AI 编程代理按项目风险选择最小够用的工程方法，并把需求、设计、开发、测试、验收和发布连接成可验证的交付过程。
 
 ## 适合什么场景
 
-- 初始化会持续开发、跨多个 Codex 会话的产品项目。
+- 初始化会持续开发、跨多个 Agent 会话的产品项目。
 - 从需求讨论一路推进到设计、实现、验收和上线。
 - 治理所有角色共同使用的 UI 视觉参考图。
 - 为本地应用、Web 或双端产品选择相称的验证与发布门禁。
 - 把经过验证的项目经验提炼成可复用方法。
 
-它不替代测试框架、CI/CD、项目管理工具或发布平台，也不会让 Codex 自动记住旧聊天。普通问答、单文件简单修改和普通代码审查不会因此套上完整流程。
+它不替代测试框架、CI/CD、项目管理工具或发布平台，也不会让 AI 编程代理自动共享旧会话。普通问答、单文件简单修改和普通代码审查不会因此套上完整流程。
+
+## 兼容性
+
+- 兼容 Agent Skills 的宿主可以直接安装并自动或显式调用。
+- 其他 AI 编程代理可以按自然语言要求读取 `SKILL.md` 后使用同一方法。
+- 自动发现、调用语法、安装目录和全局指令文件由宿主决定。
+
+运行时核心只有一份，不为不同平台复制规则。`AGENTS.md` 是默认的项目协作入口；若宿主使用其他入口文件，应链接到现有权威文档，不要复制内容。
 
 ## 安装
 
-在 Codex 中直接说：
+通用方式是把整个仓库克隆或安装到宿主官方文档指定的 Skills 目录；只复制 `SKILL.md` 会漏掉 references、scripts 和 templates。
+
+### Codex
+
+[OpenAI 官方文档](https://developers.openai.com/codex/skills/)确认 Codex 从 `~/.agents/skills` 和项目 `.agents/skills` 发现 Skill，也可以让 `$skill-installer` 从 GitHub 安装：
 
 ```text
 请使用 skill-installer 从 https://github.com/ManechoLIU/adaptive-delivery 安装 adaptive-delivery
 ```
 
-也可以手动安装：
+手动安装：
 
 ```bash
-git clone https://github.com/ManechoLIU/adaptive-delivery ~/.codex/skills/adaptive-delivery
+git clone https://github.com/ManechoLIU/adaptive-delivery ~/.agents/skills/adaptive-delivery
 ```
 
-安装后即可用自然语言描述任务；在支持 Skill 自动发现的 Codex 环境中，不必记固定口令。需要明确指定时再写 `$adaptive-delivery`。
+Codex 可按描述自动选择，也可显式写 `$adaptive-delivery`。
+
+### Claude Code
+
+[Claude Code 官方文档](https://code.claude.com/docs/en/slash-commands)确认个人 Skill 位于 `~/.claude/skills/<name>`，可自动选择或用 `/name` 调用：
+
+```bash
+git clone https://github.com/ManechoLIU/adaptive-delivery ~/.claude/skills/adaptive-delivery
+```
+
+### Gemini CLI
+
+[Gemini CLI 官方文档](https://geminicli.com/docs/cli/using-agent-skills/)提供直接安装命令，并支持 `~/.agents/skills`：
+
+```bash
+gemini skills install https://github.com/ManechoLIU/adaptive-delivery
+```
+
+### Cursor
+
+[Cursor 官方文档](https://cursor.com/docs/skills)确认可从 GitHub 导入，也会发现 `~/.agents/skills`、`~/.cursor/skills` 及项目级对应目录。可在 **Customize → Rules → Add Rule → Remote Rule (Github)** 输入本仓库 URL。
+
+安装后直接用自然语言描述任务即可；固定前缀只是各宿主的快捷调用方式，不是 Skill 的通用语法。
 
 ## 会自动识别什么
 
@@ -46,7 +80,7 @@ Skill 结合用户最新指令与项目当前事实判断动作，不依赖逐�
 长期、跨会话产品默认初始化六个顶层文件：
 
 ```text
-$adaptive-delivery 初始化当前项目，按协作型产品处理
+请使用 adaptive-delivery 初始化当前项目，按协作型产品处理。
 ```
 
 | 文件 | 唯一职责 |
@@ -96,14 +130,14 @@ python3 scripts/init_project.py /path/to/project --profile core
 ## 进入开发阶段
 
 ```text
-$adaptive-delivery 进入开发阶段，先制定开发计划和协作方式，不执行。
-$adaptive-delivery 按已确认计划开始开发。
-$adaptive-delivery 继续开发。
+请使用 adaptive-delivery 进入开发阶段，先制定开发计划和协作方式，不执行。
+请使用 adaptive-delivery 按已确认计划开始开发。
+请使用 adaptive-delivery 继续开发。
 ```
 
 三条指令分别表示“只规划”“按计划执行”“从当前状态续接”。开发计划按项目实际情况确定工作包、依赖、Agent 分工、文件所有权、验证、验收和停止条件，不强制所有项目使用同一种协作模式。
 
-这些是便于复制的明确写法，不是必须逐字输入的口令。自然语言意图明确时直接识别；涉及修改但授权含糊时，停在只读对账和确认，不替用户猜测。
+这些是便于复制的明确写法，不是必须逐字输入的口令。在 Codex 中可把“请使用 adaptive-delivery”替换为 `$adaptive-delivery`，Claude Code 和 Cursor 则使用各自的 `/adaptive-delivery`。自然语言意图明确时直接识别；涉及修改但授权含糊时，停在只读对账和确认，不替用户猜测。
 
 ## 常见例子
 
@@ -131,7 +165,7 @@ $adaptive-delivery 继续开发。
 
 项目事实变化时，只更新负责该事实的文档。单项目 workaround 先留在项目；只有证据、适用与不适用条件和跨项目价值明确后，才形成全局 Skill 候选。修改全局 Skill、提交、推送或公开发布仍需用户确认。
 
-Skill 不是后台服务。跨会话一致性来自项目中的 `AGENTS.md`、`PROJECT_STATUS.md` 和权威文档，而不是自动读取旧聊天。
+Skill 不是后台服务。跨会话一致性来自项目中的 `AGENTS.md`、`PROJECT_STATUS.md` 和权威文档，而不是自动读取旧聊天；宿主专用入口文件只负责引导到这些事实源。
 
 ## 贡献
 

@@ -1,6 +1,6 @@
 ---
 name: adaptive-delivery
-description: Use when initializing a software project, coordinating delivery across multiple stages, resuming work across Codex sessions, governing approved visual references, defining Harness or release gates, or extracting reusable engineering experience.
+description: Use when initializing a software project, coordinating delivery across multiple stages, resuming work across agent sessions, governing approved visual references, defining Harness or release gates, or extracting reusable engineering experience.
 ---
 
 # Adaptive Delivery

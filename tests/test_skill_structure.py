@@ -44,6 +44,14 @@ class SkillStructureTests(unittest.TestCase):
         _, body = split_frontmatter(read_entrypoint())
         self.assertLessEqual(len(body.split()), 350)
 
+    def test_core_runtime_instructions_are_vendor_neutral(self):
+        core = "\n".join(
+            [read_entrypoint(), *[path.read_text(encoding="utf-8") for path in REFERENCE_PATHS.values()]]
+        ).casefold()
+        vendor_names = ("codex", "chatgpt", "claude code", "gemini cli", "cursor")
+
+        self.assertEqual([], [name for name in vendor_names if name in core])
+
     def test_four_local_reference_links_resolve(self):
         _, body = split_frontmatter(read_entrypoint())
         links = set(re.findall(r"\[[^\]]+\]\((references/[^)\s]+)\)", body))
