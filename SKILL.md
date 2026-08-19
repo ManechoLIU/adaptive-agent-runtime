@@ -25,6 +25,7 @@ description: Use when initializing a software project, coordinating delivery acr
 2. 保护用户及其他任务的已有改动。
 3. 证据先于完成宣称；证据不足时说明边界。
 4. 达到停止条件立即结束，不为完备度扩展范围。
+5. 两次有界等待均无新证据时停止轮询，从最近证据点恢复、重新分派或报告阻塞。
 
 ## 按需读取
 
