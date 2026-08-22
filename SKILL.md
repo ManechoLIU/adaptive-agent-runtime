@@ -9,9 +9,9 @@ description: Use when initializing a software project, coordinating delivery acr
 
 ## 选择档位
 
-- **快速档**：目标明确、低风险、小范围。直接执行，做一个足以证明结果的定向检查，然后停止；不强制计划、子 Agent 或文档更新。
+- **快速档**：目标明确、低风险、小范围。直接执行，做一次定向影响扫描和足以证明结果的检查，然后停止；不强制计划或子 Agent。用户明确认可且能定位精确视觉稿时，即使需要同步少量权威文档也仍属于快速档，具体按 [visual reference governance](references/visual-reference-governance.md) 执行。
 - **标准档**：普通功能、UI 或跨文件改动。给出短计划，只协调真实依赖；当前事实变化时同步对应文档。
-- **严格档**：认证、费用、外部调用、迁移、安装、部署或发布。读取项目安全规则，使用相称的 Harness 和授权门。
+- **严格档**：认证、费用、外部调用、迁移、安装、部署或发布。读取 [methods](references/methods.md) 的调度升级门和项目安全规则；独立执行主体可用时安排非作者审查，使用相称的 Harness 和授权门。
 
 ## 开发授权
 
@@ -26,10 +26,11 @@ description: Use when initializing a software project, coordinating delivery acr
 3. 证据先于完成宣称；证据不足时说明边界。
 4. 达到停止条件立即结束，不为完备度扩展范围。
 5. 两次有界等待均无新证据时停止轮询，从最近证据点恢复、重新分派或报告阻塞。
+6. 快速档不固定文件清单或工具次数：先按项目文档职责扫描真实影响，只更新受影响事实源；发现跨域变化、冲突或高风险边界时再升级，不能为了快而漏改，也不能因涉及多份文档自动升级。
 
 ## 按需读取
 
-- 选择方法、初始化档案或跨会话续接：读 [methods](references/methods.md)。
+- 选择方法、标准/严格档调度、初始化档案或跨会话续接：读 [methods](references/methods.md)；多问题、多 Agent 或共享事实源任务使用其中的“质量保真加速协议”。
 - 涉及风险证据、外部服务、本地/Web 发布或恢复：读 [Harness and release](references/harness-and-release.md)。
 - 用户明确认可视觉参考，或任务涉及视觉基线：读 [visual reference governance](references/visual-reference-governance.md)。
 - 同步权威文档或提炼项目经验：读 [experience catalog](references/experience-catalog.md)。

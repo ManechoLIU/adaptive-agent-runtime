@@ -12,6 +12,7 @@ REFERENCE_PATHS = {
     "experience": ROOT / "references" / "experience-catalog.md",
 }
 METHODS = REFERENCE_PATHS["methods"]
+VISUAL = REFERENCE_PATHS["visual"]
 
 
 def read_entrypoint() -> str:
@@ -86,6 +87,33 @@ class SkillStructureTests(unittest.TestCase):
             "PROJECT_STATUS.md",
         ):
             self.assertIn(field, methods)
+
+    def test_mixed_requests_route_each_independent_workflow_by_its_own_risk(self):
+        methods = METHODS.read_text(encoding="utf-8")
+
+        for phrase in ("工作流 / 档位 / 证据 / 授权门", "不使用单一最高值", "共同关键路径"):
+            self.assertIn(phrase, methods)
+
+    def test_quality_preserving_acceleration_keeps_evidence_and_removes_duplicate_work(self):
+        methods = METHODS.read_text(encoding="utf-8")
+
+        for phrase in (
+            "一次读取、持续复用",
+            "分工保持互斥",
+            "草案后定向审查",
+            "局部失效与恢复",
+            "单次等待不超过 60 秒",
+            "不能删除以下质量门",
+        ):
+            self.assertIn(phrase, methods)
+
+    def test_approved_visual_reference_uses_the_fast_path_without_losing_impact_scan(self):
+        entrypoint = read_entrypoint()
+        visual = VISUAL.read_text(encoding="utf-8")
+
+        self.assertIn("定向影响扫描", entrypoint)
+        for phrase in ("已确认参考图快速路径", "强制使用快速档", "不减少必要影响扫描"):
+            self.assertIn(phrase, visual)
 
 
 if __name__ == "__main__":
