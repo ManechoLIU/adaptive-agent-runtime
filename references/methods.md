@@ -74,7 +74,7 @@
 
 `AGENTS.md`、`TASK_LEDGER.md`、`SPEC.md`、`DESIGN.md`、`TECHNICAL.md`、`EVOLUTION.md`。
 
-长期、跨会话、多资料或需要 Goal 恢复的产品使用 `durable` 档位，再增加 `MEMORY.md` 和 `WIKI_INDEX.md`。已有项目只有 `PROJECT_STATUS.md` 时继续把它作为唯一任务台账，不同时创建 `TASK_LEDGER.md`。
+长期、跨会话、多资料或需要 Goal 恢复的产品使用 `durable` 档位：增加 `MEMORY.md`、`WIKI_INDEX.md` 和项目级 `SKILL.md`，并创建 `raw_sources/`、`wiki/`、`logs/ingestion/` 目录骨架；具体职责与写入条件以 [context governance](context-governance.md) 为准。已有项目只有 `PROJECT_STATUS.md` 时继续把它作为唯一任务台账，不同时创建 `TASK_LEDGER.md`。
 
 一次性脚本、微型库或已有成熟文档体系可裁剪或不初始化，并说明理由。初始化逐个跳过已有文件；不创建空的视觉参考目录。
 
@@ -85,5 +85,5 @@
 - `AGENTS.md`：只放极短启动、路由和边界。
 - `TASK_LEDGER.md`（或已有 `PROJECT_STATUS.md`）：唯一执行控制面，记录当前目标、决定链接、工作包/所有者、证据、阻塞和下一步；替换过时事实，不追加会话日志。
 - `MEMORY.md`：只保存跨会话仍稳定、可复用且可追溯的项目结论，不保存当前进度。
-- `WIKI_INDEX.md`：只在资料复杂时提供结构化知识入口；没有真实资料时不创建空目录。
+- `WIKI_INDEX.md`：长期项目的结构化知识入口；`raw_sources/`、`wiki/`、`logs/ingestion/` 可以作为初始化目录骨架，但没有真实资料时不得把目录存在称为知识资产或编造索引内容。
 - 产品、视觉、技术和经验仍分别归各自权威文档。

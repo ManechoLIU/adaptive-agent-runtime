@@ -144,6 +144,18 @@ class SkillStructureTests(unittest.TestCase):
         ):
             self.assertIn(phrase, context)
 
+    def test_durable_initialization_guidance_matches_context_governance(self):
+        methods = METHODS.read_text(encoding="utf-8")
+
+        for phrase in (
+            "项目级 `SKILL.md`",
+            "raw_sources/",
+            "wiki/",
+            "logs/ingestion/",
+            "目录骨架",
+        ):
+            self.assertIn(phrase, methods)
+
     def test_task_ledger_template_is_an_instance_not_a_method_manual(self):
         for name in ("TASK_LEDGER.md", "PROJECT_STATUS.md"):
             ledger = (ROOT / "assets" / "templates" / name).read_text(
