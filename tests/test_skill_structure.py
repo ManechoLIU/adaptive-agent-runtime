@@ -154,8 +154,15 @@ class SkillStructureTests(unittest.TestCase):
             self.assertNotIn("阶段 / 粒度", ledger)
             self.assertNotIn("动态混合粒度", ledger)
             self.assertIn("当前目标", ledger)
+            self.assertIn("当前拆分", ledger)
             self.assertIn("任务拆分", ledger)
             self.assertIn("证据 / 下一步", ledger)
+
+    def test_instance_ledgers_preserve_the_selected_granularity(self):
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+
+        self.assertIn("项目已选择的实际粒度", long_task)
+        self.assertIn("已完成台账项及其证据", long_task)
 
     def test_long_task_governance_scopes_candidate_and_shared_environment_reconciliation(self):
         long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
