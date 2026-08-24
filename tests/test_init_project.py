@@ -112,16 +112,74 @@ class InitProjectTests(unittest.TestCase):
                 self.assertIn(heading, design)
             self.assertIn("不共享旧聊天", agents)
 
-    def test_durable_profile_adds_memory_and_wiki_without_empty_directories(self):
+    def test_durable_profile_adds_memory_wiki_and_knowledge_workspace(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             report = MODULE.initialize_project(root, profile="durable")
 
-            self.assertEqual(len(report.created), 8)
+            self.assertEqual(len(report.created), 9)
             self.assertTrue((root / "MEMORY.md").is_file())
             self.assertTrue((root / "WIKI_INDEX.md").is_file())
-            self.assertFalse((root / "raw_sources").exists())
-            self.assertFalse((root / "wiki").exists())
+            self.assertTrue((root / "SKILL.md").is_file())
+            self.assertEqual(
+                set(report.created_directories),
+                {
+                    "raw_sources",
+                    "wiki",
+                    "logs",
+                    "logs/ingestion",
+                },
+            )
+            for relative_path in report.created_directories:
+                self.assertTrue((root / relative_path).is_dir())
+
+    def test_task_ledger_template_contains_runtime_state_not_methodology(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            MODULE.initialize_project(root, profile="durable")
+
+            ledger = (root / "TASK_LEDGER.md").read_text(encoding="utf-8")
+
+            self.assertNotIn("## 使用规则", ledger)
+            self.assertNotIn("阶段 / 粒度", ledger)
+            self.assertNotIn("动态混合粒度", ledger)
+            for field in (
+                "当前目标",
+                "任务拆分",
+                "状态",
+                "阻塞",
+                "下一步",
+                "验收",
+                "证据",
+            ):
+                self.assertIn(field, ledger)
+
+    def test_durable_profile_is_idempotent_for_documents_and_directories(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = MODULE.initialize_project(root, profile="durable")
+            second = MODULE.initialize_project(root, profile="durable")
+
+            self.assertEqual(len(first.created), 9)
+            self.assertEqual(len(first.created_directories), 4)
+            self.assertEqual(second.created, ())
+            self.assertEqual(second.created_directories, ())
+            self.assertEqual(set(second.skipped), set(first.created))
+            self.assertEqual(
+                set(second.skipped_directories), set(first.created_directories)
+            )
+
+    def test_durable_directory_type_conflict_fails_before_writing(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "raw_sources").write_text("user file\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "must be a directory"):
+                MODULE.initialize_project(root, profile="durable")
+
+            self.assertEqual(
+                {path.name for path in root.iterdir()}, {"raw_sources"}
+            )
 
     def test_existing_project_status_is_the_legacy_ledger_alias(self):
         with TemporaryDirectory() as directory:

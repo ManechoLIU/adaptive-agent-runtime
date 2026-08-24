@@ -98,7 +98,7 @@ Skill 结合用户最新指令与项目当前事实判断动作，不依赖逐�
 python3 scripts/init_project.py /path/to/project --profile durable
 ```
 
-它会在上述六份文件之外增加 `MEMORY.md` 和 `WIKI_INDEX.md`。当前上下文和 Compact 不创建项目文件，也不会预先创建空的 `raw_sources/`、`wiki/` 或 `logs/` 目录。
+它会组合两套骨架：文章方法中的 `MEMORY.md`、`WIKI_INDEX.md`、项目级 `SKILL.md`、`raw_sources/`、`wiki/`、`logs/ingestion/`，以及 Adaptive Delivery 的 `SPEC.md`、`DESIGN.md`、`TECHNICAL.md`、`EVOLUTION.md`；`AGENTS.md` 和 `TASK_LEDGER.md` 由两者共享。当前上下文和 Compact 不创建项目文件。
 
 只需要四个核心文档时：
 

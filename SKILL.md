@@ -1,6 +1,6 @@
 ---
 name: adaptive-delivery
-description: Use when initializing or running a multi-stage software project, coordinating across agents, branches, worktrees, or sessions, recovering stalled or drifting work, governing approved visual references, defining Harness or release gates, or extracting reusable engineering experience.
+description: Use when initializing or governing a long-running project, choosing task-ledger granularity, managing AI context, Wiki, memory, Compact, agents, branches, worktrees, Harness or release gates, recovering stalled work, governing visual references, or extracting reusable engineering experience.
 ---
 
 # Adaptive Delivery
@@ -21,7 +21,7 @@ description: Use when initializing or running a multi-stage software project, co
 
 ## 长期任务模式
 
-出现跨阶段、跨会话、多依赖、多执行主体、高风险副作用、重复候选、持续阻塞或用户要求持续推进时，读取 [long-task governance](references/long-task-governance.md)。该模式使用 `TASK_LEDGER.md` 作为新项目的任务台账；已有项目只有 `PROJECT_STATUS.md` 时继续沿用，禁止再创建第二份台账。
+出现跨阶段、跨会话、多依赖、多执行主体、高风险副作用、重复候选、持续阻塞或用户要求持续推进时，读取 [long-task governance](references/long-task-governance.md)。用户询问“项目该用什么台账、怎么拆”时也读取它，给出建议、原因、边界和调整触发。该模式使用 `TASK_LEDGER.md` 作为新项目的任务台账；已有项目只有 `PROJECT_STATUS.md` 时继续沿用，禁止再创建第二份台账。
 
 用户已明确要求使用 Goal、要求本 Skill 持续执行长期任务，或项目规则已授权自动 Goal，且运行环境提供 Goal 工具时，按参考中的条件自动创建或切换 Goal；普通问答、轻量任务或仅因 Skill 被隐式选中时不创建 Goal。
 
@@ -45,9 +45,10 @@ description: Use when initializing or running a multi-stage software project, co
 ## 按需读取
 
 - 选择方法、标准/严格档调度、初始化档案或跨会话续接：读 [methods](references/methods.md)；多问题、多 Agent 或共享事实源任务使用其中的“质量保真加速协议”。
-- 长期项目、Goal、任务台账、Compact、项目记忆、Wiki、候选分支或共享环境治理：读 [long-task governance](references/long-task-governance.md)。
+- 长期项目、Goal、台账粒度、候选分支或共享环境治理：读 [long-task governance](references/long-task-governance.md)。
+- 上下文、Compact、Raw Sources、Wiki、长期记忆、知识目录初始化或资料摄取：读 [context governance](references/context-governance.md)。
 - 涉及风险证据、外部服务、本地/Web 发布或恢复：读 [Harness and release](references/harness-and-release.md)。
 - 用户明确认可视觉参考，或任务涉及视觉基线：读 [visual reference governance](references/visual-reference-governance.md)。
 - 同步权威文档或提炼项目经验：读 [experience catalog](references/experience-catalog.md)。
 
-初始化使用 `scripts/init_project.py`；逐个跳过已有文件，不覆盖或静默合并。全局 Skill 修改、付费调用、Git 写入和公开发布仍需对应授权。
+初始化使用 `scripts/init_project.py`；完整上下文治理选 `durable`，并创建可查询的知识工作区和项目级工作流入口。脚本逐个跳过已有内容，不覆盖或静默合并。全局 Skill 修改、付费调用、Git 写入和公开发布仍需对应授权。

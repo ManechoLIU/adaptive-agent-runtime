@@ -20,6 +20,7 @@ DURABLE_DOCUMENTS = (
     "TASK_LEDGER.md",
     "MEMORY.md",
     "WIKI_INDEX.md",
+    "SKILL.md",
     "SPEC.md",
     "DESIGN.md",
     "TECHNICAL.md",
@@ -32,12 +33,20 @@ PROFILES = {
     "core": CORE_DOCUMENTS,
 }
 TEMPLATES = Path(__file__).resolve().parents[1] / "assets" / "templates"
+DURABLE_DIRECTORIES = (
+    "raw_sources",
+    "wiki",
+    "logs",
+    "logs/ingestion",
+)
 
 
 @dataclass(frozen=True)
 class InitReport:
     created: tuple[str, ...]
     skipped: tuple[str, ...]
+    created_directories: tuple[str, ...] = ()
+    skipped_directories: tuple[str, ...] = ()
 
 
 def initialize_project(
@@ -56,7 +65,10 @@ def initialize_project(
     )
     created: list[str] = []
     skipped: list[str] = []
+    created_directories: list[str] = []
+    skipped_directories: list[str] = []
     missing: list[str] = []
+    missing_directories: list[str] = []
 
     for name in selected:
         target = root / name
@@ -95,6 +107,39 @@ def initialize_project(
             continue
         missing.append(name)
 
+    if profile == "durable":
+        for relative_path in DURABLE_DIRECTORIES:
+            target = root / relative_path
+            if target.is_symlink():
+                raise ValueError(
+                    f"directory target must not be a symbolic link: {relative_path}"
+                )
+            if target.exists():
+                if not target.is_dir():
+                    raise ValueError(
+                        f"directory target must be a directory: {relative_path}"
+                    )
+                skipped_directories.append(relative_path)
+                continue
+            missing_directories.append(relative_path)
+
+    for relative_path in missing_directories:
+        target = root / relative_path
+        try:
+            target.mkdir()
+        except FileExistsError:
+            if target.is_symlink():
+                raise ValueError(
+                    f"directory target must not be a symbolic link: {relative_path}"
+                )
+            if not target.is_dir():
+                raise ValueError(
+                    f"directory target must be a directory: {relative_path}"
+                )
+            skipped_directories.append(relative_path)
+        else:
+            created_directories.append(relative_path)
+
     for name in missing:
         target = root / name
         try:
@@ -109,7 +154,12 @@ def initialize_project(
         else:
             created.append(name)
 
-    return InitReport(tuple(created), tuple(skipped))
+    return InitReport(
+        tuple(created),
+        tuple(skipped),
+        tuple(created_directories),
+        tuple(skipped_directories),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -122,7 +172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=tuple(PROFILES),
         default="collaborative",
         help=(
-            "collaborative 创建六个协作文档，durable 再增加项目记忆与知识索引，"
+            "collaborative 创建六个协作文档，durable 再增加上下文治理文档与目录，"
             "core 创建四个核心文档"
         ),
     )
@@ -140,6 +190,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print("created: " + (", ".join(report.created) or "none"))
     print("skipped: " + (", ".join(report.skipped) or "none"))
+    print(
+        "created directories: "
+        + (", ".join(report.created_directories) or "none")
+    )
+    print(
+        "skipped directories: "
+        + (", ".join(report.skipped_directories) or "none")
+    )
     return 0
 
 

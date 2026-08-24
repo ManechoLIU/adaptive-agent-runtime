@@ -25,7 +25,7 @@ lint_governance = load_module("lint_governance", "scripts/lint_governance.py")
 
 
 class GovernanceTests(unittest.TestCase):
-    def test_durable_profile_creates_eight_project_documents(self) -> None:
+    def test_durable_profile_creates_nine_project_documents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             report = init_project.initialize_project(root, profile="durable")
@@ -37,6 +37,7 @@ class GovernanceTests(unittest.TestCase):
                     "TASK_LEDGER.md",
                     "MEMORY.md",
                     "WIKI_INDEX.md",
+                    "SKILL.md",
                     "SPEC.md",
                     "DESIGN.md",
                     "TECHNICAL.md",
@@ -46,6 +47,25 @@ class GovernanceTests(unittest.TestCase):
             errors, warnings = lint_governance.lint_project(root, strict=True)
             self.assertEqual(errors, [])
             self.assertEqual(warnings, [])
+
+    def test_durable_profile_initializes_queryable_knowledge_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            report = init_project.initialize_project(root, profile="durable")
+
+            self.assertEqual(
+                set(report.created_directories),
+                {
+                    "raw_sources",
+                    "wiki",
+                    "logs",
+                    "logs/ingestion",
+                },
+            )
+            self.assertTrue((root / "raw_sources").is_dir())
+            self.assertTrue((root / "wiki").is_dir())
+            self.assertTrue((root / "logs" / "ingestion").is_dir())
 
     def test_existing_legacy_ledger_prevents_second_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

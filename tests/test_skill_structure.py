@@ -11,6 +11,7 @@ REFERENCE_PATHS = {
     "visual": ROOT / "references" / "visual-reference-governance.md",
     "experience": ROOT / "references" / "experience-catalog.md",
     "long-task": ROOT / "references" / "long-task-governance.md",
+    "context": ROOT / "references" / "context-governance.md",
 }
 METHODS = REFERENCE_PATHS["methods"]
 VISUAL = REFERENCE_PATHS["visual"]
@@ -98,9 +99,63 @@ class SkillStructureTests(unittest.TestCase):
             "TASK_LEDGER.md",
             "MEMORY.md",
             "WIKI_INDEX.md",
-            "项目根目录不默认创建 `SKILL.md`",
+            "项目级 `SKILL.md`",
         ):
             self.assertIn(phrase, long_task)
+
+    def test_ledger_granularity_advice_uses_five_variables_and_explains_the_recommendation(self):
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+
+        for phrase in (
+            "失败代价",
+            "需求清晰度",
+            "项目或资料质量",
+            "执行者熟悉度",
+            "人工校准意愿",
+            "推荐粒度",
+            "不推荐其他粒度的原因",
+            "必须细拆",
+            "可以粗拆",
+            "调整触发",
+            "人类确认点",
+        ):
+            self.assertIn(phrase, long_task)
+
+    def test_context_governance_covers_priority_knowledge_compilation_and_memory_hygiene(self):
+        context = REFERENCE_PATHS["context"].read_text(encoding="utf-8")
+
+        for phrase in (
+            "当前上下文",
+            "Compact",
+            "Raw Sources",
+            "Wiki",
+            "长期记忆",
+            "任务台账",
+            "证据链",
+            "Ingest",
+            "Query",
+            "Lint",
+            "raw_sources/",
+            "wiki/",
+            "logs/ingestion/",
+            "以后还会复用吗",
+            "有证据来源吗",
+            "会不会污染后续判断",
+        ):
+            self.assertIn(phrase, context)
+
+    def test_task_ledger_template_is_an_instance_not_a_method_manual(self):
+        for name in ("TASK_LEDGER.md", "PROJECT_STATUS.md"):
+            ledger = (ROOT / "assets" / "templates" / name).read_text(
+                encoding="utf-8"
+            )
+
+            self.assertNotIn("## 使用规则", ledger)
+            self.assertNotIn("阶段 / 粒度", ledger)
+            self.assertNotIn("动态混合粒度", ledger)
+            self.assertIn("当前目标", ledger)
+            self.assertIn("任务拆分", ledger)
+            self.assertIn("证据 / 下一步", ledger)
 
     def test_long_task_governance_scopes_candidate_and_shared_environment_reconciliation(self):
         long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
