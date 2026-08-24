@@ -69,14 +69,36 @@ class GovernanceTests(unittest.TestCase):
 
             self.assertTrue(any("both TASK_LEDGER" in error for error in errors))
 
-    def test_linter_rejects_multiple_active_rows(self) -> None:
+    def test_linter_accepts_parallel_active_rows_in_a_declared_wave(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "TASK_LEDGER.md").write_text(
                 """# Ledger
 
-- 当前活动项：F1
-- 唯一下一项：F2
+- 当前执行波次：W1
+- 当前活动项：F1、F2
+- 协调下一动作：等待 F1 与 F2 各自验收后集成
+
+| ID | 状态 | 负责人 | 文件或范围 | 下一步动作 |
+| --- | --- | --- | --- | --- |
+| F1 | `ACTIVE` | Agent A | app/auth/** | 完成后进入 F3 |
+| F2 | `ACTIVE` | Agent B | app/reader/** | 完成后进入 F4 |
+""",
+                encoding="utf-8",
+            )
+
+            errors, _ = lint_governance.lint_project(root)
+
+            self.assertEqual(errors, [])
+
+    def test_linter_rejects_parallel_active_rows_without_a_declared_wave(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "TASK_LEDGER.md").write_text(
+                """# Ledger
+
+- 当前活动项：F1、F2
+- 协调下一动作：等待 F1 与 F2
 
 | ID | 状态 |
 | --- | --- |
@@ -88,7 +110,7 @@ class GovernanceTests(unittest.TestCase):
 
             errors, _ = lint_governance.lint_project(root)
 
-            self.assertTrue(any("more than one ACTIVE" in error for error in errors))
+            self.assertTrue(any("declared execution wave" in error for error in errors))
 
 
 if __name__ == "__main__":

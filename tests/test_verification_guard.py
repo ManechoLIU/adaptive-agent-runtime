@@ -116,6 +116,15 @@ class VerificationGuardTests(unittest.TestCase):
         self.assertIn("executed", second.stdout)
         self.assertEqual(self.counter.read_text(encoding="utf-8"), "2")
 
+    def test_acceptance_policy_can_require_a_fresh_rerun(self) -> None:
+        first = self.run_guard()
+        second = self.run_guard(force_reason="acceptance-policy")
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("executed", second.stdout)
+        self.assertEqual(self.counter.read_text(encoding="utf-8"), "2")
+
     def test_arbitrary_force_reason_is_rejected(self) -> None:
         first = self.run_guard()
         second = self.run_guard(force_reason="just run it again")

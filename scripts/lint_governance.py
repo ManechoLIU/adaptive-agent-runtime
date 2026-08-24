@@ -30,6 +30,25 @@ def is_active_row(line: str) -> bool:
     return "ACTIVE" in cells
 
 
+def active_row_ids(text: str) -> list[str]:
+    identifiers: list[str] = []
+    for line in text.splitlines():
+        if not is_active_row(line):
+            continue
+        cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+        if cells:
+            identifiers.append(cells[0])
+    return identifiers
+
+
+def pointer_ids(value: str) -> set[str]:
+    return {
+        item.strip().strip("`")
+        for item in re.split(r"[、,，/]", value)
+        if item.strip()
+    }
+
+
 def locate_ledger(root: Path) -> tuple[Path | None, list[str]]:
     existing = [root / name for name in LEDGER_NAMES if (root / name).is_file()]
     if len(existing) > 1:
@@ -59,24 +78,35 @@ def lint_project(root: Path, *, strict: bool = False) -> tuple[list[str], list[s
 
     if ledger is not None:
         text = ledger.read_text(encoding="utf-8")
-        active_rows = sum(1 for line in text.splitlines() if is_active_row(line))
-        if active_rows > 1:
-            errors.append(f"{ledger.name} has more than one ACTIVE work item")
+        active_ids = active_row_ids(text)
+        active_rows = len(active_ids)
 
         active_pointer = re.search(r"^- 当前活动项：\s*(.+?)\s*$", text, re.MULTILINE)
-        next_pointer = re.search(r"^- 唯一下一项：\s*(.+?)\s*$", text, re.MULTILINE)
+        wave_pointer = re.search(r"^- 当前执行波次：\s*(.+?)\s*$", text, re.MULTILINE)
+        next_pointer = re.search(
+            r"^- (?:协调下一动作|唯一下一项)：\s*(.+?)\s*$", text, re.MULTILINE
+        )
+        if active_rows > 1 and (
+            wave_pointer is None
+            or wave_pointer.group(1).strip() in {"无", "none", "None", "-"}
+        ):
+            errors.append(
+                f"{ledger.name} has parallel ACTIVE work items without a declared execution wave"
+            )
         if active_pointer is None:
             warnings.append(f"{ledger.name} has no current activity pointer")
         elif active_pointer.group(1) in {"无", "none", "None"} and active_rows:
             errors.append(
                 f"{ledger.name} says no current activity but contains an ACTIVE row"
             )
-        elif active_pointer.group(1) not in {"无", "none", "None"} and active_rows != 1:
+        elif active_pointer.group(1) not in {"无", "none", "None"} and (
+            not active_rows or pointer_ids(active_pointer.group(1)) != set(active_ids)
+        ):
             errors.append(
-                f"{ledger.name} current activity pointer requires exactly one ACTIVE row"
+                f"{ledger.name} current activity pointer does not match ACTIVE rows"
             )
         if next_pointer is None:
-            warnings.append(f"{ledger.name} has no unique next-action pointer")
+            warnings.append(f"{ledger.name} has no coordination next-action pointer")
 
     for name in GOVERNANCE_NAMES:
         source = root / name
@@ -96,13 +126,13 @@ def lint_project(root: Path, *, strict: bool = False) -> tuple[list[str], list[s
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="检查 Adaptive Delivery 项目的唯一台账、活动项和治理文档链接。"
+        description="检查 Adaptive Delivery 项目的唯一台账、当前执行波次和治理文档链接。"
     )
     parser.add_argument("root", nargs="?", default=".", help="项目根目录")
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="把缺少当前活动项或唯一下一项指针视为错误",
+        help="把缺少当前活动项或协调下一动作指针视为错误",
     )
     args = parser.parse_args(argv)
     root = Path(args.root).resolve()

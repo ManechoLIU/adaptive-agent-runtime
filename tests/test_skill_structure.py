@@ -102,11 +102,11 @@ class SkillStructureTests(unittest.TestCase):
         ):
             self.assertIn(phrase, long_task)
 
-    def test_long_task_governance_requires_candidate_and_shared_environment_reconciliation(self):
+    def test_long_task_governance_scopes_candidate_and_shared_environment_reconciliation(self):
         long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
 
         for phrase in (
-            "全部 worktree",
+            "与当前工作包相关的 worktree",
             "未合并提交",
             "只隔离文件，不自动隔离运行环境",
             "发现重叠候选时先登记依赖与冲突",

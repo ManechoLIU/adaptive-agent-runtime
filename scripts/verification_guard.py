@@ -14,7 +14,13 @@ from typing import Any, Sequence
 
 RECEIPT_DIRECTORY = "adaptive-delivery"
 RECEIPT_FILE = "verification-receipts.json"
-FORCE_REASONS = ("output-unavailable", "receipt-unverifiable", "user-requested")
+FORCE_REASONS = (
+    "acceptance-policy",
+    "investigation",
+    "output-unavailable",
+    "receipt-unverifiable",
+    "user-requested",
+)
 
 
 def git_path(root: Path, *arguments: str) -> str:
@@ -191,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--force-reason",
         choices=FORCE_REASONS,
-        help="仅在旧输出不可用、收据不可校验或用户明确要求时重跑",
+        help="按验收策略、问题调查、旧输出不可用、收据不可校验或用户要求重跑",
     )
     return parser
 
