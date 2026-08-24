@@ -215,6 +215,21 @@ class SkillStructureTests(unittest.TestCase):
         for phrase in ("已确认参考图快速路径", "强制使用快速档", "不减少必要影响扫描"):
             self.assertIn(phrase, visual)
 
+    def test_binding_visual_reference_is_a_hard_gate_not_inspiration(self):
+        visual = VISUAL.read_text(encoding="utf-8")
+
+        for phrase in (
+            "绑定视觉基线",
+            "不得另起一套视觉系统",
+            "语义最接近的已确认组件",
+            "同状态",
+            "浏览器缩放",
+            "截图存在不等于视觉通过",
+            "保持 `VERIFY`",
+            "visual_evidence_guard.py",
+        ):
+            self.assertIn(phrase, visual)
+
 
 if __name__ == "__main__":
     unittest.main()
