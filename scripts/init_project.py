@@ -9,7 +9,17 @@ from typing import Sequence
 
 COLLABORATIVE_DOCUMENTS = (
     "AGENTS.md",
-    "PROJECT_STATUS.md",
+    "TASK_LEDGER.md",
+    "SPEC.md",
+    "DESIGN.md",
+    "TECHNICAL.md",
+    "EVOLUTION.md",
+)
+DURABLE_DOCUMENTS = (
+    "AGENTS.md",
+    "TASK_LEDGER.md",
+    "MEMORY.md",
+    "WIKI_INDEX.md",
     "SPEC.md",
     "DESIGN.md",
     "TECHNICAL.md",
@@ -18,6 +28,7 @@ COLLABORATIVE_DOCUMENTS = (
 CORE_DOCUMENTS = ("SPEC.md", "DESIGN.md", "TECHNICAL.md", "EVOLUTION.md")
 PROFILES = {
     "collaborative": COLLABORATIVE_DOCUMENTS,
+    "durable": DURABLE_DOCUMENTS,
     "core": CORE_DOCUMENTS,
 }
 TEMPLATES = Path(__file__).resolve().parents[1] / "assets" / "templates"
@@ -49,6 +60,32 @@ def initialize_project(
 
     for name in selected:
         target = root / name
+        if name == "TASK_LEDGER.md":
+            legacy_ledger = root / "PROJECT_STATUS.md"
+            if target.is_symlink():
+                raise ValueError(
+                    "document target must not be a symbolic link: TASK_LEDGER.md"
+                )
+            if target.exists() and not target.is_file():
+                raise ValueError(
+                    "document target must be a regular file: TASK_LEDGER.md"
+                )
+            if legacy_ledger.is_symlink():
+                raise ValueError(
+                    "legacy ledger target must not be a symbolic link: PROJECT_STATUS.md"
+                )
+            if legacy_ledger.exists():
+                if not legacy_ledger.is_file():
+                    raise ValueError(
+                        "legacy ledger target must be a regular file: PROJECT_STATUS.md"
+                    )
+                if target.exists():
+                    raise ValueError(
+                        "both task ledgers exist; reconcile TASK_LEDGER.md and "
+                        "PROJECT_STATUS.md before initialization"
+                    )
+                skipped.append("TASK_LEDGER.md (using existing PROJECT_STATUS.md)")
+                continue
         if target.is_symlink():
             raise ValueError(f"document target must not be a symbolic link: {name}")
         if target.exists():
@@ -84,7 +121,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--profile",
         choices=tuple(PROFILES),
         default="collaborative",
-        help="collaborative 创建六文件，core 创建四个核心文档",
+        help=(
+            "collaborative 创建六个协作文档，durable 再增加项目记忆与知识索引，"
+            "core 创建四个核心文档"
+        ),
     )
     parser.add_argument("--without-design", action="store_true", help="不创建 DESIGN.md")
     args = parser.parse_args(argv)

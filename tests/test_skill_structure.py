@@ -10,6 +10,7 @@ REFERENCE_PATHS = {
     "harness": ROOT / "references" / "harness-and-release.md",
     "visual": ROOT / "references" / "visual-reference-governance.md",
     "experience": ROOT / "references" / "experience-catalog.md",
+    "long-task": ROOT / "references" / "long-task-governance.md",
 }
 METHODS = REFERENCE_PATHS["methods"]
 VISUAL = REFERENCE_PATHS["visual"]
@@ -53,7 +54,7 @@ class SkillStructureTests(unittest.TestCase):
 
         self.assertEqual([], [name for name in vendor_names if name in core])
 
-    def test_four_local_reference_links_resolve(self):
+    def test_local_reference_links_resolve(self):
         _, body = split_frontmatter(read_entrypoint())
         links = set(re.findall(r"\[[^\]]+\]\((references/[^)\s]+)\)", body))
         expected = {f"references/{path.name}" for path in REFERENCE_PATHS.values()}
@@ -84,9 +85,34 @@ class SkillStructureTests(unittest.TestCase):
             "文件所有权",
             "停止条件",
             "主 Agent",
-            "PROJECT_STATUS.md",
+            "唯一任务台账",
         ):
             self.assertIn(field, methods)
+
+    def test_long_task_governance_separates_runtime_context_from_project_files(self):
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+
+        for phrase in (
+            "当前上下文",
+            "Compact / 交接摘要",
+            "TASK_LEDGER.md",
+            "MEMORY.md",
+            "WIKI_INDEX.md",
+            "项目根目录不默认创建 `SKILL.md`",
+        ):
+            self.assertIn(phrase, long_task)
+
+    def test_long_task_governance_requires_candidate_and_shared_environment_reconciliation(self):
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+
+        for phrase in (
+            "全部 worktree",
+            "未合并提交",
+            "只隔离文件，不自动隔离运行环境",
+            "发现重叠候选时先登记依赖与冲突",
+            "未集成到主线前保持 `VERIFY`",
+        ):
+            self.assertIn(phrase, long_task)
 
     def test_mixed_requests_route_each_independent_workflow_by_its_own_risk(self):
         methods = METHODS.read_text(encoding="utf-8")

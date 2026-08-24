@@ -21,7 +21,7 @@ class InitProjectTests(unittest.TestCase):
 
             self.assertEqual(
                 set(report.created),
-                {"AGENTS.md", "PROJECT_STATUS.md", "SPEC.md", "DESIGN.md", "TECHNICAL.md", "EVOLUTION.md"},
+                {"AGENTS.md", "TASK_LEDGER.md", "SPEC.md", "DESIGN.md", "TECHNICAL.md", "EVOLUTION.md"},
             )
             self.assertEqual(report.skipped, ())
             self.assertEqual({path.name for path in root.iterdir()}, set(report.created))
@@ -102,7 +102,7 @@ class InitProjectTests(unittest.TestCase):
             root = Path(directory)
             MODULE.initialize_project(root)
 
-            status = (root / "PROJECT_STATUS.md").read_text(encoding="utf-8")
+            status = (root / "TASK_LEDGER.md").read_text(encoding="utf-8")
             design = (root / "DESIGN.md").read_text(encoding="utf-8")
             agents = (root / "AGENTS.md").read_text(encoding="utf-8")
 
@@ -111,6 +111,40 @@ class InitProjectTests(unittest.TestCase):
             for heading in ("参考图", "采用点", "不得照搬", "状态"):
                 self.assertIn(heading, design)
             self.assertIn("不共享旧聊天", agents)
+
+    def test_durable_profile_adds_memory_and_wiki_without_empty_directories(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = MODULE.initialize_project(root, profile="durable")
+
+            self.assertEqual(len(report.created), 8)
+            self.assertTrue((root / "MEMORY.md").is_file())
+            self.assertTrue((root / "WIKI_INDEX.md").is_file())
+            self.assertFalse((root / "raw_sources").exists())
+            self.assertFalse((root / "wiki").exists())
+
+    def test_existing_project_status_is_the_legacy_ledger_alias(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "PROJECT_STATUS.md"
+            legacy.write_text("# user-owned ledger\n", encoding="utf-8")
+
+            report = MODULE.initialize_project(root, profile="durable")
+
+            self.assertFalse((root / "TASK_LEDGER.md").exists())
+            self.assertEqual(legacy.read_text(encoding="utf-8"), "# user-owned ledger\n")
+            self.assertIn(
+                "TASK_LEDGER.md (using existing PROJECT_STATUS.md)", report.skipped
+            )
+
+    def test_two_existing_ledgers_are_rejected(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "TASK_LEDGER.md").write_text("# new ledger\n", encoding="utf-8")
+            (root / "PROJECT_STATUS.md").write_text("# legacy ledger\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "both task ledgers exist"):
+                MODULE.initialize_project(root, profile="durable")
 
 
 if __name__ == "__main__":
