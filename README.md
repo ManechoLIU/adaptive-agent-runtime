@@ -116,6 +116,17 @@ python3 scripts/init_project.py /path/to/project --profile core
 
 混合请求先按可独立交付的工作流分别选档。一个付费或外部调用步骤只升级依赖它的工作流，不会把无依赖的只读核查和低风险修改整体升级；多问题任务复用同一事实源证据，并把独立审查集中在高风险结论。
 
+## 验证不重复
+
+完整验证发生在全部 diff 审查结束、候选内容冻结之后。同一候选快照与命令已经通过时直接复用收据；提交不改变内容就不重跑，推送后默认只核对远端 SHA。Git 项目可用机械守卫执行完整检查：
+
+```bash
+python3 scripts/verification_guard.py run /path/to/project \
+  --check-id full-suite -- your-test-command
+```
+
+守卫把收据保存在目标仓库的 `.git/adaptive-delivery/`，不会进入提交；内容或明确声明的环境输入变化后才重新执行。确需重跑时，`--force-reason` 只接受 `output-unavailable`、`receipt-unverifiable` 或 `user-requested`。
+
 ## 使用场景总览
 
 | 你的情况 | Skill 会怎么处理 |
