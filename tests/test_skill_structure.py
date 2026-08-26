@@ -188,6 +188,37 @@ class SkillStructureTests(unittest.TestCase):
         ):
             self.assertIn(phrase, long_task)
 
+    def test_long_task_controller_closes_atomic_events_before_yielding(self):
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+
+        for phrase in (
+            "原子控制事务",
+            "当前 Goal",
+            "活动工作包",
+            "READY",
+            "阻塞",
+            "下一可见检查点",
+            "短事件回合",
+            "立即 yield",
+        ):
+            self.assertIn(phrase, long_task)
+
+    def test_long_task_controller_uses_evidence_before_interrupt_or_replacement(self):
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+
+        for phrase in (
+            "消息送达",
+            "任务活动",
+            "工具事件",
+            "工作树状态",
+            "clean",
+            "loaded ACK",
+            "连续两次",
+            "更换总控",
+            "唯一常驻验收入口",
+        ):
+            self.assertIn(phrase, long_task)
+
     def test_mixed_requests_route_each_independent_workflow_by_its_own_risk(self):
         methods = METHODS.read_text(encoding="utf-8")
 
