@@ -560,6 +560,17 @@ class GovernanceTests(unittest.TestCase):
 
         self.assertEqual(lint_governance.task_rows(text), [("M2", "READY")])
 
+    def test_task_record_prefers_next_step_over_evidence_column(self) -> None:
+        text = """| ID | 状态 / owner | 固定边界与当前证据 | 依赖、阻塞与下一步 |
+| --- | --- | --- | --- |
+| F1 | `RECOVERING` / Agent A | 旧候选失败 | 修复后在 checkpoint 复审 |
+"""
+
+        self.assertEqual(
+            lint_governance.task_records(text)[0]["next_action"],
+            "修复后在 checkpoint 复审",
+        )
+
     def test_legacy_project_status_template_passes_strict_lint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

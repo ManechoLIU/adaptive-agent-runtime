@@ -91,9 +91,16 @@ def task_records(text: str) -> list[dict[str, str]]:
                         (
                             value
                             for key, value in values.items()
-                            if "下一步" in key or "证据" in key
+                            if "下一步" in key
                         ),
-                        cells[-1] if cells else "",
+                        next(
+                            (
+                                value
+                                for key, value in values.items()
+                                if "证据" in key
+                            ),
+                            cells[-1] if cells else "",
+                        ),
                     )
                     rows.append(
                         {
