@@ -12,7 +12,10 @@ REFERENCE_PATHS = {
     "experience": ROOT / "references" / "experience-catalog.md",
     "long-task": ROOT / "references" / "long-task-governance.md",
     "context": ROOT / "references" / "context-governance.md",
+    "agent-routing": ROOT / "references" / "agent-model-routing.md",
+    "external-agent": ROOT / "references" / "external-agent-auth.md",
 }
+CORE_REFERENCE_KEYS = ("methods", "harness", "visual", "experience", "long-task", "context")
 METHODS = REFERENCE_PATHS["methods"]
 VISUAL = REFERENCE_PATHS["visual"]
 
@@ -49,7 +52,10 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_core_runtime_instructions_are_vendor_neutral(self):
         core = "\n".join(
-            [read_entrypoint(), *[path.read_text(encoding="utf-8") for path in REFERENCE_PATHS.values()]]
+            [read_entrypoint(), *[
+                REFERENCE_PATHS[key].read_text(encoding="utf-8")
+                for key in CORE_REFERENCE_KEYS
+            ]]
         ).casefold()
         vendor_names = ("codex", "chatgpt", "claude code", "gemini cli", "cursor")
 
