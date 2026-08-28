@@ -228,9 +228,28 @@ class SkillStructureTests(unittest.TestCase):
             "scripts/event_scope_guard.py",
             "scripts/assignment_lease_guard.py",
             "scripts/ledger_consistency_guard.py",
+            "scripts/lifecycle_hook.py",
             "不另建评分表",
         ):
             self.assertIn(phrase, long_task)
+
+    def test_controller_lifecycle_hook_is_documented_as_runtime_enforcement(self):
+        entrypoint = read_entrypoint()
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("生命周期执行器", entrypoint)
+        for phrase in (
+            "SessionStart",
+            "PostToolUse",
+            "SubagentStop",
+            "Stop",
+            "registered controller",
+            "control_event_guard.py",
+        ):
+            self.assertIn(phrase, long_task)
+        self.assertIn("--register-controller", readme)
+        self.assertIn("/hooks", readme)
 
     def test_long_task_governance_bounds_event_append_and_agent_reuse(self):
         long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")

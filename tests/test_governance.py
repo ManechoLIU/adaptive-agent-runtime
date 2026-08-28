@@ -33,6 +33,7 @@ assignment_lease_guard = load_module(
 ledger_consistency_guard = load_module(
     "ledger_consistency_guard", "scripts/ledger_consistency_guard.py"
 )
+lifecycle_hook = load_module("lifecycle_hook", "scripts/lifecycle_hook.py")
 
 
 class GovernanceTests(unittest.TestCase):
@@ -58,6 +59,100 @@ class GovernanceTests(unittest.TestCase):
             ],
             "terminal_receipt_issued": True,
         }
+
+    def test_lifecycle_hook_surfaces_ready_work_after_tool_use(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": ["WEB-READY", "MINI-READY"],
+        }
+
+        output, next_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status --short"},
+                "tool_response": {"output": ""},
+            },
+            snapshot=snapshot,
+            prior_state=None,
+        )
+
+        self.assertEqual(
+            output["hookSpecificOutput"]["hookEventName"], "PostToolUse"
+        )
+        self.assertIn("WEB-READY", output["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("MINI-READY", output["hookSpecificOutput"]["additionalContext"])
+        self.assertTrue(next_state["pending_control_event"])
+
+    def test_lifecycle_hook_stop_continues_until_ready_is_dispatched(self) -> None:
+        output, next_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "stop_hook_active": False,
+            },
+            snapshot={
+                "head": "abc123",
+                "ledger_sha256": "ledger-1",
+                "worktree_status_sha256": "status-1",
+                "ready_ids": ["WEB-READY"],
+            },
+            prior_state={
+                "pending_control_event": True,
+                "triggers": ["READY:WEB-READY"],
+            },
+        )
+
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("WEB-READY", output["reason"])
+        self.assertTrue(next_state["pending_control_event"])
+
+    def test_lifecycle_hook_successful_guard_receipt_clears_pending_event(self) -> None:
+        output, next_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "python3 scripts/control_event_guard.py receipt.json --ledger TASK_LEDGER.md"
+                },
+                "tool_response": {"output": "control-event: allowed", "exit_code": 0},
+            },
+            snapshot={
+                "head": "abc123",
+                "ledger_sha256": "ledger-2",
+                "worktree_status_sha256": "status-2",
+                "ready_ids": [],
+            },
+            prior_state={
+                "pending_control_event": True,
+                "triggers": ["ledger_changed"],
+            },
+        )
+
+        self.assertEqual(output, {})
+        self.assertFalse(next_state["pending_control_event"])
+        self.assertEqual(next_state["triggers"], [])
+
+    def test_lifecycle_hook_ignores_projects_without_a_canonical_ledger(self) -> None:
+        output, next_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+            },
+            snapshot=None,
+            prior_state={"pending_control_event": True},
+        )
+
+        self.assertEqual(output, {})
+        self.assertEqual(next_state, {})
 
     def test_event_scope_guard_allows_only_causally_required_same_candidate_action(self) -> None:
         contract = {

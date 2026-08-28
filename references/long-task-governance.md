@@ -97,6 +97,8 @@
 
 每个控制事件结束前都用 `scripts/control_event_guard.py --ledger <唯一台账>` 校验一次临时 JSON。输入除台账 SHA-256、槽位、全部 `READY` 决定、必需 Reviewer 与规则 ACK 外，还必须包含本轮 `event_contract`、`event_actions` 和 `terminal_receipt_issued=true`；脚本会再次拒绝跨任务 / revision 的动作链。`available_slots` 表示派发前可用槽位；`READY` 延后必须填写结构化 `reason_code`，只接受容量已满、文件冲突、共享环境、顺序集成、外部阻塞或授权门，不能用“下一事件”“稍后处理”或主观优先级留下空槽。必需 Reviewer 与规则更新的受影响 live 任务仍由命令行显式声明，脚本不会自行推断。输入不写入项目文件；门禁只替代确定性的完整性检查，不能代替总控对文件冲突、优先级、证据质量或真实完成的判断。
 
+仅靠结束时手动运行门禁不足以约束长回合。持续总控注册为 **registered controller** 后，使用 `scripts/lifecycle_hook.py` 接入 `SessionStart / PostToolUse / SubagentStop / Stop`：会话启动时建立真实主线与台账基线；工具调用后检测 `main`、工作区、台账或 `READY` 变化；子 Agent 停止时登记待处理候选事件；总控准备停止时，若这些变化尚未由成功的 `control_event_guard.py` 收据闭合，则自动继续当前 turn。连续三次仍未闭合时明确 fail closed，不把它伪装成正常 idle。Hook 只对登记的唯一总控和 canonical `main` 生效，Writer / Reviewer 工作树不受影响；它只能触发检查与续作，不能代替总控调用 `spawn_agent`、判断文件冲突或选择优先级。非托管 Hook 必须完成运行平台的定义审核与信任后才算生效，具体命令只放在平台安装指南中。
+
 完成既有项目的一次性迁移后，台账每次提交或总控 yield 前运行 `scripts/ledger_consistency_guard.py <ledger>`：当前 Goal 和下一检查点必须指向开放任务，`ACTIVE / RECOVERING` 必须有唯一负责人，`RECOVERING` 必须有恢复动作 / checkpoint，若仍保留顶部活动指针则必须与任务表完全一致。门禁失败只修受影响字段，不展开台账重写；未迁移项目先用普通 lint 得到警告并继续无冲突实现。
 
 下游工作唯一缺口是尚未冻结的共享契约、字段语义或适配边界时，不得把“输入未准备好”长期写成空槽理由。先把缺失输入拆成能独立验收的上游工作包，明确下游释放条件；上游进入主线并通过相称验证后，在同一状态事件中更新台账并释放下游。契约冻结前禁止下游猜测字段、状态或单位并行实现；这类顺序等待是有效依赖，不是低并行失职。

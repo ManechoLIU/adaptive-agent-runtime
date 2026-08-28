@@ -269,6 +269,26 @@ python3 scripts/control_event_guard.py \
 
 该 JSON 只在当前事件中使用，不进入项目台账。除当前台账 SHA-256、派发前可用槽位、全部 `READY` 决定和显式声明的 Reviewer / 规则 ACK 外，还要带本轮 `event_contract`、`event_actions` 与 `terminal_receipt_issued=true`。脚本会复核整条动作链是否仍属于同一主任务和候选 revision；延后 `READY` 必须使用结构化 `reason_code`，不能用“下一事件”或“稍后处理”留下空槽。门禁通过后删除临时输入，不新增治理文档。
 
+### 让控制事件自动触发，而不是等总控想起来
+
+`scripts/lifecycle_hook.py` 把持续总控的控制事件接到 Codex 生命周期：
+
+- `SessionStart`：读取 canonical `main` 与唯一台账基线；
+- `PostToolUse`：主线、工作区、台账或 `READY` 改变后立即给总控追加控制上下文；
+- `SubagentStop`：把子 Agent 完成登记为待审候选事件；
+- `Stop`：仍有待处理事件或 `READY` 且没有通过的控制收据时，自动续作而不是静默 idle。
+
+先把唯一总控登记到本机状态；临时 Writer / Reviewer 不登记：
+
+```bash
+python3 ~/.agents/skills/adaptive-delivery/scripts/lifecycle_hook.py \
+  --register-controller <controller-session-id> /path/to/canonical/main
+```
+
+然后在 `~/.codex/hooks.json` 合并四个 command handler，命令都指向安装副本的 `scripts/lifecycle_hook.py`：`SessionStart`、`PostToolUse`（matcher `*`）、`SubagentStop` 和 `Stop`。Codex 的非托管 Hook 还必须在 CLI 的 `/hooks` 中审核并信任精确定义；未显示 Active 就不能声称自动门禁已生效。
+
+Hook 不会替总控盲目派发。它负责自动发现和阻止漏处理；文件冲突、共享环境、优先级与 `spawn_agent` 仍由总控判断。成功运行 `control_event_guard.py`，且台账已无未决 `READY` 后，本次自动控制事件才会清除。
+
 ### 防止短事件继续无边界加任务
 
 ```bash
