@@ -36,6 +36,29 @@ ledger_consistency_guard = load_module(
 
 
 class GovernanceTests(unittest.TestCase):
+    def complete_event_receipt(self) -> dict[str, object]:
+        return {
+            "event_contract": {
+                "event_id": "control-event-1",
+                "event_type": "dispatch",
+                "primary_task": "CONTROL-WAVE-1",
+                "candidate_revision": "ledger-abc123",
+                "allowed_actions": ["ledger_sync"],
+                "allowed_files": [],
+                "terminal_receipt": "control event synchronized",
+            },
+            "event_actions": [
+                {
+                    "action": "ledger_sync",
+                    "primary_task": "CONTROL-WAVE-1",
+                    "candidate_revision": "ledger-abc123",
+                    "files": [],
+                    "required_to_close_current_state": True,
+                }
+            ],
+            "terminal_receipt_issued": True,
+        }
+
     def test_event_scope_guard_allows_only_causally_required_same_candidate_action(self) -> None:
         contract = {
             "event_id": "event-1",
@@ -145,6 +168,7 @@ class GovernanceTests(unittest.TestCase):
 
     def test_control_event_guard_requires_every_ready_decision(self) -> None:
         snapshot = {
+            **self.complete_event_receipt(),
             "ledger_sha256": "abc123",
             "available_slots": 1,
             "ready_packages": [
@@ -165,6 +189,7 @@ class GovernanceTests(unittest.TestCase):
 
     def test_control_event_guard_checks_reviewer_and_rule_acks(self) -> None:
         snapshot = {
+            **self.complete_event_receipt(),
             "ledger_sha256": "abc123",
             "available_slots": 0,
             "ready_packages": [],
@@ -191,6 +216,7 @@ class GovernanceTests(unittest.TestCase):
 
     def test_control_event_guard_allows_complete_event(self) -> None:
         snapshot = {
+            **self.complete_event_receipt(),
             "ledger_sha256": "abc123",
             "available_slots": 1,
             "ready_packages": [
@@ -204,6 +230,7 @@ class GovernanceTests(unittest.TestCase):
                     "id": "F2",
                     "decision": "deferred",
                     "reason": "shares the same output directory as F1",
+                    "reason_code": "file_conflict",
                 },
             ],
             "required_reviews": [
@@ -230,6 +257,7 @@ class GovernanceTests(unittest.TestCase):
 
     def test_control_event_guard_rejects_stale_ledger_and_omitted_expectations(self) -> None:
         snapshot = {
+            **self.complete_event_receipt(),
             "ledger_sha256": "stale",
             "available_slots": 0,
             "ready_packages": [],
@@ -247,6 +275,85 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("ledger_sha256 does not match the current ledger", errors)
         self.assertIn("control event omitted required reviews: UX-EARLY", errors)
         self.assertIn("control event omitted the declared rule update", errors)
+
+    def test_control_event_guard_rejects_multi_chain_event_journal(self) -> None:
+        snapshot = {
+            "ledger_sha256": "abc123",
+            "available_slots": 0,
+            "ready_packages": [],
+            "event_contract": {
+                "event_id": "event-1",
+                "event_type": "candidate integration",
+                "primary_task": "F1",
+                "candidate_revision": "abc123",
+                "allowed_actions": ["review", "integrate", "ledger_sync"],
+                "allowed_files": ["app/a.ts", "TASK_LEDGER.md"],
+                "terminal_receipt": "F1 integrated and ledger synchronized",
+            },
+            "event_actions": [
+                {
+                    "action": "integrate",
+                    "primary_task": "F1",
+                    "candidate_revision": "abc123",
+                    "files": ["app/a.ts"],
+                    "required_to_close_current_state": True,
+                },
+                {
+                    "action": "integrate",
+                    "primary_task": "F2",
+                    "candidate_revision": "def456",
+                    "files": ["app/b.ts"],
+                    "required_to_close_current_state": True,
+                },
+            ],
+            "terminal_receipt_issued": True,
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set()
+        )
+
+        self.assertTrue(any("event_actions[1]" in error for error in errors))
+        self.assertTrue(any("different primary task" in error for error in errors))
+
+    def test_control_event_guard_rejects_vague_deferral_with_idle_slot(self) -> None:
+        snapshot = {
+            "ledger_sha256": "abc123",
+            "available_slots": 2,
+            "ready_packages": [
+                {
+                    "id": "F1",
+                    "decision": "deferred",
+                    "reason": "handle in the next event",
+                }
+            ],
+            "event_contract": {
+                "event_id": "event-1",
+                "event_type": "dispatch",
+                "primary_task": "F1",
+                "candidate_revision": "ledger-abc123",
+                "allowed_actions": ["dispatch", "ledger_sync"],
+                "allowed_files": ["TASK_LEDGER.md"],
+                "terminal_receipt": "all READY packages have exact decisions",
+            },
+            "event_actions": [
+                {
+                    "action": "ledger_sync",
+                    "primary_task": "F1",
+                    "candidate_revision": "ledger-abc123",
+                    "files": ["TASK_LEDGER.md"],
+                    "required_to_close_current_state": True,
+                }
+            ],
+            "terminal_receipt_issued": True,
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids={"F1"}
+        )
+
+        self.assertTrue(any("reason_code" in error for error in errors))
+        self.assertTrue(any("idle dispatch capacity" in error for error in errors))
 
     def test_preblock_guard_rejects_ready_work_outside_current_goal(self) -> None:
         snapshot = {
@@ -537,6 +644,24 @@ class GovernanceTests(unittest.TestCase):
         errors = ledger_consistency_guard.validate_ledger(text)
 
         self.assertIn("current Goal must reference at least one open task ID", errors)
+
+    def test_ledger_consistency_rejects_duplicated_runtime_capacity_pointer(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：`F1` 完成登录闭环
+- 下一可见检查点：`F1` 真实浏览器通过
+- 当前阻塞：无
+- 规则版本：abc123
+- 容量 / READY：1/4，三个空槽
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| F1 | `ACTIVE` / Agent A | 完成登录恢复 Case |
+"""
+
+        errors = ledger_consistency_guard.validate_ledger(text)
+
+        self.assertTrue(any("runtime capacity" in error for error in errors))
 
     def test_task_parser_ignores_status_words_in_evidence_and_non_task_tables(self) -> None:
         text = """# Ledger

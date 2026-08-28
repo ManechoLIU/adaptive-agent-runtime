@@ -11,6 +11,15 @@ from typing import Any, Sequence
 from lint_governance import task_rows
 
 DECISIONS = {"active", "deferred", "blocked"}
+DEFER_REASON_CODES = {
+    "capacity",
+    "file_conflict",
+    "shared_environment",
+    "ordered_integration",
+    "external_blocker",
+    "authorization",
+}
+HARD_DEFER_REASON_CODES = DEFER_REASON_CODES - {"capacity"}
 
 
 def ready_ledger_package_ids(ledger: Path) -> set[str]:
@@ -45,6 +54,27 @@ def validate_snapshot(
     affected_task_ids: set[str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
+    contract = snapshot.get("event_contract")
+    actions = snapshot.get("event_actions")
+    if not isinstance(contract, dict):
+        errors.append("event_contract is required")
+    if not isinstance(actions, list) or not actions:
+        errors.append("event_actions must be a non-empty list")
+    elif isinstance(contract, dict):
+        from event_scope_guard import classify_append
+
+        for index, action in enumerate(actions):
+            if not isinstance(action, dict):
+                errors.append(f"event_actions[{index}] must be an object")
+                continue
+            decision, reasons = classify_append(contract, action)
+            if decision != "SAME_EVENT":
+                errors.append(
+                    f"event_actions[{index}] is {decision}: " + "; ".join(reasons)
+                )
+    if snapshot.get("terminal_receipt_issued") is not True:
+        errors.append("terminal_receipt_issued=true is required")
+
     snapshot_sha = str(snapshot.get("ledger_sha256", "")).strip()
     if not snapshot_sha:
         errors.append("ledger_sha256 is required")
@@ -59,6 +89,8 @@ def validate_snapshot(
         errors.append("ready_packages must enumerate every READY ledger package")
         raw_ready = []
     snapshot_ready_ids: set[str] = set()
+    active_decisions = 0
+    deferred_without_hard_constraint: list[str] = []
     for index, package in enumerate(raw_ready):
         if not isinstance(package, dict):
             errors.append(f"ready_packages[{index}] must be an object")
@@ -75,12 +107,28 @@ def validate_snapshot(
             errors.append(f"{package_id} decision must be active, deferred, or blocked")
             continue
         if decision == "active":
+            active_decisions += 1
             if not str(package.get("task_id", "")).strip():
                 errors.append(f"{package_id} active decision requires task_id")
             if package.get("delivered_ack") is not True:
                 errors.append(f"{package_id} active decision requires delivered_ack=true")
-        elif not str(package.get("reason", "")).strip():
-            errors.append(f"{package_id} {decision} decision requires an exact reason")
+        else:
+            if not str(package.get("reason", "")).strip():
+                errors.append(f"{package_id} {decision} decision requires an exact reason")
+            reason_code = str(package.get("reason_code", "")).strip().lower()
+            if reason_code not in DEFER_REASON_CODES:
+                errors.append(
+                    f"{package_id} {decision} decision requires reason_code: "
+                    + ", ".join(sorted(DEFER_REASON_CODES))
+                )
+            if reason_code not in HARD_DEFER_REASON_CODES:
+                deferred_without_hard_constraint.append(package_id)
+
+    if isinstance(slots, int) and slots > active_decisions and deferred_without_hard_constraint:
+        errors.append(
+            "idle dispatch capacity remains for READY packages without a hard constraint: "
+            + ", ".join(sorted(deferred_without_hard_constraint))
+        )
 
     if ledger_ready_ids is not None:
         missing = sorted(ledger_ready_ids - snapshot_ready_ids)

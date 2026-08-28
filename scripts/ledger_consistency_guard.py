@@ -12,6 +12,10 @@ from lint_governance import pointer_ids, task_records
 OPEN_STATES = {"PENDING", "READY", "ACTIVE", "RECOVERING", "VERIFY", "BLOCKED"}
 WORK_IN_FLIGHT_STATES = {"ACTIVE", "RECOVERING"}
 NONE_VALUES = {"无", "none", "None"}
+RUNTIME_CAPACITY_POINTER = re.compile(
+    r"^-\s*(?:容量\s*/\s*READY|当前容量|实时容量|当前\s*Writer|当前\s*Reviewer)\s*：",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 def pointer(text: str, label: str) -> str | None:
@@ -45,6 +49,10 @@ def has_owner(record: dict[str, str]) -> bool:
 
 def validate_ledger(text: str) -> list[str]:
     errors: list[str] = []
+    if RUNTIME_CAPACITY_POINTER.search(text):
+        errors.append(
+            "runtime capacity and live assignment counts belong in the ephemeral control receipt, not the ledger header"
+        )
     records = task_records(text)
     identifiers = [record["id"] for record in records]
     duplicate_ids = sorted(

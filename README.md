@@ -257,7 +257,7 @@ python3 scripts/lint_governance.py --strict /path/to/project
 
 既有项目先不加 `--strict` 查看迁移警告，完成一次范围单一的台账瘦身并对账后再启用严格门；迁移本身不得暂停无冲突开发。
 
-一次调度事件中同时存在多个 `READY`、必需 Reviewer 或规则更新时，可用临时 JSON 做轻量收口：
+每次控制事件结束前都用临时 JSON 做轻量收口；存在多个 `READY`、必需 Reviewer 或规则更新时一并声明：
 
 ```bash
 python3 scripts/control_event_guard.py \
@@ -267,7 +267,7 @@ python3 scripts/control_event_guard.py \
   control-event.json
 ```
 
-该 JSON 只在当前事件中使用，不进入项目台账。脚本精确读取任务表的状态列，并校验当前台账 SHA-256、全部 `READY` 决定，以及命令行显式声明的 Reviewer 和受影响任务 ACK；它不会猜测哪些审查或任务应受影响。门禁通过后删除临时输入，不新增治理文档。
+该 JSON 只在当前事件中使用，不进入项目台账。除当前台账 SHA-256、派发前可用槽位、全部 `READY` 决定和显式声明的 Reviewer / 规则 ACK 外，还要带本轮 `event_contract`、`event_actions` 与 `terminal_receipt_issued=true`。脚本会复核整条动作链是否仍属于同一主任务和候选 revision；延后 `READY` 必须使用结构化 `reason_code`，不能用“下一事件”或“稍后处理”留下空槽。门禁通过后删除临时输入，不新增治理文档。
 
 ### 防止短事件继续无边界加任务
 
@@ -291,7 +291,7 @@ python3 scripts/assignment_lease_guard.py assignment.json
 python3 scripts/ledger_consistency_guard.py /path/to/project/TASK_LEDGER.md
 ```
 
-任务表是状态唯一权威。门禁检查 Goal / 下一检查点是否指向开放任务、`ACTIVE / RECOVERING` 是否有负责人、恢复项是否有恢复动作，以及旧式顶部活动指针是否与任务表一致。新项目直接启用；旧项目先完成一次不阻塞开发的范围单一迁移，再把它放到台账提交和总控 yield 前。
+任务表是状态唯一权威。门禁检查 Goal / 下一检查点是否指向开放任务、`ACTIVE / RECOVERING` 是否有负责人、恢复项是否有恢复动作，以及旧式顶部活动指针是否与任务表一致；实时槽位和 Writer / Reviewer 数量只能出现在临时控制收据，不能在台账顶部复制。新项目直接启用；旧项目先完成一次不阻塞开发的范围单一迁移，再把它放到台账提交和总控 yield 前。
 
 ### 复用验证收据
 

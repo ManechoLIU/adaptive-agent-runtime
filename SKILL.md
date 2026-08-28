@@ -37,7 +37,7 @@ description: Use when initializing or governing a long-running project, choosing
 8. 需要分派子 Agent 或选择模型时，先读取 [Agent and model routing](references/agent-model-routing.md)。Adaptive Delivery 是项目工作包、执行通道、模型与认证路由的唯一事实源，并直接执行已确认的路由合同；Task Navigator 等生命周期插件只管理用户可见任务容器、续接、标题和最近进展，不读取、执行或修改项目路由合同。
 9. 完成宣称必须绑定当前候选与适用环境的验证证据。仍有效的收据可以复用；项目验收策略、问题调查或环境漂移要求新证据时可以重跑并记录原因。具体按 [Harness and release](references/harness-and-release.md) 执行。
 10. 项目总控把系统 Goal 标为 `blocked` 前，必须按 [long-task governance](references/long-task-governance.md) 对唯一台账做项目全量存活扫描，并以该台账路径运行 `scripts/preblock_guard.py`。门禁会直接比对台账开放项与临时扫描，不能靠漏填任务绕过。当前 Goal、优先级或阶段只决定先后，不能把不服务当前 Goal 的开放工作包排除出 `READY`；单个 GUI、凭证、付费或外部环境阻塞只约束依赖它的工作包。连续三轮遇到同一阻塞只是必要条件，不是跳过项目级扫描的充分条件。
-11. 规则和台账治理按 [long-task governance](references/long-task-governance.md) 的减法与机器门执行；短事件追加、Agent Assignment 租约和台账一致性分别使用 `event_scope_guard.py`、`assignment_lease_guard.py`、`ledger_consistency_guard.py`，不新增平行台账、同义规则或无行动价值的过程流水。
+11. 规则和台账治理按 [long-task governance](references/long-task-governance.md) 的减法与机器门执行；短事件追加先用 `event_scope_guard.py`，结束时再由 `control_event_guard.py` 复核整条动作链、全部 `READY` 决定和空槽理由；Agent Assignment 租约与台账一致性分别使用 `assignment_lease_guard.py`、`ledger_consistency_guard.py`。实时容量只进临时收据，不在台账顶部重复维护；不新增平行台账、同义规则或无行动价值的过程流水。
 
 ## 续接与执行预算
 
