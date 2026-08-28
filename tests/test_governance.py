@@ -22,9 +22,120 @@ def load_module(name: str, relative_path: str):
 
 init_project = load_module("init_project", "scripts/init_project.py")
 lint_governance = load_module("lint_governance", "scripts/lint_governance.py")
+preblock_guard = load_module("preblock_guard", "scripts/preblock_guard.py")
 
 
 class GovernanceTests(unittest.TestCase):
+    def test_preblock_guard_rejects_ready_work_outside_current_goal(self) -> None:
+        snapshot = {
+            "project_scope_scan": True,
+            "ledger_revision": "abc123",
+            "open_packages": [
+                {
+                    "id": "CURRENT-GOAL",
+                    "state": "BLOCKED",
+                    "can_progress": False,
+                    "reason": "GUI unavailable",
+                    "external_condition_id": "gui-session",
+                },
+                {
+                    "id": "P2-OTHER-END",
+                    "state": "READY",
+                    "can_progress": True,
+                    "reason": "independent package",
+                    "external_condition_id": "",
+                },
+            ],
+            "live_tasks": 0,
+            "pending_candidates": 0,
+            "controller_actions": 0,
+        }
+
+        errors = preblock_guard.validate_snapshot(
+            snapshot, ledger_package_ids={"CURRENT-GOAL", "P2-OTHER-END"}
+        )
+
+        self.assertTrue(any("P2-OTHER-END can still make progress" in e for e in errors))
+        self.assertTrue(any("P2-OTHER-END is still READY" in e for e in errors))
+
+    def test_preblock_guard_rejects_active_work_and_controller_actions(self) -> None:
+        snapshot = {
+            "project_scope_scan": True,
+            "ledger_revision": "abc123",
+            "open_packages": [
+                {
+                    "id": "F1",
+                    "state": "ACTIVE",
+                    "can_progress": False,
+                    "reason": "writer still running",
+                    "external_condition_id": "writer-result",
+                }
+            ],
+            "live_tasks": 1,
+            "pending_candidates": 0,
+            "controller_actions": 1,
+        }
+
+        errors = preblock_guard.validate_snapshot(snapshot, ledger_package_ids={"F1"})
+
+        self.assertTrue(any("F1 is still ACTIVE" in e for e in errors))
+        self.assertTrue(any("live_tasks must be zero" in e for e in errors))
+        self.assertTrue(any("controller_actions must be zero" in e for e in errors))
+
+    def test_preblock_guard_allows_single_shared_external_blocker(self) -> None:
+        snapshot = {
+            "project_scope_scan": True,
+            "ledger_revision": "abc123",
+            "open_packages": [
+                {
+                    "id": "F1",
+                    "state": "BLOCKED",
+                    "can_progress": False,
+                    "reason": "waiting for the same production credential",
+                    "external_condition_id": "production-credential",
+                },
+                {
+                    "id": "F2",
+                    "state": "BLOCKED",
+                    "can_progress": False,
+                    "reason": "waiting for the same production credential",
+                    "external_condition_id": "production-credential",
+                },
+            ],
+            "live_tasks": 0,
+            "pending_candidates": 0,
+            "controller_actions": 0,
+        }
+
+        self.assertEqual(
+            preblock_guard.validate_snapshot(snapshot, ledger_package_ids={"F1", "F2"}),
+            [],
+        )
+
+    def test_preblock_guard_rejects_omitted_open_ledger_package(self) -> None:
+        snapshot = {
+            "project_scope_scan": True,
+            "ledger_revision": "abc123",
+            "open_packages": [
+                {
+                    "id": "F1",
+                    "state": "BLOCKED",
+                    "can_progress": False,
+                    "reason": "waiting for credential",
+                    "external_condition_id": "credential",
+                }
+            ],
+            "live_tasks": 0,
+            "pending_candidates": 0,
+            "controller_actions": 0,
+        }
+
+        errors = preblock_guard.validate_snapshot(
+            snapshot, ledger_package_ids={"F1", "P2-READY"}
+        )
+
+        self.assertIn("scan omitted ledger packages: P2-READY", errors)
+
     def test_durable_profile_creates_nine_project_documents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

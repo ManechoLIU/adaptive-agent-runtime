@@ -35,6 +35,7 @@ description: Use when initializing or governing a long-running project, choosing
 6. 快速档不固定文件清单或工具次数：先按项目文档职责扫描真实影响，只更新受影响事实源；发现跨域变化、冲突或高风险边界时再升级，不能为了快而漏改，也不能因涉及多份文档自动升级。
 7. 多 Agent 数量是从 `0` 到运行环境上限的动态选择，不是流程配额。主 Agent 保留范围、共享契约、集成和最终验收；能以现有边界或小规模行为不变拆分隔离的实现优先分派，不默认由主 Agent 包揽全部用户可见模块。
 8. 完成宣称必须绑定当前候选与适用环境的验证证据。仍有效的收据可以复用；项目验收策略、问题调查或环境漂移要求新证据时可以重跑并记录原因。具体按 [Harness and release](references/harness-and-release.md) 执行。
+9. 项目总控把系统 Goal 标为 `blocked` 前，必须按 [long-task governance](references/long-task-governance.md) 对唯一台账做项目全量存活扫描，并以该台账路径运行 `scripts/preblock_guard.py`。门禁会直接比对台账开放项与临时扫描，不能靠漏填任务绕过。当前 Goal、优先级或阶段只决定先后，不能把不服务当前 Goal 的开放工作包排除出 `READY`；单个 GUI、凭证、付费或外部环境阻塞只约束依赖它的工作包。连续三轮遇到同一阻塞只是必要条件，不是跳过项目级扫描的充分条件。
 
 ## 续接与执行预算
 
