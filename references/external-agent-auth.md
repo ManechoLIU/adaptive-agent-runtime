@@ -48,6 +48,12 @@ node <skill-directory>/scripts/run_external_agent.mjs --check --engine grok-buil
 
 `available` proves only executable and version discovery. `credentialConfigured` proves only that the expected local credential source exists. Neither proves subscription entitlement, balance, model access, successful inference, or billing behavior.
 
+## Visible execution status
+
+External runners execute inside the controller task and do not create a native Codex subagent card. After preflight succeeds and immediately before a real authorized request, publish the `外部 Agent 运行中` line defined in [Agent and model routing](agent-model-routing.md), including the work package, engine/model, `auth_mode`, selected reasoning effort, and category. Do not publish it for `--check` or while authorization is still missing.
+
+When the runner exits, publish `外部 Agent 已返回` with its exit code and the concrete candidate or diff boundary. Publish `外部 Agent 已验收` only after the parent has inspected the actual diff and completed the route contract's verification. A preflight failure uses `外部 Agent 阻塞`; an interrupted or ambiguous request that may have consumed allowance or produced partial edits uses `外部 Agent 结果未知` and stops without automatic retry. Never include credentials or sensitive raw output in these status lines.
+
 ## Paid execution gate
 
 Immediately before a real model request, confirm that the current user request authorizes the selected model, `auth_mode`, scope, and expected paid or allowance-consuming call. Prior installation, login, key configuration, or general delegation consent is insufficient.
