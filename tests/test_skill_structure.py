@@ -219,6 +219,31 @@ class SkillStructureTests(unittest.TestCase):
         ):
             self.assertIn(phrase, long_task)
 
+    def test_long_task_controller_turns_missing_inputs_into_upstream_work(self):
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+
+        for phrase in (
+            "缺失输入拆成能独立验收的上游工作包",
+            "明确下游释放条件",
+            "契约冻结前禁止下游猜测",
+            "补齐 ACK 后从原 checkpoint 恢复",
+            "不因握手缺失自动丢弃有效 WIP",
+        ):
+            self.assertIn(phrase, long_task)
+
+    def test_shared_contract_review_checks_scale_and_unit_semantics(self):
+        harness = REFERENCE_PATHS["harness"].read_text(encoding="utf-8")
+
+        for phrase in (
+            "多记录或批量场景",
+            "N+1",
+            "单位一致性",
+            "UTF-16 code unit",
+            "权威持久化或冻结合同",
+            "独立工作包登记",
+        ):
+            self.assertIn(phrase, harness)
+
     def test_mixed_requests_route_each_independent_workflow_by_its_own_risk(self):
         methods = METHODS.read_text(encoding="utf-8")
 
