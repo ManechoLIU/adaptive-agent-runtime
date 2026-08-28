@@ -178,6 +178,8 @@ Writer 开始前必须回传可送达总控的 ACK，包括工作树、分支、
 
 当台账维护成本开始超过执行收益时，合并机械项、压缩完成历史和过程收据；不能停止登记真实任务拆分、状态、阻塞和证据，也不能另建第二台账。
 
+推荐的最小运行形态与减法触发条件见 [长任务治理](references/long-task-governance.md)：每个任务 ID 只出现一次，历史过程由 Git 和既有证据承担。
+
 ## 五层上下文治理
 
 | 层 | 保存什么 | 不保存什么 |
@@ -242,7 +244,21 @@ python3 scripts/init_project.py /path/to/project --profile core
 python3 scripts/lint_governance.py --strict /path/to/project
 ```
 
-检查唯一台账、当前执行波次、活动项、协调下一动作和文档链接。它只发现结构问题，不能代替总控判断与真实开发。
+检查唯一台账、重复任务 ID、活动项、下一检查点、阻塞、规则版本和文档链接。它只发现结构问题，不能代替总控判断与真实开发。
+
+既有项目先不加 `--strict` 查看迁移警告，完成一次范围单一的台账瘦身并对账后再启用严格门；迁移本身不得暂停无冲突开发。
+
+一次调度事件中同时存在多个 `READY`、必需 Reviewer 或规则更新时，可用临时 JSON 做轻量收口：
+
+```bash
+python3 scripts/control_event_guard.py \
+  --ledger /path/to/project/TASK_LEDGER.md \
+  --require-review UX-EARLY \
+  --rule-revision abc123 --affected-task writer-1 \
+  control-event.json
+```
+
+该 JSON 只在当前事件中使用，不进入项目台账。脚本精确读取任务表的状态列，并校验当前台账 SHA-256、全部 `READY` 决定，以及命令行显式声明的 Reviewer 和受影响任务 ACK；它不会猜测哪些审查或任务应受影响。门禁通过后删除临时输入，不新增治理文档。
 
 ### 复用验证收据
 

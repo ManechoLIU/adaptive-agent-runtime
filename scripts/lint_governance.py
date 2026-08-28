@@ -21,24 +21,71 @@ GOVERNANCE_NAMES = (
     "EVOLUTION.md",
 )
 LINK_PATTERN = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+STATUS_PATTERN = re.compile(
+    r"(?<![A-Z])(PENDING|READY|ACTIVE|RECOVERING|VERIFY|BLOCKED|DONE|SUPERSEDED)(?![A-Z])"
+)
+TASK_ID_HEADERS = {"ID", "功能组"}
 
 
-def is_active_row(line: str) -> bool:
-    if not line.lstrip().startswith("|"):
-        return False
-    cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
-    return "ACTIVE" in cells
+def markdown_cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def is_separator_row(cells: list[str]) -> bool:
+    return bool(cells) and all(cell and set(cell) <= {"-", ":", " "} for cell in cells)
+
+
+def task_identifier(cell: str) -> str:
+    code_span = re.match(r"^`([^`]+)`", cell.strip())
+    return code_span.group(1).strip() if code_span else cell.strip().strip("`")
+
+
+def task_rows(text: str) -> list[tuple[str, str]]:
+    """Return (task ID, status) only from declared task tables.
+
+    A task table must have an ID or 功能组 first column, a status column, and a
+    Markdown separator row. Status words in evidence or prose cells are ignored.
+    """
+    lines = text.splitlines()
+    rows: list[tuple[str, str]] = []
+    index = 0
+    while index + 1 < len(lines):
+        if not lines[index].lstrip().startswith("|"):
+            index += 1
+            continue
+        header = markdown_cells(lines[index])
+        separator = markdown_cells(lines[index + 1])
+        if (
+            not header
+            or header[0] not in TASK_ID_HEADERS
+            or not is_separator_row(separator)
+        ):
+            index += 1
+            continue
+        status_index = next(
+            (position for position, cell in enumerate(header) if "状态" in cell),
+            None,
+        )
+        if status_index is None:
+            index += 1
+            continue
+        index += 2
+        while index < len(lines) and lines[index].lstrip().startswith("|"):
+            cells = markdown_cells(lines[index])
+            if len(cells) > status_index and cells[0]:
+                status = STATUS_PATTERN.search(cells[status_index])
+                if status:
+                    rows.append((task_identifier(cells[0]), status.group(1)))
+            index += 1
+    return rows
 
 
 def active_row_ids(text: str) -> list[str]:
-    identifiers: list[str] = []
-    for line in text.splitlines():
-        if not is_active_row(line):
-            continue
-        cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
-        if cells:
-            identifiers.append(cells[0])
-    return identifiers
+    return [identifier for identifier, status in task_rows(text) if status == "ACTIVE"]
+
+
+def task_row_ids(text: str) -> list[str]:
+    return [identifier for identifier, _ in task_rows(text)]
 
 
 def pointer_ids(value: str) -> set[str]:
@@ -80,19 +127,17 @@ def lint_project(root: Path, *, strict: bool = False) -> tuple[list[str], list[s
         text = ledger.read_text(encoding="utf-8")
         active_ids = active_row_ids(text)
         active_rows = len(active_ids)
+        task_ids = task_row_ids(text)
+        duplicate_ids = sorted(
+            identifier for identifier in set(task_ids) if task_ids.count(identifier) > 1
+        )
+        if duplicate_ids:
+            warnings.append(
+                f"{ledger.name} repeats task IDs across task tables: "
+                + ", ".join(duplicate_ids)
+            )
 
         active_pointer = re.search(r"^- 当前活动项：\s*(.+?)\s*$", text, re.MULTILINE)
-        wave_pointer = re.search(r"^- 当前执行波次：\s*(.+?)\s*$", text, re.MULTILINE)
-        next_pointer = re.search(
-            r"^- (?:协调下一动作|唯一下一项)：\s*(.+?)\s*$", text, re.MULTILINE
-        )
-        if active_rows > 1 and (
-            wave_pointer is None
-            or wave_pointer.group(1).strip() in {"无", "none", "None", "-"}
-        ):
-            errors.append(
-                f"{ledger.name} has parallel ACTIVE work items without a declared execution wave"
-            )
         if active_pointer is None:
             warnings.append(f"{ledger.name} has no current activity pointer")
         elif active_pointer.group(1) in {"无", "none", "None"} and active_rows:
@@ -105,8 +150,16 @@ def lint_project(root: Path, *, strict: bool = False) -> tuple[list[str], list[s
             errors.append(
                 f"{ledger.name} current activity pointer does not match ACTIVE rows"
             )
-        if next_pointer is None:
-            warnings.append(f"{ledger.name} has no coordination next-action pointer")
+        required_pointers = {
+            "current Goal": r"^- 当前 Goal：\s*(.+?)\s*$",
+            "next visible checkpoint": r"^- 下一可见检查点：\s*(.+?)\s*$",
+            "current blockers": r"^- 当前阻塞：\s*(.+?)\s*$",
+            "governance revision": r"^- 规则版本：\s*(.+?)\s*$",
+        }
+        for label, pattern in required_pointers.items():
+            match = re.search(pattern, text, re.MULTILINE)
+            if match is None or match.group(1).strip() in {"", "-"}:
+                warnings.append(f"{ledger.name} has no {label} pointer")
 
     for name in GOVERNANCE_NAMES:
         source = root / name
@@ -132,7 +185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="把缺少当前活动项或协调下一动作指针视为错误",
+        help="把缺少最小运行指针视为错误",
     )
     args = parser.parse_args(argv)
     root = Path(args.root).resolve()

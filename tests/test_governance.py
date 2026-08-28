@@ -23,9 +23,117 @@ def load_module(name: str, relative_path: str):
 init_project = load_module("init_project", "scripts/init_project.py")
 lint_governance = load_module("lint_governance", "scripts/lint_governance.py")
 preblock_guard = load_module("preblock_guard", "scripts/preblock_guard.py")
+control_event_guard = load_module(
+    "control_event_guard", "scripts/control_event_guard.py"
+)
 
 
 class GovernanceTests(unittest.TestCase):
+    def test_control_event_guard_requires_every_ready_decision(self) -> None:
+        snapshot = {
+            "ledger_sha256": "abc123",
+            "available_slots": 1,
+            "ready_packages": [
+                {
+                    "id": "F1",
+                    "decision": "active",
+                    "task_id": "task-1",
+                    "delivered_ack": True,
+                }
+            ],
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids={"F1", "F2"}
+        )
+
+        self.assertIn("control event omitted READY packages: F2", errors)
+
+    def test_control_event_guard_checks_reviewer_and_rule_acks(self) -> None:
+        snapshot = {
+            "ledger_sha256": "abc123",
+            "available_slots": 0,
+            "ready_packages": [],
+            "required_reviews": [
+                {"id": "R1", "task_id": "review-1", "delivered_ack": False}
+            ],
+            "rule_update": {
+                "revision": "def456",
+                "affected_tasks": ["writer-1", "writer-2"],
+                "acknowledged_tasks": ["writer-1"],
+            },
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(),
+            required_review_ids={"R1"},
+            expected_rule_revision="def456",
+            affected_task_ids={"writer-1", "writer-2"},
+        )
+
+        self.assertIn("required review R1 requires delivered_ack=true", errors)
+        self.assertIn("rule update missing loaded ACK: writer-2", errors)
+
+    def test_control_event_guard_allows_complete_event(self) -> None:
+        snapshot = {
+            "ledger_sha256": "abc123",
+            "available_slots": 1,
+            "ready_packages": [
+                {
+                    "id": "F1",
+                    "decision": "active",
+                    "task_id": "task-1",
+                    "delivered_ack": True,
+                },
+                {
+                    "id": "F2",
+                    "decision": "deferred",
+                    "reason": "shares the same output directory as F1",
+                },
+            ],
+            "required_reviews": [
+                {"id": "R1", "task_id": "review-1", "delivered_ack": True}
+            ],
+            "rule_update": {
+                "revision": "def456",
+                "affected_tasks": ["writer-1"],
+                "acknowledged_tasks": ["writer-1"],
+            },
+        }
+
+        self.assertEqual(
+            control_event_guard.validate_snapshot(
+                snapshot,
+                ledger_ready_ids={"F1", "F2"},
+                expected_ledger_sha256="abc123",
+                required_review_ids={"R1"},
+                expected_rule_revision="def456",
+                affected_task_ids={"writer-1"},
+            ),
+            [],
+        )
+
+    def test_control_event_guard_rejects_stale_ledger_and_omitted_expectations(self) -> None:
+        snapshot = {
+            "ledger_sha256": "stale",
+            "available_slots": 0,
+            "ready_packages": [],
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(),
+            expected_ledger_sha256="current",
+            required_review_ids={"UX-EARLY"},
+            expected_rule_revision="rule-2",
+            affected_task_ids={"writer-1"},
+        )
+
+        self.assertIn("ledger_sha256 does not match the current ledger", errors)
+        self.assertIn("control event omitted required reviews: UX-EARLY", errors)
+        self.assertIn("control event omitted the declared rule update", errors)
+
     def test_preblock_guard_rejects_ready_work_outside_current_goal(self) -> None:
         snapshot = {
             "project_scope_scan": True,
@@ -200,15 +308,13 @@ class GovernanceTests(unittest.TestCase):
 
             self.assertTrue(any("both TASK_LEDGER" in error for error in errors))
 
-    def test_linter_accepts_parallel_active_rows_in_a_declared_wave(self) -> None:
+    def test_linter_accepts_parallel_active_rows_when_pointer_matches(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "TASK_LEDGER.md").write_text(
                 """# Ledger
 
-- 当前执行波次：W1
 - 当前活动项：F1、F2
-- 协调下一动作：等待 F1 与 F2 各自验收后集成
 
 | ID | 状态 | 负责人 | 文件或范围 | 下一步动作 |
 | --- | --- | --- | --- | --- |
@@ -222,14 +328,13 @@ class GovernanceTests(unittest.TestCase):
 
             self.assertEqual(errors, [])
 
-    def test_linter_rejects_parallel_active_rows_without_a_declared_wave(self) -> None:
+    def test_linter_rejects_activity_pointer_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "TASK_LEDGER.md").write_text(
                 """# Ledger
 
-- 当前活动项：F1、F2
-- 协调下一动作：等待 F1 与 F2
+- 当前活动项：F1
 
 | ID | 状态 |
 | --- | --- |
@@ -241,7 +346,90 @@ class GovernanceTests(unittest.TestCase):
 
             errors, _ = lint_governance.lint_project(root)
 
-            self.assertTrue(any("declared execution wave" in error for error in errors))
+            self.assertTrue(any("current activity pointer does not match" in error for error in errors))
+
+    def test_task_parser_ignores_status_words_in_evidence_and_non_task_tables(self) -> None:
+        text = """# Ledger
+
+| ID | 状态 / owner | 证据 / 下一步 |
+| --- | --- | --- |
+| F1 | `VERIFY` | 旧收据写 READY，但本项仍待复验 |
+
+| 证据 | 结论 |
+| --- | --- |
+| screenshot | READY FOR EARLY |
+"""
+
+        self.assertEqual(lint_governance.task_rows(text), [("F1", "VERIFY")])
+
+    def test_task_parser_normalizes_code_span_id_with_summary_label(self) -> None:
+        text = """| 功能组 | 汇总状态 |
+| --- | --- |
+| `M2` 微信小程序 | `READY` |
+"""
+
+        self.assertEqual(lint_governance.task_rows(text), [("M2", "READY")])
+
+    def test_legacy_project_status_template_passes_strict_lint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            template = (
+                SKILL_ROOT / "assets" / "templates" / "PROJECT_STATUS.md"
+            ).read_text(encoding="utf-8")
+            (root / "PROJECT_STATUS.md").write_text(template, encoding="utf-8")
+
+            errors, warnings = lint_governance.lint_project(root, strict=True)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(warnings, [])
+
+    def test_linter_rejects_duplicate_task_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "TASK_LEDGER.md").write_text(
+                """# Ledger
+
+- 当前活动项：无
+- 协调下一动作：选择 F1
+
+| ID | 状态 |
+| --- | --- |
+| F1 | `READY` |
+
+| ID | 状态 |
+| --- | --- |
+| F1 | `DONE` |
+""",
+                encoding="utf-8",
+            )
+
+            errors, _ = lint_governance.lint_project(root, strict=True)
+
+            self.assertTrue(any("repeats task IDs" in error for error in errors))
+
+    def test_linter_warns_before_strict_duplicate_id_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "TASK_LEDGER.md").write_text(
+                """# Ledger
+
+- 当前活动项：无
+
+| ID | 状态 |
+| --- | --- |
+| F1 | `READY` |
+
+| ID | 状态 |
+| --- | --- |
+| F1 | `DONE` |
+""",
+                encoding="utf-8",
+            )
+
+            errors, warnings = lint_governance.lint_project(root)
+
+            self.assertEqual(errors, [])
+            self.assertTrue(any("repeats task IDs" in warning for warning in warnings))
 
 
 if __name__ == "__main__":
