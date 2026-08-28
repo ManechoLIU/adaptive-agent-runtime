@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -15,7 +15,7 @@ const routes = {
     fallbackPaths: [path.join(homedir(), ".kimi-code", "bin", "kimi")],
     modelsByAuthMode: {
       oauth: new Set(["kimi-code/k3"]),
-      api: new Set(["kimi-k3"]),
+      api: new Set(["k3"]),
     },
     versionArgs: ["--version"],
   },
@@ -167,7 +167,7 @@ function credentialState(engine, authMode) {
     };
   }
   if (engine === "kimi-code") {
-    if (process.env.KIMI_MODEL_API_KEY || process.env.MOONSHOT_API_KEY) {
+    if (process.env.KIMI_MODEL_API_KEY) {
       return { configured: true, source: "environment" };
     }
     return { configured: keychainHas(kimiKeychainService()), source: "os-keychain" };
@@ -185,7 +185,6 @@ function credentialState(engine, authMode) {
 function readApiKey(engine) {
   if (engine === "kimi-code") {
     return process.env.KIMI_MODEL_API_KEY
-      || process.env.MOONSHOT_API_KEY
       || readKeychain(kimiKeychainService());
   }
   return process.env.XAI_API_KEY || readKeychain(xaiKeychainService());
@@ -201,12 +200,7 @@ function sanitizedEnvironment(prefixes = [], exactNames = []) {
 
 function kimiApiBaseUrl() {
   if (process.env.KIMI_K3_BASE_URL) return process.env.KIMI_K3_BASE_URL;
-  try {
-    if (readFileSync(path.join(kimiHome(), "region"), "utf8").trim() === "mainland-cn") {
-      return "https://api.moonshot.cn/v1";
-    }
-  } catch {}
-  return "https://api.moonshot.ai/v1";
+  return "https://api.kimi.com/coding/v1";
 }
 
 function commonGrokArgs(model, prompt) {

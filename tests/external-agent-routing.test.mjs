@@ -22,6 +22,7 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
     cwd: process.cwd(),
     hasKimiApiKey: Boolean(process.env.KIMI_MODEL_API_KEY),
     kimiModelName: process.env.KIMI_MODEL_NAME || null,
+    kimiModelBaseUrl: process.env.KIMI_MODEL_BASE_URL || null,
     hasXaiApiKey: Boolean(process.env.XAI_API_KEY),
     grokHome: process.env.GROK_HOME || null,
   }) + "\\n");
@@ -30,7 +31,7 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
   await chmod(target, 0o755);
 }
 
-test("route parsing requires explicit auth mode and preserves the legacy Kimi API alias", () => {
+test("route parsing requires explicit auth mode and the official Kimi Code API model id", () => {
   assert.throws(() => parseArgs([
     "--check", "--engine", "grok-build", "--model", "grok-4.6", "--cwd", skillRoot,
   ]), /auth-mode/);
@@ -38,12 +39,16 @@ test("route parsing requires explicit auth mode and preserves the legacy Kimi AP
     "--login", "--engine", "grok-build", "--auth-mode", "oauth", "--cwd", skillRoot,
   ]), /authorized-login/);
   assert.throws(() => parseArgs([
-    "--execute", "--engine", "kimi-code", "--auth-mode", "api", "--model", "kimi-k3",
+    "--execute", "--engine", "kimi-code", "--auth-mode", "api", "--model", "k3",
     "--cwd", skillRoot,
   ]), /authorized-external-call/);
+  assert.throws(() => parseArgs([
+    "--check", "--engine", "kimi-code", "--auth-mode", "api", "--model", "kimi-k3",
+    "--cwd", skillRoot,
+  ]), /not allowed/);
 
   const legacy = parseArgs([
-    "--check", "--engine", "kimi-code-api", "--model", "kimi-k3", "--cwd", skillRoot,
+    "--check", "--engine", "kimi-code-api", "--model", "k3", "--cwd", skillRoot,
   ]);
   assert.equal(legacy.engine, "kimi-code");
   assert.equal(legacy.authMode, "api");
@@ -70,7 +75,7 @@ test("all four routes report the selected credential source without a model call
   };
   const cases = [
     ["kimi-code", "oauth", "kimi-code/k3", {}, "cli-session"],
-    ["kimi-code", "api", "kimi-k3", { MOONSHOT_API_KEY: "test-key" }, "environment"],
+    ["kimi-code", "api", "k3", { KIMI_MODEL_API_KEY: "test-key" }, "environment"],
     ["grok-build", "oauth", "grok-4.6", {}, "cli-session"],
     ["grok-build", "api", "grok-4.6", { XAI_API_KEY: "test-key" }, "environment"],
   ];
@@ -125,13 +130,14 @@ test("OAuth and API execution stay on distinct Kimi and Grok credential paths", 
 
   const kimiApi = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "kimi-code", "--auth-mode", "api",
-    "--model", "kimi-k3", "--cwd", skillRoot,
-  ], { encoding: "utf8", input: "bounded contract", env: { ...baseEnv, MOONSHOT_API_KEY: "test-key" } });
+    "--model", "k3", "--cwd", skillRoot,
+  ], { encoding: "utf8", input: "bounded contract", env: { ...baseEnv, KIMI_MODEL_API_KEY: "test-key" } });
   assert.equal(kimiApi.status, 0, kimiApi.stderr);
   const kimiApiCall = JSON.parse(kimiApi.stdout.trim());
   assert.deepEqual(kimiApiCall.args, ["-p", "bounded contract", "--output-format", "stream-json"]);
   assert.equal(kimiApiCall.hasKimiApiKey, true);
-  assert.equal(kimiApiCall.kimiModelName, "kimi-k3");
+  assert.equal(kimiApiCall.kimiModelName, "k3");
+  assert.equal(kimiApiCall.kimiModelBaseUrl, "https://api.kimi.com/coding/v1");
 
   const grokOauth = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
