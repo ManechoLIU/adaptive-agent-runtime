@@ -133,6 +133,16 @@ class InitProjectTests(unittest.TestCase):
             for relative_path in report.created_directories:
                 self.assertTrue((root / relative_path).is_dir())
 
+    def test_durable_profile_installs_the_project_workflow_template_as_skill_md(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = ROOT / "assets" / "templates" / "PROJECT_SKILL.md"
+
+            MODULE.initialize_project(root, profile="durable")
+
+            self.assertTrue(source.is_file())
+            self.assertEqual((root / "SKILL.md").read_bytes(), source.read_bytes())
+
     def test_task_ledger_template_contains_runtime_state_not_methodology(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

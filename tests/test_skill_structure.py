@@ -32,6 +32,12 @@ def split_frontmatter(markdown: str) -> tuple[str, str]:
 
 
 class SkillStructureTests(unittest.TestCase):
+    def test_packaged_project_workflow_template_is_not_discoverable_as_a_skill(self):
+        discoverable = sorted(path.relative_to(ROOT) for path in ROOT.rglob("SKILL.md"))
+
+        self.assertEqual([Path("SKILL.md")], discoverable)
+        self.assertTrue((ROOT / "assets" / "templates" / "PROJECT_SKILL.md").is_file())
+
     def test_required_skill_files_exist(self):
         missing = [str(path.relative_to(ROOT)) for path in [ENTRYPOINT, *REFERENCE_PATHS.values()] if not path.is_file()]
         self.assertEqual([], missing, f"required Skill files are missing: {missing}")

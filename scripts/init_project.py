@@ -33,6 +33,9 @@ PROFILES = {
     "core": CORE_DOCUMENTS,
 }
 TEMPLATES = Path(__file__).resolve().parents[1] / "assets" / "templates"
+TEMPLATE_SOURCE_NAMES = {
+    "SKILL.md": "PROJECT_SKILL.md",
+}
 DURABLE_DIRECTORIES = (
     "raw_sources",
     "wiki",
@@ -142,9 +145,10 @@ def initialize_project(
 
     for name in missing:
         target = root / name
+        source = TEMPLATES / TEMPLATE_SOURCE_NAMES.get(name, name)
         try:
             with target.open("xb") as output:
-                output.write((TEMPLATES / name).read_bytes())
+                output.write(source.read_bytes())
         except FileExistsError:
             if target.is_symlink():
                 raise ValueError(f"document target must not be a symbolic link: {name}")
