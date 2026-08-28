@@ -63,18 +63,18 @@ Adaptive Delivery 负责把项目目标拆成可验收工作包，为每个工�
 
 Kimi Code 与 Grok Build 由总控通过外部运行器启动，不会注册为 Codex 原生子 Agent，因此通常不会出现在原生子 Agent 列表中。不得只为获得一张原生 Agent 卡片而再套一层 Luna、Terra 或 Sol；这种包装会显示错误的执行模型、额外消耗原生模型额度，并模糊实际责任边界。
 
-总控必须在当前任务的用户可见进度中展示外部执行者，不得只留下终端流或事后口头说明：
+总控必须在当前任务的用户可见进度中用紧凑 Markdown 文本框展示外部执行者，不得只留下终端流或事后口头说明。每张卡最多三行：
 
 ```text
-[外部 Agent 运行中] <work_package> | <engine>/<model> | <auth_mode> | <reasoning_effort> | <category>
-[外部 Agent 已返回] <work_package> | exit=<code> | candidate=<commit 或实际 diff>
-[外部 Agent 已验收] <work_package> | model=<实际模型> | verification=<主 Agent 验证摘要>
-[外部 Agent 阻塞] <work_package> | stage=<preflight 或 authorization> | reason=<无敏感信息的原因>
-[外部 Agent 结果未知] <work_package> | charged_or_partial=possible | retry=stopped
+╭─ <状态图标> <model> · <状态>
+│ <work_package> · <category> · <auth_mode> · <reasoning_effort>
+╰─ <候选、验证或简短原因>
 ```
 
+- 状态图标固定为：`🟣 运行中`、`🔵 已返回`、`🟢 已验收`、`🟠 阻塞`、`🔴 结果未知`，不额外绘制大表格、长标题或重复字段。
 - `运行中` 只在无调用预检通过、授权边界满足且即将发出真实请求时显示；预检本身不能冒充模型正在工作。
-- 外部进程正常退出只显示 `已返回`。主 Agent 审查实际 diff、确认文件所有权并完成合同验证后，才能显示 `已验收`。
+- 每次调用最多一张 `运行中` 和一张终态卡，不做定时刷新。外部进程返回后若主 Agent 能在同一短事件内立即验收，省略 `已返回`，直接显示 `已验收`；只有验收需要等待时才显示 `已返回`。
+- 主 Agent 审查实际 diff、确认文件所有权并完成合同验证后，才能显示 `已验收`。
 - 预检或授权门未通过时显示 `阻塞`，不显示 `运行中`。请求可能已消耗额度、结果未知或留下部分修改时显示 `结果未知`，停止自动重试与降级。
 - 可见状态只包含工作包、运行器、模型、认证模式、推理强度、阶段和候选结果；不得显示凭据值、完整环境、原始密钥来源内容或敏感模型输出。
 - 这些进度行是当前执行收据，不新增平行台账。项目已有唯一任务台账时，只把最终路由、候选、验证和阻塞结果写回对应工作包。
