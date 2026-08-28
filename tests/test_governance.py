@@ -26,9 +26,123 @@ preblock_guard = load_module("preblock_guard", "scripts/preblock_guard.py")
 control_event_guard = load_module(
     "control_event_guard", "scripts/control_event_guard.py"
 )
+event_scope_guard = load_module("event_scope_guard", "scripts/event_scope_guard.py")
+assignment_lease_guard = load_module(
+    "assignment_lease_guard", "scripts/assignment_lease_guard.py"
+)
+ledger_consistency_guard = load_module(
+    "ledger_consistency_guard", "scripts/ledger_consistency_guard.py"
+)
 
 
 class GovernanceTests(unittest.TestCase):
+    def test_event_scope_guard_allows_only_causally_required_same_candidate_action(self) -> None:
+        contract = {
+            "event_id": "event-1",
+            "event_type": "candidate integration",
+            "primary_task": "F1",
+            "candidate_revision": "abc123",
+            "allowed_actions": ["review", "integrate", "main_regression", "ledger_sync"],
+            "allowed_files": ["app/a.ts", "TASK_LEDGER.md"],
+            "terminal_receipt": "main regression and ledger sync",
+        }
+        proposed = {
+            "action": "main_regression",
+            "primary_task": "F1",
+            "candidate_revision": "abc123",
+            "files": [],
+            "required_to_close_current_state": True,
+        }
+
+        self.assertEqual(
+            event_scope_guard.classify_append(contract, proposed),
+            ("SAME_EVENT", []),
+        )
+
+    def test_event_scope_guard_queues_unrelated_or_future_work(self) -> None:
+        contract = {
+            "event_id": "event-1",
+            "event_type": "candidate integration",
+            "primary_task": "F1",
+            "candidate_revision": "abc123",
+            "allowed_actions": ["review", "integrate", "ledger_sync"],
+            "allowed_files": ["app/a.ts", "TASK_LEDGER.md"],
+            "terminal_receipt": "integration verdict",
+        }
+        proposed = {
+            "action": "implement",
+            "primary_task": "F2",
+            "candidate_revision": "def456",
+            "files": ["app/b.ts"],
+            "required_to_close_current_state": False,
+            "starts_new_implementation": True,
+            "waits_for_future_input": True,
+        }
+
+        decision, reasons = event_scope_guard.classify_append(contract, proposed)
+
+        self.assertEqual(decision, "QUEUE_NEXT_EVENT")
+        self.assertIn("different primary task", reasons)
+        self.assertIn("new implementation belongs to a new event", reasons)
+        self.assertIn("future input must trigger a new event", reasons)
+
+    def test_assignment_lease_rejects_writes_before_complete_ack(self) -> None:
+        errors = assignment_lease_guard.validate_assignment(
+            {
+                "assignment_id": "F1-writer-1",
+                "agent_id": "/root/writer",
+                "state": "RESERVED",
+                "observed_modified_files": ["app/a.ts"],
+            }
+        )
+
+        self.assertIn(
+            "RESERVED assignment cannot modify files before delivered ACK", errors
+        )
+
+    def test_assignment_lease_allows_active_writer_with_complete_ack(self) -> None:
+        errors = assignment_lease_guard.validate_assignment(
+            {
+                "assignment_id": "F1-writer-1",
+                "agent_id": "/root/writer",
+                "state": "ACTIVE",
+                "role": "writer",
+                "observed_modified_files": ["app/a.ts"],
+                "ack": {
+                    "repository_root": "/repo",
+                    "branch": "codex/f1",
+                    "head": "abc123",
+                    "status": "clean at ACK",
+                    "owned_files": ["app/a.ts"],
+                    "first_red": "test_f1 fails",
+                    "stop_condition": "candidate commit and receipt",
+                },
+            }
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_assignment_lease_reuse_requires_release_and_new_ack(self) -> None:
+        errors = assignment_lease_guard.validate_assignment(
+            {
+                "assignment_id": "F2-writer-2",
+                "agent_id": "/root/reused",
+                "state": "ACTIVE",
+                "observed_modified_files": [],
+                "previous_assignment": {
+                    "state": "ACTIVE",
+                    "files_released": False,
+                    "worktree_released": False,
+                },
+            }
+        )
+
+        self.assertTrue(any("complete delivered ACK" in error for error in errors))
+        self.assertIn(
+            "reused agent requires previous assignment to be FROZEN or TERMINAL",
+            errors,
+        )
+
     def test_control_event_guard_requires_every_ready_decision(self) -> None:
         snapshot = {
             "ledger_sha256": "abc123",
@@ -347,6 +461,82 @@ class GovernanceTests(unittest.TestCase):
             errors, _ = lint_governance.lint_project(root)
 
             self.assertTrue(any("current activity pointer does not match" in error for error in errors))
+
+    def test_linter_allows_omitting_derived_activity_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "TASK_LEDGER.md").write_text(
+                """# Ledger
+
+| ID | 状态 / 负责人 |
+| --- | --- |
+| F1 | `ACTIVE` / Agent A |
+""",
+                encoding="utf-8",
+            )
+
+            errors, warnings = lint_governance.lint_project(root)
+
+            self.assertEqual(errors, [])
+            self.assertFalse(any("current activity" in warning for warning in warnings))
+
+    def test_ledger_consistency_uses_task_table_as_canonical_state(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：`F1` 完成真实登录闭环
+- 下一可见检查点：`F1` 真实浏览器登录恢复通过
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| F1 | `ACTIVE` / Agent A | 完成登录恢复 Case |
+| F2 | `RECOVERING` / Agent B | 修复 RED 后在 checkpoint 复审 |
+"""
+
+        self.assertEqual(ledger_consistency_guard.validate_ledger(text), [])
+
+    def test_ledger_consistency_rejects_stale_pointer_and_unmapped_goal(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：旧目标
+- 当前活动项：F1
+- 下一可见检查点：稍后看看
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| F1 | `ACTIVE` / Agent A | 完成登录恢复 Case |
+| F2 | `RECOVERING` / 待分配 | 等待 |
+"""
+
+        errors = ledger_consistency_guard.validate_ledger(text)
+
+        self.assertIn(
+            "current activity pointer does not match ACTIVE/RECOVERING task rows",
+            errors,
+        )
+        self.assertIn("current Goal must reference at least one open task ID", errors)
+        self.assertIn("next visible checkpoint must reference at least one open task ID", errors)
+        self.assertIn("F2 RECOVERING requires a unique owner", errors)
+
+    def test_ledger_consistency_does_not_match_task_id_prefixes(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：`F10` 另一个任务
+- 下一可见检查点：`F10` 稍后
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| F1 | `READY` / 主 Agent | 执行 F1 |
+"""
+
+        errors = ledger_consistency_guard.validate_ledger(text)
+
+        self.assertIn("current Goal must reference at least one open task ID", errors)
 
     def test_task_parser_ignores_status_words_in_evidence_and_non_task_tables(self) -> None:
         text = """# Ledger

@@ -40,14 +40,14 @@ def task_identifier(cell: str) -> str:
     return code_span.group(1).strip() if code_span else cell.strip().strip("`")
 
 
-def task_rows(text: str) -> list[tuple[str, str]]:
-    """Return (task ID, status) only from declared task tables.
+def task_records(text: str) -> list[dict[str, str]]:
+    """Return normalized records only from declared task tables.
 
     A task table must have an ID or 功能组 first column, a status column, and a
     Markdown separator row. Status words in evidence or prose cells are ignored.
     """
     lines = text.splitlines()
-    rows: list[tuple[str, str]] = []
+    rows: list[dict[str, str]] = []
     index = 0
     while index + 1 < len(lines):
         if not lines[index].lstrip().startswith("|"):
@@ -75,13 +75,55 @@ def task_rows(text: str) -> list[tuple[str, str]]:
             if len(cells) > status_index and cells[0]:
                 status = STATUS_PATTERN.search(cells[status_index])
                 if status:
-                    rows.append((task_identifier(cells[0]), status.group(1)))
+                    values = {
+                        header[position]: cells[position]
+                        for position in range(min(len(header), len(cells)))
+                    }
+                    owner = next(
+                        (
+                            value
+                            for key, value in values.items()
+                            if "负责人" in key or "owner" in key.lower()
+                        ),
+                        "",
+                    )
+                    next_action = next(
+                        (
+                            value
+                            for key, value in values.items()
+                            if "下一步" in key or "证据" in key
+                        ),
+                        cells[-1] if cells else "",
+                    )
+                    rows.append(
+                        {
+                            "id": task_identifier(cells[0]),
+                            "status": status.group(1),
+                            "status_cell": cells[status_index],
+                            "owner": owner,
+                            "next_action": next_action,
+                            "row": " | ".join(cells),
+                        }
+                    )
             index += 1
     return rows
 
 
+def task_rows(text: str) -> list[tuple[str, str]]:
+    """Return the stable (task ID, status) compatibility view."""
+    return [(record["id"], record["status"]) for record in task_records(text)]
+
+
 def active_row_ids(text: str) -> list[str]:
     return [identifier for identifier, status in task_rows(text) if status == "ACTIVE"]
+
+
+def work_in_flight_ids(text: str) -> list[str]:
+    return [
+        identifier
+        for identifier, status in task_rows(text)
+        if status in {"ACTIVE", "RECOVERING"}
+    ]
 
 
 def task_row_ids(text: str) -> list[str]:
@@ -125,7 +167,7 @@ def lint_project(root: Path, *, strict: bool = False) -> tuple[list[str], list[s
 
     if ledger is not None:
         text = ledger.read_text(encoding="utf-8")
-        active_ids = active_row_ids(text)
+        active_ids = work_in_flight_ids(text)
         active_rows = len(active_ids)
         task_ids = task_row_ids(text)
         duplicate_ids = sorted(
@@ -138,17 +180,15 @@ def lint_project(root: Path, *, strict: bool = False) -> tuple[list[str], list[s
             )
 
         active_pointer = re.search(r"^- 当前活动项：\s*(.+?)\s*$", text, re.MULTILINE)
-        if active_pointer is None:
-            warnings.append(f"{ledger.name} has no current activity pointer")
-        elif active_pointer.group(1) in {"无", "none", "None"} and active_rows:
+        if active_pointer is not None and active_pointer.group(1) in {"无", "none", "None"} and active_rows:
             errors.append(
-                f"{ledger.name} says no current activity but contains an ACTIVE row"
+                f"{ledger.name} says no current activity but contains ACTIVE/RECOVERING rows"
             )
-        elif active_pointer.group(1) not in {"无", "none", "None"} and (
+        elif active_pointer is not None and active_pointer.group(1) not in {"无", "none", "None"} and (
             not active_rows or pointer_ids(active_pointer.group(1)) != set(active_ids)
         ):
             errors.append(
-                f"{ledger.name} current activity pointer does not match ACTIVE rows"
+                f"{ledger.name} current activity pointer does not match ACTIVE/RECOVERING rows"
             )
         required_pointers = {
             "current Goal": r"^- 当前 Goal：\s*(.+?)\s*$",

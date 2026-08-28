@@ -125,7 +125,7 @@ Goal 不是必须由用户每次手动开启。用户明确要求长期持续推
 - 候选需要审查、合入、回归或真实验收。
 - 工作包阻塞、恢复或改派。
 
-每次只闭合一组相关动作，然后结束本轮等待下一事件。但只要还有可立即执行的审查、集成、验收、ACK 追问、恢复或台账同步，就不能提前结束。
+每次只闭合一组因果相关动作，然后结束本轮等待下一事件。是否能顺手追加，不看动作多少：只有同一工作包、同一候选且为保持当前状态一致、安全、可恢复所必需的动作可以留下；另一任务、新实现或未来输入必须排到下一事件。但只要当前事件还有可立即执行的审查、集成、验收、ACK 追问、恢复或台账同步，就不能提前结束。
 
 ### 候选不能无限堆积
 
@@ -160,7 +160,7 @@ Goal 不是必须由用户每次手动开启。用户明确要求长期持续推
 - 数据库、端口、GUI、模拟器、产物目录等共享环境已经隔离或登记。
 - 并行带来的收益大于交接、审查和集成成本。
 
-Writer 开始前必须回传可送达总控的 ACK，包括工作树、分支、`HEAD/status`、精确文件范围、首个复现或 RED、验证和停止条件。任务创建成功、消息已发送、工作树 clean 或 Agent 显示 running，都不等于开发已经开始。若握手迟延时已经产生边界清楚的 RED WIP，总控先暂停、核对范围，再在完整 ACK 后从原检查点恢复；不粗暴丢弃有效修改，也不提前标记 `ACTIVE`。
+Writer 开始前必须回传可送达总控的 ACK，包括工作树、分支、`HEAD/status`、精确文件范围、首个复现或 RED、验证和停止条件。任务创建成功、消息已发送、工作树 clean 或 Agent 显示 running，都不等于开发已经开始。Agent 可以复用，但每次必须换新的 Assignment：上一 Assignment 结束 / 冻结并释放文件和 worktree，新 Assignment 再 ACK 后才能写。若握手迟延时已经产生边界清楚的 RED WIP，总控先冻结并指定唯一恢复人，再在完整 ACK 后从原检查点恢复；不粗暴丢弃有效修改，也不叠加多个 Writer。
 
 主 Agent 不重复实现已经分派的内容；它保留共享接缝、冲突、集成和最终验收。高风险边界、纵向里程碑或发布候选在条件允许时安排非作者审查，但 Reviewer 不能成为第一个真正打开页面或运行功能的人。
 
@@ -244,7 +244,7 @@ python3 scripts/init_project.py /path/to/project --profile core
 python3 scripts/lint_governance.py --strict /path/to/project
 ```
 
-检查唯一台账、重复任务 ID、活动项、下一检查点、阻塞、规则版本和文档链接。它只发现结构问题，不能代替总控判断与真实开发。
+检查唯一台账、重复任务 ID、下一检查点、阻塞、规则版本和文档链接。任务表是状态唯一权威；顶部不再重复维护“当前活动项”，旧项目若保留该字段则必须与 `ACTIVE / RECOVERING` 完全一致。它只发现结构问题，不能代替总控判断与真实开发。
 
 既有项目先不加 `--strict` 查看迁移警告，完成一次范围单一的台账瘦身并对账后再启用严格门；迁移本身不得暂停无冲突开发。
 
@@ -259,6 +259,30 @@ python3 scripts/control_event_guard.py \
 ```
 
 该 JSON 只在当前事件中使用，不进入项目台账。脚本精确读取任务表的状态列，并校验当前台账 SHA-256、全部 `READY` 决定，以及命令行显式声明的 Reviewer 和受影响任务 ACK；它不会猜测哪些审查或任务应受影响。门禁通过后删除临时输入，不新增治理文档。
+
+### 防止短事件继续无边界加任务
+
+```bash
+python3 scripts/event_scope_guard.py event-append.json
+```
+
+临时 JSON 包含 `event_contract` 和 `proposed_action`。合同固定事件 ID / 类型、主任务、候选 revision、允许动作 / 文件和终止收据；每次想把新动作塞入当前回合前运行。输出 `SAME_EVENT` 才能继续，`QUEUE_NEXT_EVENT` 表示先结束当前事件，等待下一次输入或另开回合。文件用完即删，不写进台账。
+
+### 防止 Agent 复用和 ACK 越界
+
+```bash
+python3 scripts/assignment_lease_guard.py assignment.json
+```
+
+每次 Assignment 都有独立 ID。`RESERVED` 阶段禁止写文件；`ACKED / ACTIVE / CANDIDATE` 必须带完整 ACK，修改只能落在 owned files；复用同一 Agent 时，上一 Assignment 必须已经冻结 / 结束并释放文件和 worktree。临时 JSON 不进项目提交。
+
+### 防止台账和真实任务状态漂移
+
+```bash
+python3 scripts/ledger_consistency_guard.py /path/to/project/TASK_LEDGER.md
+```
+
+任务表是状态唯一权威。门禁检查 Goal / 下一检查点是否指向开放任务、`ACTIVE / RECOVERING` 是否有负责人、恢复项是否有恢复动作，以及旧式顶部活动指针是否与任务表一致。新项目直接启用；旧项目先完成一次不阻塞开发的范围单一迁移，再把它放到台账提交和总控 yield 前。
 
 ### 复用验证收据
 

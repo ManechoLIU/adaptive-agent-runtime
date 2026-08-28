@@ -213,7 +213,23 @@ class SkillStructureTests(unittest.TestCase):
             "业务功能纵向切片",
             "可观察的用户能力",
             "scripts/control_event_guard.py",
+            "scripts/event_scope_guard.py",
+            "scripts/assignment_lease_guard.py",
+            "scripts/ledger_consistency_guard.py",
             "不另建评分表",
+        ):
+            self.assertIn(phrase, long_task)
+
+    def test_long_task_governance_bounds_event_append_and_agent_reuse(self):
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+
+        for phrase in (
+            "短事件按因果边界",
+            "QUEUE_NEXT_EVENT",
+            "若延后动作不会造成不一致、不安全或不可恢复",
+            "Agent 实例和本次 Assignment 是两个身份",
+            "Reviewer 改为同候选 Writer 后失去该 revision 的非作者资格",
+            "任务表是状态唯一权威",
         ):
             self.assertIn(phrase, long_task)
 
