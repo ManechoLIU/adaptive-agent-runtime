@@ -7,7 +7,7 @@ Adaptive Delivery owns this workflow end to end. Task Navigator and Codex Contin
 | Runner | `auth_mode` | Model | Credential source |
 | --- | --- | --- | --- |
 | `kimi-code` | `oauth` | `kimi-code/k3` | Kimi Code managed login/session |
-| `kimi-code` | `api` | `k3` | Kimi Code API Key via `KIMI_MODEL_API_KEY` or OS credential store |
+| `kimi-code` | `api` | `kimi-k3` | Kimi Open Platform key via `KIMI_MODEL_API_KEY`, `MOONSHOT_API_KEY`, or OS credential store |
 | `grok-build` | `oauth` | `grok-4.6` | Grok Build OAuth session |
 | `grok-build` | `api` | `grok-4.6` | `XAI_API_KEY` or OS credential store |
 
@@ -26,14 +26,14 @@ node <skill-directory>/scripts/run_external_agent.mjs --login --authorized-login
 node <skill-directory>/scripts/run_external_agent.mjs --login --authorized-login --device-auth --engine grok-build --auth-mode oauth --cwd <repository-root>
 ```
 
-For API mode, never request that the user paste a key into chat. CI and managed environments may provide `KIMI_MODEL_API_KEY` or `XAI_API_KEY` to the execution process. On macOS, a user can store keys interactively without putting the secret in shell history:
+For API mode, never request that the user paste a key into chat. CI and managed environments may provide `KIMI_MODEL_API_KEY`/`MOONSHOT_API_KEY` or `XAI_API_KEY` to the execution process. On macOS, a user can store keys interactively without putting the secret in shell history:
 
 ```text
 security add-generic-password -U -s adaptive-delivery-kimi-k3 -a "$USER" -w
 security add-generic-password -U -s adaptive-delivery-xai-grok -a "$USER" -w
 ```
 
-Kimi K3 API uses the Kimi Code membership endpoint `https://api.kimi.com/coding/v1` and the API model ID `k3`. Create the key in the Kimi Code Console, not the Moonshot Open Platform; the two products use different endpoints, credentials, and billing. `KIMI_K3_BASE_URL` is reserved for an explicitly authorized compatible gateway override.
+Kimi K3 API uses the Kimi Open Platform endpoint `https://api.moonshot.cn/v1` for mainland China and the API model ID `kimi-k3`; this route is pay-as-you-go and does not require a Kimi membership. The global Open Platform uses `https://api.moonshot.ai/v1`. Create the key on the matching Open Platform because platform credentials and endpoints are not interchangeable. `KIMI_K3_BASE_URL` can explicitly override the region-derived endpoint.
 
 ## No-call preflight
 
@@ -41,7 +41,7 @@ Run only the route selected by the contract:
 
 ```text
 node <skill-directory>/scripts/run_external_agent.mjs --check --engine kimi-code --auth-mode oauth --model kimi-code/k3 --cwd <repository-root>
-node <skill-directory>/scripts/run_external_agent.mjs --check --engine kimi-code --auth-mode api --model k3 --cwd <repository-root>
+node <skill-directory>/scripts/run_external_agent.mjs --check --engine kimi-code --auth-mode api --model kimi-k3 --cwd <repository-root>
 node <skill-directory>/scripts/run_external_agent.mjs --check --engine grok-build --auth-mode oauth --model grok-4.6 --cwd <repository-root>
 node <skill-directory>/scripts/run_external_agent.mjs --check --engine grok-build --auth-mode api --model grok-4.6 --cwd <repository-root>
 ```
@@ -56,7 +56,7 @@ Build the smallest self-contained prompt from the route contract and pipe it on 
 
 ```text
 node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine kimi-code --auth-mode oauth --model kimi-code/k3 --cwd <repository-root>
-node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine kimi-code --auth-mode api --model k3 --cwd <repository-root>
+node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine kimi-code --auth-mode api --model kimi-k3 --cwd <repository-root>
 node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine grok-build --auth-mode oauth --model grok-4.6 --cwd <repository-root>
 node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine grok-build --auth-mode api --model grok-4.6 --cwd <repository-root>
 ```

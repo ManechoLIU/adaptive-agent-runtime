@@ -17,7 +17,7 @@ Adaptive Delivery 负责把项目目标拆成可验收工作包，为每个工�
 
 | 工作包 | 首选执行通道 | 首选模型 | 说明 |
 | --- | --- | --- | --- |
-| `frontend` | 外部 Kimi Code Agent | Kimi K3 | `auth_mode: oauth` 使用 Kimi Code 会员登录；`auth_mode: api` 使用 Kimi Code 控制台生成的会员 API Key，模型 ID 为 `k3` |
+| `frontend` | 外部 Kimi Code Agent | Kimi K3 | `auth_mode: oauth` 使用 Kimi Code 会员登录；`auth_mode: api` 使用 Kimi 开放平台按量付费 API Key，模型 ID 为 `kimi-k3` |
 | `backend` | 外部 Grok Build Agent | Grok 4.6（`grok-4.6`） | `auth_mode: oauth` 使用 Grok 会员；`auth_mode: api` 使用 xAI API Key |
 | 清晰、窄范围、重复性 `general` | Codex 原生子 Agent | `gpt-5.6-luna` | 优先低时延、低成本 |
 | 常规实现、调试、审查 `general` | Codex 原生子 Agent | `gpt-5.6-terra` | 默认通用执行层 |
