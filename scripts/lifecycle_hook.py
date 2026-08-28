@@ -60,6 +60,9 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         if status == "READY"
     )
     status = run_git(root, "status", "--porcelain=v1", "--untracked-files=no")
+    from control_event_guard import unmerged_worktree_candidates
+
+    candidates = unmerged_worktree_candidates(root)
     return {
         "root": str(root),
         "ledger": str(ledger),
@@ -67,10 +70,13 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         "ledger_sha256": sha256_bytes(ledger.read_bytes()),
         "worktree_status_sha256": sha256_bytes(status.encode("utf-8")),
         "ready_ids": ready_ids,
+        "candidate_revisions": sorted(candidates.values()),
     }
 
 
-def successful_control_receipt(event: dict[str, Any]) -> bool:
+def successful_control_receipt(
+    event: dict[str, Any], snapshot: dict[str, Any] | None = None
+) -> bool:
     if event.get("hook_event_name") != "PostToolUse":
         return False
     tool_input = event.get("tool_input")
@@ -78,6 +84,8 @@ def successful_control_receipt(event: dict[str, Any]) -> bool:
         return False
     command = str(tool_input.get("command", ""))
     if "control_event_guard.py" not in command:
+        return False
+    if snapshot and snapshot.get("candidate_revisions") and "--repo" not in command:
         return False
     response = event.get("tool_response")
     if not isinstance(response, dict) or response.get("exit_code") not in (None, 0):
@@ -90,6 +98,10 @@ def lifecycle_triggers(
     snapshot: dict[str, Any], prior_state: dict[str, Any] | None
 ) -> list[str]:
     triggers = [f"READY:{identifier}" for identifier in snapshot.get("ready_ids", [])]
+    triggers.extend(
+        f"CANDIDATE:{revision}"
+        for revision in snapshot.get("candidate_revisions", [])
+    )
     previous = prior_state.get("snapshot") if isinstance(prior_state, dict) else None
     if isinstance(previous, dict):
         for field, label in (
@@ -102,12 +114,15 @@ def lifecycle_triggers(
     return sorted(set(triggers))
 
 
-def continuation_reason(triggers: list[str], ready_ids: list[str]) -> str:
+def continuation_reason(
+    triggers: list[str], ready_ids: list[str], candidate_revisions: list[str]
+) -> str:
     ready = ", ".join(ready_ids) if ready_ids else "无新增 READY"
     trigger_text = ", ".join(triggers) if triggers else "未闭合控制事件"
+    candidates = ", ".join(revision[:9] for revision in candidate_revisions) or "无未处理候选"
     return (
         "Adaptive Delivery 生命周期门检测到尚未闭合的控制事件。"
-        f"触发：{trigger_text}；当前 READY：{ready}。"
+        f"触发：{trigger_text}；当前 READY：{ready}；候选：{candidates}。"
         "请立即核对真实 main / 台账 / live Agent，处理候选审查、集成、验收、"
         "READY 派发与 ACK；随后用 control_event_guard.py 生成通过收据。"
         "不得仅把动作写成下一事件后停止。"
@@ -138,7 +153,11 @@ def evaluate_event(
         )
         if not triggers:
             return {}, state
-        context = continuation_reason(triggers, list(snapshot.get("ready_ids", [])))
+        context = continuation_reason(
+            triggers,
+            list(snapshot.get("ready_ids", [])),
+            list(snapshot.get("candidate_revisions", [])),
+        )
         return {
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
@@ -159,7 +178,7 @@ def evaluate_event(
         )
         return {}, state
 
-    if successful_control_receipt(event) and not snapshot.get("ready_ids"):
+    if successful_control_receipt(event, snapshot) and not snapshot.get("ready_ids"):
         state.update(
             {
                 "pending_control_event": False,
@@ -177,7 +196,11 @@ def evaluate_event(
     if event_name == "PostToolUse":
         if not pending:
             return {}, state
-        context = continuation_reason(triggers, list(snapshot.get("ready_ids", [])))
+        context = continuation_reason(
+            triggers,
+            list(snapshot.get("ready_ids", [])),
+            list(snapshot.get("candidate_revisions", [])),
+        )
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
@@ -188,7 +211,11 @@ def evaluate_event(
     if event_name == "Stop" and pending:
         continuations = int(state.get("stop_continuations", 0)) + 1
         state["stop_continuations"] = continuations
-        reason = continuation_reason(triggers, list(snapshot.get("ready_ids", [])))
+        reason = continuation_reason(
+            triggers,
+            list(snapshot.get("ready_ids", [])),
+            list(snapshot.get("candidate_revisions", [])),
+        )
         if continuations <= 3:
             return {"decision": "block", "reason": reason}, state
         return {

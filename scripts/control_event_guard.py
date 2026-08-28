@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -11,6 +12,14 @@ from typing import Any, Sequence
 from lint_governance import task_rows
 
 DECISIONS = {"active", "deferred", "blocked"}
+CANDIDATE_DECISIONS = {
+    "review",
+    "integrate",
+    "rework",
+    "queued",
+    "blocked",
+    "superseded",
+}
 DEFER_REASON_CODES = {
     "capacity",
     "file_conflict",
@@ -34,6 +43,158 @@ def ledger_sha256(ledger: Path) -> str:
     return hashlib.sha256(ledger.read_bytes()).hexdigest()
 
 
+def run_git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+def unmerged_worktree_candidates(root: Path) -> dict[str, str]:
+    """Return worktree -> revision for every non-canonical worktree not in main."""
+    canonical = Path(
+        run_git(root, "rev-parse", "--show-toplevel").stdout.strip()
+    ).resolve()
+    main_revision = run_git(canonical, "rev-parse", "main").stdout.strip()
+    porcelain = run_git(canonical, "worktree", "list", "--porcelain").stdout
+    candidates: dict[str, str] = {}
+    path: Path | None = None
+    revision = ""
+    for line in porcelain.splitlines() + [""]:
+        if line.startswith("worktree "):
+            path = Path(line.removeprefix("worktree ")).resolve()
+            revision = ""
+        elif line.startswith("HEAD "):
+            revision = line.removeprefix("HEAD ").strip()
+        elif not line and path is not None and revision:
+            if path != canonical:
+                merged = run_git(
+                    canonical,
+                    "merge-base",
+                    "--is-ancestor",
+                    revision,
+                    main_revision,
+                    check=False,
+                ).returncode == 0
+                if not merged:
+                    candidates[str(path)] = revision
+            path = None
+            revision = ""
+    return candidates
+
+
+def validate_candidate_queue(
+    snapshot: dict[str, Any],
+    *,
+    expected_candidates: dict[str, str],
+) -> list[str]:
+    errors: list[str] = []
+    raw_candidates = snapshot.get("candidate_packages")
+    if not isinstance(raw_candidates, list):
+        return ["candidate_packages must enumerate every unmerged worktree candidate"]
+
+    seen: set[str] = set()
+    flow_counts: dict[str, int] = {}
+    candidate_flows: set[str] = set()
+    for index, candidate in enumerate(raw_candidates):
+        if not isinstance(candidate, dict):
+            errors.append(f"candidate_packages[{index}] must be an object")
+            continue
+        revision = str(candidate.get("revision", "")).strip()
+        worktree = str(candidate.get("worktree", "")).strip()
+        task_id = str(candidate.get("task_id", "")).strip()
+        flow = str(candidate.get("integration_flow", "")).strip()
+        decision = str(candidate.get("decision", "")).strip().lower()
+        if not revision:
+            errors.append(f"candidate_packages[{index}].revision is required")
+            continue
+        if revision in seen:
+            errors.append(f"duplicate candidate revision: {revision}")
+        seen.add(revision)
+        if expected_candidates.get(worktree) != revision:
+            errors.append(f"{revision} worktree does not match the live worktree")
+        if not task_id:
+            errors.append(f"{revision} requires task_id")
+        if not flow:
+            errors.append(f"{revision} requires integration_flow")
+        else:
+            candidate_flows.add(flow)
+            flow_counts[flow] = flow_counts.get(flow, 0) + 1
+        if decision not in CANDIDATE_DECISIONS:
+            errors.append(
+                f"{revision} decision must be review, integrate, rework, queued, blocked, or superseded"
+            )
+            continue
+        if decision == "review":
+            if not str(candidate.get("review_task_id", "")).strip():
+                errors.append(f"{revision} review requires review_task_id")
+            if candidate.get("delivered_ack") is not True:
+                errors.append(f"{revision} review requires delivered_ack=true")
+        elif decision == "integrate":
+            if not str(candidate.get("controller_event_id", "")).strip():
+                errors.append(f"{revision} integrate requires controller_event_id")
+        elif decision == "rework":
+            if not str(candidate.get("writer_task_id", "")).strip():
+                errors.append(f"{revision} rework requires writer_task_id")
+            if candidate.get("delivered_ack") is not True:
+                errors.append(f"{revision} rework requires delivered_ack=true")
+        elif decision == "queued":
+            if str(candidate.get("reason_code", "")).strip().lower() not in {
+                "capacity",
+                "ordered_integration",
+            }:
+                errors.append(
+                    f"{revision} queued requires reason_code capacity or ordered_integration"
+                )
+            if not str(candidate.get("next_checkpoint", "")).strip():
+                errors.append(f"{revision} queued requires next_checkpoint")
+        elif decision == "blocked":
+            if str(candidate.get("reason_code", "")).strip().lower() not in {
+                "shared_environment",
+                "external_blocker",
+                "authorization",
+            }:
+                errors.append(f"{revision} blocked requires a hard reason_code")
+            if not str(candidate.get("wake_condition", "")).strip():
+                errors.append(f"{revision} blocked requires wake_condition")
+        elif decision == "superseded":
+            if not str(candidate.get("superseding_revision", "")).strip():
+                errors.append(f"{revision} superseded requires superseding_revision")
+            if not str(candidate.get("cleanup_action", "")).strip():
+                errors.append(f"{revision} superseded requires cleanup_action")
+
+    expected_revisions = set(expected_candidates.values())
+    missing = sorted(expected_revisions - seen)
+    extra = sorted(seen - expected_revisions)
+    if missing:
+        errors.append("control event omitted unmerged candidates: " + ", ".join(missing))
+    if extra:
+        errors.append("control event contains non-live candidates: " + ", ".join(extra))
+    for flow, count in sorted(flow_counts.items()):
+        if count > 1:
+            errors.append(f"integration flow {flow} exceeds candidate WIP limit 1")
+
+    assignments = snapshot.get("new_assignments")
+    if not isinstance(assignments, list):
+        errors.append("new_assignments must be a list")
+        assignments = []
+    for index, assignment in enumerate(assignments):
+        if not isinstance(assignment, dict):
+            errors.append(f"new_assignments[{index}] must be an object")
+            continue
+        task_id = str(assignment.get("task_id", "")).strip()
+        flow = str(assignment.get("integration_flow", "")).strip()
+        if not task_id or not flow:
+            errors.append(f"new_assignments[{index}] requires task_id and integration_flow")
+        elif flow in candidate_flows:
+            errors.append(
+                f"{task_id} cannot start: integration flow {flow} already has an unmerged candidate"
+            )
+    return errors
+
+
 def string_set(value: Any, field: str, errors: list[str]) -> set[str]:
     if not isinstance(value, list):
         errors.append(f"{field} must be a list")
@@ -52,6 +213,7 @@ def validate_snapshot(
     required_review_ids: set[str] | None = None,
     expected_rule_revision: str | None = None,
     affected_task_ids: set[str] | None = None,
+    expected_candidates: dict[str, str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     contract = snapshot.get("event_contract")
@@ -187,6 +349,10 @@ def validate_snapshot(
                 errors.append("rule update ACK contains unaffected tasks: " + ", ".join(extra))
             if affected_task_ids is not None and affected != affected_task_ids:
                 errors.append("rule_update.affected_tasks does not match declared affected tasks")
+    if expected_candidates is not None:
+        errors.extend(
+            validate_candidate_queue(snapshot, expected_candidates=expected_candidates)
+        )
     return errors
 
 
@@ -217,6 +383,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--rule-revision", help="rule revision applied in this event")
     parser.add_argument(
+        "--repo",
+        help="canonical repository; when set, every unmerged worktree candidate must receive a decision",
+    )
+    parser.add_argument(
         "--affected-task",
         action="append",
         default=[],
@@ -232,6 +402,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         current_ledger_sha256 = ledger_sha256(ledger)
         if args.affected_task and not args.rule_revision:
             raise ValueError("--affected-task requires --rule-revision")
+        candidates = (
+            unmerged_worktree_candidates(Path(args.repo).expanduser().resolve())
+            if args.repo
+            else None
+        )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"control-event: invalid snapshot: {error}")
         return 2
@@ -243,12 +418,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         required_review_ids=set(args.require_review),
         expected_rule_revision=args.rule_revision,
         affected_task_ids=set(args.affected_task) if args.rule_revision else None,
+        expected_candidates=candidates,
     )
     for error in errors:
         print(f"control-event: blocked: {error}")
     if errors:
         return 1
-    print("control-event: allowed; declared READY, review and rule ACK decisions are complete")
+    print(
+        "control-event: allowed; declared READY, candidate, review and rule ACK decisions are complete"
+    )
     return 0
 
 

@@ -88,6 +88,31 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("MINI-READY", output["hookSpecificOutput"]["additionalContext"])
         self.assertTrue(next_state["pending_control_event"])
 
+    def test_lifecycle_hook_surfaces_unmerged_candidate(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "candidate_revisions": ["candidate-123"],
+        }
+
+        output, next_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status --short"},
+                "tool_response": {"output": ""},
+            },
+            snapshot=snapshot,
+            prior_state=None,
+        )
+
+        self.assertIn("candidate-123", output["hookSpecificOutput"]["additionalContext"])
+        self.assertTrue(next_state["pending_control_event"])
+
     def test_lifecycle_hook_stop_continues_until_ready_is_dispatched(self) -> None:
         output, next_state = lifecycle_hook.evaluate_event(
             {
@@ -449,6 +474,111 @@ class GovernanceTests(unittest.TestCase):
 
         self.assertTrue(any("reason_code" in error for error in errors))
         self.assertTrue(any("idle dispatch capacity" in error for error in errors))
+
+    def test_control_event_guard_requires_every_live_candidate_decision(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 1,
+            "ready_packages": [],
+            "candidate_packages": [],
+            "new_assignments": [],
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(),
+            expected_candidates={"/repo/worktree-1": "candidate-1"},
+        )
+
+        self.assertIn("control event omitted unmerged candidates: candidate-1", errors)
+
+    def test_control_event_guard_blocks_same_flow_writer_behind_candidate(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 2,
+            "ready_packages": [],
+            "candidate_packages": [
+                {
+                    "revision": "candidate-1",
+                    "worktree": "/repo/worktree-1",
+                    "task_id": "WEB-1",
+                    "integration_flow": "web-main",
+                    "decision": "review",
+                    "review_task_id": "review-web-1",
+                    "delivered_ack": True,
+                }
+            ],
+            "new_assignments": [
+                {"task_id": "WEB-2", "integration_flow": "web-main"}
+            ],
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(),
+            expected_candidates={"/repo/worktree-1": "candidate-1"},
+        )
+
+        self.assertTrue(any("WEB-2 cannot start" in error for error in errors))
+
+    def test_control_event_guard_accepts_parallel_flow_behind_candidate(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 2,
+            "ready_packages": [],
+            "candidate_packages": [
+                {
+                    "revision": "candidate-1",
+                    "worktree": "/repo/worktree-1",
+                    "task_id": "WEB-1",
+                    "integration_flow": "web-main",
+                    "decision": "integrate",
+                    "controller_event_id": "integrate-web-1",
+                }
+            ],
+            "new_assignments": [
+                {"task_id": "MINI-1", "integration_flow": "mini-main"}
+            ],
+        }
+
+        self.assertEqual(
+            control_event_guard.validate_snapshot(
+                snapshot,
+                ledger_ready_ids=set(),
+                expected_candidates={"/repo/worktree-1": "candidate-1"},
+            ),
+            [],
+        )
+
+    def test_control_event_guard_requires_exact_checkpoint_for_queued_candidate(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 0,
+            "ready_packages": [],
+            "candidate_packages": [
+                {
+                    "revision": "candidate-1",
+                    "worktree": "/repo/worktree-1",
+                    "task_id": "SERVER-1",
+                    "integration_flow": "server-main",
+                    "decision": "queued",
+                    "reason_code": "capacity",
+                }
+            ],
+            "new_assignments": [],
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(),
+            expected_candidates={"/repo/worktree-1": "candidate-1"},
+        )
+
+        self.assertIn("candidate-1 queued requires next_checkpoint", errors)
 
     def test_preblock_guard_rejects_ready_work_outside_current_goal(self) -> None:
         snapshot = {

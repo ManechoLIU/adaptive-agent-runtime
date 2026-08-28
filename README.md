@@ -148,6 +148,8 @@ Goal 不是必须由用户每次手动开启。用户明确要求长期持续推
 
 这可以防止“开发了很久，但用户一直看不到 main 上的新结果”。
 
+生命周期门会直接扫描 Git worktree 中尚未进入主线的候选。每个候选必须明确进入审查、集成、返工、排队、外部阻塞或被替代之一；排队只允许容量或顺序集成两种原因且必须写明下一检查点。同一集成流有候选时不能继续创建下一个 Writer，但 Desktop、Mini、Server 等互不冲突的其他流仍可并行。这样候选积压不再依赖总控“记得处理”。
+
 如果下游页面缺少一个尚未冻结的共享字段或语义，总控不会让下游 Agent 猜着开发，也不会只写“等待输入”后空转。缺失合同本身会成为上游工作包；它进入主线并验证通过后，同一事件立即释放下游实现。
 
 ### 阻塞一个包，不阻塞整个项目
@@ -262,19 +264,20 @@ python3 scripts/lint_governance.py --strict /path/to/project
 ```bash
 python3 scripts/control_event_guard.py \
   --ledger /path/to/project/TASK_LEDGER.md \
+  --repo /path/to/project \
   --require-review UX-EARLY \
   --rule-revision abc123 --affected-task writer-1 \
   control-event.json
 ```
 
-该 JSON 只在当前事件中使用，不进入项目台账。除当前台账 SHA-256、派发前可用槽位、全部 `READY` 决定和显式声明的 Reviewer / 规则 ACK 外，还要带本轮 `event_contract`、`event_actions` 与 `terminal_receipt_issued=true`。脚本会复核整条动作链是否仍属于同一主任务和候选 revision；延后 `READY` 必须使用结构化 `reason_code`，不能用“下一事件”或“稍后处理”留下空槽。门禁通过后删除临时输入，不新增治理文档。
+该 JSON 只在当前事件中使用，不进入项目台账。除当前台账 SHA-256、派发前可用槽位、全部 `READY` 决定和显式声明的 Reviewer / 规则 ACK 外，还要带本轮 `event_contract`、`event_actions`、`terminal_receipt_issued=true`、全部未合入 worktree 的 `candidate_packages` 决定与本轮 `new_assignments`。脚本会复核整条动作链是否仍属于同一主任务和候选 revision，并直接用 Git 对账候选是否遗漏；延后 `READY` 必须使用结构化 `reason_code`，不能用“下一事件”或“稍后处理”留下空槽。门禁通过后删除临时输入，不新增治理文档。
 
 ### 让控制事件自动触发，而不是等总控想起来
 
 `scripts/lifecycle_hook.py` 把持续总控的控制事件接到 Codex 生命周期：
 
 - `SessionStart`：读取 canonical `main` 与唯一台账基线；
-- `PostToolUse`：主线、工作区、台账或 `READY` 改变后立即给总控追加控制上下文；
+- `PostToolUse`：主线、工作区、台账、`READY` 或任一 worktree 未合入候选改变后立即给总控追加控制上下文；
 - `SubagentStop`：把子 Agent 完成登记为待审候选事件；
 - `Stop`：仍有待处理事件或 `READY` 且没有通过的控制收据时，自动续作而不是静默 idle。
 
@@ -287,7 +290,7 @@ python3 ~/.agents/skills/adaptive-delivery/scripts/lifecycle_hook.py \
 
 然后在 `~/.codex/hooks.json` 合并四个 command handler，命令都指向安装副本的 `scripts/lifecycle_hook.py`：`SessionStart`、`PostToolUse`（matcher `*`）、`SubagentStop` 和 `Stop`。Codex 的非托管 Hook 还必须在 CLI 的 `/hooks` 中审核并信任精确定义；未显示 Active 就不能声称自动门禁已生效。
 
-Hook 不会替总控盲目派发。它负责自动发现和阻止漏处理；文件冲突、共享环境、优先级与 `spawn_agent` 仍由总控判断。成功运行 `control_event_guard.py`，且台账已无未决 `READY` 后，本次自动控制事件才会清除。
+Hook 不会替总控盲目派发。它负责自动发现和阻止漏处理；文件冲突、共享环境、优先级与 `spawn_agent` 仍由总控判断。存在未合入候选时，只有带 `--repo` 且完整声明候选处置的 `control_event_guard.py` 收据才能清除本次自动控制事件。
 
 ### 防止短事件继续无边界加任务
 
