@@ -292,6 +292,24 @@ class SkillStructureTests(unittest.TestCase):
         for phrase in ("工作流 / 档位 / 证据 / 授权门", "不使用单一最高值", "共同关键路径"):
             self.assertIn(phrase, methods)
 
+    def test_external_agent_routes_pin_the_selected_reasoning_effort(self):
+        routing = REFERENCE_PATHS["agent-routing"].read_text(encoding="utf-8")
+        external = REFERENCE_PATHS["external-agent"].read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        for effort in ("`low`", "`medium`", "`high`", "`xhigh`", "`max`"):
+            self.assertIn(effort, routing)
+        self.assertIn("不得省略 `reasoning_effort`", routing)
+        self.assertIn("为每个工作包分别选择模型和推理强度", readme)
+
+        routed_commands = [
+            line for line in external.splitlines()
+            if line.startswith("node ") and (" --check " in line or " --execute " in line)
+        ]
+        self.assertEqual(8, len(routed_commands))
+        for command in routed_commands:
+            self.assertIn("--reasoning-effort <selected-effort>", command)
+
     def test_quality_preserving_acceleration_keeps_evidence_and_removes_duplicate_work(self):
         methods = METHODS.read_text(encoding="utf-8")
 

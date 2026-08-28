@@ -8,6 +8,7 @@ import process from "node:process";
 
 const KIMI_KEYCHAIN_SERVICE = "adaptive-delivery-kimi-k3";
 const XAI_KEYCHAIN_SERVICE = "adaptive-delivery-xai-grok";
+const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 const routes = {
   "kimi-code": {
@@ -60,6 +61,7 @@ export function parseArgs(argv) {
     deviceAuth: false,
     engine: null,
     model: null,
+    reasoningEffort: null,
     authMode: null,
     region: null,
     cwd: null,
@@ -73,10 +75,11 @@ export function parseArgs(argv) {
     else if (argument === "--authorized-external-call") options.authorizedExternalCall = true;
     else if (argument === "--authorized-login") options.authorizedLogin = true;
     else if (argument === "--device-auth") options.deviceAuth = true;
-    else if (["--engine", "--model", "--auth-mode", "--region", "--cwd"].includes(argument)) {
+    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd"].includes(argument)) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`Missing value for ${argument}`);
       if (argument === "--auth-mode") options.authMode = value;
+      else if (argument === "--reasoning-effort") options.reasoningEffort = value;
       else options[argument.slice(2)] = value;
       index += 1;
     } else {
@@ -117,6 +120,10 @@ export function parseArgs(argv) {
     throw new Error(
       `Model ${options.model} is not allowed for engine ${options.engine} with auth mode ${options.authMode}`,
     );
+  }
+  if (!options.reasoningEffort) throw new Error("--reasoning-effort is required");
+  if (!REASONING_EFFORTS.has(options.reasoningEffort)) {
+    throw new Error(`Unsupported reasoning effort: ${options.reasoningEffort}`);
   }
   if (options.execute && !options.authorizedExternalCall) {
     throw new Error("--execute requires --authorized-external-call after current user authorization");
@@ -209,10 +216,11 @@ function kimiApiBaseUrl() {
   return "https://api.moonshot.ai/v1";
 }
 
-function commonGrokArgs(model, prompt) {
+function commonGrokArgs(model, prompt, reasoningEffort) {
   return [
     "--no-auto-update", "--no-subagents", "--no-memory", "--sandbox", "workspace",
     "--always-approve", "-m", model, "-p", prompt, "--output-format", "streaming-json",
+    "--reasoning-effort", reasoningEffort,
   ];
 }
 
@@ -227,13 +235,13 @@ function runAttached(executable, args, { cwd, env }) {
   });
 }
 
-export function checkExternalAgent({ cwd, engine, model, authMode }) {
+export function checkExternalAgent({ cwd, engine, model, reasoningEffort, authMode }) {
   assertDirectory(cwd);
   const route = routes[engine];
   const executable = resolveExecutable(route);
   const result = spawnSync(executable, route.versionArgs, { cwd, encoding: "utf8", env: process.env });
   if (result.error?.code === "ENOENT") {
-    return { available: false, engine, model, authMode, reason: `${route.executable} executable not found` };
+    return { available: false, engine, model, reasoningEffort, authMode, reason: `${route.executable} executable not found` };
   }
   if (result.error) throw result.error;
   if (result.status !== 0) {
@@ -241,6 +249,7 @@ export function checkExternalAgent({ cwd, engine, model, authMode }) {
       available: false,
       engine,
       model,
+      reasoningEffort,
       authMode,
       reason: (result.stderr || `${route.executable} version check exited ${result.status}`).trim(),
     };
@@ -250,6 +259,7 @@ export function checkExternalAgent({ cwd, engine, model, authMode }) {
     available: true,
     engine,
     model,
+    reasoningEffort,
     authMode,
     version: (result.stdout || result.stderr).trim(),
     credentialConfigured: credential.configured,
@@ -273,7 +283,7 @@ async function loginExternalAgent({ cwd, engine, region, deviceAuth }) {
   return await runAttached(executable, args, { cwd, env: process.env });
 }
 
-async function executeExternalAgent({ cwd, engine, model, authMode }) {
+async function executeExternalAgent({ cwd, engine, model, reasoningEffort, authMode }) {
   assertDirectory(cwd);
   const prompt = await readStdin();
   if (!prompt) throw new Error("A bounded routing contract prompt is required on stdin");
@@ -300,13 +310,17 @@ async function executeExternalAgent({ cwd, engine, model, authMode }) {
       KIMI_MODEL_MAX_CONTEXT_SIZE: "1048576",
       KIMI_MODEL_CAPABILITIES: "image_in,video_in,thinking,always_thinking,tool_use",
       KIMI_MODEL_DISPLAY_NAME: "Kimi K3 API",
+      KIMI_MODEL_THINKING_EFFORT: reasoningEffort,
     };
   } else if (engine === "kimi-code") {
     if (!credentialState(engine, authMode).configured) {
       throw new Error("Kimi Code OAuth session not found; run the Adaptive Delivery login command first");
     }
     args = ["-m", model, "-p", prompt, "--output-format", "stream-json"];
-    env = sanitizedEnvironment(["KIMI_MODEL_"], ["MOONSHOT_API_KEY"]);
+    env = {
+      ...sanitizedEnvironment(["KIMI_MODEL_"], ["MOONSHOT_API_KEY"]),
+      KIMI_MODEL_THINKING_EFFORT: reasoningEffort,
+    };
   } else if (authMode === "api") {
     const apiKey = readApiKey(engine);
     if (!apiKey) {
@@ -316,13 +330,13 @@ async function executeExternalAgent({ cwd, engine, model, authMode }) {
     }
     const isolatedHome = mkdtempSync(path.join(tmpdir(), "adaptive-delivery-grok-api-"));
     cleanup = () => rmSync(isolatedHome, { recursive: true, force: true });
-    args = commonGrokArgs(model, prompt);
+    args = commonGrokArgs(model, prompt, reasoningEffort);
     env = { ...process.env, GROK_HOME: isolatedHome, XAI_API_KEY: apiKey };
   } else {
     if (!credentialState(engine, authMode).configured) {
       throw new Error("Grok OAuth session not found; run the Adaptive Delivery login command first");
     }
-    args = commonGrokArgs(model, prompt);
+    args = commonGrokArgs(model, prompt, reasoningEffort);
     env = sanitizedEnvironment([], ["XAI_API_KEY"]);
   }
 

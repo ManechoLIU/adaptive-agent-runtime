@@ -25,6 +25,20 @@ Adaptive Delivery 负责把项目目标拆成可验收工作包，为每个工�
 
 推理强度从能可靠完成任务的最低档开始；不得把最高档作为所有子 Agent 的默认值。用户或项目选择了固定模型时，不得静默换成别的模型。
 
+## 推理强度选择
+
+主 Agent 对每个工作包分别选择模型和推理强度，不继承某个全局固定档。原生或外部子 Agent 派发均不得省略 `reasoning_effort`；执行通道不能精确支持所选档位时停止派发，不退回供应商默认值。
+
+| 档位 | 适用判断 |
+| --- | --- |
+| `low` | 固定输出、机械检查、窄范围重复修改，错误容易发现和重做 |
+| `medium` | 边界明确的常规实现、测试补充或局部审查 |
+| `high` | 多文件实现、普通调试、需要权衡的代码审查 |
+| `xhigh` | 架构决策、复杂根因、跨模块契约或高风险审查 |
+| `max` | 失败代价极高且额外推理能改变结果；不得作为默认档 |
+
+复杂度变化时为下一次派发重新选择；已经运行的 Agent 不在中途静默改模型或强度。用户或项目固定了模型、计费通道或强度时优先服从；未固定部分仍由主 Agent 按上述判断选择。
+
 ## 认证与计费通道路由
 
 - 外部模型合同必须显式填写 `auth_mode: oauth | api`。OAuth/会员与 API Key 是不同的认证、额度和计费路线，执行器不得自行选择。
@@ -57,7 +71,7 @@ model: <精确模型标识>
 model_provider: <需要时填写>
 auth_mode: oauth | api  # external-agent 必填
 credential_source: cli-session | environment | os-keychain  # 不写密钥值
-reasoning_effort: <最低可靠档；不适用时省略>
+reasoning_effort: low | medium | high | xhigh | max  # 原生或外部子 Agent 必填
 repository_root: <绝对路径>
 base_revision: <提交或明确的非 Git 快照>
 owned_files: <唯一写入范围>

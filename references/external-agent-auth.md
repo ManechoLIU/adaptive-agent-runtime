@@ -40,10 +40,10 @@ Kimi K3 API uses the Kimi Open Platform endpoint `https://api.moonshot.cn/v1` fo
 Run only the route selected by the contract:
 
 ```text
-node <skill-directory>/scripts/run_external_agent.mjs --check --engine kimi-code --auth-mode oauth --model kimi-code/k3 --cwd <repository-root>
-node <skill-directory>/scripts/run_external_agent.mjs --check --engine kimi-code --auth-mode api --model kimi-k3 --cwd <repository-root>
-node <skill-directory>/scripts/run_external_agent.mjs --check --engine grok-build --auth-mode oauth --model grok-4.6 --cwd <repository-root>
-node <skill-directory>/scripts/run_external_agent.mjs --check --engine grok-build --auth-mode api --model grok-4.6 --cwd <repository-root>
+node <skill-directory>/scripts/run_external_agent.mjs --check --engine kimi-code --auth-mode oauth --model kimi-code/k3 --reasoning-effort <selected-effort> --cwd <repository-root>
+node <skill-directory>/scripts/run_external_agent.mjs --check --engine kimi-code --auth-mode api --model kimi-k3 --reasoning-effort <selected-effort> --cwd <repository-root>
+node <skill-directory>/scripts/run_external_agent.mjs --check --engine grok-build --auth-mode oauth --model grok-4.6 --reasoning-effort <selected-effort> --cwd <repository-root>
+node <skill-directory>/scripts/run_external_agent.mjs --check --engine grok-build --auth-mode api --model grok-4.6 --reasoning-effort <selected-effort> --cwd <repository-root>
 ```
 
 `available` proves only executable and version discovery. `credentialConfigured` proves only that the expected local credential source exists. Neither proves subscription entitlement, balance, model access, successful inference, or billing behavior.
@@ -55,11 +55,13 @@ Immediately before a real model request, confirm that the current user request a
 Build the smallest self-contained prompt from the route contract and pipe it on standard input:
 
 ```text
-node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine kimi-code --auth-mode oauth --model kimi-code/k3 --cwd <repository-root>
-node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine kimi-code --auth-mode api --model kimi-k3 --cwd <repository-root>
-node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine grok-build --auth-mode oauth --model grok-4.6 --cwd <repository-root>
-node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine grok-build --auth-mode api --model grok-4.6 --cwd <repository-root>
+node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine kimi-code --auth-mode oauth --model kimi-code/k3 --reasoning-effort <selected-effort> --cwd <repository-root>
+node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine kimi-code --auth-mode api --model kimi-k3 --reasoning-effort <selected-effort> --cwd <repository-root>
+node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine grok-build --auth-mode oauth --model grok-4.6 --reasoning-effort <selected-effort> --cwd <repository-root>
+node <skill-directory>/scripts/run_external_agent.mjs --execute --authorized-external-call --engine grok-build --auth-mode api --model grok-4.6 --reasoning-effort <selected-effort> --cwd <repository-root>
 ```
+
+`<selected-effort>` must be one of `low`, `medium`, `high`, `xhigh`, or `max`. The adapter rejects a missing or unsupported value. It passes the selection as `KIMI_MODEL_THINKING_EFFORT` to Kimi and `--reasoning-effort` to Grok, so neither runner silently falls back to its configured default.
 
 The Grok API route uses a temporary isolated `GROK_HOME` so a cached OAuth session cannot take precedence. The Grok OAuth route removes `XAI_API_KEY` from the child environment. The Kimi OAuth route removes temporary API-model variables; the Kimi API route injects the selected model only in the child process.
 
