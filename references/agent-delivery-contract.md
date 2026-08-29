@@ -29,6 +29,8 @@ For implementation work, completion evidence should form the shortest applicable
 
 Every downstream decision cites exact upstream evidence. A claim such as “reviewer approved” or “tests passed” without the relevant revision/receipt is insufficient for integration.
 
+For bug fixes and high-risk behavior changes (including migration, money/cost, authorization, state-machine, external-call, and release-critical logic), the non-author Reviewer is a **TDD causal-evidence reviewer**. Its review receipt sets `tdd_required=true` and must bind `red_evidence`, exact `candidate_revision`, `green_evidence`, `red_green_same_case=true`, `reviewer_counterexample`, and `verdict=PASS|FAIL`. The Reviewer verifies that the pre-fix RED genuinely exposed the same defect that becomes GREEN on the candidate, and performs a bounded counterexample or edge attack; a test added only after the fix that was never observed failing cannot establish the causal chain. Low-risk mechanical/text changes remain risk-tailored and do not require synthetic RED/GREEN ceremony.
+
 Research-only or diagnostic work uses the analogous chain `question -> source/observation -> finding -> independent check when risk requires -> decision` rather than fabricating RED/GREEN steps.
 
 ## 4. Conflict Record

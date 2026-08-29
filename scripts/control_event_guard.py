@@ -544,6 +544,14 @@ def validate_snapshot(
             errors.append(f"required review {review_id} requires task_id")
         if review.get("delivered_ack") is not True:
             errors.append(f"required review {review_id} requires delivered_ack=true")
+        if review.get("tdd_required") is True:
+            for field in ("red_evidence", "candidate_revision", "green_evidence", "reviewer_counterexample"):
+                if not str(review.get(field, "")).strip():
+                    errors.append(f"required review {review_id} requires {field}")
+            if review.get("red_green_same_case") is not True:
+                errors.append(f"required review {review_id} requires red_green_same_case=true")
+            if str(review.get("verdict", "")).strip().upper() not in {"PASS", "FAIL"}:
+                errors.append(f"required review {review_id} requires verdict PASS or FAIL")
     if required_review_ids is not None:
         missing = sorted(required_review_ids - snapshot_review_ids)
         extra = sorted(snapshot_review_ids - required_review_ids)

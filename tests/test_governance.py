@@ -687,6 +687,33 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("required review R1 requires delivered_ack=true", errors)
         self.assertIn("rule update missing loaded ACK: writer-2", errors)
 
+    def test_control_event_guard_requires_tdd_causal_evidence_for_risk_scoped_review(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc123", "available_slots": 0,
+            "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True, "tdd_required": True}],
+        }
+        errors = control_event_guard.validate_snapshot(snapshot, ledger_ready_ids=set(), required_review_ids={"R1"})
+        self.assertIn("required review R1 requires red_evidence", errors)
+        self.assertIn("required review R1 requires candidate_revision", errors)
+        self.assertIn("required review R1 requires green_evidence", errors)
+        self.assertIn("required review R1 requires red_green_same_case=true", errors)
+        self.assertIn("required review R1 requires reviewer_counterexample", errors)
+        self.assertIn("required review R1 requires verdict PASS or FAIL", errors)
+
+    def test_control_event_guard_accepts_complete_tdd_causal_review(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc123", "available_slots": 0,
+            "ready_packages": [],
+            "required_reviews": [{
+                "id": "R1", "task_id": "review-1", "delivered_ack": True, "tdd_required": True,
+                "red_evidence": "pre-fix test X fails with expected assertion", "candidate_revision": "deadbeef",
+                "green_evidence": "candidate test X passes", "red_green_same_case": True,
+                "reviewer_counterexample": "boundary X+1 remains rejected", "verdict": "PASS",
+            }],
+        }
+        self.assertEqual(control_event_guard.validate_snapshot(snapshot, ledger_ready_ids=set(), required_review_ids={"R1"}), [])
+
     def test_control_event_guard_allows_complete_event(self) -> None:
         snapshot = {
             **self.complete_event_receipt(),
