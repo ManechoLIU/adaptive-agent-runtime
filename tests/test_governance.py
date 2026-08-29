@@ -295,6 +295,18 @@ class GovernanceTests(unittest.TestCase):
             ),
             [],
         )
+    def test_runtime_reconciliation_keeps_checkpoint_governance_lightweight(self) -> None:
+        long_task = (SKILL_ROOT / "references" / "long-task-governance.md").read_text(encoding="utf-8")
+        delivery = (SKILL_ROOT / "references" / "agent-delivery-contract.md").read_text(encoding="utf-8")
+        for phrase in (
+            "普通短任务不强制 checkpoint",
+            "不新增总控人工必填字段",
+            "不新增第二套状态机",
+            "最近已验收 checkpoint",
+        ):
+            self.assertIn(phrase, long_task)
+        self.assertIn("checkpoint 只作为恢复锚点", delivery)
+
     def test_lifecycle_clears_stale_recovery_trigger_after_task_returns_ready(self) -> None:
         prior_snapshot = {
             "head": "abc", "ledger_sha256": "ledger-old", "worktree_status_sha256": "status",

@@ -119,6 +119,8 @@ yield 前先清空总控本人当前即可执行的动作：已交候选的实�
 
 运行时 heartbeat / PID 只证明存活，不证明进展。只有 Git HEAD、tracked worktree status hash、测试 / 证据 receipt、artifact fingerprint 或 blocker evidence fingerprint 至少一项产生新的非空值，`assignment_progress` 才刷新进展 deadline；重复同一指纹只续 heartbeat。Assignment runtime 以 `git rev-parse --git-common-dir` 下的 `adaptive-delivery/runtime-assignments.json` 为跨 main / Writer / Reviewer worktree 的唯一机器账本；`run_external_agent.mjs` 对 Assignment-bound 执行必须在 spawn 前把 `assignment_started` 原子 apply 到该账本，JSONL 只作可选审计副本，不能替代 canonical state。相同任务合同默认最多允许两次 recovery；第三次执行若再次失败、进展超时或进程失效，运行层派生 `health=budget_exhausted`，同一 Assignment 禁止再开 attempt 4；总控必须把策略变化固化为新的 Assignment 合同（缩范围、换 Agent/session/provider、修环境后的新执行、拆 Assignment、限时接管或形成真实外部 BLOCKED 证明），不能继续同路径重试。最终成功不会抹除历史 recovery count。
 
+为控制治理复杂度，runtime reconciliation 只替换不可靠的存活推断，不新增第二套状态机，也不新增总控人工必填字段。普通短任务不强制 checkpoint；只有长任务、高风险任务或已经进入恢复路径的工作包才需要可恢复检查点。恢复时优先从最近已验收 checkpoint 继续，已验收阶段不重复执行；checkpoint 是恢复锚点，不是新的项目状态或审批层。
+
 回收只保护恢复点，不解决阻塞。既有台账回收后可把该包写作 `RECOVERING`（主状态仍为 `ACTIVE + health=recovering`），先区分消息 / 握手、任务运行、工具故障、工作树 / 分支冲突、依赖环境和目标合同等原因，再选择恢复原执行者、从 checkpoint 补派、收缩范围、修复环境或由主 Agent 接管。只有恢复路径已经穷尽且确实等待用户、外部系统、凭证、付费授权或其他不可内部消解的状态时，工作包才标 `BLOCKED`。
 
 Required Review `PASS` 后若声明已集成，`control_event_guard.py` 还必须用 Git 证明 candidate revision 是当前主线 revision 的祖先，并绑定 current-main regression evidence；只填写 main revision 字符串不能证明已集成。Reviewer 通道失效时，优先按相同协议追问并补派独立 Reviewer。只有关键路径因此停滞、当前没有可安全补派的审查者，且总控未参与该实现时，总控才可进行一次限时、窄范围的非作者审查；给出 verdict 与证据后立即回到调度，不承担常驻或跨页面审查，也不能因此让其他无冲突 `READY` 闲置。

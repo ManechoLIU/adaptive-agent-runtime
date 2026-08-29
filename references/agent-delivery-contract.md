@@ -23,7 +23,7 @@ All execution transports (native subagent, Grok/Kimi runner, future A2A transpor
 
 When code or a versioned artifact is produced, `artifacts` must identify the exact revision/path. Transport-specific prose may be retained as evidence, but it is not the authoritative result.
 
-Runtime heartbeat is liveness only. A progress receipt extends the progress deadline only when at least one authoritative fingerprint changes (Git HEAD, tracked status hash, evidence receipt, artifact, or blocker evidence). Repeating the same fingerprint does not count as progress. Same-contract recovery is bounded to two recovery attempts; after exhaustion the same Assignment cannot start another attempt. Strategy-changing execution must use a new Assignment contract rather than silently resetting the counter.
+Runtime heartbeat is liveness only. A progress receipt extends the progress deadline only when at least one authoritative fingerprint changes (Git HEAD, tracked status hash, evidence receipt, artifact, or blocker evidence). Repeating the same fingerprint does not count as progress. Same-contract recovery is bounded to two recovery attempts; after exhaustion the same Assignment cannot start another attempt. Strategy-changing execution must use a new Assignment contract rather than silently resetting the counter. Checkpoint governance stays risk-tailored: checkpoint 只作为恢复锚点，ordinary short assignments do not gain a new mandatory approval step or controller-authored runtime field.
 
 ## 3. Evidence Chain
 
