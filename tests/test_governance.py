@@ -88,6 +88,22 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("MINI-READY", output["hookSpecificOutput"]["additionalContext"])
         self.assertTrue(next_state["pending_control_event"])
 
+    def test_lifecycle_hook_surfaces_unhealthy_active_runtime_without_git_change(self) -> None:
+        snapshot = {
+            "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",
+            "ready_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {"F1": {"ledger_state": "ACTIVE", "state": "unhealthy", "reason": "lease_expired"}},
+            "stale_active_ids": ["F1"], "progress_stale_ids": [], "terminal_active_ids": [],
+        }
+        prior={"snapshot":dict(snapshot),"pending_control_event":False,"triggers":[],"stop_continuations":0}
+        output, state=lifecycle_hook.evaluate_event({"hook_event_name":"PostToolUse","session_id":"s","tool_input":{},"tool_response":{}},snapshot=snapshot,prior_state=prior)
+        self.assertTrue(state["pending_control_event"]); self.assertIn("active_lease_expired:F1", state["triggers"]); self.assertIn("active_lease_expired:F1", str(output))
+
+    def test_control_event_guard_blocks_stale_active_runtime(self) -> None:
+        snapshot=self.complete_event_receipt(); snapshot.update({"ledger_sha256":"x","available_slots":0,"ready_packages":[],"assignment_liveness":{"F1":{"ledger_state":"ACTIVE","state":"unhealthy","reason":"lease_expired"}}})
+        errors=control_event_guard.validate_snapshot(snapshot)
+        self.assertIn("ACTIVE runtime unhealthy: F1 (lease_expired)", errors)
+
     def test_lifecycle_hook_surfaces_invalid_ledger_at_session_start(self) -> None:
         output, next_state = lifecycle_hook.evaluate_event(
             {

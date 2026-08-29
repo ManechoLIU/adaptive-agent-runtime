@@ -109,6 +109,23 @@ def lifecycle_triggers(
     triggers.extend(
         f"LEDGER_INVALID:{error}" for error in snapshot.get("ledger_errors", [])
     )
+    liveness = snapshot.get("assignment_liveness", {})
+    if isinstance(liveness, dict):
+        for task_id, decision in liveness.items():
+            if not isinstance(decision, dict):
+                continue
+            ledger_state = str(decision.get("ledger_state", "")).upper()
+            state = str(decision.get("state", ""))
+            reason = str(decision.get("reason", ""))
+            if ledger_state == "ACTIVE" and state == "unhealthy":
+                label = "active_lease_expired" if reason == "lease_expired" else "assignment_became_unhealthy"
+                triggers.append(f"{label}:{task_id}")
+            elif ledger_state == "ACTIVE" and state == "terminal":
+                triggers.append(f"agent_session_terminal:{task_id}")
+            elif state == "progress_stale":
+                triggers.append(f"active_without_progress:{task_id}")
+            elif ledger_state == "RECOVERING" and state in {"unhealthy", "unknown", "terminal"}:
+                triggers.append(f"recovery_stalled:{task_id}")
     previous = prior_state.get("snapshot") if isinstance(prior_state, dict) else None
     if isinstance(previous, dict):
         for field, label in (

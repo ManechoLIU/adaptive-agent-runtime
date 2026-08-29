@@ -450,6 +450,22 @@ def validate_snapshot(
     if snapshot.get("terminal_receipt_issued") is not True:
         errors.append("terminal_receipt_issued=true is required")
 
+    liveness = snapshot.get("assignment_liveness", {})
+    if liveness is not None and not isinstance(liveness, dict):
+        errors.append("assignment_liveness must be an object")
+    elif isinstance(liveness, dict):
+        for task_id, decision in sorted(liveness.items()):
+            if not isinstance(decision, dict):
+                errors.append(f"assignment_liveness[{task_id}] must be an object")
+                continue
+            ledger_state = str(decision.get("ledger_state", "")).upper()
+            runtime_state = str(decision.get("state", ""))
+            reason = str(decision.get("reason", "")).strip() or "unknown"
+            if ledger_state == "ACTIVE" and runtime_state not in {"healthy", "progress_stale"}:
+                errors.append(f"ACTIVE runtime unhealthy: {task_id} ({reason})")
+            if ledger_state == "RECOVERING" and runtime_state in {"unhealthy", "unknown", "terminal"}:
+                errors.append(f"RECOVERING runtime stalled: {task_id} ({reason})")
+
     snapshot_sha = str(snapshot.get("ledger_sha256", "")).strip()
     if not snapshot_sha:
         errors.append("ledger_sha256 is required")
