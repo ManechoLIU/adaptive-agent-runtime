@@ -359,6 +359,34 @@ class GovernanceTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_runtime_aware_active_requires_current_matching_lease(self) -> None:
+        assignment = {
+            "assignment_id": "F1-writer-1", "task_id": "F1", "agent_id": "/root/writer",
+            "state": "ACTIVE", "worktree": "/tmp/wt", "observed_modified_files": [],
+            "ack": {"repository_root": "/repo", "branch": "codex/f1", "head": "abc123",
+                    "status": "clean at ACK", "owned_files": ["app/a.ts"],
+                    "first_red": "test_f1 fails", "stop_condition": "candidate commit and receipt"},
+        }
+        errors = assignment_lease_guard.validate_assignment(assignment, runtime_state={"schema_version": 1, "leases": {}})
+        self.assertIn("ACTIVE requires current runtime lease", errors)
+
+    def test_runtime_aware_active_accepts_healthy_matching_lease(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        now=datetime(2026,8,29,10,0,tzinfo=timezone.utc)
+        assignment = {
+            "assignment_id": "F1-writer-1", "task_id": "F1", "agent_id": "/root/writer",
+            "state": "ACTIVE", "worktree": "/tmp/wt", "observed_modified_files": [],
+            "ack": {"repository_root": "/repo", "branch": "codex/f1", "head": "abc123",
+                    "status": "clean at ACK", "owned_files": ["app/a.ts"],
+                    "first_red": "test_f1 fails", "stop_condition": "candidate commit and receipt"},
+        }
+        lease={"assignment_id":"F1-writer-1","task_id":"F1","agent_id":"/root/writer",
+               "provider":"grok","session_id":"s1","worktree":"/tmp/wt",
+               "lease_expires_at":(now+timedelta(minutes=20)).isoformat(),
+               "progress_deadline_at":(now+timedelta(minutes=30)).isoformat(),"terminal_state":None}
+        errors=assignment_lease_guard.validate_assignment(assignment, runtime_state={"schema_version":1,"leases":{"F1-writer-1":lease}}, now=now)
+        self.assertEqual(errors, [])
+
     def test_assignment_lease_reuse_requires_release_and_new_ack(self) -> None:
         errors = assignment_lease_guard.validate_assignment(
             {

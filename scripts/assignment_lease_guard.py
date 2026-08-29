@@ -4,7 +4,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime
 from typing import Any, Sequence
+
+try:
+    from scripts.assignment_runtime import evaluate_lease
+except ModuleNotFoundError:
+    from assignment_runtime import evaluate_lease
 
 
 STATES = {"RESERVED", "ACKED", "ACTIVE", "CANDIDATE", "FROZEN", "TERMINAL"}
@@ -28,7 +34,7 @@ def nonempty_list(value: Any) -> bool:
     )
 
 
-def validate_assignment(assignment: dict[str, Any]) -> list[str]:
+def validate_assignment(assignment: dict[str, Any], runtime_state: dict[str, Any] | None = None, now: datetime | None = None) -> list[str]:
     errors: list[str] = []
     assignment_id = str(assignment.get("assignment_id", "")).strip()
     agent_id = str(assignment.get("agent_id", "")).strip()
@@ -95,6 +101,19 @@ def validate_assignment(assignment: dict[str, Any]) -> list[str]:
         errors.append("writer is not non-author reviewer for the same candidate revision")
     if state == "FROZEN" and observed and not str(assignment.get("recovery_owner", "")).strip():
         errors.append("dirty FROZEN assignment requires one recovery_owner")
+
+    if runtime_state is not None and state == "ACTIVE":
+        lease = runtime_state.get("leases", {}).get(assignment_id) if isinstance(runtime_state, dict) else None
+        if not lease:
+            errors.append("ACTIVE requires current runtime lease")
+        else:
+            for field in ("assignment_id", "task_id", "agent_id", "worktree"):
+                expected = str(assignment.get(field, "")).strip()
+                if expected and str(lease.get(field, "")).strip() != expected:
+                    errors.append(f"ACTIVE runtime lease identity mismatch: {field}")
+            decision = evaluate_lease(lease, now=now)
+            if decision["state"] not in {"healthy", "progress_stale"}:
+                errors.append(f"ACTIVE runtime lease is {decision['state']}: {decision['reason']}")
     return errors
 
 
