@@ -292,6 +292,8 @@ python3 ~/.agents/skills/adaptive-delivery/scripts/lifecycle_hook.py \
 
 ChatGPT Web + AI-Bridge 需要额外的 Web bridge，因为 Web 工具调用不会天然触发 Codex Hook。`scripts/web_lifecycle_bridge.py` 可把**唯一 registered controller** 项目下由 AI-Bridge 启动的 shell 调用桥接为 `PostToolUse`，并从 AI-Bridge 审计收据确认 `control_event_guard.py` 的真实 `control-event: allowed` 输出。未登记项目静默跳过；同一 repo 若登记多个 controller 则拒绝映射；没有 repo 归属的 `computer` 事件不自动猜测归属。Web 平台最终回复仍没有本地 `Stop` 回调，所以硬 Stop 必须复用原 controller session 走 Codex 原生生命周期（例如 `codex exec resume <session-id>`），不能把 Web bridge 宣称成完整原生 Hook。
 
+`computer` 收据本身没有 repo / Web session ID，因此只允许**短租约归属**：先在 canonical repo 内运行 `python3 scripts/web_lifecycle_bridge.py arm-computer --cwd <repo>`，默认只授权接下来 90 秒内 1 次 GUI 收据，可显式设置 `--ttl-seconds 5..300` 与 `--uses 1..8`；租约过期或耗尽即删除，租约外 `computer` 静默忽略。需要硬 Stop 时使用 `python3 scripts/web_lifecycle_bridge.py native-stop --session-id <registered-controller> --repo <repo>`；命令先核对 registry 精确匹配，再通过 `codex exec resume` 续接**同一 thread**，不会 fork 或创建第二 controller。
+
 Hook 不会替总控盲目派发。它负责自动发现和阻止漏处理；文件冲突、共享环境、优先级与 `spawn_agent` 仍由总控判断。存在未合入候选时，只有带 `--repo` 且完整声明候选处置的 `control_event_guard.py` 收据才能清除本次自动控制事件。
 
 ### 防止短事件继续无边界加任务

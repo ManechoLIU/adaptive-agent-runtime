@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -150,6 +151,96 @@ def audit_receipts_from_cursor(audit_log: Path, cursor_path: Path) -> list[dict[
     return receipts
 
 
+def computer_event_from_receipt(
+    receipt: dict[str, Any],
+    *,
+    session_id: str,
+    repo: Path,
+    lease_path: Path,
+    now_unix_ms: int | None = None,
+) -> dict[str, Any] | None:
+    if receipt.get("childTool") != "computer":
+        return None
+    if receipt.get("state") not in {"succeeded", "failed"}:
+        return None
+    lease = load_json(lease_path)
+    if not lease:
+        return None
+    if lease.get("session_id") != session_id:
+        return None
+    if str(lease.get("repo") or "") != str(repo.resolve()):
+        return None
+    now_ms = int(time.time() * 1000) if now_unix_ms is None else now_unix_ms
+    issued_ms = int(lease.get("issued_at_unix_ms", 0) or 0)
+    expires_ms = int(lease.get("expires_at_unix_ms", 0) or 0)
+    remaining = int(lease.get("remaining_uses", 0) or 0)
+    receipt_ms = int(receipt.get("occurredAtUnixMs", 0) or 0)
+    if remaining <= 0 or expires_ms <= now_ms:
+        lease_path.unlink(missing_ok=True)
+        return None
+    if receipt_ms and issued_ms and receipt_ms < issued_ms:
+        return None
+
+    detail = receipt.get("detail")
+    target = receipt.get("targetLabel")
+    event = {
+        "hook_event_name": "PostToolUse",
+        "session_id": session_id,
+        "turn_id": f"web-audit:{receipt.get('receiptId') or 'computer'}",
+        "cwd": str(repo.resolve()),
+        "tool_name": "AI-Bridge.computer",
+        "tool_input": {
+            "detail": detail if isinstance(detail, str) else "",
+            "target": target if isinstance(target, str) else "",
+        },
+        "tool_response": {"state": receipt.get("state")},
+    }
+    remaining -= 1
+    if remaining <= 0:
+        lease_path.unlink(missing_ok=True)
+    else:
+        lease["remaining_uses"] = remaining
+        lease_path.write_text(json.dumps(lease, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return event
+
+
+def write_computer_lease(
+    *, lease_path: Path, session_id: str, repo: Path, ttl_seconds: int, uses: int
+) -> dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    value = {
+        "session_id": session_id,
+        "repo": str(repo.resolve()),
+        "issued_at_unix_ms": now_ms,
+        "expires_at_unix_ms": now_ms + ttl_seconds * 1000,
+        "remaining_uses": uses,
+    }
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return value
+
+
+def default_computer_lease_path(session_id: str) -> Path:
+    return (
+        Path.home()
+        / ".codex"
+        / "state"
+        / "adaptive-delivery-web-lifecycle"
+        / f"{session_id}.computer-lease.json"
+    )
+
+
+def native_resume_command(*, codex: str, session_id: str, repo: Path) -> list[str]:
+    prompt = (
+        "Adaptive Delivery Web Stop checkpoint. Continue this existing registered controller "
+        "thread only; do not create or fork another controller. Reconcile any pending lifecycle "
+        "control event against the real main, ledger, live tasks, READY queue and candidates. "
+        "Obey the installed lifecycle hooks and control_event_guard; if no pending control action "
+        "remains, stop without starting unrelated work."
+    )
+    return [codex, "exec", "resume", "-C", str(repo.resolve()), session_id, prompt]
+
+
 def successful_guard_event_from_receipt(
     receipt: dict[str, Any], *, session_id: str, repo: Path
 ) -> dict[str, Any] | None:
@@ -235,6 +326,21 @@ def build_parser() -> argparse.ArgumentParser:
     audit_once.add_argument("--audit-log", default=str(DEFAULT_AUDIT_LOG))
     audit_once.add_argument("--cursor", required=True)
     audit_once.add_argument("--capture-events")
+    audit_once.add_argument("--computer-lease")
+
+    arm_computer = subparsers.add_parser("arm-computer")
+    arm_computer.add_argument("--cwd", required=True)
+    arm_computer.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    arm_computer.add_argument("--lease")
+    arm_computer.add_argument("--ttl-seconds", type=int, default=90)
+    arm_computer.add_argument("--uses", type=int, default=1)
+
+    native_stop = subparsers.add_parser("native-stop")
+    native_stop.add_argument("--session-id", required=True)
+    native_stop.add_argument("--repo", required=True)
+    native_stop.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    native_stop.add_argument("--codex", default="/opt/homebrew/bin/codex")
+    native_stop.add_argument("--dry-run", action="store_true")
 
     subparsers.add_parser("print-zshenv-block")
     return parser
@@ -287,10 +393,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         receipts = audit_receipts_from_cursor(
             Path(args.audit_log).expanduser(), Path(args.cursor).expanduser()
         )
+        lease_path = (
+            Path(args.computer_lease).expanduser()
+            if args.computer_lease
+            else default_computer_lease_path(args.session_id)
+        )
         for receipt in receipts:
             event = successful_guard_event_from_receipt(
                 receipt, session_id=args.session_id, repo=repo
             )
+            if event is None:
+                event = computer_event_from_receipt(
+                    receipt, session_id=args.session_id, repo=repo, lease_path=lease_path
+                )
             if event is None:
                 continue
             if args.capture_events:
@@ -298,6 +413,63 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 dispatch_event(event)
         return 0
+
+    if args.command_name == "arm-computer":
+        repo = canonical_root(args.cwd)
+        try:
+            session_id = registered_controller_for_repo(
+                repo, Path(args.registry).expanduser()
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if session_id is None:
+            print(f"no registered controller for {repo}", file=sys.stderr)
+            return 2
+        if not (5 <= args.ttl_seconds <= 300):
+            print("ttl-seconds must be between 5 and 300", file=sys.stderr)
+            return 2
+        if not (1 <= args.uses <= 8):
+            print("uses must be between 1 and 8", file=sys.stderr)
+            return 2
+        lease_path = (
+            Path(args.lease).expanduser()
+            if args.lease
+            else default_computer_lease_path(session_id)
+        )
+        value = write_computer_lease(
+            lease_path=lease_path,
+            session_id=session_id,
+            repo=repo,
+            ttl_seconds=args.ttl_seconds,
+            uses=args.uses,
+        )
+        print(json.dumps(value, ensure_ascii=False))
+        return 0
+
+    if args.command_name == "native-stop":
+        repo = canonical_root(args.repo)
+        try:
+            registered = registered_controller_for_repo(
+                repo, Path(args.registry).expanduser()
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if registered != args.session_id:
+            print(
+                f"session {args.session_id} is not the registered controller for {repo}",
+                file=sys.stderr,
+            )
+            return 2
+        command = native_resume_command(
+            codex=args.codex, session_id=args.session_id, repo=repo
+        )
+        if args.dry_run:
+            print(json.dumps(command, ensure_ascii=False))
+            return 0
+        completed = subprocess.run(command, check=False)
+        return completed.returncode
 
     if args.command_name == "print-zshenv-block":
         print(zshenv_block())

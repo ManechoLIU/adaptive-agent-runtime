@@ -264,3 +264,135 @@ class WebLifecycleAuditTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(capture.exists())
             self.assertEqual(json.loads(cursor.read_text())["offset"], audit.stat().st_size)
+
+
+class WebLifecycleComputerLeaseTests(unittest.TestCase):
+    def run_bridge(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["/usr/bin/python3", str(BRIDGE), *args],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_audit_once_ignores_computer_without_valid_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            audit = tmp_path / "audit.jsonl"
+            audit.write_text(json.dumps({
+                "receiptId":"computer-1", "childTool":"computer", "state":"succeeded",
+                "targetLabel":"Google Chrome", "detail":"电脑操作：get_app_state · 应用 Google Chrome"
+            }) + "\n", encoding="utf-8")
+            cursor = tmp_path / "cursor.json"
+            capture = tmp_path / "events.jsonl"
+            lease = tmp_path / "lease.json"
+
+            result = self.run_bridge(
+                "audit-once", "--session-id", "controller-1", "--repo", str(repo),
+                "--audit-log", str(audit), "--cursor", str(cursor),
+                "--computer-lease", str(lease), "--capture-events", str(capture),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(capture.exists())
+
+    def test_audit_once_consumes_one_computer_event_from_valid_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            audit = tmp_path / "audit.jsonl"
+            audit.write_text(json.dumps({
+                "receiptId":"computer-2", "childTool":"computer", "state":"succeeded",
+                "targetLabel":"Google Chrome", "detail":"电脑操作：click · 应用 Google Chrome"
+            }) + "\n", encoding="utf-8")
+            cursor = tmp_path / "cursor.json"
+            capture = tmp_path / "events.jsonl"
+            lease = tmp_path / "lease.json"
+            lease.write_text(json.dumps({
+                "session_id":"controller-1", "repo":str(repo.resolve()),
+                "expires_at_unix_ms":4102444800000, "remaining_uses":1
+            }), encoding="utf-8")
+
+            result = self.run_bridge(
+                "audit-once", "--session-id", "controller-1", "--repo", str(repo),
+                "--audit-log", str(audit), "--cursor", str(cursor),
+                "--computer-lease", str(lease), "--capture-events", str(capture),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            event = json.loads(capture.read_text().splitlines()[0])
+            self.assertEqual(event["tool_name"], "AI-Bridge.computer")
+            self.assertIn("click", event["tool_input"]["detail"])
+            self.assertFalse(lease.exists())
+
+    def test_arm_computer_resolves_registered_controller_and_writes_bounded_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = tmp_path / "controllers.json"
+            registry.write_text(json.dumps({"controller-1":str(repo.resolve())}), encoding="utf-8")
+            lease = tmp_path / "lease.json"
+
+            result = self.run_bridge(
+                "arm-computer", "--cwd", str(repo), "--registry", str(registry),
+                "--lease", str(lease), "--ttl-seconds", "90", "--uses", "2",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            value=json.loads(lease.read_text())
+            self.assertEqual(value["session_id"], "controller-1")
+            self.assertEqual(value["remaining_uses"], 2)
+            self.assertGreater(value["expires_at_unix_ms"], value["issued_at_unix_ms"])
+
+
+class WebLifecycleNativeStopTests(unittest.TestCase):
+    def run_bridge(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["/usr/bin/python3", str(BRIDGE), *args],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_native_stop_dry_run_reuses_exact_registered_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path=Path(tmp)
+            repo=tmp_path/"repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry=tmp_path/"controllers.json"
+            registry.write_text(json.dumps({"controller-1":str(repo.resolve())}), encoding="utf-8")
+
+            result=self.run_bridge(
+                "native-stop", "--session-id", "controller-1", "--repo", str(repo),
+                "--registry", str(registry), "--codex", "/opt/homebrew/bin/codex", "--dry-run"
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            argv=json.loads(result.stdout)
+            self.assertEqual(argv[:3], ["/opt/homebrew/bin/codex", "exec", "resume"])
+            self.assertIn("controller-1", argv)
+            self.assertIn(str(repo.resolve()), argv)
+            self.assertNotIn("fork", argv)
+
+    def test_native_stop_rejects_session_not_registered_for_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path=Path(tmp)
+            repo=tmp_path/"repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry=tmp_path/"controllers.json"
+            registry.write_text(json.dumps({"other-controller":str(repo.resolve())}), encoding="utf-8")
+
+            result=self.run_bridge(
+                "native-stop", "--session-id", "controller-1", "--repo", str(repo),
+                "--registry", str(registry), "--dry-run"
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("registered controller", result.stderr)
