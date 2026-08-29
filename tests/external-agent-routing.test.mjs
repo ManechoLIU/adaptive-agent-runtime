@@ -62,6 +62,7 @@ async function fakeInstalledSkill(directory) {
 async function fakeRunner(bin, name, versionArgument) {
   const target = path.join(bin, name);
   await writeFile(target, `#!/usr/bin/env node
+import fs from "node:fs";
 if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
   process.stdout.write(${JSON.stringify(`${name} test\n`)});
 } else {
@@ -75,7 +76,8 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
     hasXaiApiKey: Boolean(process.env.XAI_API_KEY),
     grokHome: process.env.GROK_HOME || null,
   }) + "\\n");
-  if (process.env.SPAWN_MARKER) require("node:fs").appendFileSync(process.env.SPAWN_MARKER, "spawned\\n");
+  if (process.env.SPAWN_MARKER) fs.appendFileSync(process.env.SPAWN_MARKER, "spawned\\n");
+  if (process.env.FAKE_RUNNER_TOUCH_FILE) fs.writeFileSync(process.env.FAKE_RUNNER_TOUCH_FILE, "changed\\n");
   const delay = Number(process.env.FAKE_RUNNER_DELAY_MS || 0);
   if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
 }
@@ -420,6 +422,38 @@ test("long external execution emits automatic heartbeat before terminal", async 
   assert.ok(events.some((event) => event.event_type === "assignment_heartbeat"), JSON.stringify(events));
   assert.deepEqual(events.map((event) => event.event_seq), events.map((_, index) => index + 1));
   assert.equal(events.filter((event) => event.event_type === "assignment_terminal").length, 1);
+});
+
+
+
+test("external execution emits progress when tracked worktree evidence changes", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-progress-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const receipts = path.join(bin, "receipts.jsonl");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "progress-a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", await assignmentAckFile(bin, { assignment_id: "progress-a1" }, repo),
+    "--attempt", "1", "--lease-id", "progress-lease-1", "--runtime-receipts", receipts,
+  ], { encoding: "utf8", input: "bounded contract", env: {
+    ...process.env,
+    PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`,
+    GROK_HOME: grokHome,
+    FAKE_RUNNER_DELAY_MS: "180",
+    FAKE_RUNNER_TOUCH_FILE: path.join(repo, "TASK_LEDGER.md"),
+    AD_RUNTIME_HEARTBEAT_MS: "50",
+  } });
+  assert.equal(result.status, 0, result.stderr);
+  const events = (await readFile(receipts, "utf8")).trim().split("\n").map(JSON.parse);
+  const progress = events.find((event) => event.event_type === "assignment_progress");
+  assert.ok(progress, JSON.stringify(events));
+  assert.ok(progress.last_observed_status_sha256);
+  assert.equal(events.at(-1).event_type, "assignment_terminal");
 });
 
 test("assignment-bound execution persists canonical runtime without audit JSONL", async () => {
