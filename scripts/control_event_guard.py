@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -19,7 +20,10 @@ CANDIDATE_DECISIONS = {
     "queued",
     "blocked",
     "superseded",
+    "absorbed",
+    "parked",
 }
+RETAINED_CANDIDATE_DECISIONS = {"absorbed", "parked"}
 DEFER_REASON_CODES = {
     "capacity",
     "file_conflict",
@@ -52,14 +56,84 @@ def run_git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedP
     )
 
 
-def unmerged_worktree_candidates(root: Path) -> dict[str, str]:
-    """Return worktree -> revision for every non-canonical worktree not in main."""
+CANDIDATE_STATE_ROOT = Path(
+    os.environ.get(
+        "AD_CANDIDATE_STATE_DIR",
+        str(Path.home() / ".codex" / "state" / "adaptive-delivery-candidates"),
+    )
+).expanduser()
+
+
+def candidate_state_path(root: Path, state_dir: Path | None = None) -> Path:
+    canonical = Path(run_git(root, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
+    key = hashlib.sha256(str(canonical).encode("utf-8")).hexdigest()[:24]
+    return (state_dir or CANDIDATE_STATE_ROOT) / f"{key}.json"
+
+
+def load_candidate_lifecycle(root: Path, state_dir: Path | None = None) -> dict[str, Any]:
+    path = candidate_state_path(root, state_dir)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"schema_version": 1, "worktrees": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("worktrees"), dict):
+        return {"schema_version": 1, "worktrees": {}}
+    return data
+
+
+def write_candidate_lifecycle(
+    root: Path, value: dict[str, Any], state_dir: Path | None = None
+) -> None:
+    path = candidate_state_path(root, state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def record_candidate_lifecycle(
+    root: Path, candidate_packages: Sequence[dict[str, Any]], *, state_dir: Path | None = None
+) -> None:
+    lifecycle = load_candidate_lifecycle(root, state_dir)
+    worktrees = lifecycle.setdefault("worktrees", {})
+    if not isinstance(worktrees, dict):
+        worktrees = {}
+        lifecycle["worktrees"] = worktrees
+    for candidate in candidate_packages:
+        decision = str(candidate.get("decision", "")).strip().lower()
+        if decision not in RETAINED_CANDIDATE_DECISIONS:
+            continue
+        worktree = str(Path(str(candidate.get("worktree", ""))).expanduser().resolve())
+        revision = str(candidate.get("revision", "")).strip()
+        record: dict[str, Any] = {
+            "revision": revision,
+            "state": decision,
+            "retention_reason": str(candidate.get("retention_reason", "")).strip(),
+        }
+        if decision == "absorbed":
+            record["absorbing_revision"] = str(candidate.get("absorbing_revision", "")).strip()
+        else:
+            record["reason_code"] = str(candidate.get("reason_code", "")).strip()
+            record["wake_condition"] = str(candidate.get("wake_condition", "")).strip()
+        worktrees[worktree] = record
+    write_candidate_lifecycle(root, lifecycle, state_dir)
+
+
+def worktree_candidate_inventory(
+    root: Path, *, state_dir: Path | None = None
+) -> dict[str, dict[str, Any]]:
+    """Return live candidates plus retained terminal worktrees with exact-revision matching."""
     canonical = Path(
         run_git(root, "rev-parse", "--show-toplevel").stdout.strip()
     ).resolve()
     main_revision = run_git(canonical, "rev-parse", "main").stdout.strip()
+    lifecycle = load_candidate_lifecycle(canonical, state_dir)
+    retained_records = lifecycle.get("worktrees", {})
+    if not isinstance(retained_records, dict):
+        retained_records = {}
     porcelain = run_git(canonical, "worktree", "list", "--porcelain").stdout
-    candidates: dict[str, str] = {}
+    live: dict[str, Any] = {}
+    retained: dict[str, Any] = {}
     path: Path | None = None
     revision = ""
     for line in porcelain.splitlines() + [""]:
@@ -79,10 +153,26 @@ def unmerged_worktree_candidates(root: Path) -> dict[str, str]:
                     check=False,
                 ).returncode == 0
                 if not merged:
-                    candidates[str(path)] = revision
+                    key = str(path)
+                    record = retained_records.get(key)
+                    if (
+                        isinstance(record, dict)
+                        and record.get("revision") == revision
+                        and record.get("state") in RETAINED_CANDIDATE_DECISIONS
+                    ):
+                        retained[key] = dict(record)
+                    else:
+                        live[key] = revision
             path = None
             revision = ""
-    return candidates
+    return {"live": live, "retained": retained}
+
+
+def unmerged_worktree_candidates(
+    root: Path, *, state_dir: Path | None = None
+) -> dict[str, str]:
+    """Return only live unmerged worktree candidates; retained terminal states are excluded."""
+    return dict(worktree_candidate_inventory(root, state_dir=state_dir)["live"])
 
 
 def validate_candidate_queue(
@@ -119,12 +209,12 @@ def validate_candidate_queue(
             errors.append(f"{revision} requires task_id")
         if not flow:
             errors.append(f"{revision} requires integration_flow")
-        else:
+        elif decision not in RETAINED_CANDIDATE_DECISIONS:
             candidate_flows.add(flow)
             flow_counts[flow] = flow_counts.get(flow, 0) + 1
         if decision not in CANDIDATE_DECISIONS:
             errors.append(
-                f"{revision} decision must be review, integrate, rework, queued, blocked, or superseded"
+                f"{revision} decision must be review, integrate, rework, queued, blocked, superseded, absorbed, or parked"
             )
             continue
         if decision == "review":
@@ -164,6 +254,18 @@ def validate_candidate_queue(
                 errors.append(f"{revision} superseded requires superseding_revision")
             if not str(candidate.get("cleanup_action", "")).strip():
                 errors.append(f"{revision} superseded requires cleanup_action")
+        elif decision == "absorbed":
+            if not str(candidate.get("absorbing_revision", "")).strip():
+                errors.append(f"{revision} absorbed requires absorbing_revision")
+            if not str(candidate.get("retention_reason", "")).strip():
+                errors.append(f"{revision} absorbed requires retention_reason")
+        elif decision == "parked":
+            if not str(candidate.get("reason_code", "")).strip():
+                errors.append(f"{revision} parked requires reason_code")
+            if not str(candidate.get("wake_condition", "")).strip():
+                errors.append(f"{revision} parked requires wake_condition")
+            if not str(candidate.get("retention_reason", "")).strip():
+                errors.append(f"{revision} parked requires retention_reason")
 
     expected_revisions = set(expected_candidates.values())
     missing = sorted(expected_revisions - seen)
@@ -430,6 +532,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"control-event: blocked: {error}")
     if errors:
         return 1
+    if args.repo:
+        raw_candidates = snapshot.get("candidate_packages", [])
+        if isinstance(raw_candidates, list):
+            try:
+                record_candidate_lifecycle(Path(args.repo).expanduser().resolve(), [c for c in raw_candidates if isinstance(c, dict)])
+            except OSError as error:
+                print(f"control-event: blocked: failed to persist candidate lifecycle: {error}")
+                return 1
     print(
         "control-event: allowed; declared READY, candidate, review and rule ACK decisions are complete"
     )

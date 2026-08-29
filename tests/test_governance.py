@@ -607,6 +607,185 @@ class GovernanceTests(unittest.TestCase):
         self.assertTrue(any("reason_code" in error for error in errors))
         self.assertTrue(any("idle dispatch capacity" in error for error in errors))
 
+    def test_control_event_guard_absorbed_candidate_releases_flow_wip(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 1,
+            "ready_packages": [],
+            "candidate_packages": [{
+                "revision": "candidate-1",
+                "worktree": "/repo/worktree-1",
+                "task_id": "WEB-1",
+                "integration_flow": "web-main",
+                "decision": "absorbed",
+                "absorbing_revision": "main-2",
+                "retention_reason": "retain QA evidence",
+            }],
+            "new_assignments": [{"task_id": "WEB-2", "integration_flow": "web-main"}],
+        }
+
+        self.assertEqual(
+            control_event_guard.validate_snapshot(
+                snapshot,
+                ledger_ready_ids=set(),
+                expected_candidates={"/repo/worktree-1": "candidate-1"},
+            ),
+            [],
+        )
+
+    def test_control_event_guard_parked_candidate_requires_recovery_metadata(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 0,
+            "ready_packages": [],
+            "candidate_packages": [{
+                "revision": "candidate-1",
+                "worktree": "/repo/worktree-1",
+                "task_id": "SERVER-1",
+                "integration_flow": "server-main",
+                "decision": "parked",
+            }],
+            "new_assignments": [],
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(),
+            expected_candidates={"/repo/worktree-1": "candidate-1"},
+        )
+
+        self.assertTrue(any("parked requires reason_code" in error for error in errors))
+        self.assertTrue(any("parked requires wake_condition" in error for error in errors))
+        self.assertTrue(any("parked requires retention_reason" in error for error in errors))
+
+    def test_candidate_inventory_excludes_absorbed_retained_worktree(self) -> None:
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            worktree = Path(directory) / "candidate"
+            state_dir = Path(directory) / "state"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "base.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "base.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "worktree", "add", "-b", "candidate", str(worktree)], cwd=root, check=True, capture_output=True)
+            (worktree / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.txt"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "candidate"], cwd=worktree, check=True, capture_output=True)
+            revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, capture_output=True, text=True).stdout.strip()
+            main_revision = subprocess.run(["git", "rev-parse", "main"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+
+            control_event_guard.record_candidate_lifecycle(
+                root,
+                [{
+                    "revision": revision,
+                    "worktree": str(worktree),
+                    "decision": "absorbed",
+                    "absorbing_revision": main_revision,
+                    "retention_reason": "keep real-device QA evidence",
+                }],
+                state_dir=state_dir,
+            )
+
+            self.assertEqual(
+                control_event_guard.unmerged_worktree_candidates(root, state_dir=state_dir),
+                {},
+            )
+            inventory = control_event_guard.worktree_candidate_inventory(root, state_dir=state_dir)
+            self.assertEqual(inventory["retained"][str(worktree.resolve())]["state"], "absorbed")
+
+    def test_candidate_inventory_reactivates_when_retained_worktree_head_changes(self) -> None:
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            worktree = Path(directory) / "candidate"
+            state_dir = Path(directory) / "state"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "base.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "base.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "worktree", "add", "-b", "candidate", str(worktree)], cwd=root, check=True, capture_output=True)
+            (worktree / "candidate.txt").write_text("v1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.txt"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "v1"], cwd=worktree, check=True, capture_output=True)
+            old_revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, capture_output=True, text=True).stdout.strip()
+            main_revision = subprocess.run(["git", "rev-parse", "main"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+            control_event_guard.record_candidate_lifecycle(root, [{
+                "revision": old_revision,
+                "worktree": str(worktree),
+                "decision": "absorbed",
+                "absorbing_revision": main_revision,
+                "retention_reason": "keep QA evidence",
+            }], state_dir=state_dir)
+            (worktree / "candidate.txt").write_text("v2\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.txt"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "v2"], cwd=worktree, check=True, capture_output=True)
+            new_revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, capture_output=True, text=True).stdout.strip()
+
+            self.assertEqual(
+                control_event_guard.unmerged_worktree_candidates(root, state_dir=state_dir),
+                {str(worktree.resolve()): new_revision},
+            )
+
+    def test_control_event_guard_cli_persists_retained_candidate_state(self) -> None:
+        import json
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            worktree = Path(directory) / "candidate"
+            state_dir = Path(directory) / "state"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            ledger = root / "TASK_LEDGER.md"
+            ledger.write_text((SKILL_ROOT / "assets" / "templates" / "TASK_LEDGER.md").read_text(encoding="utf-8"), encoding="utf-8")
+            subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "worktree", "add", "-b", "candidate", str(worktree)], cwd=root, check=True, capture_output=True)
+            (worktree / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.txt"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "candidate"], cwd=worktree, check=True, capture_output=True)
+            revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, capture_output=True, text=True).stdout.strip()
+            main_revision = subprocess.run(["git", "rev-parse", "main"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+            snapshot = {
+                **self.complete_event_receipt(),
+                "ledger_sha256": control_event_guard.ledger_sha256(ledger),
+                "available_slots": 1,
+                "ready_packages": [{"id": "INIT-01", "decision": "active", "task_id": "INIT-01-WRITER", "delivered_ack": True}],
+                "candidate_packages": [{
+                    "revision": revision,
+                    "worktree": str(worktree.resolve()),
+                    "task_id": "OLD-CANDIDATE",
+                    "integration_flow": "mini-main",
+                    "decision": "absorbed",
+                    "absorbing_revision": main_revision,
+                    "retention_reason": "retain QA evidence",
+                }],
+                "new_assignments": [],
+            }
+            receipt = root / "receipt.json"
+            receipt.write_text(json.dumps(snapshot), encoding="utf-8")
+            previous = control_event_guard.CANDIDATE_STATE_ROOT
+            control_event_guard.CANDIDATE_STATE_ROOT = state_dir
+            try:
+                result = control_event_guard.main([str(receipt), "--ledger", str(ledger), "--repo", str(root)])
+                self.assertEqual(result, 0)
+                self.assertEqual(control_event_guard.unmerged_worktree_candidates(root, state_dir=state_dir), {})
+            finally:
+                control_event_guard.CANDIDATE_STATE_ROOT = previous
+
     def test_control_event_guard_requires_every_live_candidate_decision(self) -> None:
         snapshot = {
             **self.complete_event_receipt(),
