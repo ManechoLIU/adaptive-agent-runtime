@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -65,6 +65,8 @@ export function parseArgs(argv) {
     authMode: null,
     region: null,
     cwd: null,
+    assignmentId: null, taskId: null, agentId: null, sessionId: null,
+    attempt: 1, leaseId: null, runtimeReceipts: null,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -75,11 +77,18 @@ export function parseArgs(argv) {
     else if (argument === "--authorized-external-call") options.authorizedExternalCall = true;
     else if (argument === "--authorized-login") options.authorizedLogin = true;
     else if (argument === "--device-auth") options.deviceAuth = true;
-    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd"].includes(argument)) {
+    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts"].includes(argument)) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`Missing value for ${argument}`);
       if (argument === "--auth-mode") options.authMode = value;
       else if (argument === "--reasoning-effort") options.reasoningEffort = value;
+      else if (argument === "--assignment-id") options.assignmentId = value;
+      else if (argument === "--task-id") options.taskId = value;
+      else if (argument === "--agent-id") options.agentId = value;
+      else if (argument === "--session-id") options.sessionId = value;
+      else if (argument === "--attempt") options.attempt = Number.parseInt(value, 10);
+      else if (argument === "--lease-id") options.leaseId = value;
+      else if (argument === "--runtime-receipts") options.runtimeReceipts = value;
       else options[argument.slice(2)] = value;
       index += 1;
     } else {
@@ -129,6 +138,20 @@ export function parseArgs(argv) {
     throw new Error("--execute requires --authorized-external-call after current user authorization");
   }
   return options;
+}
+
+function emitRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
+  if (!options.runtimeReceipts) return;
+  const required = [options.assignmentId, options.taskId, options.agentId, options.sessionId];
+  if (required.some((value) => !value)) throw new Error("runtime receipts require assignment/task/agent/session identity");
+  const receipt = {
+    event_type: eventType, assignment_id: options.assignmentId, task_id: options.taskId,
+    agent_id: options.agentId, provider: options.engine, session_id: options.sessionId,
+    worktree: options.cwd, issued_at: new Date().toISOString(), attempt: options.attempt,
+    lease_id: options.leaseId || `${options.assignmentId}:attempt:${options.attempt}`, event_seq: eventSeq,
+    receipt_id: `${options.assignmentId}:${options.attempt}:${eventSeq}`, ...extra,
+  };
+  appendFileSync(options.runtimeReceipts, `${JSON.stringify(receipt)}\n`, "utf8");
 }
 
 function assertDirectory(cwd) {
@@ -360,7 +383,20 @@ async function main() {
       process.exitCode = await loginExternalAgent(options);
       return;
     }
-    process.exitCode = await executeExternalAgent(options);
+    emitRuntimeReceipt(options, "assignment_started", 1);
+    try {
+      const code = await executeExternalAgent(options);
+      emitRuntimeReceipt(options, "assignment_terminal", 2, {
+        terminal_state: code === 0 ? "completed" : "failed", outcome: code === 0 ? "success" : "failed",
+        summary: code === 0 ? "external agent completed" : `external agent exited ${code}`,
+        evidence: [], artifacts: [], next_action: code === 0 ? "none" : "inspect external agent output",
+        retry_class: code === 0 ? "none" : "provider_exit",
+      });
+      process.exitCode = code;
+    } catch (error) {
+      emitRuntimeReceipt(options, "assignment_terminal", 2, { terminal_state: "failed", outcome: "failed", summary: error.message, evidence: [], artifacts: [], next_action: "inspect external agent failure", retry_class: "transport_error" });
+      throw error;
+    }
   } catch (error) {
     process.stderr.write(`adaptive-delivery-external-agent: ${error.message}\n`);
     process.exitCode = 1;
