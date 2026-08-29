@@ -90,10 +90,13 @@ class GovernanceTests(unittest.TestCase):
 
     def test_project_snapshot_joins_runtime_liveness_for_active_ledger_task(self) -> None:
         import json
+        import subprocess
         from datetime import datetime, timedelta, timezone
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as d:
-            root=Path(d); (root/".git"/"adaptive-delivery").mkdir(parents=True)
+            root=Path(d)
+            subprocess.run(["git", "-C", str(root), "init", "-b", "main"], check=True, capture_output=True)
+            (root/".git"/"adaptive-delivery").mkdir(parents=True)
             (root/"TASK_LEDGER.md").write_text("| ID | 状态 | 负责人 | 下一步 |\n|---|---|---|---|\n| `T1` | `ACTIVE` | grok | y |\n",encoding="utf-8")
             now=datetime.now(timezone.utc)
             lease={"assignment_id":"a1","task_id":"T1","agent_id":"grok","provider":"grok","session_id":"s1","worktree":"/tmp/wt","lease_expires_at":(now-timedelta(minutes=1)).isoformat(),"progress_deadline_at":(now+timedelta(minutes=10)).isoformat(),"terminal_state":None}
@@ -110,9 +113,11 @@ class GovernanceTests(unittest.TestCase):
             self.assertEqual(snap["assignment_liveness"]["T1"]["reason"],"lease_expired")
 
     def test_project_snapshot_exposes_five_state_task_projection(self) -> None:
+        import subprocess
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
+            subprocess.run(["git", "-C", str(root), "init", "-b", "main"], check=True, capture_output=True)
             (root / ".git" / "adaptive-delivery").mkdir(parents=True)
             (root / "TASK_LEDGER.md").write_text(
                 """# Ledger
@@ -157,6 +162,62 @@ class GovernanceTests(unittest.TestCase):
             self.assertEqual((projection["T7"]["main_state"], projection["T7"]["closure_reason"]), ("CLOSED", "done"))
             self.assertEqual((projection["T8"]["main_state"], projection["T8"]["closure_reason"]), ("CLOSED", "superseded"))
 
+    def test_lifecycle_rule_update_is_persistent_and_exact_until_ack_and_ledger_sync(self) -> None:
+        base = {
+            "head": "abc", "ledger_sha256": "l1", "worktree_status_sha256": "s1",
+            "ready_ids": [], "candidate_revisions": [], "ledger_errors": [], "assignment_liveness": {},
+        }
+        pending = {**base, "rule_handshake": {
+            "state": "pending_ack", "blocking": True, "installed_revision": "rev-new",
+            "summary": "canonical runtime", "impact": "live_assignments",
+            "stop_condition": "ACK and ledger sync", "changed_files": ["scripts/assignment_runtime.py"],
+        }}
+        first, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "SessionStart", "session_id": "controller-1"}, snapshot=pending, prior_state=None
+        )
+        self.assertIn("rule_update_pending:rev-new", state["triggers"])
+        context = first["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("rev-new", context)
+        self.assertIn("canonical runtime", context)
+        self.assertIn("rule_handshake.py ack", context)
+
+        receipt_event = {
+            "hook_event_name": "PostToolUse", "session_id": "controller-1",
+            "tool_input": {"command": "python3 scripts/control_event_guard.py snapshot --ledger TASK_LEDGER.md"},
+            "tool_response": {"exit_code": 0, "output": "control-event: allowed"},
+        }
+        _, still_pending = lifecycle_hook.evaluate_event(receipt_event, snapshot=pending, prior_state=state)
+        self.assertTrue(still_pending["pending_control_event"])
+        self.assertIn("rule_update_pending:rev-new", still_pending["triggers"])
+
+        stale = {**base, "ledger_sha256": "l2", "rule_handshake": {
+            **pending["rule_handshake"], "state": "ledger_stale", "loaded_revision": "rev-new",
+        }}
+        _, stale_state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "PostToolUse", "session_id": "controller-1", "tool_input": {}, "tool_response": {}},
+            snapshot=stale, prior_state=still_pending,
+        )
+        self.assertNotIn("rule_update_pending:rev-new", stale_state["triggers"])
+        self.assertIn("rule_ledger_stale:rev-new", stale_state["triggers"])
+
+        current = {**base, "ledger_sha256": "l3", "rule_handshake": {
+            **pending["rule_handshake"], "state": "current", "blocking": False, "loaded_revision": "rev-new",
+        }}
+        _, current_state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "PostToolUse", "session_id": "controller-1", "tool_input": {}, "tool_response": {}},
+            snapshot=current, prior_state=stale_state,
+        )
+        self.assertFalse(any(t.startswith("rule_update_pending:") or t.startswith("rule_ledger_stale:") for t in current_state["triggers"]))
+
+    def test_lifecycle_rule_install_integrity_error_is_blocking(self) -> None:
+        snapshot = {
+            "head": "abc", "ledger_sha256": "l", "worktree_status_sha256": "s",
+            "ready_ids": [], "candidate_revisions": [], "ledger_errors": [], "assignment_liveness": {},
+            "rule_handshake": {"state": "integrity_error", "blocking": True, "installed_revision": "rev-bad", "errors": ["hash mismatch"]},
+        }
+        triggers = lifecycle_hook.lifecycle_triggers(snapshot, None)
+        self.assertIn("rule_install_integrity_error:rev-bad", triggers)
+
     def test_lifecycle_hook_surfaces_unhealthy_active_runtime_without_git_change(self) -> None:
         snapshot = {
             "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",
@@ -167,6 +228,14 @@ class GovernanceTests(unittest.TestCase):
         prior={"snapshot":dict(snapshot),"pending_control_event":False,"triggers":[],"stop_continuations":0}
         output, state=lifecycle_hook.evaluate_event({"hook_event_name":"PostToolUse","session_id":"s","tool_input":{},"tool_response":{}},snapshot=snapshot,prior_state=prior)
         self.assertTrue(state["pending_control_event"]); self.assertIn("active_lease_expired:F1", state["triggers"]); self.assertIn("active_lease_expired:F1", str(output))
+
+    def test_control_event_guard_blocks_canonical_pending_rule_handshake(self) -> None:
+        from unittest.mock import patch
+        with patch("scripts.rule_handshake.evaluate_rule_handshake", return_value={
+            "state": "pending_ack", "blocking": True, "installed_revision": "rev-new"
+        }):
+            errors = control_event_guard.canonical_rule_handshake_errors(Path("."), Path("TASK_LEDGER.md"))
+        self.assertIn("rule handshake pending_ack for installed revision rev-new", errors)
 
     def test_control_event_guard_blocks_stale_active_runtime(self) -> None:
         snapshot=self.complete_event_receipt(); snapshot.update({"ledger_sha256":"x","available_slots":0,"ready_packages":[],"assignment_liveness":{"F1":{"ledger_state":"ACTIVE","state":"unhealthy","reason":"lease_expired"}}})

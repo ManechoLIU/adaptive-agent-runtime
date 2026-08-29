@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
+import crypto from "node:crypto";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -11,20 +12,51 @@ import { parseArgs, renderExternalAgentCard } from "../scripts/run_external_agen
 const skillRoot = fileURLToPath(new URL("../", import.meta.url));
 const adapter = path.join(skillRoot, "scripts", "run_external_agent.mjs");
 
-async function assignmentAckFile(directory, overrides = {}) {
-  const branch = execFileSync("git", ["-C", skillRoot, "branch", "--show-current"], { encoding: "utf8" }).trim();
-  const head = execFileSync("git", ["-C", skillRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+async function assignmentAckFile(directory, overrides = {}, repositoryRoot = skillRoot) {
+  const branch = execFileSync("git", ["-C", repositoryRoot, "branch", "--show-current"], { encoding: "utf8" }).trim();
+  const head = execFileSync("git", ["-C", repositoryRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   const assignment = {
     assignment_id: "a1", task_id: "T1", agent_id: "writer", state: "ACKED",
     primary_goal: "finish bounded task", success_criteria: ["green"], owned_scope: ["scripts/run_external_agent.mjs"],
     forbidden_scope: [], parallelizable: true, observed_modified_files: [],
-    ack: { repository_root: skillRoot, branch, head, status: "clean", owned_files: ["scripts/run_external_agent.mjs"], first_red: "red", stop_condition: "candidate" },
+    ack: { repository_root: repositoryRoot, branch, head, status: "clean", owned_files: ["scripts/run_external_agent.mjs"], first_red: "red", stop_condition: "candidate" },
     ...overrides,
   };
   if (overrides.ack) assignment.ack = { ...assignment.ack, ...overrides.ack };
   const target = path.join(directory, `assignment-${Math.random().toString(36).slice(2)}.json`);
   await writeFile(target, JSON.stringify(assignment));
   return target;
+}
+
+
+async function makeAssignmentRepo(directory) {
+  const repo = path.join(directory, `repo-${Math.random().toString(36).slice(2)}`);
+  await mkdir(repo, { recursive: true });
+  execFileSync("git", ["-C", repo, "init", "-b", "main"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "Test"]);
+  await writeFile(path.join(repo, "TASK_LEDGER.md"), "# Tasks\n\n- 规则版本：old\n");
+  execFileSync("git", ["-C", repo, "add", "TASK_LEDGER.md"]);
+  execFileSync("git", ["-C", repo, "commit", "-m", "init"]);
+  return repo;
+}
+
+async function fakeInstalledSkill(directory) {
+  const root = path.join(directory, "installed-skill");
+  const scripts = path.join(root, "scripts");
+  await mkdir(scripts, { recursive: true });
+  for (const file of ["run_external_agent.mjs", "assignment_lease_guard.py", "assignment_runtime.py", "project_state.py", "rule_handshake.py"]) {
+    await copyFile(path.join(skillRoot, "scripts", file), path.join(scripts, file));
+  }
+  const rel = "scripts/rule_handshake.py";
+  const bytes = await readFile(path.join(root, rel));
+  const hash = crypto.createHash("sha256").update(bytes).digest("hex");
+  await writeFile(path.join(root, ".adaptive-delivery-install.json"), JSON.stringify({
+    schema_version: 1, revision: "new-rule-revision", previous_revision: "old",
+    installed_at: "2026-08-30T00:00:00+00:00", source_root: skillRoot, summary: "runtime governance",
+    impact: "live_assignments", stop_condition: "ack exact revision", changed_files: [rel], files: { [rel]: hash },
+  }));
+  return { root, adapter: await realpath(path.join(scripts, "run_external_agent.mjs")) };
 }
 
 async function fakeRunner(bin, name, versionArgument) {
@@ -275,6 +307,7 @@ test("login mode delegates to the official CLI without a model request", async (
 
 test("assignment-bound execute fails before agent spawn without delivered ACK", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-ack-missing-"));
+  const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   const marker = path.join(bin, "spawned.txt");
   await mkdir(grokHome, { recursive: true });
@@ -282,7 +315,7 @@ test("assignment-bound execute fails before agent spawn without delivered ACK", 
   await fakeRunner(bin, "grok", "version");
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
   ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
   assert.equal(result.status, 1);
@@ -292,17 +325,18 @@ test("assignment-bound execute fails before agent spawn without delivered ACK", 
 
 test("assignment-bound execute rejects stale or mismatched ACK before spawn", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-ack-bad-"));
+  const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   const marker = path.join(bin, "spawned.txt");
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
-  const badId = await assignmentAckFile(bin, { assignment_id: "other" });
-  const badHead = await assignmentAckFile(bin, { ack: { head: "deadbeef" } });
+  const badId = await assignmentAckFile(bin, { assignment_id: "other" }, repo);
+  const badHead = await assignmentAckFile(bin, { ack: { head: "deadbeef" } }, repo);
   for (const ack of [badId, badHead]) {
     const result = spawnSync(process.execPath, [adapter,
       "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
       "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
       "--assignment-ack", ack,
     ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
@@ -313,15 +347,16 @@ test("assignment-bound execute rejects stale or mismatched ACK before spawn", as
 
 test("assignment-bound execute spawns only after exact delivered ACK passes", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-ack-good-"));
+  const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   const marker = path.join(bin, "spawned.txt");
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
-  const ack = await assignmentAckFile(bin);
+  const ack = await assignmentAckFile(bin, {}, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack,
   ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
@@ -331,22 +366,94 @@ test("assignment-bound execute spawns only after exact delivered ACK passes", as
 
 test("external execution emits provider-neutral start and terminal runtime receipts", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-runtime-"));
+  const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   const receipts = path.join(bin, "receipts.jsonl");
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
-  const ack = await assignmentAckFile(bin);
+  const ack = await assignmentAckFile(bin, {}, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
-    "--assignment-ack", ack, "--attempt", "2", "--lease-id", "lease-2", "--runtime-receipts", receipts,
+    "--assignment-ack", ack, "--attempt", "1", "--lease-id", "lease-1", "--runtime-receipts", receipts,
   ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
   assert.equal(result.status, 0, result.stderr);
   const events = (await readFile(receipts, "utf8")).trim().split("\n").map(JSON.parse);
   assert.deepEqual(events.map((e) => e.event_type), ["assignment_started", "assignment_terminal"]);
   assert.deepEqual(events.map((e) => e.event_seq), [1, 2]);
-  assert.equal(events[0].attempt, 2); assert.equal(events[0].lease_id, "lease-2");
+  assert.equal(events[0].attempt, 1); assert.equal(events[0].lease_id, "lease-1");
   assert.equal(events[1].outcome, "success"); assert.equal(events[1].terminal_state, "completed");
+});
+
+test("assignment-bound execution persists canonical runtime without audit JSONL", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-runtime-canonical-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, {}, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "canonical-a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", await assignmentAckFile(bin, { assignment_id: "canonical-a1" }, repo),
+  ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
+  assert.equal(result.status, 0, result.stderr);
+  const common = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
+  const statePath = path.join(path.resolve(repo, common), "adaptive-delivery", "runtime-assignments.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  assert.equal(state.leases["canonical-a1"].terminal_state, "completed");
+});
+
+test("pending live rule handshake blocks before external agent spawn", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-rule-pending-"));
+  const repo = await makeAssignmentRepo(bin);
+  const installed = await fakeInstalledSkill(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, {}, repo);
+  const result = spawnSync(process.execPath, [installed.adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack,
+  ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /rule handshake|rule-handshake/i);
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
+test("same assignment attempt four is rejected from another linked worktree before spawn", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-runtime-budget-"));
+  const repo = await makeAssignmentRepo(bin);
+  const wt = path.join(bin, "worker");
+  execFileSync("git", ["-C", repo, "worktree", "add", wt, "-b", "worker"]);
+  const common = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
+  const stateDir = path.join(path.resolve(repo, common), "adaptive-delivery");
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(path.join(stateDir, "runtime-assignments.json"), JSON.stringify({ schema_version: 1, leases: { a1: {
+    assignment_id: "a1", task_id: "T1", agent_id: "writer", provider: "grok-build", session_id: "s1", worktree: wt,
+    attempt: 3, lease_id: "a1:attempt:3", last_event_seq: 2, recovery_count: 2, terminal_state: "failed",
+  } } }));
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, {}, wt);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", wt,
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack, "--attempt", "4", "--lease-id", "a1:attempt:4",
+  ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /recovery budget exhausted/i);
+  await assert.rejects(readFile(marker, "utf8"));
 });

@@ -2,13 +2,20 @@
 """Ephemeral runtime lease evidence for adaptive-delivery assignments."""
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+try:
+    from project_state import adaptive_delivery_state_dir
+except ModuleNotFoundError:
+    from scripts.project_state import adaptive_delivery_state_dir
 
 UTC = timezone.utc
 EVENTS = {"assignment_started", "assignment_heartbeat", "assignment_progress", "assignment_terminal"}
@@ -42,7 +49,7 @@ def _iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat()
 
 def runtime_state_path(repo: str | Path) -> Path:
-    return Path(repo) / ".git" / "adaptive-delivery" / "runtime-assignments.json"
+    return adaptive_delivery_state_dir(repo) / "runtime-assignments.json"
 
 def load_runtime_state(repo: str | Path) -> dict[str, Any]:
     path = runtime_state_path(repo)
@@ -180,3 +187,26 @@ def retry_decision(retry_class: str, attempt: int, base_delay_seconds: int = 5) 
     # Deterministic envelope; caller adds random jitter within this range.
     delay = base_delay_seconds * (2 ** max(0, attempt - 1))
     return {"retry": True, "next_attempt": attempt + 1, "backoff_seconds": delay, "jitter_max_seconds": max(1, delay // 2)}
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Apply Adaptive Delivery runtime receipts to canonical Git state.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    apply_parser = sub.add_parser("apply")
+    apply_parser.add_argument("--repo", required=True)
+    args = parser.parse_args(argv)
+    try:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            raise ValueError("runtime receipt must be a JSON object")
+        state = load_runtime_state(args.repo)
+        updated = apply_receipt(state, payload)
+        save_runtime_state(args.repo, updated)
+        print(json.dumps({"allowed": True, "assignment_id": payload.get("assignment_id"), "attempt": payload.get("attempt", 1)}, sort_keys=True))
+        return 0
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"assignment-runtime: blocked: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

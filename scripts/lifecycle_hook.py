@@ -16,6 +16,11 @@ try:
 except ModuleNotFoundError:
     from scripts.controller_state import project_task_state
 
+try:
+    from rule_handshake import evaluate_rule_handshake
+except ModuleNotFoundError:
+    from scripts.rule_handshake import evaluate_rule_handshake
+
 
 STATE_ROOT = Path(
     os.environ.get(
@@ -99,6 +104,10 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         )
         for task_id, ledger_state in ledger_states.items()
     }
+    try:
+        rule_handshake = evaluate_rule_handshake(root, ledger=ledger)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        rule_handshake = {"state": "integrity_error", "blocking": True, "installed_revision": None, "errors": [str(error)]}
     return {
         "root": str(root),
         "ledger": str(ledger),
@@ -110,12 +119,16 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         "ledger_errors": ledger_errors,
         "assignment_liveness": assignment_liveness,
         "task_projection": task_projection,
+        "rule_handshake": rule_handshake,
     }
 
 
 def successful_control_receipt(
     event: dict[str, Any], snapshot: dict[str, Any] | None = None
 ) -> bool:
+    handshake = snapshot.get("rule_handshake", {}) if isinstance(snapshot, dict) else {}
+    if isinstance(handshake, dict) and handshake.get("blocking") is True:
+        return False
     if event.get("hook_event_name") != "PostToolUse":
         return False
     tool_input = event.get("tool_input")
@@ -171,6 +184,17 @@ def lifecycle_triggers(
                 triggers.append(f"active_without_progress:{task_id}")
             elif ledger_state == "RECOVERING" and state in {"unhealthy", "unknown", "terminal"}:
                 triggers.append(f"recovery_stalled:{task_id}")
+    handshake = snapshot.get("rule_handshake", {})
+    if isinstance(handshake, dict):
+        rule_state = str(handshake.get("state", ""))
+        revision = str(handshake.get("installed_revision", "")).strip() or "unknown"
+        if rule_state == "pending_ack":
+            triggers.append(f"rule_update_pending:{revision}")
+        elif rule_state == "ledger_stale":
+            triggers.append(f"rule_ledger_stale:{revision}")
+        elif rule_state == "integrity_error":
+            triggers.append(f"rule_install_integrity_error:{revision}")
+
     if previous is not None:
         for field, label in (
             ("head", "main_head_changed"),
@@ -185,17 +209,43 @@ def lifecycle_triggers(
 
 
 def continuation_reason(
-    triggers: list[str], ready_ids: list[str], candidate_revisions: list[str]
+    triggers: list[str],
+    ready_ids: list[str],
+    candidate_revisions: list[str],
+    *,
+    rule_handshake: dict[str, Any] | None = None,
+    root: str | None = None,
+    session_id: str | None = None,
 ) -> str:
     ready = ", ".join(ready_ids) if ready_ids else "无新增 READY"
     trigger_text = ", ".join(triggers) if triggers else "未闭合控制事件"
     candidates = ", ".join(revision[:9] for revision in candidate_revisions) or "无未处理候选"
+    rule_text = ""
+    handshake = rule_handshake if isinstance(rule_handshake, dict) else {}
+    state = str(handshake.get("state", ""))
+    revision = str(handshake.get("installed_revision", "")).strip()
+    if state == "pending_ack":
+        summary = str(handshake.get("summary", "")).strip()
+        impact = str(handshake.get("impact", "")).strip()
+        stop = str(handshake.get("stop_condition", "")).strip()
+        repo_arg = f" --repo {root}" if root else " --repo <repo>"
+        session_arg = f" --controller-session {session_id}" if session_id else " --controller-session <controller-session>"
+        rule_text = (
+            f" 规则更新待加载：{revision}；摘要：{summary}；影响：{impact}；停止条件：{stop}。"
+            "先读取已安装的新规则，再执行 "
+            f"python3 ~/.agents/skills/adaptive-delivery/scripts/rule_handshake.py ack{repo_arg}{session_arg} --revision {revision}，随后同步现有台账规则版本行。"
+        )
+    elif state == "ledger_stale":
+        rule_text = f" 已有 LOADED ACK {revision}，但台账规则版本仍旧；先把现有规则版本行同步到精确 revision {revision}。"
+    elif state == "integrity_error":
+        errors = "; ".join(str(item) for item in handshake.get("errors", []))
+        rule_text = f" Adaptive Delivery 安装完整性失败：{errors}；禁止 ACK 或启动受影响 Assignment。"
     return (
         "Adaptive Delivery 生命周期门检测到尚未闭合的控制事件。"
         f"触发：{trigger_text}；当前 READY：{ready}；候选：{candidates}。"
         "请立即核对真实 main / 台账 / live Agent，处理候选审查、集成、验收、"
         "READY 派发与 ACK；随后用 control_event_guard.py 生成通过收据。"
-        "不得仅把动作写成下一事件后停止。"
+        "不得仅把动作写成下一事件后停止。" + rule_text
     )
 
 
@@ -227,6 +277,7 @@ def evaluate_event(
             triggers,
             list(snapshot.get("ready_ids", [])),
             list(snapshot.get("candidate_revisions", [])),
+            rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
         )
         return {
             "hookSpecificOutput": {
@@ -259,7 +310,10 @@ def evaluate_event(
         return {}, state
 
     detected = lifecycle_triggers(snapshot, prior_state)
-    triggers = sorted(set(state.get("triggers", [])) | set(detected))
+    prior_triggers = {str(item) for item in state.get("triggers", [])}
+    rule_prefixes = ("rule_update_pending:", "rule_ledger_stale:", "rule_install_integrity_error:")
+    prior_triggers = {item for item in prior_triggers if not item.startswith(rule_prefixes)}
+    triggers = sorted(prior_triggers | set(detected))
     pending = bool(state.get("pending_control_event")) or bool(triggers)
     state.update({"pending_control_event": pending, "triggers": triggers})
 
@@ -279,6 +333,7 @@ def evaluate_event(
             triggers,
             list(snapshot.get("ready_ids", [])),
             list(snapshot.get("candidate_revisions", [])),
+            rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
         )
         return {
             "hookSpecificOutput": {
@@ -294,6 +349,7 @@ def evaluate_event(
             triggers,
             list(snapshot.get("ready_ids", [])),
             list(snapshot.get("candidate_revisions", [])),
+            rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
         )
         if continuations <= 1:
             return {"decision": "block", "reason": reason}, state

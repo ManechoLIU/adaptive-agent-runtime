@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scripts.assignment_runtime import (
-    RuntimePolicy, apply_receipt, evaluate_lease, load_runtime_state, save_runtime_state,
+    RuntimePolicy, apply_receipt, evaluate_lease, load_runtime_state, save_runtime_state, runtime_state_path,
 )
 
 UTC=timezone.utc
@@ -52,9 +52,15 @@ class RuntimeTests(unittest.TestCase):
         state=apply_receipt({},receipt("assignment_started"),now=T0)
         with self.assertRaises(ValueError): apply_receipt(state,receipt("assignment_heartbeat",T0+timedelta(minutes=1),session_id="other"),now=T0+timedelta(minutes=1))
     def test_state_round_trip_under_git(self):
+        import subprocess
         with tempfile.TemporaryDirectory() as d:
-            root=Path(d); (root/".git").mkdir(); state=apply_receipt({},receipt("assignment_started"),now=T0)
-            save_runtime_state(root,state); self.assertEqual(load_runtime_state(root)["leases"]["a1"]["session_id"],"s1")
+            root=Path(d) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "-C", str(root), "init", "-b", "main"], check=True, capture_output=True)
+            state=apply_receipt({},receipt("assignment_started"),now=T0)
+            save_runtime_state(root,state)
+            self.assertEqual(load_runtime_state(root)["leases"]["a1"]["session_id"],"s1")
+            self.assertIn("adaptive-delivery", str(runtime_state_path(root)))
 
 if __name__=="__main__": unittest.main()
 
@@ -240,3 +246,69 @@ class RuntimeAttemptSequenceTests(unittest.TestCase):
                 receipt("assignment_started", T0 + timedelta(minutes=1), attempt=3, lease_id="l3", event_seq=1),
                 now=T0 + timedelta(minutes=1),
             )
+
+class RuntimeCliCommonStateTests(unittest.TestCase):
+    def test_apply_cli_shares_lineage_and_rejects_attempt_four_across_worktrees(self):
+        import json
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            repo = base / "repo"
+            wt = base / "wt"
+            repo.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init", "-b", "main"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "README.md").write_text("x\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "worktree", "add", str(wt), "-b", "worker"], check=True, capture_output=True)
+            script = Path(__file__).resolve().parents[1] / "scripts" / "assignment_runtime.py"
+
+            def apply(repo_arg: Path, payload: dict) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, str(script), "apply", "--repo", str(repo_arg)],
+                    input=json.dumps(payload), text=True, capture_output=True,
+                )
+
+            def event(event_type: str, attempt: int, seq: int, **extra):
+                payload = receipt(
+                    event_type,
+                    assignment_id="shared-a1",
+                    task_id="T1",
+                    agent_id="writer",
+                    provider="grok-build",
+                    session_id="s1",
+                    worktree=str(wt),
+                    attempt=attempt,
+                    lease_id=f"shared-a1:attempt:{attempt}",
+                    event_seq=seq,
+                    **extra,
+                )
+                return payload
+
+            for attempt in (1, 2, 3):
+                started = apply(repo if attempt == 1 else wt, event("assignment_started", attempt, 1))
+                self.assertEqual(started.returncode, 0, started.stderr + started.stdout)
+                failed = apply(
+                    wt,
+                    event(
+                        "assignment_terminal", attempt, 2,
+                        terminal_state="failed", outcome="recoverable_failure", summary="failed",
+                        evidence=["checkpoint"], artifacts=[], next_action="retry", retry_class="transport_error",
+                    ),
+                )
+                self.assertEqual(failed.returncode, 0, failed.stderr + failed.stdout)
+
+            before = load_runtime_state(repo)
+            blocked = apply(wt, event("assignment_started", 4, 1))
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("recovery budget exhausted", blocked.stdout + blocked.stderr)
+            self.assertEqual(load_runtime_state(wt), before)
+
+            new_assignment = event("assignment_started", 1, 1)
+            new_assignment.update({"assignment_id": "shared-a2", "lease_id": "shared-a2:attempt:1"})
+            allowed = apply(wt, new_assignment)
+            self.assertEqual(allowed.returncode, 0, allowed.stderr + allowed.stdout)
+            self.assertIn("shared-a2", load_runtime_state(repo)["leases"])

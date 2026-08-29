@@ -44,6 +44,15 @@ class SkillStructureTests(unittest.TestCase):
         missing = [str(path.relative_to(ROOT)) for path in [ENTRYPOINT, *REFERENCE_PATHS.values()] if not path.is_file()]
         self.assertEqual([], missing, f"required Skill files are missing: {missing}")
 
+    def test_rule_and_runtime_handshake_scripts_are_packaged(self):
+        required = [
+            ROOT / "scripts" / "project_state.py",
+            ROOT / "scripts" / "install_skill.py",
+            ROOT / "scripts" / "rule_handshake.py",
+            ROOT / "scripts" / "assignment_runtime.py",
+        ]
+        self.assertEqual([], [str(path.relative_to(ROOT)) for path in required if not path.is_file()])
+
     def test_entrypoint_frontmatter_has_trigger_only_metadata(self):
         frontmatter, _ = split_frontmatter(read_entrypoint())
         fields = dict(re.findall(r"(?m)^([A-Za-z][\w-]*):\s*(.+?)\s*$", frontmatter))
@@ -263,6 +272,18 @@ class SkillStructureTests(unittest.TestCase):
             "Agent 实例和本次 Assignment 是两个身份",
             "Reviewer 改为同候选 Writer 后失去该 revision 的非作者资格",
             "任务表是状态唯一权威",
+        ):
+            self.assertIn(phrase, long_task)
+
+    def test_long_task_rule_updates_use_machine_handshake_and_common_runtime_state(self):
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+        for phrase in (
+            "scripts/install_skill.py",
+            "scripts/rule_handshake.py ack",
+            "rule_update_pending:<revision>",
+            "git rev-parse --git-common-dir",
+            "runtime-assignments.json",
+            "spawn 前 fail closed",
         ):
             self.assertIn(phrase, long_task)
 
