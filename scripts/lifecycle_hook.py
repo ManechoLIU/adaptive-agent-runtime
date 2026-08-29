@@ -66,6 +66,28 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
     from control_event_guard import unmerged_worktree_candidates
 
     candidates = unmerged_worktree_candidates(root)
+    try:
+        from assignment_runtime import evaluate_lease, load_runtime_state
+    except ModuleNotFoundError:
+        from scripts.assignment_runtime import evaluate_lease, load_runtime_state
+
+    runtime_state = load_runtime_state(root)
+    leases = runtime_state.get("leases", {}) if isinstance(runtime_state, dict) else {}
+    ledger_states = {identifier: status for identifier, status in task_rows(text)}
+    assignment_liveness: dict[str, dict[str, Any]] = {}
+    if isinstance(leases, dict):
+        for lease in leases.values():
+            if not isinstance(lease, dict):
+                continue
+            task_id = str(lease.get("task_id", "")).strip()
+            ledger_state = ledger_states.get(task_id, "")
+            if not task_id or ledger_state not in {"ACTIVE", "RECOVERING"}:
+                continue
+            decision = evaluate_lease(lease)
+            assignment_liveness[task_id] = {"ledger_state": ledger_state, **decision}
+    for task_id, ledger_state in ledger_states.items():
+        if ledger_state in {"ACTIVE", "RECOVERING"} and task_id not in assignment_liveness:
+            assignment_liveness[task_id] = {"ledger_state": ledger_state, "state": "unknown", "reason": "missing_runtime_lease"}
     return {
         "root": str(root),
         "ledger": str(ledger),
@@ -75,6 +97,7 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         "ready_ids": ready_ids,
         "candidate_revisions": sorted(candidates.values()),
         "ledger_errors": ledger_errors,
+        "assignment_liveness": assignment_liveness,
     }
 
 

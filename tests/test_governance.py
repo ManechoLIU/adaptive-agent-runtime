@@ -88,6 +88,27 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("MINI-READY", output["hookSpecificOutput"]["additionalContext"])
         self.assertTrue(next_state["pending_control_event"])
 
+    def test_project_snapshot_joins_runtime_liveness_for_active_ledger_task(self) -> None:
+        import json
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); (root/".git"/"adaptive-delivery").mkdir(parents=True)
+            (root/"TASK_LEDGER.md").write_text("| ID | 状态 | 负责人 | 下一步 |\n|---|---|---|---|\n| `T1` | `ACTIVE` | grok | y |\n",encoding="utf-8")
+            now=datetime.now(timezone.utc)
+            lease={"assignment_id":"a1","task_id":"T1","agent_id":"grok","provider":"grok","session_id":"s1","worktree":"/tmp/wt","lease_expires_at":(now-timedelta(minutes=1)).isoformat(),"progress_deadline_at":(now+timedelta(minutes=10)).isoformat(),"terminal_state":None}
+            (root/".git"/"adaptive-delivery"/"runtime-assignments.json").write_text(json.dumps({"schema_version":1,"leases":{"a1":lease}}))
+            def fake_git(_root,*args):
+                if args==("rev-parse","--show-toplevel"): return str(root)
+                if args==("branch","--show-current"): return "main"
+                if args==("status","--porcelain=v1","--untracked-files=no"): return ""
+                if args==("rev-parse","HEAD"): return "abc"
+                raise AssertionError(args)
+            with patch.object(lifecycle_hook,"run_git",side_effect=fake_git), patch("control_event_guard.unmerged_worktree_candidates",return_value={}):
+                snap=lifecycle_hook.project_snapshot(root)
+            self.assertEqual(snap["assignment_liveness"]["T1"]["state"],"unhealthy")
+            self.assertEqual(snap["assignment_liveness"]["T1"]["reason"],"lease_expired")
+
     def test_lifecycle_hook_surfaces_unhealthy_active_runtime_without_git_change(self) -> None:
         snapshot = {
             "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",
