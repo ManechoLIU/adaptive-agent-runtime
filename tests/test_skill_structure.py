@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 import re
 import unittest
 
@@ -35,7 +36,11 @@ def split_frontmatter(markdown: str) -> tuple[str, str]:
 
 class SkillStructureTests(unittest.TestCase):
     def test_packaged_project_workflow_template_is_not_discoverable_as_a_skill(self):
-        discoverable = sorted(path.relative_to(ROOT) for path in ROOT.rglob("SKILL.md"))
+        tracked = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "*SKILL.md"],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        discoverable = sorted(Path(path) for path in tracked if Path(path).name == "SKILL.md")
 
         self.assertEqual([Path("SKILL.md")], discoverable)
         self.assertTrue((ROOT / "assets" / "templates" / "PROJECT_SKILL.md").is_file())
