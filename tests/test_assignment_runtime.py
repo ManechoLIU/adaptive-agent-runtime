@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scripts.assignment_runtime import (
-    RuntimePolicy, apply_receipt, evaluate_lease, load_runtime_state, save_runtime_state,
+    RuntimePolicy, apply_receipt, evaluate_lease, load_runtime_state, save_runtime_state, runtime_state_path,
 )
 
 UTC=timezone.utc
@@ -52,9 +52,15 @@ class RuntimeTests(unittest.TestCase):
         state=apply_receipt({},receipt("assignment_started"),now=T0)
         with self.assertRaises(ValueError): apply_receipt(state,receipt("assignment_heartbeat",T0+timedelta(minutes=1),session_id="other"),now=T0+timedelta(minutes=1))
     def test_state_round_trip_under_git(self):
+        import subprocess
         with tempfile.TemporaryDirectory() as d:
-            root=Path(d); (root/".git").mkdir(); state=apply_receipt({},receipt("assignment_started"),now=T0)
-            save_runtime_state(root,state); self.assertEqual(load_runtime_state(root)["leases"]["a1"]["session_id"],"s1")
+            root=Path(d) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "-C", str(root), "init", "-b", "main"], check=True, capture_output=True)
+            state=apply_receipt({},receipt("assignment_started"),now=T0)
+            save_runtime_state(root,state)
+            self.assertEqual(load_runtime_state(root)["leases"]["a1"]["session_id"],"s1")
+            self.assertIn("adaptive-delivery", str(runtime_state_path(root)))
 
 if __name__=="__main__": unittest.main()
 

@@ -10,6 +10,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    from project_state import adaptive_delivery_state_dir
+except ModuleNotFoundError:
+    from scripts.project_state import adaptive_delivery_state_dir
+
 UTC = timezone.utc
 EVENTS = {"assignment_started", "assignment_heartbeat", "assignment_progress", "assignment_terminal"}
 TERMINAL_STATES = {"completed", "failed", "cancelled", "disconnected"}
@@ -42,7 +47,7 @@ def _iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat()
 
 def runtime_state_path(repo: str | Path) -> Path:
-    return Path(repo) / ".git" / "adaptive-delivery" / "runtime-assignments.json"
+    return adaptive_delivery_state_dir(repo) / "runtime-assignments.json"
 
 def load_runtime_state(repo: str | Path) -> dict[str, Any]:
     path = runtime_state_path(repo)
