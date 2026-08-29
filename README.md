@@ -318,7 +318,7 @@ python3 scripts/assignment_lease_guard.py assignment.json
 python3 scripts/ledger_consistency_guard.py /path/to/project/TASK_LEDGER.md
 ```
 
-任务表是状态唯一权威。门禁检查 Goal / 下一检查点是否指向开放任务；“下一可见检查点”或任务“下一步”里出现的任务式 ID 必须先有显式任务行；`ACTIVE / RECOVERING` 必须有负责人，且 `RECOVERING` 必须绑定 delivered Assignment ACK 或已完成的可验证恢复动作；旧式顶部活动指针仍须与任务表一致。`control_event_guard.py` 现在也会内联执行这组一致性检查，不能靠事件收据绕过。实时槽位和 Writer / Reviewer 数量只能出现在临时控制收据，不能在台账顶部复制。新项目直接启用；旧项目先完成一次不阻塞开发的范围单一迁移，再把它放到台账提交和总控 yield 前。
+任务表是状态唯一权威。门禁检查 Goal / 下一检查点是否指向开放任务；“下一可见检查点”或任务“下一步”里出现的任务式 ID 必须先有显式任务行；`ACTIVE / RECOVERING` 必须有负责人，且 `RECOVERING` 必须绑定 delivered Assignment ACK 或已完成的可验证恢复动作；控制收据还必须枚举全部 `ACTIVE / RECOVERING` 的真实运行租约，不能省略或错配。旧式顶部活动指针仍须与任务表一致。`control_event_guard.py` 现在也会内联执行这组一致性检查，不能靠事件收据绕过。实时槽位和 Writer / Reviewer 数量只能出现在临时控制收据，不能在台账顶部复制。新项目直接启用；旧项目先完成一次不阻塞开发的范围单一迁移，再把它放到台账提交和总控 yield 前。
 
 ### 复用验证收据
 

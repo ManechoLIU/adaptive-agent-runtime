@@ -52,6 +52,14 @@ def open_ledger_package_ids(ledger: Path) -> set[str]:
     }
 
 
+def work_in_flight_ledger_packages(ledger: Path) -> dict[str, str]:
+    return {
+        identifier: status
+        for identifier, status in task_rows(ledger.read_text(encoding="utf-8"))
+        if status in {"ACTIVE", "RECOVERING"}
+    }
+
+
 def current_goal_ledger_ids(ledger: Path, open_ids: set[str] | None = None) -> set[str]:
     text = ledger.read_text(encoding="utf-8")
     match = re.search(r"^- 当前 Goal：\s*(.+?)\s*$", text, re.MULTILINE)
@@ -427,6 +435,7 @@ def validate_snapshot(
     expected_candidates: dict[str, str] | None = None,
     ledger_open_ids: set[str] | None = None,
     ledger_goal_ids: set[str] | None = None,
+    ledger_work_in_flight: dict[str, str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     contract = snapshot.get("event_contract")
@@ -465,6 +474,26 @@ def validate_snapshot(
                 errors.append(f"ACTIVE runtime unhealthy: {task_id} ({reason})")
             if ledger_state == "RECOVERING" and runtime_state in {"unhealthy", "unknown", "terminal"}:
                 errors.append(f"RECOVERING runtime stalled: {task_id} ({reason})")
+        if ledger_work_in_flight is not None:
+            expected_ids = set(ledger_work_in_flight)
+            reported_ids = set(liveness)
+            for task_id in sorted(expected_ids - reported_ids):
+                errors.append(
+                    f"assignment_liveness omitted {ledger_work_in_flight[task_id]} task: {task_id}"
+                )
+            for task_id in sorted(reported_ids - expected_ids):
+                errors.append(f"assignment_liveness contains non-work-in-flight task: {task_id}")
+            for task_id in sorted(expected_ids & reported_ids):
+                decision = liveness.get(task_id)
+                if not isinstance(decision, dict):
+                    continue
+                reported_state = str(decision.get("ledger_state", "")).upper()
+                expected_state = ledger_work_in_flight[task_id]
+                if reported_state != expected_state:
+                    errors.append(
+                        f"assignment_liveness ledger_state mismatch for {task_id}: "
+                        f"expected {expected_state}, got {reported_state or 'missing'}"
+                    )
 
     snapshot_sha = str(snapshot.get("ledger_sha256", "")).strip()
     if not snapshot_sha:
@@ -643,6 +672,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ready_ids = ready_ledger_package_ids(ledger)
         open_ids = open_ledger_package_ids(ledger)
         goal_ids = current_goal_ledger_ids(ledger, open_ids)
+        work_in_flight = work_in_flight_ledger_packages(ledger)
         current_ledger_sha256 = ledger_sha256(ledger)
         if args.affected_task and not args.rule_revision:
             raise ValueError("--affected-task requires --rule-revision")
@@ -665,6 +695,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_candidates=candidates,
         ledger_open_ids=open_ids,
         ledger_goal_ids=goal_ids,
+        ledger_work_in_flight=work_in_flight,
     )
     from ledger_consistency_guard import validate_ledger
 

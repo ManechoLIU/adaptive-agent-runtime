@@ -124,10 +124,18 @@ def successful_control_receipt(
 def lifecycle_triggers(
     snapshot: dict[str, Any], prior_state: dict[str, Any] | None
 ) -> list[str]:
-    triggers = [f"READY:{identifier}" for identifier in snapshot.get("ready_ids", [])]
+    previous = prior_state.get("snapshot") if isinstance(prior_state, dict) else None
+    previous = previous if isinstance(previous, dict) else None
+
+    def newly_present(field: str) -> set[str]:
+        current = {str(item) for item in snapshot.get(field, [])}
+        if previous is None:
+            return current
+        return current - {str(item) for item in previous.get(field, [])}
+
+    triggers = [f"READY:{identifier}" for identifier in newly_present("ready_ids")]
     triggers.extend(
-        f"CANDIDATE:{revision}"
-        for revision in snapshot.get("candidate_revisions", [])
+        f"CANDIDATE:{revision}" for revision in newly_present("candidate_revisions")
     )
     triggers.extend(
         f"LEDGER_INVALID:{error}" for error in snapshot.get("ledger_errors", [])
@@ -149,8 +157,7 @@ def lifecycle_triggers(
                 triggers.append(f"active_without_progress:{task_id}")
             elif ledger_state == "RECOVERING" and state in {"unhealthy", "unknown", "terminal"}:
                 triggers.append(f"recovery_stalled:{task_id}")
-    previous = prior_state.get("snapshot") if isinstance(prior_state, dict) else None
-    if isinstance(previous, dict):
+    if previous is not None:
         for field, label in (
             ("head", "main_head_changed"),
             ("ledger_sha256", "ledger_changed"),

@@ -125,6 +125,60 @@ class GovernanceTests(unittest.TestCase):
         errors=control_event_guard.validate_snapshot(snapshot)
         self.assertIn("ACTIVE runtime unhealthy: F1 (lease_expired)", errors)
 
+    def test_control_event_guard_requires_every_work_in_flight_runtime(self) -> None:
+        snapshot = self.complete_event_receipt()
+        snapshot.update(
+            {
+                "ledger_sha256": "x",
+                "available_slots": 0,
+                "ready_packages": [],
+                "assignment_liveness": {
+                    "F1": {
+                        "ledger_state": "ACTIVE",
+                        "state": "healthy",
+                        "reason": "lease_current",
+                    }
+                },
+            }
+        )
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_work_in_flight={"F1": "ACTIVE", "F2": "RECOVERING"},
+        )
+
+        self.assertIn("assignment_liveness omitted RECOVERING task: F2", errors)
+
+    def test_control_event_guard_accepts_exact_work_in_flight_runtime(self) -> None:
+        snapshot = self.complete_event_receipt()
+        snapshot.update(
+            {
+                "ledger_sha256": "x",
+                "available_slots": 0,
+                "ready_packages": [],
+                "assignment_liveness": {
+                    "F1": {
+                        "ledger_state": "ACTIVE",
+                        "state": "healthy",
+                        "reason": "lease_current",
+                    },
+                    "F2": {
+                        "ledger_state": "RECOVERING",
+                        "state": "healthy",
+                        "reason": "lease_current",
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(
+            control_event_guard.validate_snapshot(
+                snapshot,
+                ledger_work_in_flight={"F1": "ACTIVE", "F2": "RECOVERING"},
+            ),
+            [],
+        )
+
     def test_lifecycle_hook_surfaces_invalid_ledger_at_session_start(self) -> None:
         output, next_state = lifecycle_hook.evaluate_event(
             {
@@ -293,6 +347,57 @@ class GovernanceTests(unittest.TestCase):
         )
 
         self.assertEqual(output, {})
+        self.assertFalse(next_state["pending_control_event"])
+        self.assertEqual(next_state["triggers"], [])
+
+    def test_lifecycle_hook_does_not_retrigger_unchanged_candidate_after_receipt(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-2",
+            "worktree_status_sha256": "status-2",
+            "ready_ids": [],
+            "candidate_revisions": ["candidate-123"],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+        }
+        receipt_output, receipt_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": (
+                        "python3 scripts/control_event_guard.py receipt.json "
+                        "--ledger TASK_LEDGER.md --repo ."
+                    )
+                },
+                "tool_response": {"output": "control-event: allowed", "exit_code": 0},
+            },
+            snapshot=snapshot,
+            prior_state={
+                "snapshot": dict(snapshot),
+                "pending_control_event": True,
+                "triggers": ["CANDIDATE:candidate-123"],
+            },
+        )
+        self.assertEqual(receipt_output, {})
+        self.assertFalse(receipt_state["pending_control_event"])
+
+        next_output, next_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status --short"},
+                "tool_response": {"output": "", "exit_code": 0},
+            },
+            snapshot=snapshot,
+            prior_state=receipt_state,
+        )
+
+        self.assertEqual(next_output, {})
         self.assertFalse(next_state["pending_control_event"])
         self.assertEqual(next_state["triggers"], [])
 
