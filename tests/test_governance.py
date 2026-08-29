@@ -426,13 +426,45 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("WEB-READY", output["reason"])
         self.assertTrue(next_state["pending_control_event"])
 
+    def test_lifecycle_hook_repeated_stop_with_ready_stays_blocked_until_dispatch_or_blocked(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": ["SERVER-GATE"],
+            "candidate_revisions": [],
+            "rule_handshake": {"state": "current", "blocking": False, "installed_revision": "rev-current"},
+        }
+        prior = {
+            "pending_control_event": True,
+            "triggers": ["READY:SERVER-GATE", "ledger_changed"],
+            "stop_continuations": 1,
+            "snapshot": snapshot,
+        }
+
+        output, next_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "session-1",
+                "turn_id": "turn-2",
+                "stop_hook_active": False,
+            },
+            snapshot=snapshot,
+            prior_state=prior,
+        )
+
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("SERVER-GATE", output["reason"])
+        self.assertIn("BLOCKED", output["reason"])
+        self.assertTrue(next_state["pending_control_event"])
+
     def test_lifecycle_hook_second_stop_without_progress_fails_closed(self) -> None:
         snapshot = {
             "head": "abc123",
             "ledger_sha256": "ledger-1",
             "worktree_status_sha256": "status-1",
-            "ready_ids": ["WEB-READY"],
-            "candidate_revisions": [],
+            "ready_ids": [],
+            "candidate_revisions": ["candidate-123"],
         }
         first_output, first_state = lifecycle_hook.evaluate_event(
             {
@@ -443,7 +475,7 @@ class GovernanceTests(unittest.TestCase):
             snapshot=snapshot,
             prior_state={
                 "pending_control_event": True,
-                "triggers": ["READY:WEB-READY"],
+                "triggers": ["CANDIDATE:candidate-123"],
             },
         )
         self.assertEqual(first_output["decision"], "block")

@@ -244,7 +244,7 @@ def continuation_reason(
         "Adaptive Delivery 生命周期门检测到尚未闭合的控制事件。"
         f"触发：{trigger_text}；当前 READY：{ready}；候选：{candidates}。"
         "请立即核对真实 main / 台账 / live Agent，处理候选审查、集成、验收、"
-        "READY 派发与 ACK；随后用 control_event_guard.py 生成通过收据。"
+        "READY 派发与 ACK；若客观上无法派发，必须把对应任务明确转为 BLOCKED 并记录可验证原因；随后用 control_event_guard.py 生成通过收据。"
         "不得仅把动作写成下一事件后停止。" + rule_text
     )
 
@@ -355,7 +355,7 @@ def evaluate_event(
             list(snapshot.get("candidate_revisions", [])),
             rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
         )
-        if continuations <= 1:
+        if snapshot.get("ready_ids") or continuations <= 1:
             return {"decision": "block", "reason": reason}, state
         return {
             "continue": False,
