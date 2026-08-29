@@ -5,6 +5,7 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 const KIMI_KEYCHAIN_SERVICE = "adaptive-delivery-kimi-k3";
 const XAI_KEYCHAIN_SERVICE = "adaptive-delivery-xai-grok";
@@ -66,7 +67,7 @@ export function parseArgs(argv) {
     region: null,
     cwd: null,
     assignmentId: null, taskId: null, agentId: null, sessionId: null,
-    attempt: 1, leaseId: null, runtimeReceipts: null,
+    attempt: 1, leaseId: null, runtimeReceipts: null, assignmentAck: null,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -77,7 +78,7 @@ export function parseArgs(argv) {
     else if (argument === "--authorized-external-call") options.authorizedExternalCall = true;
     else if (argument === "--authorized-login") options.authorizedLogin = true;
     else if (argument === "--device-auth") options.deviceAuth = true;
-    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts"].includes(argument)) {
+    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts", "--assignment-ack"].includes(argument)) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`Missing value for ${argument}`);
       if (argument === "--auth-mode") options.authMode = value;
@@ -89,6 +90,7 @@ export function parseArgs(argv) {
       else if (argument === "--attempt") options.attempt = Number.parseInt(value, 10);
       else if (argument === "--lease-id") options.leaseId = value;
       else if (argument === "--runtime-receipts") options.runtimeReceipts = value;
+      else if (argument === "--assignment-ack") options.assignmentAck = value;
       else options[argument.slice(2)] = value;
       index += 1;
     } else {
@@ -137,7 +139,61 @@ export function parseArgs(argv) {
   if (options.execute && !options.authorizedExternalCall) {
     throw new Error("--execute requires --authorized-external-call after current user authorization");
   }
+  if (options.execute) {
+    const identity = [options.assignmentId, options.taskId, options.agentId, options.sessionId];
+    const bound = identity.some(Boolean);
+    if (bound && identity.some((value) => !value)) {
+      throw new Error("Assignment-bound --execute requires assignment/task/agent/session identity");
+    }
+    if (bound && !options.assignmentAck) {
+      throw new Error("Assignment-bound --execute requires --assignment-ack");
+    }
+    if (!bound && options.assignmentAck) {
+      throw new Error("--assignment-ack requires Assignment-bound identity");
+    }
+  }
   return options;
+}
+
+function gitFact(cwd, args, label) {
+  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`cannot resolve ${label}: ${(result.stderr || result.stdout).trim()}`);
+  return result.stdout.trim();
+}
+
+function validateAssignmentLaunch(options) {
+  if (!options.assignmentId) return;
+  let assignment;
+  try {
+    assignment = JSON.parse(readFileSync(options.assignmentAck, "utf8"));
+  } catch (error) {
+    throw new Error(`assignment-ack is unreadable: ${error.message}`);
+  }
+  if (!assignment || typeof assignment !== "object" || Array.isArray(assignment)) {
+    throw new Error("assignment-ack must contain one Assignment object");
+  }
+  const state = String(assignment.state || "").toUpperCase();
+  if (!new Set(["ACKED", "ACTIVE"]).has(state)) {
+    throw new Error("assignment-ack launch state must be ACKED or ACTIVE");
+  }
+  const repositoryRoot = gitFact(options.cwd, ["rev-parse", "--show-toplevel"], "launch repository");
+  const branch = gitFact(options.cwd, ["branch", "--show-current"], "launch branch");
+  const head = gitFact(options.cwd, ["rev-parse", "HEAD"], "launch revision");
+  const guard = fileURLToPath(new URL("./assignment_lease_guard.py", import.meta.url));
+  const python = process.env.AD_PYTHON || "python3";
+  const result = spawnSync(python, [
+    guard, options.assignmentAck,
+    "--expected-assignment-id", options.assignmentId,
+    "--expected-task-id", options.taskId,
+    "--expected-agent-id", options.agentId,
+    "--expected-repository-root", repositoryRoot,
+    "--expected-branch", branch,
+    "--expected-head", head,
+  ], { encoding: "utf8" });
+  if (result.error) throw new Error(`assignment-ack validation failed: ${result.error.message}`);
+  if (result.status !== 0) {
+    throw new Error(`assignment-ack validation failed: ${(result.stdout || result.stderr).trim()}`);
+  }
 }
 
 function emitRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
@@ -383,6 +439,7 @@ async function main() {
       process.exitCode = await loginExternalAgent(options);
       return;
     }
+    validateAssignmentLaunch(options);
     emitRuntimeReceipt(options, "assignment_started", 1);
     try {
       const code = await executeExternalAgent(options);

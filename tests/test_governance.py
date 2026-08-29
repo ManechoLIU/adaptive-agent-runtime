@@ -521,6 +521,52 @@ class GovernanceTests(unittest.TestCase):
         errors=assignment_lease_guard.validate_assignment(assignment, runtime_state={"schema_version":1,"leases":{"F1-writer-1":lease}}, now=now)
         self.assertEqual(errors, [])
 
+    def test_assignment_lease_exact_launch_expectations_fail_closed(self) -> None:
+        assignment = {
+            "assignment_id": "F1-writer-1", "task_id": "F1", "agent_id": "writer",
+            "state": "ACKED", "primary_goal": "close F1",
+            "success_criteria": ["green"], "owned_scope": ["app/a.ts"],
+            "forbidden_scope": [], "parallelizable": True, "observed_modified_files": [],
+            "ack": {
+                "repository_root": "/repo", "branch": "codex/f1", "head": "abc123",
+                "status": "clean", "owned_files": ["app/a.ts"], "first_red": "red",
+                "stop_condition": "candidate",
+            },
+        }
+        errors = assignment_lease_guard.validate_assignment(
+            assignment,
+            expected_assignment_id="F1-writer-2",
+            expected_task_id="F2",
+            expected_agent_id="reviewer",
+            expected_repository_root="/other",
+            expected_branch="main",
+            expected_head="def456",
+        )
+        self.assertIn("assignment_id does not match launch contract", errors)
+        self.assertIn("task_id does not match launch contract", errors)
+        self.assertIn("agent_id does not match launch contract", errors)
+        self.assertIn("ack.repository_root does not match launch repository", errors)
+        self.assertIn("ack.branch does not match launch branch", errors)
+        self.assertIn("ack.head does not match launch revision", errors)
+
+    def test_assignment_lease_exact_launch_expectations_accept_matching_ack(self) -> None:
+        assignment = {
+            "assignment_id": "F1-writer-1", "task_id": "F1", "agent_id": "writer",
+            "state": "ACKED", "primary_goal": "close F1",
+            "success_criteria": ["green"], "owned_scope": ["app/a.ts"],
+            "forbidden_scope": [], "parallelizable": True, "observed_modified_files": [],
+            "ack": {
+                "repository_root": "/repo", "branch": "codex/f1", "head": "abc123",
+                "status": "clean", "owned_files": ["app/a.ts"], "first_red": "red",
+                "stop_condition": "candidate",
+            },
+        }
+        self.assertEqual(assignment_lease_guard.validate_assignment(
+            assignment,
+            expected_assignment_id="F1-writer-1", expected_task_id="F1", expected_agent_id="writer",
+            expected_repository_root="/repo", expected_branch="codex/f1", expected_head="abc123",
+        ), [])
+
     def test_assignment_lease_reuse_requires_release_and_new_ack(self) -> None:
         errors = assignment_lease_guard.validate_assignment(
             {
