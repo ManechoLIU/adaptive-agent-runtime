@@ -76,6 +76,8 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
     grokHome: process.env.GROK_HOME || null,
   }) + "\\n");
   if (process.env.SPAWN_MARKER) require("node:fs").appendFileSync(process.env.SPAWN_MARKER, "spawned\\n");
+  const delay = Number(process.env.FAKE_RUNNER_DELAY_MS || 0);
+  if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
 }
 `);
   await chmod(target, 0o755);
@@ -385,6 +387,39 @@ test("external execution emits provider-neutral start and terminal runtime recei
   assert.deepEqual(events.map((e) => e.event_seq), [1, 2]);
   assert.equal(events[0].attempt, 1); assert.equal(events[0].lease_id, "lease-1");
   assert.equal(events[1].outcome, "success"); assert.equal(events[1].terminal_state, "completed");
+});
+
+
+
+test("long external execution emits automatic heartbeat before terminal", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-heartbeat-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const receipts = path.join(bin, "receipts.jsonl");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, {}, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "heartbeat-a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", await assignmentAckFile(bin, { assignment_id: "heartbeat-a1" }, repo),
+    "--attempt", "1", "--lease-id", "heartbeat-lease-1", "--runtime-receipts", receipts,
+  ], { encoding: "utf8", input: "bounded contract", env: {
+    ...process.env,
+    PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`,
+    GROK_HOME: grokHome,
+    FAKE_RUNNER_DELAY_MS: "180",
+    AD_RUNTIME_HEARTBEAT_MS: "50",
+  } });
+  assert.equal(result.status, 0, result.stderr);
+  const events = (await readFile(receipts, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(events[0].event_type, "assignment_started");
+  assert.equal(events.at(-1).event_type, "assignment_terminal");
+  assert.ok(events.some((event) => event.event_type === "assignment_heartbeat"), JSON.stringify(events));
+  assert.deepEqual(events.map((event) => event.event_seq), events.map((_, index) => index + 1));
+  assert.equal(events.filter((event) => event.event_type === "assignment_terminal").length, 1);
 });
 
 test("assignment-bound execution persists canonical runtime without audit JSONL", async () => {

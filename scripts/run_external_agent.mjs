@@ -2,6 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -288,6 +289,21 @@ function recordRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
   if (options.runtimeReceipts) appendFileSync(options.runtimeReceipts, `${JSON.stringify(receipt)}\n`, "utf8");
 }
 
+function runtimeGitSnapshot(cwd) {
+  const head = gitFact(cwd, ["rev-parse", "HEAD"], "runtime HEAD");
+  const status = gitFact(cwd, ["status", "--porcelain=v1", "--untracked-files=all"], "runtime status");
+  return {
+    head,
+    statusSha256: createHash("sha256").update(status).digest("hex"),
+  };
+}
+
+function runtimeHeartbeatIntervalMs() {
+  const configured = Number(process.env.AD_RUNTIME_HEARTBEAT_MS || 300000);
+  if (!Number.isFinite(configured) || configured < 10) throw new Error("AD_RUNTIME_HEARTBEAT_MS must be at least 10ms");
+  return configured;
+}
+
 function assertDirectory(cwd) {
   let stats;
   try {
@@ -523,15 +539,43 @@ async function main() {
     }
     validateAssignmentLaunch(options);
     validateRuleHandshake(options);
-    recordRuntimeReceipt(options, "assignment_started", 1);
+    let eventSeq = 1;
+    let previousSnapshot = runtimeGitSnapshot(options.cwd);
+    recordRuntimeReceipt(options, "assignment_started", eventSeq, {
+      baseline_head: previousSnapshot.head,
+      last_observed_head: previousSnapshot.head,
+      last_observed_status_sha256: previousSnapshot.statusSha256,
+    });
+    const heartbeat = options.assignmentId ? setInterval(() => {
+      try {
+        const snapshot = runtimeGitSnapshot(options.cwd);
+        eventSeq += 1;
+        if (snapshot.head !== previousSnapshot.head || snapshot.statusSha256 !== previousSnapshot.statusSha256) {
+          recordRuntimeReceipt(options, "assignment_progress", eventSeq, {
+            last_observed_head: snapshot.head,
+            last_observed_status_sha256: snapshot.statusSha256,
+          });
+          previousSnapshot = snapshot;
+        } else {
+          recordRuntimeReceipt(options, "assignment_heartbeat", eventSeq);
+        }
+      } catch (error) {
+        process.stderr.write(`adaptive-delivery-runtime-heartbeat: ${error.message}\n`);
+      }
+    }, runtimeHeartbeatIntervalMs()) : null;
+    heartbeat?.unref();
     let code;
     try {
       code = await executeExternalAgent(options);
     } catch (error) {
-      recordRuntimeReceipt(options, "assignment_terminal", 2, { terminal_state: "failed", outcome: "failed", summary: error.message, evidence: [], artifacts: [], next_action: "inspect external agent failure", retry_class: "transport_error" });
+      if (heartbeat) clearInterval(heartbeat);
+      eventSeq += 1;
+      recordRuntimeReceipt(options, "assignment_terminal", eventSeq, { terminal_state: "failed", outcome: "failed", summary: error.message, evidence: [], artifacts: [], next_action: "inspect external agent failure", retry_class: "transport_error" });
       throw error;
     }
-    recordRuntimeReceipt(options, "assignment_terminal", 2, {
+    if (heartbeat) clearInterval(heartbeat);
+    eventSeq += 1;
+    recordRuntimeReceipt(options, "assignment_terminal", eventSeq, {
       terminal_state: code === 0 ? "completed" : "failed", outcome: code === 0 ? "success" : "failed",
       summary: code === 0 ? "external agent completed" : `external agent exited ${code}`,
       evidence: [], artifacts: [], next_action: code === 0 ? "none" : "inspect external agent output",
