@@ -99,6 +99,8 @@
 
 仅靠结束时手动运行门禁不足以约束长回合。持续总控注册为 **registered controller** 后，使用 `scripts/lifecycle_hook.py` 接入 `SessionStart / PostToolUse / SubagentStop / Stop`：会话启动时建立真实主线与台账基线；工具调用后检测 `main`、工作区、台账、`READY` 或任一 worktree 的未合入候选变化；子 Agent 停止时登记待处理候选事件；总控准备停止时，若这些变化尚未由带 `--repo` 的成功 `control_event_guard.py` 收据闭合，则自动继续当前 turn。首次 Stop 只允许一次受控续作；若此后 `main / 台账 / 工作区 / READY / 候选队列` 均无可验证变化，第二次 Stop 直接 fail closed，不把长时间分析或重复检查伪装成持续推进。出现真实快照变化后才重置该计数。Hook 只对登记的唯一总控和 canonical `main` 生效，Writer / Reviewer 工作树不受影响；它只能触发检查与续作，不能代替总控调用 `spawn_agent`、判断文件冲突或选择优先级。非托管 Hook 必须完成运行平台的定义审核与信任后才算生效，具体命令只放在平台安装指南中。
 
+浏览器托管的控制面通过本地工具桥操作项目时，如果宿主不产生原生生命周期事件，只允许做受限桥接：本地 shell 可在退出时把 canonical repo、真实命令和退出码映射为同一 controller 的 `PostToolUse`，前提是该 repo 恰好只有一个 registered controller；未登记项目静默跳过，多 controller 必须 fail closed。控制门闭合还要回读工具桥的真实审计收据，只有 `control_event_guard.py` 输出包含 `control-event: allowed` 才能当成成功收据；不能仅凭 shell 退出码推断。没有 repo 归属的 GUI 事件不得猜测映射。若宿主最终回复没有本地 `Stop` 回调，桥接层就不能冒充完整原生 Hook；需要硬 `Stop` / `SubagentStop` 时复用同一 controller session 走原生生命周期，不创建第二个长期总控。
+
 完成既有项目的一次性迁移后，台账每次提交或总控 yield 前运行 `scripts/ledger_consistency_guard.py <ledger>`：当前 Goal 和下一检查点必须指向开放任务，`ACTIVE / RECOVERING` 必须有唯一负责人；任何出现在“下一可见检查点”或任务“下一步”里的任务式 ID 都必须先成为显式任务行；`RECOVERING` 除恢复动作 / checkpoint 外，还必须绑定已 delivered ACK 的 Assignment，或记录已完成且可验证的恢复动作。若仍保留顶部活动指针则必须与任务表完全一致。门禁失败只修受影响字段，不展开台账重写；未迁移项目先用普通 lint 得到警告并继续无冲突实现。
 
 下游工作唯一缺口是尚未冻结的共享契约、字段语义或适配边界时，不得把“输入未准备好”长期写成空槽理由。先把缺失输入拆成能独立验收的上游工作包，明确下游释放条件；上游进入主线并通过相称验证后，在同一状态事件中更新台账并释放下游。契约冻结前禁止下游猜测字段、状态或单位并行实现；这类顺序等待是有效依赖，不是低并行失职。

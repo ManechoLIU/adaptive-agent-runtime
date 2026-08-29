@@ -290,6 +290,8 @@ python3 ~/.agents/skills/adaptive-delivery/scripts/lifecycle_hook.py \
 
 然后在 `~/.codex/hooks.json` 合并四个 command handler，命令都指向安装副本的 `scripts/lifecycle_hook.py`：`SessionStart`、`PostToolUse`（matcher `*`）、`SubagentStop` 和 `Stop`。Codex 的非托管 Hook 还必须在 CLI 的 `/hooks` 中审核并信任精确定义；未显示 Active 就不能声称自动门禁已生效。
 
+ChatGPT Web + AI-Bridge 需要额外的 Web bridge，因为 Web 工具调用不会天然触发 Codex Hook。`scripts/web_lifecycle_bridge.py` 可把**唯一 registered controller** 项目下由 AI-Bridge 启动的 shell 调用桥接为 `PostToolUse`，并从 AI-Bridge 审计收据确认 `control_event_guard.py` 的真实 `control-event: allowed` 输出。未登记项目静默跳过；同一 repo 若登记多个 controller 则拒绝映射；没有 repo 归属的 `computer` 事件不自动猜测归属。Web 平台最终回复仍没有本地 `Stop` 回调，所以硬 Stop 必须复用原 controller session 走 Codex 原生生命周期（例如 `codex exec resume <session-id>`），不能把 Web bridge 宣称成完整原生 Hook。
+
 Hook 不会替总控盲目派发。它负责自动发现和阻止漏处理；文件冲突、共享环境、优先级与 `spawn_agent` 仍由总控判断。存在未合入候选时，只有带 `--repo` 且完整声明候选处置的 `control_event_guard.py` 收据才能清除本次自动控制事件。
 
 ### 防止短事件继续无边界加任务
