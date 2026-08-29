@@ -109,6 +109,54 @@ class GovernanceTests(unittest.TestCase):
             self.assertEqual(snap["assignment_liveness"]["T1"]["state"],"unhealthy")
             self.assertEqual(snap["assignment_liveness"]["T1"]["reason"],"lease_expired")
 
+    def test_project_snapshot_exposes_five_state_task_projection(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".git" / "adaptive-delivery").mkdir(parents=True)
+            (root / "TASK_LEDGER.md").write_text(
+                """# Ledger
+
+- 当前 Goal：`T3` active work
+- 下一可见检查点：`T3` checkpoint
+- 当前阻塞：none
+- 规则版本：test
+
+| ID | 状态 | 负责人 | 下一步 |
+|---|---|---|---|
+| `T1` | `PENDING` | 待分配 | wait |
+| `T2` | `READY` | 待分配 | dispatch |
+| `T3` | `ACTIVE` | Agent A | execute |
+| `T4` | `RECOVERING` | Agent B Assignment T4-RECOVERY-01 delivered ACK | 恢复动作：继续 checkpoint 测试 PASS |
+| `T5` | `VERIFY` | reviewer | review |
+| `T6` | `BLOCKED` | controller | external |
+| `T7` | `DONE` | controller | none |
+| `T8` | `SUPERSEDED` | controller | none |
+""",
+                encoding="utf-8",
+            )
+            def fake_git(_root, *args):
+                if args == ("rev-parse", "--show-toplevel"): return str(root)
+                if args == ("branch", "--show-current"): return "main"
+                if args == ("status", "--porcelain=v1", "--untracked-files=no"): return ""
+                if args == ("rev-parse", "HEAD"): return "abc"
+                raise AssertionError(args)
+            with patch.object(lifecycle_hook, "run_git", side_effect=fake_git), patch(
+                "control_event_guard.unmerged_worktree_candidates", return_value={}
+            ):
+                snap = lifecycle_hook.project_snapshot(root)
+            projection = snap["task_projection"]
+            self.assertEqual(projection["T1"]["main_state"], "READY")
+            self.assertFalse(projection["T1"]["dispatchable"])
+            self.assertEqual(projection["T2"]["main_state"], "READY")
+            self.assertTrue(projection["T2"]["dispatchable"])
+            self.assertEqual((projection["T3"]["main_state"], projection["T3"]["health"]), ("ACTIVE", "recovering"))
+            self.assertEqual((projection["T4"]["main_state"], projection["T4"]["health"]), ("ACTIVE", "recovering"))
+            self.assertEqual(projection["T5"]["main_state"], "VERIFY")
+            self.assertEqual(projection["T6"]["main_state"], "BLOCKED")
+            self.assertEqual((projection["T7"]["main_state"], projection["T7"]["closure_reason"]), ("CLOSED", "done"))
+            self.assertEqual((projection["T8"]["main_state"], projection["T8"]["closure_reason"]), ("CLOSED", "superseded"))
+
     def test_lifecycle_hook_surfaces_unhealthy_active_runtime_without_git_change(self) -> None:
         snapshot = {
             "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",
@@ -178,6 +226,16 @@ class GovernanceTests(unittest.TestCase):
             ),
             [],
         )
+    def test_lifecycle_surfaces_recovery_budget_exhaustion_as_control_trigger(self) -> None:
+        snapshot = {
+            "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
+            "ready_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {
+                "F1": {"ledger_state": "ACTIVE", "state": "budget_exhausted", "reason": "recovery_budget_exhausted"}
+            },
+        }
+        triggers = lifecycle_hook.lifecycle_triggers(snapshot, None)
+        self.assertIn("recovery_budget_exhausted:F1", triggers)
 
     def test_lifecycle_hook_surfaces_invalid_ledger_at_session_start(self) -> None:
         output, next_state = lifecycle_hook.evaluate_event(
@@ -567,6 +625,52 @@ class GovernanceTests(unittest.TestCase):
         errors=assignment_lease_guard.validate_assignment(assignment, runtime_state={"schema_version":1,"leases":{"F1-writer-1":lease}}, now=now)
         self.assertEqual(errors, [])
 
+    def test_assignment_lease_exact_launch_expectations_fail_closed(self) -> None:
+        assignment = {
+            "assignment_id": "F1-writer-1", "task_id": "F1", "agent_id": "writer",
+            "state": "ACKED", "primary_goal": "close F1",
+            "success_criteria": ["green"], "owned_scope": ["app/a.ts"],
+            "forbidden_scope": [], "parallelizable": True, "observed_modified_files": [],
+            "ack": {
+                "repository_root": "/repo", "branch": "codex/f1", "head": "abc123",
+                "status": "clean", "owned_files": ["app/a.ts"], "first_red": "red",
+                "stop_condition": "candidate",
+            },
+        }
+        errors = assignment_lease_guard.validate_assignment(
+            assignment,
+            expected_assignment_id="F1-writer-2",
+            expected_task_id="F2",
+            expected_agent_id="reviewer",
+            expected_repository_root="/other",
+            expected_branch="main",
+            expected_head="def456",
+        )
+        self.assertIn("assignment_id does not match launch contract", errors)
+        self.assertIn("task_id does not match launch contract", errors)
+        self.assertIn("agent_id does not match launch contract", errors)
+        self.assertIn("ack.repository_root does not match launch repository", errors)
+        self.assertIn("ack.branch does not match launch branch", errors)
+        self.assertIn("ack.head does not match launch revision", errors)
+
+    def test_assignment_lease_exact_launch_expectations_accept_matching_ack(self) -> None:
+        assignment = {
+            "assignment_id": "F1-writer-1", "task_id": "F1", "agent_id": "writer",
+            "state": "ACKED", "primary_goal": "close F1",
+            "success_criteria": ["green"], "owned_scope": ["app/a.ts"],
+            "forbidden_scope": [], "parallelizable": True, "observed_modified_files": [],
+            "ack": {
+                "repository_root": "/repo", "branch": "codex/f1", "head": "abc123",
+                "status": "clean", "owned_files": ["app/a.ts"], "first_red": "red",
+                "stop_condition": "candidate",
+            },
+        }
+        self.assertEqual(assignment_lease_guard.validate_assignment(
+            assignment,
+            expected_assignment_id="F1-writer-1", expected_task_id="F1", expected_agent_id="writer",
+            expected_repository_root="/repo", expected_branch="codex/f1", expected_head="abc123",
+        ), [])
+
     def test_assignment_lease_reuse_requires_release_and_new_ack(self) -> None:
         errors = assignment_lease_guard.validate_assignment(
             {
@@ -818,6 +922,140 @@ class GovernanceTests(unittest.TestCase):
             }],
         }
         self.assertEqual(control_event_guard.validate_snapshot(snapshot, ledger_ready_ids=set(), required_review_ids={"R1"}), [])
+
+    def test_review_pass_cannot_close_while_candidate_is_still_only_in_review(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "PASS"}],
+            "candidate_packages": [{"revision": "candidate-1", "worktree": "/repo/wt",
+                                     "task_id": "F1", "integration_flow": "server-main",
+                                     "decision": "review", "review_task_id": "review-1", "delivered_ack": True}],
+            "new_assignments": [],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={"/repo/wt": "candidate-1"}
+        )
+        self.assertIn("review PASS for candidate-1 requires completed integration or ordered integration queue", errors)
+
+    def test_review_fail_requires_same_candidate_rework_disposition(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "FAIL"}],
+            "candidate_packages": [{"revision": "candidate-1", "worktree": "/repo/wt",
+                                     "task_id": "F1", "integration_flow": "server-main",
+                                     "decision": "review", "review_task_id": "review-1", "delivered_ack": True}],
+            "new_assignments": [],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={"/repo/wt": "candidate-1"}
+        )
+        self.assertIn("review FAIL for candidate-1 requires rework disposition", errors)
+
+    def test_completed_integration_requires_exact_main_revision_and_regression_evidence(self) -> None:
+        base_candidate = {
+            "revision": "candidate-1", "worktree": "/repo/wt", "task_id": "F1",
+            "integration_flow": "server-main", "decision": "integrate",
+            "controller_event_id": "event-1", "integrated_this_event": True,
+        }
+        for missing_field in ("main_revision", "regression_evidence"):
+            candidate = {**base_candidate, "main_revision": "main-2", "regression_evidence": "tests green"}
+            candidate.pop(missing_field)
+            snapshot = {
+                **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+                "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                      "candidate_revision": "candidate-1", "verdict": "PASS"}],
+                "candidate_packages": [candidate], "new_assignments": [],
+            }
+            errors = control_event_guard.validate_snapshot(
+                snapshot, ledger_ready_ids=set(), expected_candidates={}, expected_main_revision="main-2"
+            )
+            self.assertIn(f"candidate-1 integrate requires {missing_field}", errors)
+
+    def test_integrated_candidate_revisions_are_derived_from_git_ancestry(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        snapshot = {"candidate_packages": [
+            {"revision": "good", "decision": "integrate"},
+            {"revision": "bad", "decision": "integrate"},
+            {"revision": "queued", "decision": "queued"},
+        ]}
+        def fake_git(_root, *args, **kwargs):
+            self.assertEqual(args[:2], ("merge-base", "--is-ancestor"))
+            return SimpleNamespace(returncode=0 if args[2] == "good" else 1)
+        with patch.object(control_event_guard, "run_git", side_effect=fake_git):
+            revisions = control_event_guard.integrated_candidate_revisions(Path("/repo"), snapshot, "main-2")
+        self.assertEqual(revisions, {"good"})
+
+    def test_completed_integration_requires_candidate_to_be_ancestor_of_current_main(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "PASS"}],
+            "candidate_packages": [{
+                "revision": "candidate-1", "worktree": "/repo/wt", "task_id": "F1",
+                "integration_flow": "server-main", "decision": "integrate",
+                "controller_event_id": "event-1", "integrated_this_event": True,
+                "main_revision": "main-2", "regression_evidence": "current-main regression PASS",
+            }],
+            "new_assignments": [],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={}, expected_main_revision="main-2",
+            expected_integrated_revisions=set(),
+        )
+        self.assertIn("candidate-1 integrate requires candidate revision to be an ancestor of current main", errors)
+
+    def test_review_pass_accepts_completed_integration_with_current_main_regression(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "PASS"}],
+            "candidate_packages": [{
+                "revision": "candidate-1", "worktree": "/repo/wt", "task_id": "F1",
+                "integration_flow": "server-main", "decision": "integrate",
+                "controller_event_id": "event-1", "integrated_this_event": True,
+                "main_revision": "main-2", "regression_evidence": "current-main targeted 16/16 PASS",
+            }],
+            "new_assignments": [],
+        }
+        self.assertEqual(control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={}, expected_main_revision="main-2",
+            expected_integrated_revisions={"candidate-1"},
+        ), [])
+
+    def test_review_pass_accepts_ordered_integration_queue(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "PASS"}],
+            "candidate_packages": [{
+                "revision": "candidate-1", "worktree": "/repo/wt", "task_id": "F1",
+                "integration_flow": "server-main", "decision": "queued",
+                "reason_code": "ordered_integration", "next_checkpoint": "after preceding candidate integrates",
+            }],
+            "new_assignments": [],
+        }
+        self.assertEqual(control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={"/repo/wt": "candidate-1"}
+        ), [])
+
+    def test_review_fail_accepts_acknowledged_rework(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "FAIL"}],
+            "candidate_packages": [{
+                "revision": "candidate-1", "worktree": "/repo/wt", "task_id": "F1",
+                "integration_flow": "server-main", "decision": "rework",
+                "writer_task_id": "F1-REWORK", "delivered_ack": True,
+            }],
+            "new_assignments": [],
+        }
+        self.assertEqual(control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={"/repo/wt": "candidate-1"}
+        ), [])
 
     def test_control_event_guard_allows_complete_event(self) -> None:
         snapshot = {
@@ -1201,6 +1439,9 @@ class GovernanceTests(unittest.TestCase):
                     "integration_flow": "web-main",
                     "decision": "integrate",
                     "controller_event_id": "integrate-web-1",
+                    "integrated_this_event": True,
+                    "main_revision": "main-after-web-1",
+                    "regression_evidence": "current-main targeted regression PASS",
                 }
             ],
             "new_assignments": [

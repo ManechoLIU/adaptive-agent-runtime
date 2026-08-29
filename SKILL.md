@@ -31,14 +31,14 @@ description: Use when initializing or governing a long-running project, choosing
 2. 保护用户及其他任务的已有改动。
 3. 证据先于完成宣称；证据不足时说明边界。
 4. 达到停止条件立即结束，不为完备度扩展范围。
-5. 两次有界等待均无新证据时停止轮询，从最近证据点恢复、重新分派或报告阻塞。
+5. heartbeat / PID 只证明存活；只有 Git / 测试 / artifact / blocker 指纹产生新证据才算进展。相同任务合同最多两次 recovery；预算耗尽后同一 Assignment 不得再开新 attempt，必须把策略变化固化为新 Assignment，不能继续同路径重试。
 6. 快速档不固定文件清单或工具次数：先按项目文档职责扫描真实影响，只更新受影响事实源；发现跨域变化、冲突或高风险边界时再升级，不能为了快而漏改，也不能因涉及多份文档自动升级。
 7. 多 Agent 数量是从 `0` 到运行环境上限的动态选择，不是流程配额。主 Agent 保留范围、共享契约、集成和最终验收；能以现有边界或小规模行为不变拆分隔离的实现优先分派，不默认由主 Agent 包揽全部用户可见模块。
 8. 需要分派子 Agent 或选择模型时，先读取 [Agent and model routing](references/agent-model-routing.md)，并按 [Agent delivery contract](references/agent-delivery-contract.md) 固化单目标、并行判断、统一结果、证据链与冲突裁决。Adaptive Delivery 是项目工作包、执行通道、模型与认证路由的唯一事实源，并直接执行已确认的路由合同；Task Navigator 等生命周期插件只管理用户可见任务容器、续接、标题和最近进展，不读取、执行或修改项目路由合同。
 9. 完成宣称必须绑定当前候选与适用环境的验证证据。仍有效的收据可以复用；项目验收策略、问题调查或环境漂移要求新证据时可以重跑并记录原因。具体按 [Harness and release](references/harness-and-release.md) 执行。
 10. 项目总控把系统 Goal 标为 `blocked` 前，必须按 [long-task governance](references/long-task-governance.md) 对唯一台账做项目全量存活扫描，并以该台账路径运行 `scripts/preblock_guard.py`。门禁会直接比对台账开放项与临时扫描，不能靠漏填任务绕过。当前 Goal、优先级或阶段只决定先后，不能把不服务当前 Goal 的开放工作包排除出 `READY`；单个 GUI、凭证、付费或外部环境阻塞只约束依赖它的工作包。连续三轮遇到同一阻塞只是必要条件，不是跳过项目级扫描的充分条件。
-11. 规则和台账治理按 [long-task governance](references/long-task-governance.md) 的减法与机器门执行；短事件追加先用 `event_scope_guard.py`，结束时再由 `control_event_guard.py` 复核整条动作链、全部 `READY` 决定和空槽理由；Agent Assignment 租约与台账一致性分别使用 `assignment_lease_guard.py`、`ledger_consistency_guard.py`；自然语言中的下一任务必须先显式任务化，`RECOVERING` 必须有真实执行绑定或可验证恢复动作。实时容量只进临时收据，不在台账顶部重复维护；不新增平行台账、同义规则或无行动价值的过程流水。
-12. 持续项目总控应启用 [long-task governance](references/long-task-governance.md) 的生命周期执行器：自动把主线、台账、live candidate 完成与 `READY` 变化转成控制事件；为真实验收或恢复取证保留、且已明确 `absorbed / parked` 的 worktree 不再占 live candidate WIP，只有其 `HEAD` 再变化才重新进入 live 队列。Goal / 里程碑收口的控制收据必须带 `goal_rollover`，先完成项目级重算并滚到另一个真实开放 Goal，或用内联 `preblock_guard` 证明全项目阻塞 / 证明项目已完成；缺少这一步或缺少通过的 `control_event_guard.py` 收据都阻止静默结束。首次 Stop 续作后若控制快照无真实变化，第二次 Stop 应 fail closed，而不是继续拉长同一回合；Web bridge 在真实 allowed 收据后可短暂 debounce 并自动复用同一 registered controller session 触发宿主原生 Stop，不能创建第二总控或伪称直接观测到了 Web 最终回复事件。执行器只对显式 registered controller 生效，不能替代总控对冲突、优先级或派发边界的判断；平台接入细节只保留在运行参考中。
+11. 规则和台账治理按 [long-task governance](references/long-task-governance.md) 的减法与机器门执行；总控只管理 `READY / ACTIVE / VERIFY / BLOCKED / CLOSED` 五个主状态，旧 `PENDING / RECOVERING / DONE / SUPERSEDED` 仅作兼容映射。短事件追加先用 `event_scope_guard.py`，结束时再由 `control_event_guard.py` 复核整条动作链、全部 `READY` 决定、候选 Review→集成→回归衔接和空槽理由；Agent Assignment 启动前 ACK 与台账一致性分别使用 `assignment_lease_guard.py`、`ledger_consistency_guard.py`。自然语言中的下一任务必须先显式任务化；实时容量、health、recovery count、RED/GREEN、candidate 与 Reviewer verdict 只进机器证据 / 临时收据，不扩张主状态或台账顶部；不新增平行台账、同义规则或无行动价值的过程流水。
+12. 持续项目总控应启用 [long-task governance](references/long-task-governance.md) 的生命周期执行器：从 legacy 台账状态、runtime lease、candidate 与 Git 事实自动派生五状态投影和 health，并把主线、台账、live candidate 完成、`READY` 变化、无证据进展与 recovery budget 耗尽转成控制事件；为真实验收或恢复取证保留、且已明确 `absorbed / parked` 的 worktree 不再占 live candidate WIP，只有其 `HEAD` 再变化才重新进入 live 队列。Goal / 里程碑收口的控制收据必须带 `goal_rollover`，先完成项目级重算并滚到另一个真实开放 Goal，或用内联 `preblock_guard` 证明全项目阻塞 / 证明项目已完成；缺少这一步或缺少通过的 `control_event_guard.py` 收据都阻止静默结束。首次 Stop 续作后若控制快照无真实变化，第二次 Stop 应 fail closed，而不是继续拉长同一回合；Web bridge 在真实 allowed 收据后可短暂 debounce 并自动复用同一 registered controller session 触发宿主原生 Stop，不能创建第二总控或伪称直接观测到了 Web 最终回复事件。执行器只对显式 registered controller 生效，不能替代总控对冲突、优先级或派发边界的判断；平台接入细节只保留在运行参考中。
 
 ## 续接与执行预算
 

@@ -13,6 +13,8 @@ Every delivered Assignment in `ACKED`, `ACTIVE`, or `CANDIDATE` has exactly one 
 
 RED, implementation, GREEN, review, and documentation are steps or evidence for one goal, not separate hidden goals. If the primary goal changes, freeze/terminate the current Assignment and issue a new one.
 
+For Assignment-bound external execution, delivered ACK is a **launch gate**, not a retrospective quality check. The runner validates the exact Assignment/task/Agent identity plus repository root, branch, and current HEAD before spawning the external Agent. A useful result produced through a non-compliant launch may remain auxiliary evidence, but it cannot satisfy the required Assignment or Reviewer receipt.
+
 ## 2. Unified Result Envelope
 
 All execution transports (native subagent, Grok/Kimi runner, future A2A transport) normalize terminal delivery into the runtime terminal receipt. Required result semantics are:
@@ -21,13 +23,15 @@ All execution transports (native subagent, Grok/Kimi runner, future A2A transpor
 
 When code or a versioned artifact is produced, `artifacts` must identify the exact revision/path. Transport-specific prose may be retained as evidence, but it is not the authoritative result.
 
+Runtime heartbeat is liveness only. A progress receipt extends the progress deadline only when at least one authoritative fingerprint changes (Git HEAD, tracked status hash, evidence receipt, artifact, or blocker evidence). Repeating the same fingerprint does not count as progress. Same-contract recovery is bounded to two recovery attempts; after exhaustion the same Assignment cannot start another attempt. Strategy-changing execution must use a new Assignment contract rather than silently resetting the counter.
+
 ## 3. Evidence Chain
 
 For implementation work, completion evidence should form the shortest applicable causal chain:
 
 `RED/problem evidence -> exact revision/artifact -> GREEN/verification -> non-author review when required -> real-end acceptance when required -> integration decision`
 
-Every downstream decision cites exact upstream evidence. A claim such as “reviewer approved” or “tests passed” without the relevant revision/receipt is insufficient for integration.
+Every downstream decision cites exact upstream evidence. A claim such as “reviewer approved” or “tests passed” without the relevant revision/receipt is insufficient for integration. Once a required Reviewer returns `PASS`, the control event must either complete integration with machine-verified candidate ancestry in the exact current main plus current-main regression evidence or record a real `ordered_integration` queue checkpoint; `FAIL` must return the same candidate to an acknowledged rework Assignment. These are transition evidence, not new lifecycle states.
 
 For bug fixes and high-risk behavior changes (including migration, money/cost, authorization, state-machine, external-call, and release-critical logic), the non-author Reviewer is a **TDD causal-evidence reviewer**. Its review receipt sets `tdd_required=true` and must bind `red_evidence`, exact `candidate_revision`, `green_evidence`, `red_green_same_case=true`, `reviewer_counterexample`, and `verdict=PASS|FAIL`. The Reviewer verifies that the pre-fix RED genuinely exposed the same defect that becomes GREEN on the candidate, and performs a bounded counterexample or edge attack; a test added only after the fix that was never observed failing cannot establish the causal chain. Low-risk mechanical/text changes remain risk-tailored and do not require synthetic RED/GREEN ceremony.
 

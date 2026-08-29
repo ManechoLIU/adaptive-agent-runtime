@@ -61,7 +61,9 @@
 
 既有项目首次采用这套结构时，先运行非严格 lint 取得迁移警告，在不暂停无冲突实现的前提下完成一次范围单一的台账迁移；对账任务 ID、状态、依赖、授权门和证据无遗漏后再启用 `--strict`。不能把新结构直接作为既有项目的突然阻塞门，也不能因兼容旧格式而永久跳过迁移。
 
-状态使用 `PENDING / READY / ACTIVE / RECOVERING / VERIFY / BLOCKED / DONE / SUPERSEDED`。`VERIFY` 表示已有候选或结果，正在等待一个或多个**已命名**的审查、集成、真实 Case 或发布门；“待审查”只是 `VERIFY` 的一种具体原因，任务行必须写明待谁审、审什么、通过后去哪。审查 `FAIL` 且仍可内部修复时转 `RECOVERING`，不能长期留在模糊 `VERIFY`。`DONE` 只表示验收、证据和承诺的集成 / 交付位置均已满足，绝不表示失败；失败后无内部恢复路径且等待外部条件才是 `BLOCKED`，被新方案正式替代才是 `SUPERSEDED`。`RECOVERING` 表示工作包已有可恢复现场且正在诊断、恢复原执行者、补派或接管，不是把问题冻结后等待；它必须同时记录恢复负责人、当前根因假设、下一恢复动作和触发检查点。台账只保留一个当前 Goal；一个执行波次可以包含多个彼此独立的 `ACTIVE / RECOVERING` 工作包，但它们必须没有直接顺序依赖、负责人和文件所有权清楚、共享运行环境已隔离或登记。无法满足这些条件时顺序执行。同一工作包同一时刻只有一个负责人，同一文件同一时刻只有一个写入者。
+总控只使用五个主状态：`READY / ACTIVE / VERIFY / BLOCKED / CLOSED`。`READY` 表示开放但尚未执行；`ACTIVE` 表示正在真实执行，恢复动作也属于 ACTIVE；`VERIFY` 表示已有结果，正在等待已命名的审查、集成、回归、真实 Case 或发布门；`BLOCKED` 只表示内部恢复路径已穷尽且确实等待外部条件；`CLOSED` 表示承诺的交付边界已经满足或工作被正式替代。心跳、RED/GREEN、candidate、review PASS、integration、regression、recovery count 都是机器证据或门，不新增主状态。
+
+既有项目仍兼容旧台账词汇：`PENDING → READY(dispatchable=false)`、`RECOVERING → ACTIVE(health=recovering)`、`DONE → CLOSED(done)`、`SUPERSEDED → CLOSED(superseded)`；旧词只作为解析兼容，不再作为总控需要额外管理的状态。已有 `RECOVERING` 行仍须保留恢复负责人、当前根因假设、下一恢复动作和触发检查点，直到项目自然迁移；新规则不要求为了改名批量重写历史台账。一个执行波次可以包含多个彼此独立的 `ACTIVE` 工作包，但它们必须没有直接顺序依赖、负责人和文件所有权清楚、共享运行环境已隔离或登记。无法满足这些条件时顺序执行。同一工作包同一时刻只有一个负责人，同一文件同一时刻只有一个写入者。
 
 每个可执行项至少包含文章所需的九类信息：目标、非目标 / 边界、依赖、预计读写范围、当前状态、验收标准、验证方式、证据位置和本项下一步动作；再记录负责人、暂停条件。高风险项增加回滚、禁止动作和人类确认点。验证收据只在确有复用价值时登记，不是所有工作包的必填字段。
 
@@ -79,7 +81,7 @@
 - 用户要求持续执行直到可观察结果完成；
 - 执行中出现重复阻塞、目标漂移或需要从大项拆出场景项。
 
-普通问答、一次性审查、单文件低风险小改和无需恢复的短任务不创建 Goal。一个 Goal 对应一个可共同验收的小里程碑；其中可以只有一个工作包，也可以包含同一执行波次内互不依赖的多个工作包。不能把开放 backlog、没有共同验收的高风险模块或整个项目塞入一个 Goal。项目总控持续拥有整个项目，但系统同时只运行一个滚动里程碑 Goal；各工作包自己的目标、边界、验收与证据由台账固定，不随 Goal 轮换而漂移。并行旁路工作可以保持 `READY / ACTIVE / RECOVERING / VERIFY`，但不得静默扩张当前 Goal 的完成条件。
+普通问答、一次性审查、单文件低风险小改和无需恢复的短任务不创建 Goal。一个 Goal 对应一个可共同验收的小里程碑；其中可以只有一个工作包，也可以包含同一执行波次内互不依赖的多个工作包。不能把开放 backlog、没有共同验收的高风险模块或整个项目塞入一个 Goal。项目总控持续拥有整个项目，但系统同时只运行一个滚动里程碑 Goal；各工作包自己的目标、边界、验收与证据由台账固定，不随 Goal 轮换而漂移。并行旁路工作可以保持 `READY / ACTIVE / VERIFY`（legacy `RECOVERING` 计入 ACTIVE），但不得静默扩张当前 Goal 的完成条件。
 
 建设阶段选择滚动 Goal 时优先关闭业务功能纵向切片。每个 Goal 必须新增一个可观察的用户能力，或关闭一个明确阻止父级业务闭环 / 发布门通过的功能、可靠性、安全或迁移缺口；若两者都不是，就只作为现有 Goal 的工作包，不单独升级为系统 Goal。选择时用一句话说明它关闭哪个父级缺口以及为何优先于其他 `READY`，不另建评分表、排期报告或治理文档。
 
@@ -113,13 +115,15 @@ yield 前先清空总控本人当前即可执行的动作：已交候选的实�
 
 总控带着仍在运行的子任务 yield 前，还必须验证候选完成、ACK、失败或需要关注事件是否会**实际触发总控的新回合**；不能根据“任务仍 running”或产品可能支持事件通知就假设会自动唤醒。若当前运行环境不会自动触发新回合，则在结束前选择一种真实可用的恢复路径：使用产品提供的任务续作 / 线程唤醒机制，或保持有界等待直到子任务给出本轮约定的 checkpoint。没有可用唤醒路径时，该子任务仍是总控当前动作，不能把它登记为“等待候选”后 idle。额度上限、客户端退出或其他平台级强制中断属于外部中断；恢复后第一步从最近候选、工具事件与工作树 checkpoint 续接，不把中断前的旧 `ACTIVE` 状态当成仍在执行。
 
-任务创建或消息发送不等于已经开工。Agent 实例和本次 Assignment 是两个身份：Assignment 依次为 `RESERVED → ACKED / ACTIVE → CANDIDATE`，Writer 的 delivered ACK 至少包含绝对仓库根、分支与 `HEAD / status`、精确所有权、首个复现或 RED、停止条件；项目可按风险追加运行环境与禁止范围。写入前和复用 Agent 前用临时 `scripts/assignment_lease_guard.py` 校验；上一 Assignment 未 `FROZEN / TERMINAL`、文件 / worktree 未释放，或新 Assignment 未取得完整 ACK 时不得写入。Reviewer 改为同候选 Writer 后失去该 revision 的非作者资格。若 ACK 前已经出现 WIP，立即冻结该现场并只指定一个恢复负责人；补齐 ACK 后从原 checkpoint 恢复，不因握手缺失自动丢弃有效 WIP，也不得叠加多个恢复 Writer。第一次缺少 delivered ACK 时，总控必须主动定向 follow-up，要求尽快收缩到可见 checkpoint，不能因执行者没有主动汇报而放任不管。第二次判定中断前必须同时核对**消息送达、任务活动、工具事件、工作树状态**四类证据；这只是中断决策所需的即时核对，不新建表格、报告或治理文档，调度收据用一行简记结论即可。`clean` 只说明尚未写文件，不能证明 idle，running、依赖安装、测试或其他新工具证据都表示仍有进展。只要任一类有新增，就要求交付 RED checkpoint 而不误中断；只有四类证据均无新增时，才回收对应 Writer 并从最近现场重建，不连带中断其他任务。连续两次无新增后停止轮询，不把等待写成进展。
+任务创建或消息发送不等于已经开工。Agent 实例和本次 Assignment 是两个身份；运行层可记录 `RESERVED → ACKED / ACTIVE → CANDIDATE` 握手 / 产物阶段，但这些不是项目主状态。Writer / Reviewer 的 delivered ACK 至少包含绝对仓库根、分支与 `HEAD / status`、精确所有权、首个复现或 RED、停止条件；项目可按风险追加运行环境与禁止范围。通过 `run_external_agent.mjs` 启动带 Assignment 身份的外部 Agent 时，必须先提供精确 ACK 文件，并由 `scripts/assignment_lease_guard.py` 对 Assignment、任务、Agent、仓库、分支和当前 HEAD 做启动前校验；不合规时在 Agent 进程 spawn 前失败。上一 Assignment 未 `FROZEN / TERMINAL`、文件 / worktree 未释放，或新 Assignment 未取得完整 ACK 时不得写入。Reviewer 改为同候选 Writer 后失去该 revision 的非作者资格。若 ACK 前已经出现 WIP，立即冻结该现场并只指定一个恢复负责人；补齐 ACK 后从原 checkpoint 恢复，不因握手缺失自动丢弃有效 WIP，也不得叠加多个恢复 Writer。第一次缺少 delivered ACK 时，总控必须主动定向 follow-up，要求尽快收缩到可见 checkpoint，不能因执行者没有主动汇报而放任不管。第二次判定中断前必须同时核对**消息送达、任务活动、工具事件、工作树状态**四类证据；即时核对不新建表格、报告或治理文档。
 
-回收只保护恢复点，不解决阻塞。回收后必须把该包置为 `RECOVERING`，先区分消息 / 握手、任务运行、工具故障、工作树 / 分支冲突、依赖环境和目标合同等原因，再选择恢复原执行者、从 checkpoint 补派、收缩范围、修复环境或由主 Agent 接管。只有恢复路径已经穷尽且确实等待用户、外部系统、凭证、付费授权或其他不可内部消解的状态时，工作包才标 `BLOCKED`。
+运行时 heartbeat / PID 只证明存活，不证明进展。只有 Git HEAD、tracked worktree status hash、测试 / 证据 receipt、artifact fingerprint 或 blocker evidence fingerprint 至少一项产生新的非空值，`assignment_progress` 才刷新进展 deadline；重复同一指纹只续 heartbeat。相同任务合同默认最多允许两次 recovery；第三次执行若再次失败、进展超时或进程失效，运行层派生 `health=budget_exhausted`，同一 Assignment 禁止再开 attempt 4；总控必须把策略变化固化为新的 Assignment 合同（缩范围、换 Agent/session/provider、修环境后的新执行、拆 Assignment、限时接管或形成真实外部 BLOCKED 证明），不能继续同路径重试。最终成功不会抹除历史 recovery count。
 
-Reviewer 通道失效时，优先按相同协议追问并补派独立 Reviewer。只有关键路径因此停滞、当前没有可安全补派的审查者，且总控未参与该实现时，总控才可进行一次限时、窄范围的非作者审查；给出 verdict 与证据后立即回到调度，不承担常驻或跨页面审查，也不能因此让其他无冲突 `READY` 闲置。
+回收只保护恢复点，不解决阻塞。既有台账回收后可把该包写作 `RECOVERING`（主状态仍为 `ACTIVE + health=recovering`），先区分消息 / 握手、任务运行、工具故障、工作树 / 分支冲突、依赖环境和目标合同等原因，再选择恢复原执行者、从 checkpoint 补派、收缩范围、修复环境或由主 Agent 接管。只有恢复路径已经穷尽且确实等待用户、外部系统、凭证、付费授权或其他不可内部消解的状态时，工作包才标 `BLOCKED`。
 
-工作包 `BLOCKED` 不自动映射为系统 Goal blocked。只有当前 Goal 和项目都没有可执行的 `READY / ACTIVE / RECOVERING / VERIFY`、没有待集成候选、内部恢复路径已经穷尽，并且所有剩余工作都等待同一个真实外部条件时，才可把系统 Goal 标记为 blocked；否则保持系统 Goal active，继续推进不受影响的旁路工作，并在原阻塞解除后恢复该里程碑。旁路工作不改变当前 Goal 的完成条件，也不需要创建第二个系统 Goal。
+Required Review `PASS` 后若声明已集成，`control_event_guard.py` 还必须用 Git 证明 candidate revision 是当前主线 revision 的祖先，并绑定 current-main regression evidence；只填写 main revision 字符串不能证明已集成。Reviewer 通道失效时，优先按相同协议追问并补派独立 Reviewer。只有关键路径因此停滞、当前没有可安全补派的审查者，且总控未参与该实现时，总控才可进行一次限时、窄范围的非作者审查；给出 verdict 与证据后立即回到调度，不承担常驻或跨页面审查，也不能因此让其他无冲突 `READY` 闲置。
+
+工作包 `BLOCKED` 不自动映射为系统 Goal blocked。只有当前 Goal 和项目都没有可执行的 `READY / ACTIVE / VERIFY`（legacy `RECOVERING` 计入 ACTIVE）、没有待集成候选、内部恢复路径已经穷尽，并且所有剩余工作都等待同一个真实外部条件时，才可把系统 Goal 标记为 blocked；否则保持系统 Goal active，继续推进不受影响的旁路工作，并在原阻塞解除后恢复该里程碑。旁路工作不改变当前 Goal 的完成条件，也不需要创建第二个系统 Goal。
 
 这里的“项目”必须按唯一台账的全部开放工作包解释，不能缩成当前 Goal、当前阶段、P0/P1、正在验收的端或总控主观选择的优先级。优先级只能决定先做哪个，不能让本来可执行的 P2、后续里程碑或另一端工作从存活扫描中消失；“不服务当前 Goal”“不占旁路槽”“以后再做”都不是不可执行原因。GUI、模拟器、显示会话、凭证、付费授权或外部 API 暂不可用时，只把依赖该资源的包标为等待；代码、文档、审查、另一端或其他环境不依赖它时仍须继续。
 
@@ -145,11 +149,11 @@ Goal 工具要求“同一阻塞连续出现三轮”只是系统阻塞的必要
 
 ## 主线、授权与完成
 
-项目应声明唯一主线分支，不在全局规则中硬编码 `main`。新功能候选必须记录集成归宿；未集成到主线前保持 `VERIFY`，不得标记最终 `DONE`。如果项目已记录持续 merge / push 授权，可以在门禁通过后执行；否则停在已验证本地提交和明确授权点。
+项目应声明唯一主线分支，不在全局规则中硬编码 `main`。新功能候选必须记录集成归宿；未集成到主线前保持 `VERIFY`，不得标记 `CLOSED`（legacy `DONE`）。如果项目已记录持续 merge / push 授权，可以在门禁通过后执行；否则停在已验证本地提交和明确授权点。
 
 合并、远端 push、PR、发布、部署、付费调用和破坏性操作分别遵守各自授权边界。功能验证通过不自动扩大外部写入权限。
 
-`DONE` 要求验收标准全部满足、证据已回写、实际 diff 已审查，并且集成状态与项目承诺一致。测试数量、文件存在、旧日志、HTTP 成功或 Agent 报告不能替代真实结果。
+`CLOSED`（legacy `DONE`）要求验收标准全部满足、证据已回写、实际 diff 已审查，并且集成状态与项目承诺一致。测试数量、文件存在、旧日志、HTTP 成功或 Agent 报告不能替代真实结果。
 
 ## Compact 与恢复
 

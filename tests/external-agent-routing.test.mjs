@@ -11,6 +11,22 @@ import { parseArgs, renderExternalAgentCard } from "../scripts/run_external_agen
 const skillRoot = fileURLToPath(new URL("../", import.meta.url));
 const adapter = path.join(skillRoot, "scripts", "run_external_agent.mjs");
 
+async function assignmentAckFile(directory, overrides = {}) {
+  const branch = execFileSync("git", ["-C", skillRoot, "branch", "--show-current"], { encoding: "utf8" }).trim();
+  const head = execFileSync("git", ["-C", skillRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const assignment = {
+    assignment_id: "a1", task_id: "T1", agent_id: "writer", state: "ACKED",
+    primary_goal: "finish bounded task", success_criteria: ["green"], owned_scope: ["scripts/run_external_agent.mjs"],
+    forbidden_scope: [], parallelizable: true, observed_modified_files: [],
+    ack: { repository_root: skillRoot, branch, head, status: "clean", owned_files: ["scripts/run_external_agent.mjs"], first_red: "red", stop_condition: "candidate" },
+    ...overrides,
+  };
+  if (overrides.ack) assignment.ack = { ...assignment.ack, ...overrides.ack };
+  const target = path.join(directory, `assignment-${Math.random().toString(36).slice(2)}.json`);
+  await writeFile(target, JSON.stringify(assignment));
+  return target;
+}
+
 async function fakeRunner(bin, name, versionArgument) {
   const target = path.join(bin, name);
   await writeFile(target, `#!/usr/bin/env node
@@ -27,6 +43,7 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
     hasXaiApiKey: Boolean(process.env.XAI_API_KEY),
     grokHome: process.env.GROK_HOME || null,
   }) + "\\n");
+  if (process.env.SPAWN_MARKER) require("node:fs").appendFileSync(process.env.SPAWN_MARKER, "spawned\\n");
 }
 `);
   await chmod(target, 0o755);
@@ -256,10 +273,10 @@ test("login mode delegates to the official CLI without a model request", async (
 });
 
 
-test("external execution emits provider-neutral start and terminal runtime receipts", async () => {
-  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-runtime-"));
+test("assignment-bound execute fails before agent spawn without delivered ACK", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-ack-missing-"));
   const grokHome = path.join(bin, "grok-home");
-  const receipts = path.join(bin, "receipts.jsonl");
+  const marker = path.join(bin, "spawned.txt");
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
@@ -267,7 +284,64 @@ test("external execution emits provider-neutral start and terminal runtime recei
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
     "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
-    "--attempt", "2", "--lease-id", "lease-2", "--runtime-receipts", receipts,
+  ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /assignment-ack/i);
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
+test("assignment-bound execute rejects stale or mismatched ACK before spawn", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-ack-bad-"));
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const badId = await assignmentAckFile(bin, { assignment_id: "other" });
+  const badHead = await assignmentAckFile(bin, { ack: { head: "deadbeef" } });
+  for (const ack of [badId, badHead]) {
+    const result = spawnSync(process.execPath, [adapter,
+      "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+      "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+      "--assignment-ack", ack,
+    ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
+    assert.equal(result.status, 1);
+  }
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
+test("assignment-bound execute spawns only after exact delivered ACK passes", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-ack-good-"));
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack,
+  ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal((await readFile(marker, "utf8")).trim(), "spawned");
+});
+
+test("external execution emits provider-neutral start and terminal runtime receipts", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-runtime-"));
+  const grokHome = path.join(bin, "grok-home");
+  const receipts = path.join(bin, "receipts.jsonl");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack, "--attempt", "2", "--lease-id", "lease-2", "--runtime-receipts", receipts,
   ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
   assert.equal(result.status, 0, result.stderr);
   const events = (await readFile(receipts, "utf8")).trim().split("\n").map(JSON.parse);

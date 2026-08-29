@@ -5,6 +5,7 @@ import argparse
 import json
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Sequence
 
 try:
@@ -34,7 +35,18 @@ def nonempty_list(value: Any) -> bool:
     )
 
 
-def validate_assignment(assignment: dict[str, Any], runtime_state: dict[str, Any] | None = None, now: datetime | None = None) -> list[str]:
+def validate_assignment(
+    assignment: dict[str, Any],
+    runtime_state: dict[str, Any] | None = None,
+    now: datetime | None = None,
+    *,
+    expected_assignment_id: str | None = None,
+    expected_task_id: str | None = None,
+    expected_agent_id: str | None = None,
+    expected_repository_root: str | None = None,
+    expected_branch: str | None = None,
+    expected_head: str | None = None,
+) -> list[str]:
     errors: list[str] = []
     assignment_id = str(assignment.get("assignment_id", "")).strip()
     agent_id = str(assignment.get("agent_id", "")).strip()
@@ -95,6 +107,23 @@ def validate_assignment(assignment: dict[str, Any], runtime_state: dict[str, Any
         if unexpected:
             errors.append("modified files exceed assignment ownership: " + ", ".join(unexpected))
 
+    if expected_assignment_id is not None and assignment_id != expected_assignment_id:
+        errors.append("assignment_id does not match launch contract")
+    if expected_task_id is not None and str(assignment.get("task_id", "")).strip() != expected_task_id:
+        errors.append("task_id does not match launch contract")
+    if expected_agent_id is not None and agent_id != expected_agent_id:
+        errors.append("agent_id does not match launch contract")
+    if isinstance(ack, dict):
+        if expected_repository_root is not None:
+            actual_root = str(Path(str(ack.get("repository_root", ""))).expanduser().resolve())
+            launch_root = str(Path(expected_repository_root).expanduser().resolve())
+            if actual_root != launch_root:
+                errors.append("ack.repository_root does not match launch repository")
+        if expected_branch is not None and str(ack.get("branch", "")).strip() != expected_branch:
+            errors.append("ack.branch does not match launch branch")
+        if expected_head is not None and str(ack.get("head", "")).strip() != expected_head:
+            errors.append("ack.head does not match launch revision")
+
     previous = assignment.get("previous_assignment")
     if previous is not None:
         if not isinstance(previous, dict):
@@ -148,13 +177,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Validate one ephemeral Agent assignment lease before writes or reuse."
     )
     parser.add_argument("assignment", nargs="?", default="-", help="JSON file or stdin")
+    parser.add_argument("--expected-assignment-id")
+    parser.add_argument("--expected-task-id")
+    parser.add_argument("--expected-agent-id")
+    parser.add_argument("--expected-repository-root")
+    parser.add_argument("--expected-branch")
+    parser.add_argument("--expected-head")
     args = parser.parse_args(argv)
     try:
         assignment = load_json(args.assignment)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"assignment-lease: invalid input: {error}")
         return 2
-    errors = validate_assignment(assignment)
+    errors = validate_assignment(
+        assignment,
+        expected_assignment_id=args.expected_assignment_id,
+        expected_task_id=args.expected_task_id,
+        expected_agent_id=args.expected_agent_id,
+        expected_repository_root=args.expected_repository_root,
+        expected_branch=args.expected_branch,
+        expected_head=args.expected_head,
+    )
     for error in errors:
         print(f"assignment-lease: blocked: {error}")
     if errors:
