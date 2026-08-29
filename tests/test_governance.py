@@ -869,6 +869,40 @@ class GovernanceTests(unittest.TestCase):
             )
             self.assertIn(f"candidate-1 integrate requires {missing_field}", errors)
 
+    def test_integrated_candidate_revisions_are_derived_from_git_ancestry(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        snapshot = {"candidate_packages": [
+            {"revision": "good", "decision": "integrate"},
+            {"revision": "bad", "decision": "integrate"},
+            {"revision": "queued", "decision": "queued"},
+        ]}
+        def fake_git(_root, *args, **kwargs):
+            self.assertEqual(args[:2], ("merge-base", "--is-ancestor"))
+            return SimpleNamespace(returncode=0 if args[2] == "good" else 1)
+        with patch.object(control_event_guard, "run_git", side_effect=fake_git):
+            revisions = control_event_guard.integrated_candidate_revisions(Path("/repo"), snapshot, "main-2")
+        self.assertEqual(revisions, {"good"})
+
+    def test_completed_integration_requires_candidate_to_be_ancestor_of_current_main(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "PASS"}],
+            "candidate_packages": [{
+                "revision": "candidate-1", "worktree": "/repo/wt", "task_id": "F1",
+                "integration_flow": "server-main", "decision": "integrate",
+                "controller_event_id": "event-1", "integrated_this_event": True,
+                "main_revision": "main-2", "regression_evidence": "current-main regression PASS",
+            }],
+            "new_assignments": [],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={}, expected_main_revision="main-2",
+            expected_integrated_revisions=set(),
+        )
+        self.assertIn("candidate-1 integrate requires candidate revision to be an ancestor of current main", errors)
+
     def test_review_pass_accepts_completed_integration_with_current_main_regression(self) -> None:
         snapshot = {
             **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
@@ -883,7 +917,8 @@ class GovernanceTests(unittest.TestCase):
             "new_assignments": [],
         }
         self.assertEqual(control_event_guard.validate_snapshot(
-            snapshot, ledger_ready_ids=set(), expected_candidates={}, expected_main_revision="main-2"
+            snapshot, ledger_ready_ids=set(), expected_candidates={}, expected_main_revision="main-2",
+            expected_integrated_revisions={"candidate-1"},
         ), [])
 
     def test_review_pass_accepts_ordered_integration_queue(self) -> None:

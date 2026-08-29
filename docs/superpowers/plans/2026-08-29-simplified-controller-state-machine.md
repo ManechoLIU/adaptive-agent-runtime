@@ -117,3 +117,16 @@
 - [x] Run `git diff --check` and `python3 -m py_compile scripts/*.py`.
 - [x] Review diff for accidental state proliferation or unrelated refactors.
 - [x] Commit `docs: teach simplified controller lifecycle`.
+
+### Post-review adversarial hardening
+
+**Files:**
+- Modify: `scripts/assignment_runtime.py`
+- Modify: `scripts/control_event_guard.py`
+- Modify: runtime/governance tests and governing docs
+
+- [x] Reproduce that a budget-exhausted Assignment incorrectly accepted attempt 4.
+- [x] Add RED tests requiring attempt 1 for new Assignments, exact +1 recovery attempts, and rejection of attempt 4 after two recoveries.
+- [x] Reproduce that an `integrate` receipt could claim an arbitrary candidate without proving Git ancestry.
+- [x] Add RED tests and a Git-derived ancestry helper requiring the candidate to be an ancestor of exact current main.
+- [x] Implement both root-cause fixes and rerun runtime/governance/Node regression suites.

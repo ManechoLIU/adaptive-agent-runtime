@@ -87,7 +87,7 @@ Default policy:
 
 - first execution: `recovery_count=0`;
 - at most two recovery attempts using the same task contract (`max_recoveries=2`);
-- after the budget is exhausted, the runtime must not silently retry the same path.
+- after the budget is exhausted, the same Assignment lineage must reject another attempt; any strategy-changing execution must be bound to a new Assignment contract.
 
 `budget_exhausted` requires a strategy-changing action before another execution can be accepted, such as:
 
@@ -115,7 +115,7 @@ The controller still decides priority and meaning, but it must not need to remem
 - live candidate without required review receipt -> require review Assignment/ACK;
 - required Review `FAIL` -> require same-work-package rework/recovery decision;
 - required Review `PASS` -> require candidate integration decision before the control event can close, unless an explicit ordered-integration constraint is recorded;
-- integration decision -> require exact main revision plus current-main regression/acceptance evidence before the work can become `CLOSED`;
+- integration decision -> require machine-verifiable candidate ancestry in the exact current main revision plus current-main regression/acceptance evidence before the work can become `CLOSED`;
 - Goal closure -> existing `goal_rollover` gate requires project recompute and next Goal / project-blocked proof / project-complete proof.
 
 These are evidence obligations inside control receipts, not additional main states.

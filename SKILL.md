@@ -31,7 +31,7 @@ description: Use when initializing or governing a long-running project, choosing
 2. 保护用户及其他任务的已有改动。
 3. 证据先于完成宣称；证据不足时说明边界。
 4. 达到停止条件立即结束，不为完备度扩展范围。
-5. heartbeat / PID 只证明存活；只有 Git / 测试 / artifact / blocker 指纹产生新证据才算进展。相同任务合同最多两次 recovery，预算耗尽后必须改变策略，不能继续同路径重试。
+5. heartbeat / PID 只证明存活；只有 Git / 测试 / artifact / blocker 指纹产生新证据才算进展。相同任务合同最多两次 recovery；预算耗尽后同一 Assignment 不得再开新 attempt，必须把策略变化固化为新 Assignment，不能继续同路径重试。
 6. 快速档不固定文件清单或工具次数：先按项目文档职责扫描真实影响，只更新受影响事实源；发现跨域变化、冲突或高风险边界时再升级，不能为了快而漏改，也不能因涉及多份文档自动升级。
 7. 多 Agent 数量是从 `0` 到运行环境上限的动态选择，不是流程配额。主 Agent 保留范围、共享契约、集成和最终验收；能以现有边界或小规模行为不变拆分隔离的实现优先分派，不默认由主 Agent 包揽全部用户可见模块。
 8. 需要分派子 Agent 或选择模型时，先读取 [Agent and model routing](references/agent-model-routing.md)，并按 [Agent delivery contract](references/agent-delivery-contract.md) 固化单目标、并行判断、统一结果、证据链与冲突裁决。Adaptive Delivery 是项目工作包、执行通道、模型与认证路由的唯一事实源，并直接执行已确认的路由合同；Task Navigator 等生命周期插件只管理用户可见任务容器、续接、标题和最近进展，不读取、执行或修改项目路由合同。

@@ -284,11 +284,40 @@ def unmerged_worktree_candidates(
     return dict(worktree_candidate_inventory(root, state_dir=state_dir)["live"])
 
 
+def integrated_candidate_revisions(
+    root: Path, snapshot: dict[str, Any], main_revision: str
+) -> set[str]:
+    merged: set[str] = set()
+    raw = snapshot.get("candidate_packages", [])
+    if not isinstance(raw, list):
+        return merged
+    for candidate in raw:
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("decision", "")).strip().lower() != "integrate":
+            continue
+        revision = str(candidate.get("revision", "")).strip()
+        if not revision:
+            continue
+        result = run_git(
+            root,
+            "merge-base",
+            "--is-ancestor",
+            revision,
+            main_revision,
+            check=False,
+        )
+        if result.returncode == 0:
+            merged.add(revision)
+    return merged
+
+
 def validate_candidate_queue(
     snapshot: dict[str, Any],
     *,
     expected_candidates: dict[str, str],
     expected_main_revision: str | None = None,
+    expected_integrated_revisions: set[str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     raw_candidates = snapshot.get("candidate_packages")
@@ -346,6 +375,12 @@ def validate_candidate_queue(
                 errors.append(f"{revision} integrate requires main_revision")
             elif expected_main_revision is not None and main_revision != expected_main_revision:
                 errors.append(f"{revision} main_revision does not match current main")
+            if expected_main_revision is not None and (
+                expected_integrated_revisions is None or revision not in expected_integrated_revisions
+            ):
+                errors.append(
+                    f"{revision} integrate requires candidate revision to be an ancestor of current main"
+                )
             if not str(candidate.get("regression_evidence", "")).strip():
                 errors.append(f"{revision} integrate requires regression_evidence")
         elif decision == "rework":
@@ -496,6 +531,7 @@ def validate_snapshot(
     affected_task_ids: set[str] | None = None,
     expected_candidates: dict[str, str] | None = None,
     expected_main_revision: str | None = None,
+    expected_integrated_revisions: set[str] | None = None,
     ledger_open_ids: set[str] | None = None,
     ledger_goal_ids: set[str] | None = None,
 ) -> list[str]:
@@ -663,6 +699,7 @@ def validate_snapshot(
                 snapshot,
                 expected_candidates=expected_candidates,
                 expected_main_revision=expected_main_revision,
+                expected_integrated_revisions=expected_integrated_revisions,
             )
         )
     errors.extend(validate_review_transitions(snapshot, expected_main_revision=expected_main_revision))
@@ -725,6 +762,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         repo_root = Path(args.repo).expanduser().resolve() if args.repo else None
         candidates = unmerged_worktree_candidates(repo_root) if repo_root else None
         main_revision = run_git(repo_root, "rev-parse", "main").stdout.strip() if repo_root else None
+        integrated_revisions = (
+            integrated_candidate_revisions(repo_root, snapshot, main_revision)
+            if repo_root and main_revision
+            else None
+        )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"control-event: invalid snapshot: {error}")
         return 2
@@ -738,6 +780,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         affected_task_ids=set(args.affected_task) if args.rule_revision else None,
         expected_candidates=candidates,
         expected_main_revision=main_revision,
+        expected_integrated_revisions=integrated_revisions,
         ledger_open_ids=open_ids,
         ledger_goal_ids=goal_ids,
     )

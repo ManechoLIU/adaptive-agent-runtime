@@ -80,7 +80,14 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
         if attempt == current_attempt and lease_id != existing.get("lease_id"): raise ValueError("runtime lease_id mismatch")
         if attempt == current_attempt and event_seq <= int(existing.get("last_event_seq", 0)): raise ValueError("runtime event_seq must increase")
     if event == "assignment_started":
-        if existing and attempt <= int(existing.get("attempt", 1)): raise ValueError("new runtime start requires a higher attempt")
+        if not existing and attempt != 1:
+            raise ValueError("new Assignment must start at attempt 1")
+        if existing:
+            current_attempt = int(existing.get("attempt", 1))
+            if attempt != current_attempt + 1:
+                raise ValueError("recovery attempt must increment by exactly one")
+            if int(existing.get("recovery_count", 0)) >= policy.max_recoveries:
+                raise ValueError("recovery budget exhausted; strategy change requires a new Assignment")
         previous_recovery_count = int(existing.get("recovery_count", 0)) if existing else 0
         recovery_count = previous_recovery_count + 1 if existing else 0
         lease = {f: receipt[f] for f in IDENTITY_FIELDS}
