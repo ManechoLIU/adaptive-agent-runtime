@@ -380,6 +380,11 @@ class GovernanceTests(unittest.TestCase):
                 "assignment_id": "F1-writer-1",
                 "agent_id": "/root/writer",
                 "state": "ACTIVE",
+                "primary_goal": "close F1 safely",
+                "success_criteria": ["targeted test green"],
+                "owned_scope": ["app/a.ts"],
+                "forbidden_scope": [],
+                "parallelizable": True,
                 "role": "writer",
                 "observed_modified_files": ["app/a.ts"],
                 "ack": {
@@ -396,10 +401,41 @@ class GovernanceTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_assignment_contract_requires_one_goal_and_parallel_decision(self) -> None:
+        assignment = {
+            "assignment_id": "F1-writer-1", "task_id": "F1", "agent_id": "/root/writer",
+            "state": "ACKED", "observed_modified_files": [],
+            "ack": {"repository_root": "/repo", "branch": "codex/f1", "head": "abc123",
+                    "status": "clean at ACK", "owned_files": ["app/a.ts"],
+                    "first_red": "test_f1 fails", "stop_condition": "candidate commit and receipt"},
+        }
+        errors = assignment_lease_guard.validate_assignment(assignment)
+        self.assertIn("primary_goal is required", errors)
+        self.assertIn("success_criteria must contain unique non-empty items", errors)
+        self.assertIn("owned_scope must contain unique non-empty items", errors)
+        self.assertIn("forbidden_scope must be a list", errors)
+        self.assertIn("parallelizable must be true or false", errors)
+
+    def test_assignment_contract_accepts_single_goal_and_parallel_reason(self) -> None:
+        assignment = {
+            "assignment_id": "F1-writer-1", "task_id": "F1", "agent_id": "/root/writer",
+            "state": "ACKED", "primary_goal": "close F1 migration guard",
+            "success_criteria": ["targeted test green", "scope-only diff"],
+            "owned_scope": ["app/a.ts"], "forbidden_scope": ["app/b.ts"],
+            "parallelizable": False, "dependency_reason": "shares migration contract with F0",
+            "observed_modified_files": [],
+            "ack": {"repository_root": "/repo", "branch": "codex/f1", "head": "abc123",
+                    "status": "clean at ACK", "owned_files": ["app/a.ts"],
+                    "first_red": "test_f1 fails", "stop_condition": "candidate commit and receipt"},
+        }
+        self.assertEqual(assignment_lease_guard.validate_assignment(assignment), [])
+
     def test_runtime_aware_active_requires_current_matching_lease(self) -> None:
         assignment = {
             "assignment_id": "F1-writer-1", "task_id": "F1", "agent_id": "/root/writer",
             "state": "ACTIVE", "worktree": "/tmp/wt", "observed_modified_files": [],
+            "primary_goal": "close F1 safely", "success_criteria": ["targeted test green"],
+            "owned_scope": ["app/a.ts"], "forbidden_scope": [], "parallelizable": True,
             "ack": {"repository_root": "/repo", "branch": "codex/f1", "head": "abc123",
                     "status": "clean at ACK", "owned_files": ["app/a.ts"],
                     "first_red": "test_f1 fails", "stop_condition": "candidate commit and receipt"},
@@ -413,6 +449,8 @@ class GovernanceTests(unittest.TestCase):
         assignment = {
             "assignment_id": "F1-writer-1", "task_id": "F1", "agent_id": "/root/writer",
             "state": "ACTIVE", "worktree": "/tmp/wt", "observed_modified_files": [],
+            "primary_goal": "close F1 safely", "success_criteria": ["targeted test green"],
+            "owned_scope": ["app/a.ts"], "forbidden_scope": [], "parallelizable": True,
             "ack": {"repository_root": "/repo", "branch": "codex/f1", "head": "abc123",
                     "status": "clean at ACK", "owned_files": ["app/a.ts"],
                     "first_red": "test_f1 fails", "stop_condition": "candidate commit and receipt"},

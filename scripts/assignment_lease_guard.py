@@ -46,6 +46,21 @@ def validate_assignment(assignment: dict[str, Any], runtime_state: dict[str, Any
     if state not in STATES:
         errors.append("state must be RESERVED, ACKED, ACTIVE, CANDIDATE, FROZEN, or TERMINAL")
 
+    if state in {"ACKED", "ACTIVE", "CANDIDATE"}:
+        if not isinstance(assignment.get("primary_goal"), str) or not assignment["primary_goal"].strip():
+            errors.append("primary_goal is required")
+        for field in ("success_criteria", "owned_scope"):
+            if not nonempty_list(assignment.get(field)):
+                errors.append(f"{field} must contain unique non-empty items")
+        forbidden = assignment.get("forbidden_scope")
+        if not isinstance(forbidden, list) or any(not isinstance(item, str) or not item.strip() for item in forbidden) or len(set(forbidden or [])) != len(forbidden or []):
+            errors.append("forbidden_scope must be a list")
+        parallelizable = assignment.get("parallelizable")
+        if not isinstance(parallelizable, bool):
+            errors.append("parallelizable must be true or false")
+        elif parallelizable is False and not str(assignment.get("dependency_reason", "")).strip():
+            errors.append("non-parallel assignment requires dependency_reason")
+
     observed = assignment.get("observed_modified_files", [])
     if not isinstance(observed, list) or any(
         not isinstance(item, str) or not item.strip() for item in observed

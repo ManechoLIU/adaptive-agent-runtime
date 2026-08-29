@@ -13,6 +13,7 @@ REFERENCE_PATHS = {
     "long-task": ROOT / "references" / "long-task-governance.md",
     "context": ROOT / "references" / "context-governance.md",
     "agent-routing": ROOT / "references" / "agent-model-routing.md",
+    "agent-delivery": ROOT / "references" / "agent-delivery-contract.md",
     "external-agent": ROOT / "references" / "external-agent-auth.md",
     "controller-scoring": ROOT / "references" / "controller-performance-scoring.md",
 }

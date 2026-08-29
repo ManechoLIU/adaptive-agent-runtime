@@ -1,0 +1,49 @@
+# Agent Delivery Contract
+
+Use this contract for delegated implementation, review, research, recovery, and external-agent work. It complements runtime liveness: runtime evidence proves an Agent is executing; this contract proves it is executing the right bounded goal and returning auditable evidence.
+
+## 1. Single Goal Assignment
+
+Every delivered Assignment in `ACKED`, `ACTIVE`, or `CANDIDATE` has exactly one `primary_goal` plus:
+
+- `success_criteria`: observable conditions that close the goal.
+- `owned_scope`: the bounded files, interfaces, decisions, or evidence the Agent may change or produce.
+- `forbidden_scope`: explicit nearby scope the Agent must not absorb. An empty list is allowed when ownership already makes the exclusion obvious.
+- `parallelizable`: explicit boolean. `false` requires `dependency_reason`; `true` still remains subject to READY, ownership, and shared-contract gates.
+
+RED, implementation, GREEN, review, and documentation are steps or evidence for one goal, not separate hidden goals. If the primary goal changes, freeze/terminate the current Assignment and issue a new one.
+
+## 2. Unified Result Envelope
+
+All execution transports (native subagent, Grok/Kimi runner, future A2A transport) normalize terminal delivery into the runtime terminal receipt. Required result semantics are:
+
+`task_id + assignment_id + attempt + lease_id + outcome + summary + evidence[] + artifacts[] + next_action + retry_class`
+
+When code or a versioned artifact is produced, `artifacts` must identify the exact revision/path. Transport-specific prose may be retained as evidence, but it is not the authoritative result.
+
+## 3. Evidence Chain
+
+For implementation work, completion evidence should form the shortest applicable causal chain:
+
+`RED/problem evidence -> exact revision/artifact -> GREEN/verification -> non-author review when required -> real-end acceptance when required -> integration decision`
+
+Every downstream decision cites exact upstream evidence. A claim such as “reviewer approved” or “tests passed” without the relevant revision/receipt is insufficient for integration.
+
+Research-only or diagnostic work uses the analogous chain `question -> source/observation -> finding -> independent check when risk requires -> decision` rather than fabricating RED/GREEN steps.
+
+## 4. Conflict Record
+
+When independent Agents or reviewers reach materially conflicting conclusions about the same revision/decision, do not silently choose one. Record one conflict object containing:
+
+- `conflict_id`, `task_id`, exact revision/decision under dispute;
+- each position with its evidence references;
+- `arbiter` (controller or explicitly assigned non-author adjudicator);
+- `decision`, `decision_evidence`, and resulting `next_action`.
+
+A conflict blocks the disputed integration decision until adjudicated. Code-review defects and design/requirements disputes may share this envelope but remain distinct conflict types.
+
+## 5. Progressive Scale-up
+
+A new provider, model route, or execution transport starts with bounded concurrency. Before raising concurrency, demonstrate one lifecycle covering dispatch/ACK, start, progress or checkpoint, terminal success, and one controlled failure/recovery path. Existing trusted routes do not repeat this ceremony unless the transport/auth/runtime contract materially changes.
+
+Do not build a full A2A server or transactional event bus merely to satisfy this contract. The governance contract is transport-neutral so a future A2A execution layer can replace the current runner without replacing Assignment, evidence, review, or integration governance.
