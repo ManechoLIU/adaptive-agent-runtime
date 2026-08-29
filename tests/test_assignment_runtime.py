@@ -312,3 +312,23 @@ class RuntimeCliCommonStateTests(unittest.TestCase):
             allowed = apply(wt, new_assignment)
             self.assertEqual(allowed.returncode, 0, allowed.stderr + allowed.stdout)
             self.assertIn("shared-a2", load_runtime_state(repo)["leases"])
+
+class WorktreeRuntimePathTests(unittest.TestCase):
+    def test_root_and_linked_worktree_share_runtime_state_path(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            wt = Path(d) / "wt"
+            root.mkdir()
+            subprocess.run(["git", "-C", str(root), "init", "-b", "main"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+            (root / "seed").write_text("seed\n")
+            subprocess.run(["git", "-C", str(root), "add", "seed"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-m", "seed"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "worktree", "add", "-b", "worker", str(wt)], check=True, capture_output=True)
+            self.assertEqual(runtime_state_path(root), runtime_state_path(wt))
+            self.assertEqual(runtime_state_path(root), (root / ".git" / "adaptive-delivery" / "runtime-assignments.json").resolve())
+            state = apply_receipt({}, receipt("assignment_started"), now=T0)
+            save_runtime_state(wt, state)
+            self.assertEqual(load_runtime_state(root)["leases"]["a1"]["session_id"], "s1")
