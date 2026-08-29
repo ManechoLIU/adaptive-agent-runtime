@@ -255,18 +255,37 @@ function validateAssignmentLaunch(options) {
   }
 }
 
-function emitRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
-  if (!options.runtimeReceipts) return;
+function validateRuleHandshake(options) {
+  if (!options.assignmentId) return;
+  const guard = fileURLToPath(new URL("./rule_handshake.py", import.meta.url));
+  const python = process.env.AD_PYTHON || "python3";
+  const result = spawnSync(python, [guard, "launch-guard", "--repo", options.cwd], { encoding: "utf8" });
+  if (result.error) throw new Error(`rule handshake validation failed: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(`rule handshake validation failed: ${(result.stdout || result.stderr).trim()}`);
+}
+
+function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
+  if (!options.assignmentId) return null;
   const required = [options.assignmentId, options.taskId, options.agentId, options.sessionId];
   if (required.some((value) => !value)) throw new Error("runtime receipts require assignment/task/agent/session identity");
-  const receipt = {
+  return {
     event_type: eventType, assignment_id: options.assignmentId, task_id: options.taskId,
     agent_id: options.agentId, provider: options.engine, session_id: options.sessionId,
     worktree: options.cwd, issued_at: new Date().toISOString(), attempt: options.attempt,
     lease_id: options.leaseId || `${options.assignmentId}:attempt:${options.attempt}`, event_seq: eventSeq,
     receipt_id: `${options.assignmentId}:${options.attempt}:${eventSeq}`, ...extra,
   };
-  appendFileSync(options.runtimeReceipts, `${JSON.stringify(receipt)}\n`, "utf8");
+}
+
+function recordRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
+  const receipt = buildRuntimeReceipt(options, eventType, eventSeq, extra);
+  if (!receipt) return;
+  const runtime = fileURLToPath(new URL("./assignment_runtime.py", import.meta.url));
+  const python = process.env.AD_PYTHON || "python3";
+  const result = spawnSync(python, [runtime, "apply", "--repo", options.cwd], { encoding: "utf8", input: JSON.stringify(receipt) });
+  if (result.error) throw new Error(`runtime receipt apply failed: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(`runtime receipt apply failed: ${(result.stdout || result.stderr).trim()}`);
+  if (options.runtimeReceipts) appendFileSync(options.runtimeReceipts, `${JSON.stringify(receipt)}\n`, "utf8");
 }
 
 function assertDirectory(cwd) {
@@ -503,20 +522,22 @@ async function main() {
       return;
     }
     validateAssignmentLaunch(options);
-    emitRuntimeReceipt(options, "assignment_started", 1);
+    validateRuleHandshake(options);
+    recordRuntimeReceipt(options, "assignment_started", 1);
+    let code;
     try {
-      const code = await executeExternalAgent(options);
-      emitRuntimeReceipt(options, "assignment_terminal", 2, {
-        terminal_state: code === 0 ? "completed" : "failed", outcome: code === 0 ? "success" : "failed",
-        summary: code === 0 ? "external agent completed" : `external agent exited ${code}`,
-        evidence: [], artifacts: [], next_action: code === 0 ? "none" : "inspect external agent output",
-        retry_class: code === 0 ? "none" : "provider_exit",
-      });
-      process.exitCode = code;
+      code = await executeExternalAgent(options);
     } catch (error) {
-      emitRuntimeReceipt(options, "assignment_terminal", 2, { terminal_state: "failed", outcome: "failed", summary: error.message, evidence: [], artifacts: [], next_action: "inspect external agent failure", retry_class: "transport_error" });
+      recordRuntimeReceipt(options, "assignment_terminal", 2, { terminal_state: "failed", outcome: "failed", summary: error.message, evidence: [], artifacts: [], next_action: "inspect external agent failure", retry_class: "transport_error" });
       throw error;
     }
+    recordRuntimeReceipt(options, "assignment_terminal", 2, {
+      terminal_state: code === 0 ? "completed" : "failed", outcome: code === 0 ? "success" : "failed",
+      summary: code === 0 ? "external agent completed" : `external agent exited ${code}`,
+      evidence: [], artifacts: [], next_action: code === 0 ? "none" : "inspect external agent output",
+      retry_class: code === 0 ? "none" : "provider_exit",
+    });
+    process.exitCode = code;
   } catch (error) {
     process.stderr.write(`adaptive-delivery-external-agent: ${error.message}\n`);
     process.exitCode = 1;
