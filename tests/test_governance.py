@@ -109,6 +109,54 @@ class GovernanceTests(unittest.TestCase):
             self.assertEqual(snap["assignment_liveness"]["T1"]["state"],"unhealthy")
             self.assertEqual(snap["assignment_liveness"]["T1"]["reason"],"lease_expired")
 
+    def test_project_snapshot_exposes_five_state_task_projection(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".git" / "adaptive-delivery").mkdir(parents=True)
+            (root / "TASK_LEDGER.md").write_text(
+                """# Ledger
+
+- 当前 Goal：`T3` active work
+- 下一可见检查点：`T3` checkpoint
+- 当前阻塞：none
+- 规则版本：test
+
+| ID | 状态 | 负责人 | 下一步 |
+|---|---|---|---|
+| `T1` | `PENDING` | 待分配 | wait |
+| `T2` | `READY` | 待分配 | dispatch |
+| `T3` | `ACTIVE` | Agent A | execute |
+| `T4` | `RECOVERING` | Agent B Assignment T4-RECOVERY-01 delivered ACK | 恢复动作：继续 checkpoint 测试 PASS |
+| `T5` | `VERIFY` | reviewer | review |
+| `T6` | `BLOCKED` | controller | external |
+| `T7` | `DONE` | controller | none |
+| `T8` | `SUPERSEDED` | controller | none |
+""",
+                encoding="utf-8",
+            )
+            def fake_git(_root, *args):
+                if args == ("rev-parse", "--show-toplevel"): return str(root)
+                if args == ("branch", "--show-current"): return "main"
+                if args == ("status", "--porcelain=v1", "--untracked-files=no"): return ""
+                if args == ("rev-parse", "HEAD"): return "abc"
+                raise AssertionError(args)
+            with patch.object(lifecycle_hook, "run_git", side_effect=fake_git), patch(
+                "control_event_guard.unmerged_worktree_candidates", return_value={}
+            ):
+                snap = lifecycle_hook.project_snapshot(root)
+            projection = snap["task_projection"]
+            self.assertEqual(projection["T1"]["main_state"], "READY")
+            self.assertFalse(projection["T1"]["dispatchable"])
+            self.assertEqual(projection["T2"]["main_state"], "READY")
+            self.assertTrue(projection["T2"]["dispatchable"])
+            self.assertEqual((projection["T3"]["main_state"], projection["T3"]["health"]), ("ACTIVE", "recovering"))
+            self.assertEqual((projection["T4"]["main_state"], projection["T4"]["health"]), ("ACTIVE", "recovering"))
+            self.assertEqual(projection["T5"]["main_state"], "VERIFY")
+            self.assertEqual(projection["T6"]["main_state"], "BLOCKED")
+            self.assertEqual((projection["T7"]["main_state"], projection["T7"]["closure_reason"]), ("CLOSED", "done"))
+            self.assertEqual((projection["T8"]["main_state"], projection["T8"]["closure_reason"]), ("CLOSED", "superseded"))
+
     def test_lifecycle_hook_surfaces_unhealthy_active_runtime_without_git_change(self) -> None:
         snapshot = {
             "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",

@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from lint_governance import task_rows
+try:
+    from controller_state import project_task_state
+except ModuleNotFoundError:
+    from scripts.controller_state import project_task_state
 
 
 STATE_ROOT = Path(
@@ -88,6 +92,13 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
     for task_id, ledger_state in ledger_states.items():
         if ledger_state in {"ACTIVE", "RECOVERING"} and task_id not in assignment_liveness:
             assignment_liveness[task_id] = {"ledger_state": ledger_state, "state": "unknown", "reason": "missing_runtime_lease"}
+    task_projection = {
+        task_id: project_task_state(
+            ledger_state,
+            runtime=assignment_liveness.get(task_id),
+        )
+        for task_id, ledger_state in ledger_states.items()
+    }
     return {
         "root": str(root),
         "ledger": str(ledger),
@@ -98,6 +109,7 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         "candidate_revisions": sorted(candidates.values()),
         "ledger_errors": ledger_errors,
         "assignment_liveness": assignment_liveness,
+        "task_projection": task_projection,
     }
 
 
