@@ -31,10 +31,16 @@ class RuntimeTests(unittest.TestCase):
         t=T0+timedelta(minutes=10); state=apply_receipt(state,receipt("assignment_progress",t,last_observed_head="abc"),now=t)
         lease=state["leases"]["a1"]
         self.assertEqual(lease["lease_expires_at"],(t+timedelta(minutes=20)).isoformat()); self.assertEqual(lease["progress_deadline_at"],(t+timedelta(minutes=30)).isoformat())
-    def test_progress_stale_then_unhealthy_after_grace(self):
-        state=apply_receipt({},receipt("assignment_started"),now=T0); lease=state["leases"]["a1"]
+    def test_progress_stale_then_unhealthy_after_grace_while_heartbeats_continue(self):
+        state=apply_receipt({},receipt("assignment_started"),now=T0)
+        for minute in (15, 30):
+            t=T0+timedelta(minutes=minute)
+            state=apply_receipt(state,receipt("assignment_heartbeat",t),now=t)
+        lease=state["leases"]["a1"]
         self.assertEqual(evaluate_lease(lease,now=T0+timedelta(minutes=31))["state"],"progress_stale")
-        self.assertEqual(evaluate_lease(lease,now=T0+timedelta(minutes=46))["state"],"unhealthy")
+        t=T0+timedelta(minutes=44)
+        state=apply_receipt(state,receipt("assignment_heartbeat",t),now=t)
+        self.assertEqual(evaluate_lease(state["leases"]["a1"],now=T0+timedelta(minutes=46))["state"],"unhealthy")
     def test_lease_expiry_is_unhealthy(self):
         state=apply_receipt({},receipt("assignment_started"),now=T0)
         self.assertEqual(evaluate_lease(state["leases"]["a1"],now=T0+timedelta(minutes=21))["reason"],"lease_expired")
