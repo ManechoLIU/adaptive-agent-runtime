@@ -47,6 +47,46 @@ def has_owner(record: dict[str, str]) -> bool:
     )
 
 
+TASK_LIKE_ID = re.compile(
+    r"(?<![A-Za-z0-9_/-])([A-Z][A-Z0-9]*(?:-[A-Z0-9]+){2,})(?![A-Za-z0-9_/-])"
+)
+
+
+def looks_like_task_id(identifier: str) -> bool:
+    return any(
+        any(character.isalpha() for character in segment)
+        and any(character.isdigit() for character in segment)
+        for segment in identifier.split("-")
+    )
+
+
+RECOVERY_ACK = re.compile(r"(?:delivered\s+ACK|完整\s*(?:delivered\s*)?ACK|\bACK\b)", re.I)
+RECOVERY_ASSIGNMENT = re.compile(
+    r"(?:\bAssignment\b|[A-Z][A-Z0-9]*(?:-[A-Z0-9]+){2,})", re.I
+)
+RECOVERY_ACTION_EVIDENCE = re.compile(
+    r"(?:已完成|已执行|已修复|已恢复|已复验|已合入|已提交|已回收).{0,100}"
+    r"(?:PASS|FAIL|[0-9a-f]{7,40}|checkpoint|检查点|测试|验证|收据|main)",
+    re.I,
+)
+
+
+def undeclared_next_task_ids(record: dict[str, str], declared_ids: set[str]) -> set[str]:
+    return {
+        match.group(1)
+        for match in TASK_LIKE_ID.finditer(record["next_action"])
+        if looks_like_task_id(match.group(1)) and match.group(1) not in declared_ids
+    }
+
+
+def has_recovery_execution_binding(record: dict[str, str]) -> bool:
+    row = record["row"]
+    assignment_ack = bool(RECOVERY_ACK.search(row)) and bool(
+        RECOVERY_ASSIGNMENT.search(record["owner"])
+    )
+    return assignment_ack or bool(RECOVERY_ACTION_EVIDENCE.search(row))
+
+
 def validate_ledger(text: str) -> list[str]:
     errors: list[str] = []
     if RUNTIME_CAPACITY_POINTER.search(text):
@@ -55,6 +95,7 @@ def validate_ledger(text: str) -> list[str]:
         )
     records = task_records(text)
     identifiers = [record["id"] for record in records]
+    declared_ids = set(identifiers)
     duplicate_ids = sorted(
         identifier for identifier in set(identifiers) if identifiers.count(identifier) > 1
     )
@@ -82,14 +123,26 @@ def validate_ledger(text: str) -> list[str]:
     checkpoint = pointer(text, "下一可见检查点")
     if not checkpoint:
         errors.append("next visible checkpoint is required")
-    elif open_ids and not referenced_ids(checkpoint, open_ids):
-        errors.append("next visible checkpoint must reference at least one open task ID")
+    else:
+        if open_ids and not referenced_ids(checkpoint, open_ids):
+            errors.append("next visible checkpoint must reference at least one open task ID")
+        for match in TASK_LIKE_ID.finditer(checkpoint):
+            checkpoint_id = match.group(1)
+            if looks_like_task_id(checkpoint_id) and checkpoint_id not in declared_ids:
+                errors.append(
+                    f"checkpoint references undeclared task ID {checkpoint_id}; add an explicit task row before dispatch"
+                )
 
     for label in ("当前阻塞", "规则版本"):
         if not pointer(text, label):
             errors.append(f"{label} is required")
 
     for record in records:
+        hidden_task_ids = sorted(undeclared_next_task_ids(record, declared_ids))
+        for hidden_task_id in hidden_task_ids:
+            errors.append(
+                f"{record['id']} next action references undeclared task ID {hidden_task_id}; add an explicit task row before dispatch"
+            )
         if record["status"] not in WORK_IN_FLIGHT_STATES:
             continue
         if not has_owner(record):
@@ -104,6 +157,10 @@ def validate_ledger(text: str) -> list[str]:
                 re.IGNORECASE,
             ):
                 errors.append(f"{record['id']} RECOVERING next step lacks a recovery action/checkpoint")
+            if not has_recovery_execution_binding(record):
+                errors.append(
+                    f"{record['id']} RECOVERING requires a delivered assignment ACK or a verifiable recovery action"
+                )
     return errors
 
 

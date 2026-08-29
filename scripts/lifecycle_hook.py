@@ -54,6 +54,9 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
     if ledger is None:
         return None
     text = ledger.read_text(encoding="utf-8")
+    from ledger_consistency_guard import validate_ledger
+
+    ledger_errors = validate_ledger(text)
     ready_ids = sorted(
         identifier
         for identifier, status in task_rows(text)
@@ -71,6 +74,7 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         "worktree_status_sha256": sha256_bytes(status.encode("utf-8")),
         "ready_ids": ready_ids,
         "candidate_revisions": sorted(candidates.values()),
+        "ledger_errors": ledger_errors,
     }
 
 
@@ -102,12 +106,17 @@ def lifecycle_triggers(
         f"CANDIDATE:{revision}"
         for revision in snapshot.get("candidate_revisions", [])
     )
+    triggers.extend(
+        f"LEDGER_INVALID:{error}" for error in snapshot.get("ledger_errors", [])
+    )
     previous = prior_state.get("snapshot") if isinstance(prior_state, dict) else None
     if isinstance(previous, dict):
         for field, label in (
             ("head", "main_head_changed"),
             ("ledger_sha256", "ledger_changed"),
             ("worktree_status_sha256", "main_worktree_changed"),
+            ("ready_ids", "ready_set_changed"),
+            ("candidate_revisions", "candidate_queue_changed"),
         ):
             if previous.get(field) != snapshot.get(field):
                 triggers.append(label)
@@ -194,6 +203,15 @@ def evaluate_event(
     state.update({"pending_control_event": pending, "triggers": triggers})
 
     if event_name == "PostToolUse":
+        progress_labels = {
+            "main_head_changed",
+            "ledger_changed",
+            "main_worktree_changed",
+            "ready_set_changed",
+            "candidate_queue_changed",
+        }
+        if progress_labels.intersection(detected):
+            state["stop_continuations"] = 0
         if not pending:
             return {}, state
         context = continuation_reason(
@@ -216,7 +234,7 @@ def evaluate_event(
             list(snapshot.get("ready_ids", [])),
             list(snapshot.get("candidate_revisions", [])),
         )
-        if continuations <= 3:
+        if continuations <= 1:
             return {"decision": "block", "reason": reason}, state
         return {
             "continue": False,

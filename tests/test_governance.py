@@ -88,6 +88,30 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("MINI-READY", output["hookSpecificOutput"]["additionalContext"])
         self.assertTrue(next_state["pending_control_event"])
 
+    def test_lifecycle_hook_surfaces_invalid_ledger_at_session_start(self) -> None:
+        output, next_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+            },
+            snapshot={
+                "head": "abc123",
+                "ledger_sha256": "ledger-1",
+                "worktree_status_sha256": "status-1",
+                "ready_ids": [],
+                "candidate_revisions": [],
+                "ledger_errors": [
+                    "M2-F2 next action references undeclared task ID M2-F2-DEV-WEREAD-QA-01"
+                ],
+            },
+            prior_state=None,
+        )
+
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("LEDGER_INVALID", context)
+        self.assertTrue(next_state["pending_control_event"])
+
     def test_lifecycle_hook_surfaces_unmerged_candidate(self) -> None:
         snapshot = {
             "head": "abc123",
@@ -136,6 +160,76 @@ class GovernanceTests(unittest.TestCase):
         self.assertEqual(output["decision"], "block")
         self.assertIn("WEB-READY", output["reason"])
         self.assertTrue(next_state["pending_control_event"])
+
+    def test_lifecycle_hook_second_stop_without_progress_fails_closed(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": ["WEB-READY"],
+            "candidate_revisions": [],
+        }
+        first_output, first_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+            },
+            snapshot=snapshot,
+            prior_state={
+                "pending_control_event": True,
+                "triggers": ["READY:WEB-READY"],
+            },
+        )
+        self.assertEqual(first_output["decision"], "block")
+
+        second_output, second_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+            },
+            snapshot=snapshot,
+            prior_state=first_state,
+        )
+
+        self.assertFalse(second_output["continue"])
+        self.assertIn("failed closed", second_output["stopReason"])
+        self.assertEqual(second_state["stop_continuations"], 2)
+
+    def test_lifecycle_hook_snapshot_progress_resets_stop_continuation(self) -> None:
+        output, next_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status --short"},
+                "tool_response": {"output": ""},
+            },
+            snapshot={
+                "head": "abc123",
+                "ledger_sha256": "ledger-2",
+                "worktree_status_sha256": "status-1",
+                "ready_ids": ["WEB-READY"],
+                "candidate_revisions": [],
+            },
+            prior_state={
+                "pending_control_event": True,
+                "triggers": ["READY:WEB-READY"],
+                "stop_continuations": 1,
+                "snapshot": {
+                    "head": "abc123",
+                    "ledger_sha256": "ledger-1",
+                    "worktree_status_sha256": "status-1",
+                    "ready_ids": ["WEB-READY"],
+                    "candidate_revisions": [],
+                },
+            },
+        )
+
+        self.assertEqual(output["hookSpecificOutput"]["hookEventName"], "PostToolUse")
+        self.assertEqual(next_state["stop_continuations"], 0)
 
     def test_lifecycle_hook_successful_guard_receipt_clears_pending_event(self) -> None:
         output, next_state = lifecycle_hook.evaluate_event(
@@ -285,6 +379,44 @@ class GovernanceTests(unittest.TestCase):
             "reused agent requires previous assignment to be FROZEN or TERMINAL",
             errors,
         )
+
+    def test_control_event_guard_cli_rejects_invalid_ledger_contract(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "TASK_LEDGER.md"
+            ledger.write_text(
+                """# Ledger
+
+- 当前 Goal：`M2-F2` 完成微信读书内部闭环
+- 下一可见检查点：`M2-F2` 形成真实端证据
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| M2-F2 | `ACTIVE` / 项目总控 | 下一步派发 `M2-F2-DEV-WEREAD-QA-01` 后继续 |
+""",
+                encoding="utf-8",
+            )
+            snapshot = self.complete_event_receipt()
+            snapshot.update(
+                {
+                    "ledger_sha256": control_event_guard.ledger_sha256(ledger),
+                    "available_slots": 0,
+                    "ready_packages": [],
+                    "required_reviews": [],
+                }
+            )
+            receipt = root / "receipt.json"
+            receipt.write_text(json.dumps(snapshot), encoding="utf-8")
+
+            result = control_event_guard.main(
+                [str(receipt), "--ledger", str(ledger)]
+            )
+
+            self.assertEqual(result, 1)
 
     def test_control_event_guard_requires_every_ready_decision(self) -> None:
         snapshot = {
@@ -823,7 +955,97 @@ class GovernanceTests(unittest.TestCase):
 | ID | 状态 / 负责人 | 证据 / 下一步 |
 | --- | --- | --- |
 | F1 | `ACTIVE` / Agent A | 完成登录恢复 Case |
-| F2 | `RECOVERING` / Agent B | 修复 RED 后在 checkpoint 复审 |
+| F2 | `RECOVERING` / Agent B Assignment F2-RECOVERY-01 | delivered ACK；修复 RED 后在 checkpoint 复审 |
+"""
+
+        self.assertEqual(ledger_consistency_guard.validate_ledger(text), [])
+
+    def test_ledger_consistency_rejects_implicit_next_task_not_in_task_table(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：`M2-F2` 完成微信读书内部闭环
+- 下一可见检查点：`M2-F2` 形成真实端证据
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| M2-F2 | `ACTIVE` / 项目总控 | 下一步派发 `M2-F2-DEV-WEREAD-QA-01` 后继续 |
+"""
+
+        errors = ledger_consistency_guard.validate_ledger(text)
+
+        self.assertTrue(
+            any("undeclared task ID M2-F2-DEV-WEREAD-QA-01" in error for error in errors)
+        )
+
+    def test_ledger_consistency_rejects_implicit_task_in_visible_checkpoint(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：`M2-F2` 完成微信读书内部闭环
+- 下一可见检查点：`M2-F2` 的 `M2-F2-DEV-WEREAD-QA-01` 先形成候选
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| M2-F2 | `ACTIVE` / 项目总控 | 完成当前父任务 |
+"""
+
+        errors = ledger_consistency_guard.validate_ledger(text)
+
+        self.assertTrue(
+            any("checkpoint references undeclared task ID M2-F2-DEV-WEREAD-QA-01" in error for error in errors)
+        )
+
+    def test_ledger_consistency_does_not_treat_crypto_algorithm_as_task_id(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：`M1-F3A-A` 完成加密闭环
+- 下一可见检查点：`M1-F3A-A` 完成验证
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| M1-F3A-A | `ACTIVE` / Agent A | 使用 AES-256-GCM 完成加密验证 |
+"""
+
+        errors = ledger_consistency_guard.validate_ledger(text)
+
+        self.assertFalse(any("AES-256-GCM" in error for error in errors))
+
+    def test_ledger_consistency_recovering_requires_real_execution_binding(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：`M1-F4-B` 修复后端闭环
+- 下一可见检查点：`M1-F4-B` 恢复执行
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| M1-F4-B | `RECOVERING` / 项目总控 | 后续只在形成新的可验证执行路由后再恢复 |
+"""
+
+        errors = ledger_consistency_guard.validate_ledger(text)
+
+        self.assertIn(
+            "M1-F4-B RECOVERING requires a delivered assignment ACK or a verifiable recovery action",
+            errors,
+        )
+
+    def test_ledger_consistency_allows_recovering_with_delivered_assignment_ack(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：`M2-F2` 完成微信读书内部闭环
+- 下一可见检查点：`M2-F2` 候选进入代码门
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 固定边界与当前证据 | 依赖、阻塞与下一步 |
+| --- | --- | --- | --- |
+| M2-F2 | `RECOVERING` / 外部 Kimi `M2-F2-DEV-WEREAD-QA-01 / kimi-k3 / api / high` | Writer 已完整 delivered ACK，lease guard PASS | 恢复动作：只实现 develop-only port，候选先过非作者代码门 |
 """
 
         self.assertEqual(ledger_consistency_guard.validate_ledger(text), [])

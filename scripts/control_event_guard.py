@@ -420,6 +420,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         affected_task_ids=set(args.affected_task) if args.rule_revision else None,
         expected_candidates=candidates,
     )
+    from ledger_consistency_guard import validate_ledger
+
+    errors.extend(
+        f"ledger consistency: {error}"
+        for error in validate_ledger(ledger.read_text(encoding="utf-8"))
+    )
     for error in errors:
         print(f"control-event: blocked: {error}")
     if errors:

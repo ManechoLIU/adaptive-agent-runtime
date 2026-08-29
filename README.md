@@ -276,10 +276,10 @@ python3 scripts/control_event_guard.py \
 
 `scripts/lifecycle_hook.py` 把持续总控的控制事件接到 Codex 生命周期：
 
-- `SessionStart`：读取 canonical `main` 与唯一台账基线；
+- `SessionStart`：读取 canonical `main` 与唯一台账基线，并立即暴露台账一致性错误；
 - `PostToolUse`：主线、工作区、台账、`READY` 或任一 worktree 未合入候选改变后立即给总控追加控制上下文；
 - `SubagentStop`：把子 Agent 完成登记为待审候选事件；
-- `Stop`：仍有待处理事件或 `READY` 且没有通过的控制收据时，自动续作而不是静默 idle。
+- `Stop`：仍有待处理事件且没有通过的控制收据时，只允许一次受控续作；若快照没有真实变化，第二次 Stop 直接 fail closed，避免把长回合伪装成推进。
 
 先把唯一总控登记到本机状态；临时 Writer / Reviewer 不登记：
 
@@ -314,7 +314,7 @@ python3 scripts/assignment_lease_guard.py assignment.json
 python3 scripts/ledger_consistency_guard.py /path/to/project/TASK_LEDGER.md
 ```
 
-任务表是状态唯一权威。门禁检查 Goal / 下一检查点是否指向开放任务、`ACTIVE / RECOVERING` 是否有负责人、恢复项是否有恢复动作，以及旧式顶部活动指针是否与任务表一致；实时槽位和 Writer / Reviewer 数量只能出现在临时控制收据，不能在台账顶部复制。新项目直接启用；旧项目先完成一次不阻塞开发的范围单一迁移，再把它放到台账提交和总控 yield 前。
+任务表是状态唯一权威。门禁检查 Goal / 下一检查点是否指向开放任务；“下一可见检查点”或任务“下一步”里出现的任务式 ID 必须先有显式任务行；`ACTIVE / RECOVERING` 必须有负责人，且 `RECOVERING` 必须绑定 delivered Assignment ACK 或已完成的可验证恢复动作；旧式顶部活动指针仍须与任务表一致。`control_event_guard.py` 现在也会内联执行这组一致性检查，不能靠事件收据绕过。实时槽位和 Writer / Reviewer 数量只能出现在临时控制收据，不能在台账顶部复制。新项目直接启用；旧项目先完成一次不阻塞开发的范围单一迁移，再把它放到台账提交和总控 yield 前。
 
 ### 复用验证收据
 
