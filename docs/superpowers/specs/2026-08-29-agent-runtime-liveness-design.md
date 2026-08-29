@@ -250,3 +250,38 @@ The change is complete only when all of the following are true:
 - `control_event_guard.py --repo` refuses a success receipt while stale/unhealthy ACTIVE or stalled RECOVERING tasks exist.
 - Existing candidate/READY/review/retained-candidate semantics continue to pass regression tests.
 - SelfAlone can consume the upgraded adaptive-delivery rules without direct edits to SelfAlone product code.
+
+## Reliable Attempt Protocol (A2A-Compatible, Serverless for Now)
+
+The runtime contract is extended with the reliability semantics worth preserving before a dedicated A2A Server exists. Adaptive Delivery remains the project governance/control plane; this layer only makes Worker execution durable and unambiguous.
+
+### Attempt Fencing
+
+Every execution generation has a monotonic positive `attempt` and a unique `lease_id`. A recovery/restart creates a new attempt/lease. Receipts from an older attempt or different lease are stale and MUST NOT mutate the current lease, even if they arrive late with a success outcome.
+
+### Monotonic Event Sequence
+
+Every receipt carries a positive `event_seq`, monotonic within `(assignment_id, attempt, lease_id)`. Duplicate event keys are idempotent only when their canonical payload is byte/semantic equivalent. A lower sequence, conflicting duplicate, or sequence attached to a stale attempt is rejected without overwriting current state.
+
+### Structured Terminal Outcome
+
+`assignment_terminal` carries a normalized result contract:
+
+- `outcome`: `success | failed | blocked | cancelled | recoverable_failure`
+- `summary`: non-empty concise result
+- `evidence`: list of evidence/checkpoint references (may be empty only for cancellation/block before execution)
+- `artifacts`: produced candidate/artifact references
+- `next_action`: explicit next action or `none`
+- `retry_class`: normalized retry classification
+
+Transport ACK, empty content, malformed output, or receipt delivery alone never implies success.
+
+### Retry Classification and Budget
+
+Automatic retry is allowed only for transient execution failures: `rate_limit`, `transport_error`, `provider_5xx`, `capacity`, and `lease_timeout`. Deterministic/business failures such as `invalid_input`, `schema_error`, `permission`, `deterministic_failure`, and `policy_block` do not auto-retry.
+
+Default automatic retry budget is 3 total attempts. Backoff is exponential with jitter and must be represented as a retry decision/receipt rather than hidden looping. Exhaustion enters the recovery path and blocks only the work package that truly depends on the failed execution.
+
+### Future A2A Server Boundary
+
+No dedicated A2A Server is introduced now. The receipt/attempt contract is deliberately transport-neutral so a future A2A Server can own durable task persistence, retry, cancellation, resume and Worker routing without changing Adaptive Delivery's Goal/READY/candidate/review/integration governance semantics.

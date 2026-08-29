@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `ACTIVE` and `RECOVERING` mechanically depend on current runtime evidence, with 20-minute heartbeat leases, 30-minute progress deadlines, and a 15-minute stale-progress grace.
+**Goal:** Make `ACTIVE` and `RECOVERING` mechanically depend on current runtime evidence, and make Worker execution safe against stale attempts, duplicate/out-of-order events, ambiguous terminal results, and uncontrolled retries.
 
 **Architecture:** Add one canonical runtime-lease module and normalized lifecycle receipt store, then join that evidence into assignment validation, lifecycle snapshots, terminal control-event gating, and external/native lifecycle bridges. Static lint compatibility remains, but project control-event closure fails closed for stale or missing runtime evidence.
 
@@ -19,6 +19,10 @@
 - Do not synthesize healthy runtime evidence from ledger text or delivered ACK.
 - Do not modify SelfAlone product code or directly mutate its task ledger/control plane.
 - Preserve READY/candidate/review/retained-candidate semantics.
+- Every runtime receipt uses `attempt`, `lease_id`, and monotonic `event_seq`; stale attempts cannot overwrite current state.
+- Terminal receipts use structured `outcome`; transport ACK never implies success.
+- Automatic retries are transient-only, capped at 3 attempts, with exponential backoff + jitter.
+- Keep the protocol transport-neutral so a future A2A Server can replace the execution transport without replacing Adaptive Delivery governance.
 
 ---
 
@@ -53,6 +57,21 @@
 - [ ] Add runtime-context validation with no change to existing static-only callers.
 - [ ] Run scoped governance tests and verify GREEN.
 - [ ] Commit validation changes.
+
+### Task 2B: Attempt fencing, event sequencing, structured outcomes, and retry policy
+
+**Files:**
+- Modify: `scripts/assignment_runtime.py`
+- Modify: `tests/test_assignment_runtime.py`
+
+**Interfaces:**
+- Extends runtime receipts with `attempt`, `lease_id`, `event_seq`, structured terminal `outcome`, and retry decisions.
+
+- [ ] Add failing tests for stale-attempt late success, duplicate idempotent receipt, conflicting duplicate, out-of-order sequence, new-attempt fencing, terminal outcome validation, retry classification, max 3 attempts, and deterministic failures not retrying.
+- [ ] Verify RED.
+- [ ] Implement minimal attempt/event/outcome/retry policy without adding an A2A Server.
+- [ ] Verify GREEN and runtime regressions.
+- [ ] Commit and push this independently testable stage to `main`.
 
 ### Task 3: Lifecycle snapshot and liveness triggers
 
