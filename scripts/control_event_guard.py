@@ -740,6 +740,21 @@ def validate_snapshot(
     return errors
 
 
+def canonical_rule_handshake_errors(repo: Path, ledger: Path) -> list[str]:
+    try:
+        try:
+            from rule_handshake import evaluate_rule_handshake
+        except ModuleNotFoundError:
+            from scripts.rule_handshake import evaluate_rule_handshake
+        status = evaluate_rule_handshake(repo, ledger=ledger)
+    except (OSError, ValueError) as error:
+        return [f"rule handshake integrity check failed: {error}"]
+    if status.get("blocking") is True:
+        revision = status.get("installed_revision") or "unknown"
+        return [f"rule handshake {status.get('state')} for installed revision {revision}"]
+    return []
+
+
 def load_snapshot(path: str) -> dict[str, Any]:
     if path == "-":
         data = json.load(sys.stdin)
@@ -815,6 +830,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ledger_goal_ids=goal_ids,
         ledger_work_in_flight=work_in_flight,
     )
+    if repo_root is not None:
+        errors.extend(canonical_rule_handshake_errors(repo_root, ledger))
     from ledger_consistency_guard import validate_ledger
 
     errors.extend(

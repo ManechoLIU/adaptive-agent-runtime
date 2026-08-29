@@ -275,6 +275,18 @@ class SkillStructureTests(unittest.TestCase):
         ):
             self.assertIn(phrase, long_task)
 
+    def test_long_task_rule_updates_use_machine_handshake_and_common_runtime_state(self):
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+        for phrase in (
+            "scripts/install_skill.py",
+            "scripts/rule_handshake.py ack",
+            "rule_update_pending:<revision>",
+            "git rev-parse --git-common-dir",
+            "runtime-assignments.json",
+            "spawn 前 fail closed",
+        ):
+            self.assertIn(phrase, long_task)
+
     def test_long_task_controller_uses_evidence_before_interrupt_or_replacement(self):
         long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
 

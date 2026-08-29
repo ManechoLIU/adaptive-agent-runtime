@@ -117,7 +117,7 @@ yield 前先清空总控本人当前即可执行的动作：已交候选的实�
 
 任务创建或消息发送不等于已经开工。Agent 实例和本次 Assignment 是两个身份；运行层可记录 `RESERVED → ACKED / ACTIVE → CANDIDATE` 握手 / 产物阶段，但这些不是项目主状态。Writer / Reviewer 的 delivered ACK 至少包含绝对仓库根、分支与 `HEAD / status`、精确所有权、首个复现或 RED、停止条件；项目可按风险追加运行环境与禁止范围。通过 `run_external_agent.mjs` 启动带 Assignment 身份的外部 Agent 时，必须先提供精确 ACK 文件，并由 `scripts/assignment_lease_guard.py` 对 Assignment、任务、Agent、仓库、分支和当前 HEAD 做启动前校验；不合规时在 Agent 进程 spawn 前失败。上一 Assignment 未 `FROZEN / TERMINAL`、文件 / worktree 未释放，或新 Assignment 未取得完整 ACK 时不得写入。Reviewer 改为同候选 Writer 后失去该 revision 的非作者资格。若 ACK 前已经出现 WIP，立即冻结该现场并只指定一个恢复负责人；补齐 ACK 后从原 checkpoint 恢复，不因握手缺失自动丢弃有效 WIP，也不得叠加多个恢复 Writer。第一次缺少 delivered ACK 时，总控必须主动定向 follow-up，要求尽快收缩到可见 checkpoint，不能因执行者没有主动汇报而放任不管。第二次判定中断前必须同时核对**消息送达、任务活动、工具事件、工作树状态**四类证据；即时核对不新建表格、报告或治理文档。
 
-运行时 heartbeat / PID 只证明存活，不证明进展。只有 Git HEAD、tracked worktree status hash、测试 / 证据 receipt、artifact fingerprint 或 blocker evidence fingerprint 至少一项产生新的非空值，`assignment_progress` 才刷新进展 deadline；重复同一指纹只续 heartbeat。相同任务合同默认最多允许两次 recovery；第三次执行若再次失败、进展超时或进程失效，运行层派生 `health=budget_exhausted`，同一 Assignment 禁止再开 attempt 4；总控必须把策略变化固化为新的 Assignment 合同（缩范围、换 Agent/session/provider、修环境后的新执行、拆 Assignment、限时接管或形成真实外部 BLOCKED 证明），不能继续同路径重试。最终成功不会抹除历史 recovery count。
+运行时 heartbeat / PID 只证明存活，不证明进展。只有 Git HEAD、tracked worktree status hash、测试 / 证据 receipt、artifact fingerprint 或 blocker evidence fingerprint 至少一项产生新的非空值，`assignment_progress` 才刷新进展 deadline；重复同一指纹只续 heartbeat。Assignment runtime 以 `git rev-parse --git-common-dir` 下的 `adaptive-delivery/runtime-assignments.json` 为跨 main / Writer / Reviewer worktree 的唯一机器账本；`run_external_agent.mjs` 对 Assignment-bound 执行必须在 spawn 前把 `assignment_started` 原子 apply 到该账本，JSONL 只作可选审计副本，不能替代 canonical state。相同任务合同默认最多允许两次 recovery；第三次执行若再次失败、进展超时或进程失效，运行层派生 `health=budget_exhausted`，同一 Assignment 禁止再开 attempt 4；总控必须把策略变化固化为新的 Assignment 合同（缩范围、换 Agent/session/provider、修环境后的新执行、拆 Assignment、限时接管或形成真实外部 BLOCKED 证明），不能继续同路径重试。最终成功不会抹除历史 recovery count。
 
 回收只保护恢复点，不解决阻塞。既有台账回收后可把该包写作 `RECOVERING`（主状态仍为 `ACTIVE + health=recovering`），先区分消息 / 握手、任务运行、工具故障、工作树 / 分支冲突、依赖环境和目标合同等原因，再选择恢复原执行者、从 checkpoint 补派、收缩范围、修复环境或由主 Agent 接管。只有恢复路径已经穷尽且确实等待用户、外部系统、凭证、付费授权或其他不可内部消解的状态时，工作包才标 `BLOCKED`。
 
@@ -131,7 +131,7 @@ Required Review `PASS` 后若声明已集成，`control_event_guard.py` 还必�
 
 Goal 工具要求“同一阻塞连续出现三轮”只是系统阻塞的必要门槛，不是充分理由；项目级反例扫描仍然优先。自动化工具报告“Mac locked”或界面不可见时，先把它描述为该 GUI 验收资源不可用，并用独立系统状态复核；即使两项都显示锁定，也不能据此推断整个项目无可执行工作，更不能把用户是否主动锁屏作为未经证明的事实。
 
-事实源、产品、视觉、技术、协作或验收规则变化时，变更者须向所有受影响的 live 任务发送精确版本、变更摘要、影响范围和新停止条件，并逐个取得 **loaded ACK**。文件已共享、消息已发送或台账已更新都不能替代加载确认；未 ACK 的任务只暂停受影响范围，无关工作继续。总控收据记录已通知、已 ACK 和待 ACK，全部相关 ACK 闭合后才能宣称规则已生效。
+事实源、产品、视觉、技术、协作或验收规则变化时，变更者须向所有受影响的 live 任务发送精确版本、变更摘要、影响范围和新停止条件，并逐个取得 **loaded ACK**。Adaptive Delivery 自身发布必须通过 `scripts/install_skill.py` 写入精确 revision、文件哈希、影响范围与停止条件的安装 manifest；registered controller lifecycle 自动比较 installed revision 与项目 Git common-dir 中的 `rule-handshake.json`，出现漂移时直接注入 `rule_update_pending:<revision>`，不依赖浏览器 / GUI 消息。总控读取新规则后用 `scripts/rule_handshake.py ack` 对 exact revision 生成机器回执，再把现有台账“规则版本”行同步到同一 revision；在 `impact=live_assignments` 时，ACK 或台账同步任一未完成，Assignment-bound external Agent 都必须在 spawn 前 fail closed。文件已共享、消息已发送、安装已完成或台账单独更新都不能替代完整握手；无关工作继续。只有 installed revision、controller loaded receipt 与台账规则版本三者一致后才能宣称新规则对该项目生效。
 
 调度偏差优先从最近可运行 checkpoint 纠正：更新控制面、收缩范围、补派互斥 `READY` 或回收单个失效握手。一次候选失败、一次 ACK 迟到、一个 clean 工作树或一次调度失误都不足以更换总控。只有同一总控在收到纠偏要求后**连续两次**仍违反调度闭环，或发生必须立即止损的严重安全、数据或授权事故，才从当前主线与台账恢复点更换总控；新总控接管后旧总控停止，始终只保留一个。
 
