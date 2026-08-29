@@ -152,7 +152,9 @@ def lifecycle_triggers(
             ledger_state = str(decision.get("ledger_state", "")).upper()
             state = str(decision.get("state", ""))
             reason = str(decision.get("reason", ""))
-            if ledger_state == "ACTIVE" and state == "unhealthy":
+            if state == "budget_exhausted":
+                triggers.append(f"recovery_budget_exhausted:{task_id}")
+            elif ledger_state == "ACTIVE" and state == "unhealthy":
                 label = "active_lease_expired" if reason == "lease_expired" else "assignment_became_unhealthy"
                 triggers.append(f"{label}:{task_id}")
             elif ledger_state == "ACTIVE" and state == "terminal":

@@ -173,6 +173,17 @@ class GovernanceTests(unittest.TestCase):
         errors=control_event_guard.validate_snapshot(snapshot)
         self.assertIn("ACTIVE runtime unhealthy: F1 (lease_expired)", errors)
 
+    def test_lifecycle_surfaces_recovery_budget_exhaustion_as_control_trigger(self) -> None:
+        snapshot = {
+            "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
+            "ready_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {
+                "F1": {"ledger_state": "ACTIVE", "state": "budget_exhausted", "reason": "recovery_budget_exhausted"}
+            },
+        }
+        triggers = lifecycle_hook.lifecycle_triggers(snapshot, None)
+        self.assertIn("recovery_budget_exhausted:F1", triggers)
+
     def test_lifecycle_hook_surfaces_invalid_ledger_at_session_start(self) -> None:
         output, next_state = lifecycle_hook.evaluate_event(
             {

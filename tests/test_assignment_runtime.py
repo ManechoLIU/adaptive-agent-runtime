@@ -83,3 +83,111 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
         self.assertTrue(retry_decision("transport_error", attempt=1)["retry"])
         self.assertFalse(retry_decision("transport_error", attempt=3)["retry"])
         self.assertFalse(retry_decision("permission", attempt=1)["retry"])
+
+class EvidenceDeltaAndRecoveryBudgetTests(unittest.TestCase):
+    def test_no_delta_progress_refreshes_heartbeat_but_not_progress_deadline(self):
+        start = receipt(
+            "assignment_started",
+            baseline_head="abc",
+            last_observed_status_sha256="status-1",
+            evidence_receipt_id="red-1",
+            artifact_fingerprint="artifact-1",
+            blocker_evidence_fingerprint="blocker-1",
+        )
+        state = apply_receipt({}, start, now=T0)
+        t = T0 + timedelta(minutes=10)
+        state = apply_receipt(
+            state,
+            receipt(
+                "assignment_progress",
+                t,
+                event_seq=2,
+                last_observed_head="abc",
+                last_observed_status_sha256="status-1",
+                evidence_receipt_id="red-1",
+                artifact_fingerprint="artifact-1",
+                blocker_evidence_fingerprint="blocker-1",
+            ),
+            now=t,
+        )
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["last_progress_at"], T0.isoformat())
+        self.assertEqual(lease["progress_deadline_at"], (T0 + timedelta(minutes=30)).isoformat())
+        self.assertEqual(lease["lease_expires_at"], (t + timedelta(minutes=20)).isoformat())
+
+    def test_each_changed_evidence_fingerprint_refreshes_progress(self):
+        changes = {
+            "last_observed_head": "def",
+            "last_observed_status_sha256": "status-2",
+            "evidence_receipt_id": "green-2",
+            "artifact_fingerprint": "artifact-2",
+            "blocker_evidence_fingerprint": "blocker-2",
+        }
+        for field, changed in changes.items():
+            with self.subTest(field=field):
+                state = apply_receipt(
+                    {},
+                    receipt(
+                        "assignment_started",
+                        baseline_head="abc",
+                        last_observed_status_sha256="status-1",
+                        evidence_receipt_id="red-1",
+                        artifact_fingerprint="artifact-1",
+                        blocker_evidence_fingerprint="blocker-1",
+                    ),
+                    now=T0,
+                )
+                t = T0 + timedelta(minutes=10)
+                state = apply_receipt(
+                    state,
+                    receipt("assignment_progress", t, event_seq=2, **{field: changed}),
+                    now=t,
+                )
+                lease = state["leases"]["a1"]
+                self.assertEqual(lease["last_progress_at"], t.isoformat())
+                self.assertEqual(lease["progress_deadline_at"], (t + timedelta(minutes=30)).isoformat())
+                self.assertEqual(lease[field], changed)
+
+    def test_recovery_count_persists_and_third_same_contract_failure_exhausts_budget(self):
+        state = apply_receipt({}, receipt("assignment_started", attempt=1, lease_id="lease-1", event_seq=1), now=T0)
+        self.assertEqual(state["leases"]["a1"]["recovery_count"], 0)
+        t1 = T0 + timedelta(minutes=1)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", t1, attempt=1, lease_id="lease-1", event_seq=2,
+            terminal_state="failed", outcome="recoverable_failure", summary="first failure",
+            evidence=["red"], artifacts=[], next_action="retry", retry_class="transport_error",
+        ), now=t1)
+        t2 = T0 + timedelta(minutes=2)
+        state = apply_receipt(state, receipt("assignment_started", t2, attempt=2, lease_id="lease-2", event_seq=1), now=t2)
+        self.assertEqual(state["leases"]["a1"]["recovery_count"], 1)
+        t3 = T0 + timedelta(minutes=3)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", t3, attempt=2, lease_id="lease-2", event_seq=2,
+            terminal_state="failed", outcome="recoverable_failure", summary="second failure",
+            evidence=["red"], artifacts=[], next_action="retry", retry_class="transport_error",
+        ), now=t3)
+        t4 = T0 + timedelta(minutes=4)
+        state = apply_receipt(state, receipt("assignment_started", t4, attempt=3, lease_id="lease-3", event_seq=1), now=t4)
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["recovery_count"], 2)
+        self.assertEqual(evaluate_lease(lease, now=t4)["state"], "healthy")
+        t5 = T0 + timedelta(minutes=5)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", t5, attempt=3, lease_id="lease-3", event_seq=2,
+            terminal_state="failed", outcome="recoverable_failure", summary="third failure",
+            evidence=["red"], artifacts=[], next_action="change strategy", retry_class="transport_error",
+        ), now=t5)
+        decision = evaluate_lease(state["leases"]["a1"], now=t5)
+        self.assertEqual(decision["state"], "budget_exhausted")
+        self.assertEqual(decision["reason"], "recovery_budget_exhausted")
+
+    def test_budget_exhausts_on_stale_progress_even_when_heartbeat_is_current(self):
+        p = RuntimePolicy(progress_deadline_minutes=5, progress_grace_minutes=5, heartbeat_ttl_minutes=30, max_recoveries=2)
+        state = apply_receipt({}, receipt("assignment_started", attempt=1, lease_id="l1", event_seq=1), now=T0, policy=p)
+        state = apply_receipt(state, receipt("assignment_started", T0 + timedelta(minutes=1), attempt=2, lease_id="l2", event_seq=1), now=T0 + timedelta(minutes=1), policy=p)
+        state = apply_receipt(state, receipt("assignment_started", T0 + timedelta(minutes=2), attempt=3, lease_id="l3", event_seq=1), now=T0 + timedelta(minutes=2), policy=p)
+        heartbeat = T0 + timedelta(minutes=11)
+        state = apply_receipt(state, receipt("assignment_heartbeat", heartbeat, attempt=3, lease_id="l3", event_seq=2), now=heartbeat, policy=p)
+        decision = evaluate_lease(state["leases"]["a1"], now=T0 + timedelta(minutes=13), policy=p)
+        self.assertEqual(decision["state"], "budget_exhausted")
+        self.assertEqual(decision["reason"], "recovery_budget_exhausted")
