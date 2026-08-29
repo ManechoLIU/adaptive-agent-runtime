@@ -44,6 +44,15 @@ class SkillStructureTests(unittest.TestCase):
         missing = [str(path.relative_to(ROOT)) for path in [ENTRYPOINT, *REFERENCE_PATHS.values()] if not path.is_file()]
         self.assertEqual([], missing, f"required Skill files are missing: {missing}")
 
+    def test_rule_and_runtime_handshake_scripts_are_packaged(self):
+        required = [
+            ROOT / "scripts" / "project_state.py",
+            ROOT / "scripts" / "install_skill.py",
+            ROOT / "scripts" / "rule_handshake.py",
+            ROOT / "scripts" / "assignment_runtime.py",
+        ]
+        self.assertEqual([], [str(path.relative_to(ROOT)) for path in required if not path.is_file()])
+
     def test_entrypoint_frontmatter_has_trigger_only_metadata(self):
         frontmatter, _ = split_frontmatter(read_entrypoint())
         fields = dict(re.findall(r"(?m)^([A-Za-z][\w-]*):\s*(.+?)\s*$", frontmatter))
