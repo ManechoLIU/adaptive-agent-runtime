@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs } from "../scripts/run_external_agent.mjs";
+import { parseArgs, renderExternalAgentCard } from "../scripts/run_external_agent.mjs";
 
 const skillRoot = fileURLToPath(new URL("../", import.meta.url));
 const adapter = path.join(skillRoot, "scripts", "run_external_agent.mjs");
@@ -62,6 +62,66 @@ test("route parsing requires explicit auth mode and the Kimi Open Platform model
   ]);
   assert.equal(legacy.engine, "kimi-code");
   assert.equal(legacy.authMode, "api");
+});
+
+test("external status cards keep provider identity separate from execution state", () => {
+  assert.equal(renderExternalAgentCard({
+    engine: "kimi-code",
+    model: "kimi-k3",
+    authMode: "api",
+    reasoningEffort: "high",
+    workPackage: "M1-F4-B-REVIEW",
+    category: "frontend",
+    status: "running",
+    detail: "TDD 因果审查开始",
+  }), [
+    "╭─ 🟣 Kimi K3 (kimi-k3) · 🟢 运行中",
+    "│ M1-F4-B-REVIEW · frontend · api · high",
+    "╰─ TDD 因果审查开始",
+  ].join("\n"));
+
+  assert.equal(renderExternalAgentCard({
+    engine: "grok-build",
+    model: "grok-4.6",
+    authMode: "oauth",
+    reasoningEffort: "xhigh",
+    workPackage: "B1-API",
+    category: "backend",
+    status: "returned",
+    detail: "候选已交回总控验收",
+  }), [
+    "╭─ 🟦 Grok 4.6 (grok-4.6) · 🟡 已返回",
+    "│ B1-API · backend · oauth · xhigh",
+    "╰─ 候选已交回总控验收",
+  ].join("\n"));
+});
+
+test("status-card mode renders canonical output and rejects free-form fields", () => {
+  const rendered = execFileSync(process.execPath, [adapter,
+    "--render-status-card", "--engine", "kimi-code", "--auth-mode", "api",
+    "--model", "kimi-k3", "--reasoning-effort", "medium",
+    "--work-package", "M2-MINI", "--category", "frontend", "--status", "accepted",
+    "--detail", "current-main 验收通过",
+  ], { encoding: "utf8" });
+  assert.equal(rendered, [
+    "╭─ 🟣 Kimi K3 (kimi-k3) · ✅ 已验收",
+    "│ M2-MINI · frontend · api · medium",
+    "╰─ current-main 验收通过",
+    "",
+  ].join("\n"));
+
+  assert.throws(() => parseArgs([
+    "--render-status-card", "--engine", "kimi-code", "--auth-mode", "api",
+    "--model", "kimi-k3", "--reasoning-effort", "medium",
+    "--work-package", "M2-MINI", "--category", "frontend", "--status", "reviewing",
+    "--detail", "free-form status",
+  ]), /Unsupported card status/);
+  assert.throws(() => parseArgs([
+    "--render-status-card", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "medium",
+    "--work-package", "B1\nspoof", "--category", "backend", "--status", "running",
+    "--detail", "start",
+  ]), /single-line/);
 });
 
 test("all four routes report the selected credential source without a model call", async () => {

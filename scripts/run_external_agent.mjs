@@ -9,9 +9,19 @@ import process from "node:process";
 const KIMI_KEYCHAIN_SERVICE = "adaptive-delivery-kimi-k3";
 const XAI_KEYCHAIN_SERVICE = "adaptive-delivery-xai-grok";
 const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+const CARD_CATEGORIES = new Set(["frontend", "backend", "general"]);
+const CARD_STATUSES = {
+  running: { icon: "🟢", label: "运行中" },
+  returned: { icon: "🟡", label: "已返回" },
+  accepted: { icon: "✅", label: "已验收" },
+  blocked: { icon: "🟠", label: "阻塞" },
+  unknown: { icon: "🔴", label: "结果未知" },
+};
 
 const routes = {
   "kimi-code": {
+    cardMarker: "🟣",
+    displayName: "Kimi K3",
     executable: "kimi",
     fallbackPaths: [path.join(homedir(), ".kimi-code", "bin", "kimi")],
     modelsByAuthMode: {
@@ -21,6 +31,8 @@ const routes = {
     versionArgs: ["--version"],
   },
   "grok-build": {
+    cardMarker: "🟦",
+    displayName: "Grok 4.6",
     executable: "grok",
     fallbackPaths: [
       path.join(homedir(), ".grok", "bin", "grok"),
@@ -33,6 +45,43 @@ const routes = {
     versionArgs: ["version"],
   },
 };
+
+function assertSingleLine(value, name, maxLength) {
+  if (!value) throw new Error(`${name} is required`);
+  if (value.length > maxLength) throw new Error(`${name} must be at most ${maxLength} characters`);
+  if (/[\u0000-\u001f\u007f]/u.test(value)) throw new Error(`${name} must be single-line text`);
+}
+
+function assertCardRoute({ engine, model, authMode, reasoningEffort }) {
+  const route = routes[engine];
+  if (!route) throw new Error(`Unsupported engine: ${engine}`);
+  const models = route.modelsByAuthMode[authMode];
+  if (!models) throw new Error(`Unsupported auth mode: ${authMode}`);
+  if (!models.has(model)) {
+    throw new Error(`Model ${model} is not allowed for engine ${engine} with auth mode ${authMode}`);
+  }
+  if (!reasoningEffort) throw new Error("--reasoning-effort is required");
+  if (!REASONING_EFFORTS.has(reasoningEffort)) {
+    throw new Error(`Unsupported reasoning effort: ${reasoningEffort}`);
+  }
+  return route;
+}
+
+export function renderExternalAgentCard({
+  engine, model, authMode, reasoningEffort, workPackage, category, status, detail,
+}) {
+  const route = assertCardRoute({ engine, model, authMode, reasoningEffort });
+  assertSingleLine(workPackage, "--work-package", 120);
+  assertSingleLine(detail, "--detail", 180);
+  if (!CARD_CATEGORIES.has(category)) throw new Error(`Unsupported card category: ${category}`);
+  const statusDisplay = CARD_STATUSES[status];
+  if (!statusDisplay) throw new Error(`Unsupported card status: ${status}`);
+  return [
+    `╭─ ${route.cardMarker} ${route.displayName} (${model}) · ${statusDisplay.icon} ${statusDisplay.label}`,
+    `│ ${workPackage} · ${category} · ${authMode} · ${reasoningEffort}`,
+    `╰─ ${detail}`,
+  ].join("\n");
+}
 
 function kimiKeychainService() {
   return process.env.KIMI_K3_KEYCHAIN_SERVICE || KIMI_KEYCHAIN_SERVICE;
@@ -56,6 +105,7 @@ export function parseArgs(argv) {
     check: false,
     execute: false,
     login: false,
+    renderStatusCard: false,
     authorizedExternalCall: false,
     authorizedLogin: false,
     deviceAuth: false,
@@ -65,6 +115,7 @@ export function parseArgs(argv) {
     authMode: null,
     region: null,
     cwd: null,
+    workPackage: null, category: null, status: null, detail: null,
     assignmentId: null, taskId: null, agentId: null, sessionId: null,
     attempt: 1, leaseId: null, runtimeReceipts: null,
   };
@@ -74,10 +125,11 @@ export function parseArgs(argv) {
     if (argument === "--check") options.check = true;
     else if (argument === "--execute") options.execute = true;
     else if (argument === "--login") options.login = true;
+    else if (argument === "--render-status-card") options.renderStatusCard = true;
     else if (argument === "--authorized-external-call") options.authorizedExternalCall = true;
     else if (argument === "--authorized-login") options.authorizedLogin = true;
     else if (argument === "--device-auth") options.deviceAuth = true;
-    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts"].includes(argument)) {
+    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--work-package", "--category", "--status", "--detail", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts"].includes(argument)) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`Missing value for ${argument}`);
       if (argument === "--auth-mode") options.authMode = value;
@@ -89,6 +141,7 @@ export function parseArgs(argv) {
       else if (argument === "--attempt") options.attempt = Number.parseInt(value, 10);
       else if (argument === "--lease-id") options.leaseId = value;
       else if (argument === "--runtime-receipts") options.runtimeReceipts = value;
+      else if (argument === "--work-package") options.workPackage = value;
       else options[argument.slice(2)] = value;
       index += 1;
     } else {
@@ -96,8 +149,8 @@ export function parseArgs(argv) {
     }
   }
 
-  if ([options.check, options.execute, options.login].filter(Boolean).length !== 1) {
-    throw new Error("Choose exactly one of --check, --execute, or --login");
+  if ([options.check, options.execute, options.login, options.renderStatusCard].filter(Boolean).length !== 1) {
+    throw new Error("Choose exactly one of --check, --execute, --login, or --render-status-card");
   }
   if (options.engine === "kimi-code-api") {
     options.engine = "kimi-code";
@@ -108,6 +161,12 @@ export function parseArgs(argv) {
   if (!options.authMode) throw new Error("--auth-mode oauth|api is required");
   const models = route.modelsByAuthMode[options.authMode];
   if (!models) throw new Error(`Unsupported auth mode: ${options.authMode}`);
+
+  if (options.renderStatusCard) {
+    renderExternalAgentCard(options);
+    return options;
+  }
+
   if (!options.cwd) throw new Error("--cwd is required");
 
   if (options.login) {
@@ -373,6 +432,10 @@ async function executeExternalAgent({ cwd, engine, model, reasoningEffort, authM
 async function main() {
   try {
     const options = parseArgs(process.argv.slice(2));
+    if (options.renderStatusCard) {
+      process.stdout.write(`${renderExternalAgentCard(options)}\n`);
+      return;
+    }
     if (options.check) {
       const result = checkExternalAgent(options);
       process.stdout.write(`${JSON.stringify(result)}\n`);

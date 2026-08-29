@@ -50,9 +50,15 @@ node <skill-directory>/scripts/run_external_agent.mjs --check --engine grok-buil
 
 ## Visible execution status
 
-External runners execute inside the controller task and do not create a native Codex subagent card. After preflight succeeds and immediately before a real authorized request, publish the compact three-line `外部 Agent` card defined in [Agent and model routing](agent-model-routing.md), including the work package, model, `auth_mode`, selected reasoning effort, and category. Do not publish it for `--check` or while authorization is still missing.
+External runners execute inside the controller task and do not create a native Codex subagent card. Never compose a card by hand. After preflight succeeds and immediately before a real authorized request, call the deterministic renderer and copy its stdout verbatim into a user-visible commentary message:
 
-Emit at most one start card and one terminal card per call, with no periodic refresh. If parent validation finishes in the same short event, skip `已返回` and publish only `已验收`; otherwise `已返回` carries the candidate boundary until validation completes. Publish `已验收` only after the parent has inspected the actual diff and completed the route contract's verification. A preflight failure uses `阻塞`; an interrupted or ambiguous request that may have consumed allowance or produced partial edits uses `结果未知` and stops without automatic retry. Never include credentials or sensitive raw output in these cards.
+```text
+node <skill-directory>/scripts/run_external_agent.mjs --render-status-card --engine <kimi-code|grok-build> --auth-mode <oauth|api> --model <exact-model> --reasoning-effort <selected-effort> --work-package <stable-id> --category <frontend|backend|general> --status running --detail <short-single-line-detail>
+```
+
+For the terminal card, call the same renderer with exactly one of `returned`, `accepted`, `blocked`, or `unknown`. The renderer owns provider colors, human-readable model labels, state icons, Chinese state labels, the three-line frame, and single-line field validation. Do not edit its output, translate the state, replace its icons, or use free-form states such as `ACTIVE` or `REVIEWING`. If rendering fails, stop before the external request and report the renderer error without inventing a colored card. Do not publish a card for `--check` or while authorization is still missing.
+
+Emit at most one generated start card and one generated terminal card per call, with no periodic refresh. If parent validation finishes in the same short event, skip `已返回` and publish only `已验收`; otherwise `已返回` carries the candidate boundary until validation completes. Publish `已验收` only after the parent has inspected the actual diff and completed the route contract's verification. A preflight failure uses `blocked`; an interrupted or ambiguous request that may have consumed allowance or produced partial edits uses `unknown` and stops without automatic retry. Never include credentials or sensitive raw output in these cards.
 
 ## Paid execution gate
 
