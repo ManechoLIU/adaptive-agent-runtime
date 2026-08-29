@@ -242,7 +242,7 @@ def native_resume_command(*, codex: str, session_id: str, repo: Path) -> list[st
         "control_event_guard; if no pending control action or Goal rollover remains, stop without "
         "starting unrelated work."
     )
-    return [codex, "exec", "resume", "-C", str(repo.resolve()), session_id, prompt]
+    return [codex, "exec", "-C", str(repo.resolve()), "resume", session_id, prompt]
 
 
 def successful_guard_event_from_receipt(

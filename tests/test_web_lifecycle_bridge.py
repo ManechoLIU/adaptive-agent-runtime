@@ -419,9 +419,10 @@ class WebLifecycleNativeStopTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             argv=json.loads(result.stdout)
-            self.assertEqual(argv[:3], ["/opt/homebrew/bin/codex", "exec", "resume"])
-            self.assertIn("controller-1", argv)
-            self.assertIn(str(repo.resolve()), argv)
+            self.assertEqual(
+                argv[:6],
+                ["/opt/homebrew/bin/codex", "exec", "-C", str(repo.resolve()), "resume", "controller-1"],
+            )
             self.assertNotIn("fork", argv)
 
     def test_auto_native_stop_skips_stale_superseded_receipt(self) -> None:
