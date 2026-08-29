@@ -295,6 +295,41 @@ class GovernanceTests(unittest.TestCase):
             ),
             [],
         )
+    def test_lifecycle_clears_stale_recovery_trigger_after_task_returns_ready(self) -> None:
+        prior_snapshot = {
+            "head": "abc", "ledger_sha256": "ledger-old", "worktree_status_sha256": "status",
+            "ready_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {
+                "F1": {"ledger_state": "RECOVERING", "state": "terminal", "reason": "terminal:failed"}
+            },
+        }
+        prior_state = {
+            "snapshot": prior_snapshot, "pending_control_event": True,
+            "triggers": ["recovery_stalled:F1"], "stop_continuations": 0,
+        }
+        current_snapshot = {
+            "head": "abc", "ledger_sha256": "ledger-new", "worktree_status_sha256": "status",
+            "ready_ids": ["F1"], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {},
+        }
+        _, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "PostToolUse", "session_id": "s", "tool_input": {}, "tool_response": {}},
+            snapshot=current_snapshot, prior_state=prior_state,
+        )
+        self.assertNotIn("recovery_stalled:F1", state["triggers"])
+        self.assertIn("READY:F1", state["triggers"])
+
+    def test_lifecycle_keeps_terminal_trigger_while_task_is_still_active(self) -> None:
+        snapshot = {
+            "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
+            "ready_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {
+                "F1": {"ledger_state": "ACTIVE", "state": "terminal", "reason": "terminal:failed"}
+            },
+        }
+        triggers = lifecycle_hook.lifecycle_triggers(snapshot, None)
+        self.assertIn("agent_session_terminal:F1", triggers)
+
     def test_lifecycle_surfaces_recovery_budget_exhaustion_as_control_trigger(self) -> None:
         snapshot = {
             "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",

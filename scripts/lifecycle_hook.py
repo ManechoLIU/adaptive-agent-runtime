@@ -311,8 +311,12 @@ def evaluate_event(
 
     detected = lifecycle_triggers(snapshot, prior_state)
     prior_triggers = {str(item) for item in state.get("triggers", [])}
-    rule_prefixes = ("rule_update_pending:", "rule_ledger_stale:", "rule_install_integrity_error:")
-    prior_triggers = {item for item in prior_triggers if not item.startswith(rule_prefixes)}
+    transient_prefixes = (
+        "rule_update_pending:", "rule_ledger_stale:", "rule_install_integrity_error:",
+        "active_lease_expired:", "assignment_became_unhealthy:", "agent_session_terminal:",
+        "active_without_progress:", "recovery_stalled:", "recovery_budget_exhausted:",
+    )
+    prior_triggers = {item for item in prior_triggers if not item.startswith(transient_prefixes)}
     triggers = sorted(prior_triggers | set(detected))
     pending = bool(state.get("pending_control_event")) or bool(triggers)
     state.update({"pending_control_event": pending, "triggers": triggers})
