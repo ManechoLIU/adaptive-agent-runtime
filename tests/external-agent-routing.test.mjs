@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -193,4 +193,26 @@ test("login mode delegates to the official CLI without a model request", async (
   ], { encoding: "utf8", env });
   assert.equal(grok.status, 0, grok.stderr);
   assert.deepEqual(JSON.parse(grok.stdout.trim()).args, ["login", "--device-auth"]);
+});
+
+
+test("external execution emits provider-neutral start and terminal runtime receipts", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-runtime-"));
+  const grokHome = path.join(bin, "grok-home");
+  const receipts = path.join(bin, "receipts.jsonl");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--attempt", "2", "--lease-id", "lease-2", "--runtime-receipts", receipts,
+  ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
+  assert.equal(result.status, 0, result.stderr);
+  const events = (await readFile(receipts, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.deepEqual(events.map((e) => e.event_type), ["assignment_started", "assignment_terminal"]);
+  assert.deepEqual(events.map((e) => e.event_seq), [1, 2]);
+  assert.equal(events[0].attempt, 2); assert.equal(events[0].lease_id, "lease-2");
+  assert.equal(events[1].outcome, "success"); assert.equal(events[1].terminal_state, "completed");
 });
