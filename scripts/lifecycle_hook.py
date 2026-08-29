@@ -233,7 +233,7 @@ def continuation_reason(
         rule_text = (
             f" 规则更新待加载：{revision}；摘要：{summary}；影响：{impact}；停止条件：{stop}。"
             "先读取已安装的新规则，再执行 "
-            f"rule_handshake.py ack{repo_arg}{session_arg} --revision {revision}，随后同步现有台账规则版本行。"
+            f"python3 ~/.agents/skills/adaptive-delivery/scripts/rule_handshake.py ack{repo_arg}{session_arg} --revision {revision}，随后同步现有台账规则版本行。"
         )
     elif state == "ledger_stale":
         rule_text = f" 已有 LOADED ACK {revision}，但台账规则版本仍旧；先把现有规则版本行同步到精确 revision {revision}。"
