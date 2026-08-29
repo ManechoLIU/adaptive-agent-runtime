@@ -14,6 +14,7 @@ REFERENCE_PATHS = {
     "context": ROOT / "references" / "context-governance.md",
     "agent-routing": ROOT / "references" / "agent-model-routing.md",
     "external-agent": ROOT / "references" / "external-agent-auth.md",
+    "controller-scoring": ROOT / "references" / "controller-performance-scoring.md",
 }
 CORE_REFERENCE_KEYS = ("methods", "harness", "visual", "experience", "long-task", "context")
 METHODS = REFERENCE_PATHS["methods"]
