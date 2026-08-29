@@ -819,6 +819,105 @@ class GovernanceTests(unittest.TestCase):
         }
         self.assertEqual(control_event_guard.validate_snapshot(snapshot, ledger_ready_ids=set(), required_review_ids={"R1"}), [])
 
+    def test_review_pass_cannot_close_while_candidate_is_still_only_in_review(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "PASS"}],
+            "candidate_packages": [{"revision": "candidate-1", "worktree": "/repo/wt",
+                                     "task_id": "F1", "integration_flow": "server-main",
+                                     "decision": "review", "review_task_id": "review-1", "delivered_ack": True}],
+            "new_assignments": [],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={"/repo/wt": "candidate-1"}
+        )
+        self.assertIn("review PASS for candidate-1 requires completed integration or ordered integration queue", errors)
+
+    def test_review_fail_requires_same_candidate_rework_disposition(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "FAIL"}],
+            "candidate_packages": [{"revision": "candidate-1", "worktree": "/repo/wt",
+                                     "task_id": "F1", "integration_flow": "server-main",
+                                     "decision": "review", "review_task_id": "review-1", "delivered_ack": True}],
+            "new_assignments": [],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={"/repo/wt": "candidate-1"}
+        )
+        self.assertIn("review FAIL for candidate-1 requires rework disposition", errors)
+
+    def test_completed_integration_requires_exact_main_revision_and_regression_evidence(self) -> None:
+        base_candidate = {
+            "revision": "candidate-1", "worktree": "/repo/wt", "task_id": "F1",
+            "integration_flow": "server-main", "decision": "integrate",
+            "controller_event_id": "event-1", "integrated_this_event": True,
+        }
+        for missing_field in ("main_revision", "regression_evidence"):
+            candidate = {**base_candidate, "main_revision": "main-2", "regression_evidence": "tests green"}
+            candidate.pop(missing_field)
+            snapshot = {
+                **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+                "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                      "candidate_revision": "candidate-1", "verdict": "PASS"}],
+                "candidate_packages": [candidate], "new_assignments": [],
+            }
+            errors = control_event_guard.validate_snapshot(
+                snapshot, ledger_ready_ids=set(), expected_candidates={}, expected_main_revision="main-2"
+            )
+            self.assertIn(f"candidate-1 integrate requires {missing_field}", errors)
+
+    def test_review_pass_accepts_completed_integration_with_current_main_regression(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "PASS"}],
+            "candidate_packages": [{
+                "revision": "candidate-1", "worktree": "/repo/wt", "task_id": "F1",
+                "integration_flow": "server-main", "decision": "integrate",
+                "controller_event_id": "event-1", "integrated_this_event": True,
+                "main_revision": "main-2", "regression_evidence": "current-main targeted 16/16 PASS",
+            }],
+            "new_assignments": [],
+        }
+        self.assertEqual(control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={}, expected_main_revision="main-2"
+        ), [])
+
+    def test_review_pass_accepts_ordered_integration_queue(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "PASS"}],
+            "candidate_packages": [{
+                "revision": "candidate-1", "worktree": "/repo/wt", "task_id": "F1",
+                "integration_flow": "server-main", "decision": "queued",
+                "reason_code": "ordered_integration", "next_checkpoint": "after preceding candidate integrates",
+            }],
+            "new_assignments": [],
+        }
+        self.assertEqual(control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={"/repo/wt": "candidate-1"}
+        ), [])
+
+    def test_review_fail_accepts_acknowledged_rework(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(), "ledger_sha256": "abc", "available_slots": 0, "ready_packages": [],
+            "required_reviews": [{"id": "R1", "task_id": "review-1", "delivered_ack": True,
+                                  "candidate_revision": "candidate-1", "verdict": "FAIL"}],
+            "candidate_packages": [{
+                "revision": "candidate-1", "worktree": "/repo/wt", "task_id": "F1",
+                "integration_flow": "server-main", "decision": "rework",
+                "writer_task_id": "F1-REWORK", "delivered_ack": True,
+            }],
+            "new_assignments": [],
+        }
+        self.assertEqual(control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), expected_candidates={"/repo/wt": "candidate-1"}
+        ), [])
+
     def test_control_event_guard_allows_complete_event(self) -> None:
         snapshot = {
             **self.complete_event_receipt(),
@@ -1201,6 +1300,9 @@ class GovernanceTests(unittest.TestCase):
                     "integration_flow": "web-main",
                     "decision": "integrate",
                     "controller_event_id": "integrate-web-1",
+                    "integrated_this_event": True,
+                    "main_revision": "main-after-web-1",
+                    "regression_evidence": "current-main targeted regression PASS",
                 }
             ],
             "new_assignments": [

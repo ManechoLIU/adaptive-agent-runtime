@@ -288,6 +288,7 @@ def validate_candidate_queue(
     snapshot: dict[str, Any],
     *,
     expected_candidates: dict[str, str],
+    expected_main_revision: str | None = None,
 ) -> list[str]:
     errors: list[str] = []
     raw_candidates = snapshot.get("candidate_packages")
@@ -295,6 +296,7 @@ def validate_candidate_queue(
         return ["candidate_packages must enumerate every unmerged worktree candidate"]
 
     seen: set[str] = set()
+    integrated_transitions: set[str] = set()
     flow_counts: dict[str, int] = {}
     candidate_flows: set[str] = set()
     for index, candidate in enumerate(raw_candidates):
@@ -312,13 +314,16 @@ def validate_candidate_queue(
         if revision in seen:
             errors.append(f"duplicate candidate revision: {revision}")
         seen.add(revision)
-        if expected_candidates.get(worktree) != revision:
+        integrated_transition = decision == "integrate" and candidate.get("integrated_this_event") is True
+        if integrated_transition:
+            integrated_transitions.add(revision)
+        if expected_candidates.get(worktree) != revision and not integrated_transition:
             errors.append(f"{revision} worktree does not match the live worktree")
         if not task_id:
             errors.append(f"{revision} requires task_id")
         if not flow:
             errors.append(f"{revision} requires integration_flow")
-        elif decision not in RETAINED_CANDIDATE_DECISIONS:
+        elif decision not in RETAINED_CANDIDATE_DECISIONS and not integrated_transition:
             candidate_flows.add(flow)
             flow_counts[flow] = flow_counts.get(flow, 0) + 1
         if decision not in CANDIDATE_DECISIONS:
@@ -334,6 +339,15 @@ def validate_candidate_queue(
         elif decision == "integrate":
             if not str(candidate.get("controller_event_id", "")).strip():
                 errors.append(f"{revision} integrate requires controller_event_id")
+            if candidate.get("integrated_this_event") is not True:
+                errors.append(f"{revision} integrate requires integrated_this_event=true")
+            main_revision = str(candidate.get("main_revision", "")).strip()
+            if not main_revision:
+                errors.append(f"{revision} integrate requires main_revision")
+            elif expected_main_revision is not None and main_revision != expected_main_revision:
+                errors.append(f"{revision} main_revision does not match current main")
+            if not str(candidate.get("regression_evidence", "")).strip():
+                errors.append(f"{revision} integrate requires regression_evidence")
         elif decision == "rework":
             if not str(candidate.get("writer_task_id", "")).strip():
                 errors.append(f"{revision} rework requires writer_task_id")
@@ -378,7 +392,7 @@ def validate_candidate_queue(
 
     expected_revisions = set(expected_candidates.values())
     missing = sorted(expected_revisions - seen)
-    extra = sorted(seen - expected_revisions)
+    extra = sorted(seen - expected_revisions - integrated_transitions)
     if missing:
         errors.append("control event omitted unmerged candidates: " + ", ".join(missing))
     if extra:
@@ -406,6 +420,62 @@ def validate_candidate_queue(
     return errors
 
 
+def validate_review_transitions(
+    snapshot: dict[str, Any], *, expected_main_revision: str | None = None
+) -> list[str]:
+    errors: list[str] = []
+    candidates = snapshot.get("candidate_packages")
+    if not isinstance(candidates, list):
+        return errors
+    candidate_by_revision = {
+        str(candidate.get("revision", "")).strip(): candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and str(candidate.get("revision", "")).strip()
+    }
+    reviews = snapshot.get("required_reviews", [])
+    if not isinstance(reviews, list):
+        return errors
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        verdict = str(review.get("verdict", "")).strip().upper()
+        if not verdict:
+            continue
+        review_id = str(review.get("id", "")).strip() or "unnamed"
+        revision = str(review.get("candidate_revision", "")).strip()
+        if verdict not in {"PASS", "FAIL"}:
+            errors.append(f"required review {review_id} verdict must be PASS or FAIL")
+            continue
+        if not revision:
+            errors.append(f"required review {review_id} verdict requires candidate_revision")
+            continue
+        candidate = candidate_by_revision.get(revision)
+        if candidate is None:
+            errors.append(f"review {verdict} for {revision} requires candidate transition evidence")
+            continue
+        decision = str(candidate.get("decision", "")).strip().lower()
+        if verdict == "PASS":
+            ordered = (
+                decision == "queued"
+                and str(candidate.get("reason_code", "")).strip().lower() == "ordered_integration"
+                and bool(str(candidate.get("next_checkpoint", "")).strip())
+            )
+            integrated = decision == "integrate" and candidate.get("integrated_this_event") is True
+            if not (ordered or integrated):
+                errors.append(
+                    f"review PASS for {revision} requires completed integration or ordered integration queue"
+                )
+        else:
+            rework = (
+                decision == "rework"
+                and bool(str(candidate.get("writer_task_id", "")).strip())
+                and candidate.get("delivered_ack") is True
+            )
+            if not rework:
+                errors.append(f"review FAIL for {revision} requires rework disposition")
+    return errors
+
+
 def string_set(value: Any, field: str, errors: list[str]) -> set[str]:
     if not isinstance(value, list):
         errors.append(f"{field} must be a list")
@@ -425,6 +495,7 @@ def validate_snapshot(
     expected_rule_revision: str | None = None,
     affected_task_ids: set[str] | None = None,
     expected_candidates: dict[str, str] | None = None,
+    expected_main_revision: str | None = None,
     ledger_open_ids: set[str] | None = None,
     ledger_goal_ids: set[str] | None = None,
 ) -> list[str]:
@@ -588,8 +659,13 @@ def validate_snapshot(
                 errors.append("rule_update.affected_tasks does not match declared affected tasks")
     if expected_candidates is not None:
         errors.extend(
-            validate_candidate_queue(snapshot, expected_candidates=expected_candidates)
+            validate_candidate_queue(
+                snapshot,
+                expected_candidates=expected_candidates,
+                expected_main_revision=expected_main_revision,
+            )
         )
+    errors.extend(validate_review_transitions(snapshot, expected_main_revision=expected_main_revision))
     errors.extend(
         validate_goal_rollover(
             snapshot, ledger_open_ids=ledger_open_ids, ledger_goal_ids=ledger_goal_ids
@@ -646,11 +722,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         current_ledger_sha256 = ledger_sha256(ledger)
         if args.affected_task and not args.rule_revision:
             raise ValueError("--affected-task requires --rule-revision")
-        candidates = (
-            unmerged_worktree_candidates(Path(args.repo).expanduser().resolve())
-            if args.repo
-            else None
-        )
+        repo_root = Path(args.repo).expanduser().resolve() if args.repo else None
+        candidates = unmerged_worktree_candidates(repo_root) if repo_root else None
+        main_revision = run_git(repo_root, "rev-parse", "main").stdout.strip() if repo_root else None
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"control-event: invalid snapshot: {error}")
         return 2
@@ -663,6 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_rule_revision=args.rule_revision,
         affected_task_ids=set(args.affected_task) if args.rule_revision else None,
         expected_candidates=candidates,
+        expected_main_revision=main_revision,
         ledger_open_ids=open_ids,
         ledger_goal_ids=goal_ids,
     )
