@@ -235,8 +235,12 @@ def native_resume_command(*, codex: str, session_id: str, repo: Path) -> list[st
         "Adaptive Delivery Web Stop checkpoint. Continue this existing registered controller "
         "thread only; do not create or fork another controller. Reconcile any pending lifecycle "
         "control event against the real main, ledger, live tasks, READY queue and candidates. "
-        "Obey the installed lifecycle hooks and control_event_guard; if no pending control action "
-        "remains, stop without starting unrelated work."
+        "Even when pending_control_event is false, perform one project-wide Goal rollover check: "
+        "if the just-closed Goal has completed and the project still has executable open work, "
+        "recompute readiness and roll to the next Goal before yielding; if everything is blocked, "
+        "require the project-wide blocking proof. Obey the installed lifecycle hooks and "
+        "control_event_guard; if no pending control action or Goal rollover remains, stop without "
+        "starting unrelated work."
     )
     return [codex, "exec", "resume", "-C", str(repo.resolve()), session_id, prompt]
 
@@ -275,6 +279,103 @@ def dispatch_event(event: dict[str, Any]) -> int:
         print(completed.stdout, end="")
     if completed.stderr:
         print(completed.stderr, file=sys.stderr, end="")
+    return completed.returncode
+
+
+def default_auto_stop_state_path(session_id: str) -> Path:
+    return (
+        Path.home()
+        / ".codex"
+        / "state"
+        / "adaptive-delivery-web-lifecycle"
+        / f"{session_id}.auto-stop.json"
+    )
+
+
+def schedule_auto_native_stop(
+    *,
+    session_id: str,
+    repo: Path,
+    receipt_id: str,
+    registry: Path,
+    codex: str,
+    delay_seconds: float,
+    state_path: Path,
+    capture_path: Path | None = None,
+) -> None:
+    value = {
+        "receipt_id": receipt_id,
+        "session_id": session_id,
+        "repo": str(repo.resolve()),
+        "scheduled_at_unix_ms": int(time.time() * 1000),
+    }
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "auto-native-stop",
+        "--session-id",
+        session_id,
+        "--repo",
+        str(repo.resolve()),
+        "--receipt-id",
+        receipt_id,
+        "--registry",
+        str(registry.expanduser()),
+        "--codex",
+        codex,
+        "--delay-seconds",
+        str(delay_seconds),
+        "--state",
+        str(state_path),
+    ]
+    if capture_path is not None:
+        capture_path.write_text(json.dumps(command, ensure_ascii=False) + "\n", encoding="utf-8")
+        return
+    subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+def run_auto_native_stop(
+    *,
+    session_id: str,
+    repo: Path,
+    receipt_id: str,
+    registry: Path,
+    codex: str,
+    delay_seconds: float,
+    state_path: Path,
+) -> int:
+    if delay_seconds > 0:
+        time.sleep(delay_seconds)
+    state = load_json(state_path)
+    if state.get("receipt_id") != receipt_id:
+        return 0
+    try:
+        registered = registered_controller_for_repo(repo, registry)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if registered != session_id:
+        return 0
+    completed = subprocess.run(
+        native_resume_command(codex=codex, session_id=session_id, repo=repo),
+        check=False,
+    )
+    latest = load_json(state_path)
+    if latest.get("receipt_id") == receipt_id:
+        latest["completed_at_unix_ms"] = int(time.time() * 1000)
+        latest["returncode"] = completed.returncode
+        state_path.write_text(
+            json.dumps(latest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
     return completed.returncode
 
 
@@ -327,6 +428,12 @@ def build_parser() -> argparse.ArgumentParser:
     audit_once.add_argument("--cursor", required=True)
     audit_once.add_argument("--capture-events")
     audit_once.add_argument("--computer-lease")
+    audit_once.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    audit_once.add_argument("--auto-native-stop", action="store_true")
+    audit_once.add_argument("--auto-stop-delay-seconds", type=float, default=5.0)
+    audit_once.add_argument("--auto-stop-state")
+    audit_once.add_argument("--capture-auto-stop")
+    audit_once.add_argument("--codex", default="/opt/homebrew/bin/codex")
 
     arm_computer = subparsers.add_parser("arm-computer")
     arm_computer.add_argument("--cwd", required=True)
@@ -341,6 +448,15 @@ def build_parser() -> argparse.ArgumentParser:
     native_stop.add_argument("--registry", default=str(DEFAULT_REGISTRY))
     native_stop.add_argument("--codex", default="/opt/homebrew/bin/codex")
     native_stop.add_argument("--dry-run", action="store_true")
+
+    auto_stop = subparsers.add_parser("auto-native-stop")
+    auto_stop.add_argument("--session-id", required=True)
+    auto_stop.add_argument("--repo", required=True)
+    auto_stop.add_argument("--receipt-id", required=True)
+    auto_stop.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    auto_stop.add_argument("--codex", default="/opt/homebrew/bin/codex")
+    auto_stop.add_argument("--delay-seconds", type=float, default=5.0)
+    auto_stop.add_argument("--state")
 
     subparsers.add_parser("print-zshenv-block")
     return parser
@@ -412,6 +528,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 append_captured_event(Path(args.capture_events), event)
             else:
                 dispatch_event(event)
+            if args.auto_native_stop and successful_guard_event_from_receipt(
+                receipt, session_id=args.session_id, repo=repo
+            ) is not None:
+                receipt_id = str(receipt.get("receiptId") or "web-guard")
+                state_path = (
+                    Path(args.auto_stop_state).expanduser()
+                    if args.auto_stop_state
+                    else default_auto_stop_state_path(args.session_id)
+                )
+                schedule_auto_native_stop(
+                    session_id=args.session_id,
+                    repo=repo,
+                    receipt_id=receipt_id,
+                    registry=Path(args.registry).expanduser(),
+                    codex=args.codex,
+                    delay_seconds=max(0.0, args.auto_stop_delay_seconds),
+                    state_path=state_path,
+                    capture_path=Path(args.capture_auto_stop).expanduser() if args.capture_auto_stop else None,
+                )
         return 0
 
     if args.command_name == "arm-computer":
@@ -470,6 +605,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         completed = subprocess.run(command, check=False)
         return completed.returncode
+
+    if args.command_name == "auto-native-stop":
+        repo = canonical_root(args.repo)
+        state_path = (
+            Path(args.state).expanduser()
+            if args.state
+            else default_auto_stop_state_path(args.session_id)
+        )
+        return run_auto_native_stop(
+            session_id=args.session_id,
+            repo=repo,
+            receipt_id=args.receipt_id,
+            registry=Path(args.registry).expanduser(),
+            codex=args.codex,
+            delay_seconds=max(0.0, args.delay_seconds),
+            state_path=state_path,
+        )
 
     if args.command_name == "print-zshenv-block":
         print(zshenv_block())

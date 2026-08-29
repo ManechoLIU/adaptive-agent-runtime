@@ -229,6 +229,50 @@ class WebLifecycleAuditTests(unittest.TestCase):
             self.assertIn("control-event: allowed", events[0]["tool_response"]["output"])
             self.assertEqual(json.loads(cursor.read_text())["offset"], audit.stat().st_size)
 
+    def test_audit_once_schedules_native_stop_after_allowed_guard_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = tmp_path / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            audit = tmp_path / "audit.jsonl"
+            receipt = {
+                "receiptId": "guard-auto-stop-1",
+                "childTool": "shell_command",
+                "state": "succeeded",
+                "rootLabel": str(repo),
+                "targetLabel": "python3 scripts/control_event_guard.py event.json --repo .",
+                "detail": (
+                    "命令：python3 scripts/control_event_guard.py event.json --repo ."
+                    f" · 工作目录：{repo}\n\n命令输出：\n"
+                    "control-event: allowed; declared decisions are complete\n"
+                ),
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            cursor = tmp_path / "cursor.json"
+            capture = tmp_path / "auto-stop.json"
+
+            result = self.run_bridge(
+                "audit-once",
+                "--session-id", "controller-1",
+                "--repo", str(repo),
+                "--audit-log", str(audit),
+                "--cursor", str(cursor),
+                "--registry", str(registry),
+                "--auto-native-stop",
+                "--auto-stop-delay-seconds", "5",
+                "--capture-auto-stop", str(capture),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            scheduled = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertIn("auto-native-stop", scheduled)
+            self.assertIn("controller-1", scheduled)
+            self.assertIn(str(repo.resolve()), scheduled)
+            self.assertIn("guard-auto-stop-1", scheduled)
+
     def test_audit_once_ignores_non_guard_shell_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -379,6 +423,31 @@ class WebLifecycleNativeStopTests(unittest.TestCase):
             self.assertIn("controller-1", argv)
             self.assertIn(str(repo.resolve()), argv)
             self.assertNotIn("fork", argv)
+
+    def test_auto_native_stop_skips_stale_superseded_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = tmp_path / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            state = tmp_path / "auto-stop.json"
+            state.write_text(json.dumps({"receipt_id": "newer-receipt"}), encoding="utf-8")
+
+            result = self.run_bridge(
+                "auto-native-stop",
+                "--session-id", "controller-1",
+                "--repo", str(repo),
+                "--receipt-id", "older-receipt",
+                "--registry", str(registry),
+                "--state", str(state),
+                "--delay-seconds", "0",
+                "--codex", "/definitely/not/a/codex/binary",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("completed_at_unix_ms", json.loads(state.read_text()))
 
     def test_native_stop_rejects_session_not_registered_for_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

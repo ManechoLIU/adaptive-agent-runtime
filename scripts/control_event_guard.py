@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -41,6 +42,114 @@ def ready_ledger_package_ids(ledger: Path) -> set[str]:
         for identifier, status in task_rows(ledger.read_text(encoding="utf-8"))
         if status == "READY"
     }
+
+
+def open_ledger_package_ids(ledger: Path) -> set[str]:
+    return {
+        identifier
+        for identifier, status in task_rows(ledger.read_text(encoding="utf-8"))
+        if status in {"PENDING", "READY", "ACTIVE", "RECOVERING", "VERIFY", "BLOCKED"}
+    }
+
+
+def current_goal_ledger_ids(ledger: Path, open_ids: set[str] | None = None) -> set[str]:
+    text = ledger.read_text(encoding="utf-8")
+    match = re.search(r"^- 当前 Goal：\s*(.+?)\s*$", text, re.MULTILINE)
+    if not match:
+        return set()
+    identifiers = open_ids if open_ids is not None else open_ledger_package_ids(ledger)
+    value = match.group(1)
+    return {
+        identifier
+        for identifier in identifiers
+        if re.search(
+            rf"(?<![A-Za-z0-9_-]){re.escape(identifier)}(?![A-Za-z0-9_-])",
+            value,
+        )
+    }
+
+
+GOAL_WORD = re.compile(r"(?:\bgoal\b|里程碑|当前\s*Goal|目标)", re.I)
+GOAL_CLOSE_WORD = re.compile(r"(?:close(?:d|ure)?|complete(?:d)?|done|结束|完成|闭合|关闭|收口)", re.I)
+
+
+def event_closes_goal(snapshot: dict[str, Any]) -> bool:
+    contract = snapshot.get("event_contract")
+    chunks: list[str] = []
+    if isinstance(contract, dict):
+        for field in ("event_type", "primary_task", "terminal_receipt"):
+            value = contract.get(field)
+            if isinstance(value, str):
+                chunks.append(value)
+    actions = snapshot.get("event_actions")
+    if isinstance(actions, list):
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            value = action.get("action")
+            if isinstance(value, str):
+                chunks.append(value.replace("_", " ").replace("-", " "))
+    text = " ".join(chunks)
+    return bool(GOAL_WORD.search(text) and GOAL_CLOSE_WORD.search(text))
+
+
+def validate_goal_rollover(
+    snapshot: dict[str, Any],
+    *,
+    ledger_open_ids: set[str] | None,
+    ledger_goal_ids: set[str] | None,
+) -> list[str]:
+    if not event_closes_goal(snapshot):
+        return []
+    errors: list[str] = []
+    rollover = snapshot.get("goal_rollover")
+    if not isinstance(rollover, dict):
+        return [
+            "goal_rollover is required when the event closes a Goal; recompute the project and roll to the next Goal or prove project-wide blocking"
+        ]
+    status = str(rollover.get("status", "")).strip().lower()
+    if status not in {"rolled", "project_blocked", "project_complete"}:
+        errors.append("goal_rollover.status must be rolled, project_blocked, or project_complete")
+    if rollover.get("project_recomputed") is not True:
+        errors.append("goal_rollover.project_recomputed=true is required")
+    closed_goal_id = str(rollover.get("closed_goal_id", "")).strip()
+    if not closed_goal_id:
+        errors.append("goal_rollover.closed_goal_id is required")
+    contract = snapshot.get("event_contract")
+    contract_text = json.dumps(contract, ensure_ascii=False) if isinstance(contract, dict) else ""
+    if closed_goal_id and closed_goal_id not in contract_text:
+        errors.append("goal_rollover.closed_goal_id must match the closing event contract")
+
+    open_ids = ledger_open_ids or set()
+    goal_ids = ledger_goal_ids or set()
+    if status == "rolled":
+        current_goal_id = str(rollover.get("current_goal_id", "")).strip()
+        if not current_goal_id:
+            errors.append("goal_rollover.current_goal_id is required for rolled status")
+        elif current_goal_id == closed_goal_id:
+            errors.append("goal_rollover must move to a different current Goal after closure")
+        elif current_goal_id not in open_ids:
+            errors.append("goal_rollover.current_goal_id must be an open ledger package")
+        if current_goal_id and current_goal_id not in goal_ids:
+            errors.append("goal_rollover.current_goal_id must match the ledger current Goal")
+    elif status == "project_blocked":
+        blocked_scan = rollover.get("blocked_scan")
+        if not isinstance(blocked_scan, dict):
+            errors.append("goal_rollover.blocked_scan is required for project_blocked status")
+        else:
+            from preblock_guard import validate_snapshot as validate_preblock
+
+            errors.extend(
+                "goal_rollover blocked scan: " + error
+                for error in validate_preblock(blocked_scan, ledger_package_ids=open_ids)
+            )
+    elif status == "project_complete":
+        if open_ids:
+            errors.append(
+                "goal_rollover project_complete requires no open ledger packages: "
+                + ", ".join(sorted(open_ids))
+            )
+    return errors
 
 
 def ledger_sha256(ledger: Path) -> str:
@@ -316,6 +425,8 @@ def validate_snapshot(
     expected_rule_revision: str | None = None,
     affected_task_ids: set[str] | None = None,
     expected_candidates: dict[str, str] | None = None,
+    ledger_open_ids: set[str] | None = None,
+    ledger_goal_ids: set[str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     contract = snapshot.get("event_contract")
@@ -455,6 +566,11 @@ def validate_snapshot(
         errors.extend(
             validate_candidate_queue(snapshot, expected_candidates=expected_candidates)
         )
+    errors.extend(
+        validate_goal_rollover(
+            snapshot, ledger_open_ids=ledger_open_ids, ledger_goal_ids=ledger_goal_ids
+        )
+    )
     return errors
 
 
@@ -501,6 +617,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not ledger.is_file():
             raise ValueError("ledger path must be an existing file")
         ready_ids = ready_ledger_package_ids(ledger)
+        open_ids = open_ledger_package_ids(ledger)
+        goal_ids = current_goal_ledger_ids(ledger, open_ids)
         current_ledger_sha256 = ledger_sha256(ledger)
         if args.affected_task and not args.rule_revision:
             raise ValueError("--affected-task requires --rule-revision")
@@ -521,6 +639,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_rule_revision=args.rule_revision,
         affected_task_ids=set(args.affected_task) if args.rule_revision else None,
         expected_candidates=candidates,
+        ledger_open_ids=open_ids,
+        ledger_goal_ids=goal_ids,
     )
     from ledger_consistency_guard import validate_ledger
 

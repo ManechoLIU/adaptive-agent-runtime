@@ -418,6 +418,124 @@ class GovernanceTests(unittest.TestCase):
 
             self.assertEqual(result, 1)
 
+    def test_control_event_guard_requires_goal_rollover_on_goal_close(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 0,
+            "ready_packages": [],
+            "event_contract": {
+                "event_id": "close-goal-1",
+                "event_type": "Goal closure",
+                "primary_task": "M2-F6",
+                "candidate_revision": "ledger-abc123",
+                "allowed_actions": ["ledger_sync"],
+                "allowed_files": ["TASK_LEDGER.md"],
+                "terminal_receipt": "M2-F6 Goal closed",
+            },
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(),
+            ledger_open_ids={"M2-F6", "M1-F4-B"},
+            ledger_goal_ids={"M2-F6"},
+        )
+
+        self.assertTrue(any("goal_rollover" in error for error in errors))
+
+    def test_control_event_guard_accepts_goal_rollover_to_new_open_goal(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 0,
+            "ready_packages": [],
+            "event_contract": {
+                "event_id": "close-goal-2",
+                "event_type": "里程碑收口",
+                "primary_task": "M2-F6",
+                "candidate_revision": "ledger-abc123",
+                "allowed_actions": ["ledger_sync"],
+                "allowed_files": ["TASK_LEDGER.md"],
+                "terminal_receipt": "M2-F6 Goal 已完成并关闭",
+            },
+            "event_actions": [{
+                "action": "ledger_sync",
+                "primary_task": "M2-F6",
+                "candidate_revision": "ledger-abc123",
+                "files": ["TASK_LEDGER.md"],
+                "required_to_close_current_state": True,
+            }],
+            "goal_rollover": {
+                "status": "rolled",
+                "closed_goal_id": "M2-F6",
+                "current_goal_id": "M1-F4-B",
+                "project_recomputed": True,
+            },
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(),
+            ledger_open_ids={"M2-F6", "M1-F4-B"},
+            ledger_goal_ids={"M1-F4-B"},
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_control_event_guard_rejects_unproven_project_block_on_goal_close(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 0,
+            "ready_packages": [],
+            "event_contract": {
+                "event_id": "close-goal-blocked",
+                "event_type": "Goal closure",
+                "primary_task": "M2-F6",
+                "candidate_revision": "ledger-abc123",
+                "allowed_actions": ["ledger_sync"],
+                "allowed_files": ["TASK_LEDGER.md"],
+                "terminal_receipt": "M2-F6 Goal closed",
+            },
+            "event_actions": [{
+                "action": "ledger_sync",
+                "primary_task": "M2-F6",
+                "candidate_revision": "ledger-abc123",
+                "files": ["TASK_LEDGER.md"],
+                "required_to_close_current_state": True,
+            }],
+            "goal_rollover": {
+                "status": "project_blocked",
+                "closed_goal_id": "M2-F6",
+                "project_recomputed": True,
+                "blocked_scan": {
+                    "project_scope_scan": True,
+                    "ledger_revision": "abc123",
+                    "open_packages": [{
+                        "id": "M1-F4-B",
+                        "state": "READY",
+                        "can_progress": True,
+                        "reason": "still executable",
+                        "external_condition_id": "",
+                    }],
+                    "live_tasks": 0,
+                    "pending_candidates": 0,
+                    "controller_actions": 0,
+                },
+            },
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(),
+            ledger_open_ids={"M1-F4-B"},
+            ledger_goal_ids=set(),
+        )
+
+        self.assertTrue(any("goal_rollover blocked scan" in error for error in errors))
+        self.assertTrue(any("can still make progress" in error for error in errors))
+
     def test_control_event_guard_requires_every_ready_decision(self) -> None:
         snapshot = {
             **self.complete_event_receipt(),
