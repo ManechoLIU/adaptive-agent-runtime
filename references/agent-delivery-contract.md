@@ -17,11 +17,13 @@ For Assignment-bound external execution, delivered ACK is a **launch gate**, not
 
 ## 2. Unified Result Envelope
 
-All execution transports (native subagent, Grok/Kimi runner, future A2A transport) normalize terminal delivery into the runtime terminal receipt. Required result semantics are:
+All execution transports (native subagent, Grok/Kimi runner, future A2A transport) keep **transport completion** separate from the **delivery verdict** in the runtime terminal receipt. New terminal receipts use:
 
-`task_id + assignment_id + attempt + lease_id + outcome + summary + evidence[] + artifacts[] + next_action + retry_class`
+`task_id + assignment_id + attempt + lease_id + terminal_state + transport_outcome + delivery_outcome + summary + evidence[] + artifacts[] + next_action + retry_class`
 
-When code or a versioned artifact is produced, `artifacts` must identify the exact revision/path. Transport-specific prose may be retained as evidence, but it is not the authoritative result.
+`transport_outcome` answers only whether the provider/process completed, failed, was cancelled, or was transport-blocked. `delivery_outcome` is independently `pass | fail | blocked | unresolved`. Provider exit code `0` means transport completed only; without an explicit validated delivery receipt the delivery remains `unresolved`, never PASS. Legacy receipts with one `outcome` remain readable during migration but must not be emitted by new runner writes.
+
+When code or a versioned artifact is produced, Delivery PASS requires explicit evidence and an exact artifact/revision. Transport-specific prose may be retained as evidence, but prose or exit code alone is not an authoritative delivery result.
 
 Runtime heartbeat is liveness only. A progress receipt extends the progress deadline only when at least one authoritative fingerprint changes (Git HEAD, tracked status hash, evidence receipt, artifact, or blocker evidence). Repeating the same fingerprint does not count as progress. Same-contract recovery is bounded to two recovery attempts; after exhaustion the same Assignment cannot start another attempt. Strategy-changing execution must use a new Assignment contract rather than silently resetting the counter. Checkpoint governance stays risk-tailored: checkpoint 只作为恢复锚点，ordinary short assignments do not gain a new mandatory approval step or controller-authored runtime field.
 

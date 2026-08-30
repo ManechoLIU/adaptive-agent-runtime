@@ -80,6 +80,7 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
   if (process.env.FAKE_RUNNER_TOUCH_FILE) fs.writeFileSync(process.env.FAKE_RUNNER_TOUCH_FILE, "changed\\n");
   const delay = Number(process.env.FAKE_RUNNER_DELAY_MS || 0);
   if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+  process.exitCode = Number(process.env.FAKE_RUNNER_EXIT_CODE || 0);
 }
 `);
   await chmod(target, 0o755);
@@ -368,7 +369,7 @@ test("assignment-bound execute spawns only after exact delivered ACK passes", as
   assert.equal((await readFile(marker, "utf8")).trim(), "spawned");
 });
 
-test("external execution emits provider-neutral start and terminal runtime receipts", async () => {
+test("delivery verdict leaves exit zero without a receipt unresolved", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-runtime-"));
   const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
@@ -388,7 +389,64 @@ test("external execution emits provider-neutral start and terminal runtime recei
   assert.deepEqual(events.map((e) => e.event_type), ["assignment_started", "assignment_terminal"]);
   assert.deepEqual(events.map((e) => e.event_seq), [1, 2]);
   assert.equal(events[0].attempt, 1); assert.equal(events[0].lease_id, "lease-1");
-  assert.equal(events[1].outcome, "success"); assert.equal(events[1].terminal_state, "completed");
+  assert.equal(events[1].terminal_state, "completed");
+  assert.equal(events[1].transport_outcome, "completed");
+  assert.equal(events[1].delivery_outcome, "unresolved");
+  assert.equal(events[1].outcome, undefined);
+});
+
+test("delivery verdict preserves transport failure and explicit evidence-backed verdicts", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-delivery-verdict-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome };
+
+  const run = async ({ assignmentId, exitCode = 0, deliveryReceipt }) => {
+    const receipts = path.join(bin, `${assignmentId}.jsonl`);
+    const deliveryPath = path.join(bin, `${assignmentId}-delivery.json`);
+    const args = [adapter,
+      "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+      "--assignment-id", assignmentId, "--task-id", "T1", "--agent-id", "writer", "--session-id", `session-${assignmentId}`,
+      "--assignment-ack", await assignmentAckFile(bin, { assignment_id: assignmentId }, repo),
+      "--runtime-receipts", receipts,
+    ];
+    if (deliveryReceipt) {
+      await writeFile(deliveryPath, JSON.stringify(deliveryReceipt));
+      args.push("--delivery-receipt", deliveryPath);
+    }
+    const result = spawnSync(process.execPath, args, {
+      encoding: "utf8", input: "bounded contract", env: { ...env, FAKE_RUNNER_EXIT_CODE: String(exitCode) },
+    });
+    const events = (await readFile(receipts, "utf8")).trim().split("\n").map(JSON.parse);
+    return { result, terminal: events.at(-1) };
+  };
+
+  const failed = await run({ assignmentId: "exit-one", exitCode: 1 });
+  assert.equal(failed.result.status, 1, failed.result.stderr);
+  assert.equal(failed.terminal.transport_outcome, "failed");
+  assert.equal(failed.terminal.delivery_outcome, "unresolved");
+
+  const explicitFail = await run({
+    assignmentId: "explicit-fail",
+    deliveryReceipt: { delivery_outcome: "fail", summary: "focused test failed", evidence: ["test-log:42"], artifacts: [], next_action: "fix test", retry_class: "none" },
+  });
+  assert.equal(explicitFail.result.status, 0, explicitFail.result.stderr);
+  assert.equal(explicitFail.terminal.transport_outcome, "completed");
+  assert.equal(explicitFail.terminal.delivery_outcome, "fail");
+  assert.deepEqual(explicitFail.terminal.evidence, ["test-log:42"]);
+
+  const explicitPass = await run({
+    assignmentId: "explicit-pass",
+    deliveryReceipt: { delivery_outcome: "pass", summary: "delivery verified", evidence: ["green-test:42"], artifacts: ["git:abc123"], next_action: "review", retry_class: "none" },
+  });
+  assert.equal(explicitPass.result.status, 0, explicitPass.result.stderr);
+  assert.equal(explicitPass.terminal.transport_outcome, "completed");
+  assert.equal(explicitPass.terminal.delivery_outcome, "pass");
+  assert.deepEqual(explicitPass.terminal.artifacts, ["git:abc123"]);
 });
 
 

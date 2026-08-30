@@ -49,6 +49,39 @@ class RuntimeTests(unittest.TestCase):
         state=apply_receipt({},receipt("assignment_started"),now=T0); t=T0+timedelta(minutes=2)
         state=apply_receipt(state,receipt("assignment_terminal",t,event_seq=2,terminal_state="completed",outcome="success",summary="done",evidence=["checkpoint"],artifacts=[],next_action="none",retry_class="none"),now=t)
         self.assertEqual(evaluate_lease(state["leases"]["a1"],now=t)["state"],"terminal")
+    def test_new_terminal_receipt_separates_transport_from_unresolved_delivery(self):
+        state = apply_receipt({}, receipt("assignment_started"), now=T0)
+        terminal = receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), event_seq=2,
+            terminal_state="completed", transport_outcome="completed", delivery_outcome="unresolved",
+            summary="external agent process completed", evidence=[], artifacts=[], next_action="inspect delivery", retry_class="none",
+        )
+        state = apply_receipt(state, terminal, now=T0 + timedelta(minutes=1))
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["transport_outcome"], "completed")
+        self.assertEqual(lease["delivery_outcome"], "unresolved")
+        self.assertNotIn("outcome", lease)
+        self.assertEqual(evaluate_lease(lease, now=T0 + timedelta(minutes=1)), {"state": "terminal", "reason": "terminal:completed"})
+    def test_new_terminal_receipt_preserves_explicit_delivery_fail_after_process_completed(self):
+        state = apply_receipt({}, receipt("assignment_started"), now=T0)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), event_seq=2,
+            terminal_state="completed", transport_outcome="completed", delivery_outcome="fail",
+            summary="focused test failed", evidence=["test-log:42"], artifacts=[], next_action="fix test", retry_class="none",
+        ), now=T0 + timedelta(minutes=1))
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["terminal_state"], "completed")
+        self.assertEqual(lease["transport_outcome"], "completed")
+        self.assertEqual(lease["delivery_outcome"], "fail")
+    def test_delivery_pass_requires_explicit_evidence_and_artifact(self):
+        state = apply_receipt({}, receipt("assignment_started"), now=T0)
+        invalid = receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), event_seq=2,
+            terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
+            summary="unsubstantiated", evidence=["green-test:42"], artifacts=[], next_action="review", retry_class="none",
+        )
+        with self.assertRaisesRegex(ValueError, "delivery PASS requires evidence and artifact"):
+            apply_receipt(state, invalid, now=T0 + timedelta(minutes=1))
     def test_identity_mismatch_fails_closed(self):
         state=apply_receipt({},receipt("assignment_started"),now=T0)
         with self.assertRaises(ValueError): apply_receipt(state,receipt("assignment_heartbeat",T0+timedelta(minutes=1),session_id="other"),now=T0+timedelta(minutes=1))

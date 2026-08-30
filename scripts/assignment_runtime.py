@@ -22,7 +22,9 @@ except ModuleNotFoundError:
 UTC = timezone.utc
 EVENTS = {"assignment_started", "assignment_heartbeat", "assignment_progress", "assignment_terminal"}
 TERMINAL_STATES = {"completed", "failed", "cancelled", "disconnected"}
-OUTCOMES = {"success", "failed", "blocked", "cancelled", "recoverable_failure"}
+OUTCOMES = {"success", "failed", "blocked", "cancelled", "recoverable_failure"}  # legacy read compatibility
+TRANSPORT_OUTCOMES = {"completed", "failed", "cancelled", "blocked"}
+DELIVERY_OUTCOMES = {"pass", "fail", "blocked", "unresolved"}
 TRANSIENT_RETRY_CLASSES = {"rate_limit", "transport_error", "provider_5xx", "capacity", "lease_timeout"}
 MAX_ATTEMPTS = 3
 IDENTITY_FIELDS = ("assignment_id", "task_id", "agent_id", "provider", "session_id", "worktree")
@@ -185,11 +187,35 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
     if event == "assignment_terminal":
         terminal = receipt.get("terminal_state")
         if terminal not in TERMINAL_STATES: raise ValueError(f"invalid terminal state: {terminal}")
-        outcome = receipt.get("outcome"); summary = str(receipt.get("summary", "")).strip()
-        if outcome not in OUTCOMES or not summary: raise ValueError("terminal receipt requires structured outcome and summary")
+        summary = str(receipt.get("summary", "")).strip()
+        if not summary: raise ValueError("terminal receipt requires structured outcome and summary")
         if not isinstance(receipt.get("evidence"), list) or not isinstance(receipt.get("artifacts"), list): raise ValueError("terminal receipt requires evidence and artifacts lists")
         if not str(receipt.get("next_action", "")).strip() or not str(receipt.get("retry_class", "")).strip(): raise ValueError("terminal receipt requires next_action and retry_class")
-        lease["terminal_state"] = terminal; lease["terminal_at"] = _iso(issued); lease["outcome"] = outcome; lease["summary"] = summary
+        transport_outcome = receipt.get("transport_outcome")
+        delivery_outcome = receipt.get("delivery_outcome")
+        legacy_outcome = receipt.get("outcome")
+        if transport_outcome is None and delivery_outcome is None:
+            if legacy_outcome not in OUTCOMES:
+                raise ValueError("terminal receipt requires structured outcome and summary")
+        else:
+            if transport_outcome not in TRANSPORT_OUTCOMES or delivery_outcome not in DELIVERY_OUTCOMES:
+                raise ValueError("terminal receipt requires valid transport_outcome and delivery_outcome")
+            if terminal == "completed" and transport_outcome != "completed":
+                raise ValueError("completed terminal state requires completed transport outcome")
+            if terminal == "failed" and transport_outcome != "failed":
+                raise ValueError("failed terminal state requires failed transport outcome")
+            if delivery_outcome == "pass":
+                if transport_outcome != "completed":
+                    raise ValueError("delivery PASS requires completed transport")
+                if not receipt["evidence"] or not receipt["artifacts"]:
+                    raise ValueError("delivery PASS requires evidence and artifact")
+        lease["terminal_state"] = terminal; lease["terminal_at"] = _iso(issued); lease["summary"] = summary
+        if transport_outcome is None and delivery_outcome is None:
+            lease["outcome"] = legacy_outcome
+        else:
+            lease.pop("outcome", None)
+            lease["transport_outcome"] = transport_outcome
+            lease["delivery_outcome"] = delivery_outcome
         lease["evidence"] = receipt["evidence"]; lease["artifacts"] = receipt["artifacts"]; lease["next_action"] = receipt["next_action"]; lease["retry_class"] = receipt["retry_class"]
     lease["runtime_receipt_id"] = receipt.get("receipt_id") or lease.get("runtime_receipt_id")
     return out

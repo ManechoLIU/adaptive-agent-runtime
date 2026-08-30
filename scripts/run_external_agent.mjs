@@ -119,7 +119,7 @@ export function parseArgs(argv) {
     cwd: null,
     workPackage: null, category: null, status: null, detail: null,
     assignmentId: null, taskId: null, agentId: null, sessionId: null,
-    attempt: 1, leaseId: null, runtimeReceipts: null, assignmentAck: null,
+    attempt: 1, leaseId: null, runtimeReceipts: null, assignmentAck: null, deliveryReceipt: null,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -131,7 +131,7 @@ export function parseArgs(argv) {
     else if (argument === "--authorized-external-call") options.authorizedExternalCall = true;
     else if (argument === "--authorized-login") options.authorizedLogin = true;
     else if (argument === "--device-auth") options.deviceAuth = true;
-    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--work-package", "--category", "--status", "--detail", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts", "--assignment-ack"].includes(argument)) {
+    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--work-package", "--category", "--status", "--detail", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts", "--assignment-ack", "--delivery-receipt"].includes(argument)) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`Missing value for ${argument}`);
       if (argument === "--auth-mode") options.authMode = value;
@@ -145,6 +145,7 @@ export function parseArgs(argv) {
       else if (argument === "--runtime-receipts") options.runtimeReceipts = value;
       else if (argument === "--work-package") options.workPackage = value;
       else if (argument === "--assignment-ack") options.assignmentAck = value;
+      else if (argument === "--delivery-receipt") options.deliveryReceipt = value;
       else options[argument.slice(2)] = value;
       index += 1;
     } else {
@@ -296,6 +297,37 @@ function deriveExecutionLineage(options, assignment) {
     owned_scope: contract.owned_scope,
     strategy: contract.strategy,
     execution_lineage_id: createHash("sha256").update(canonical).digest("hex"),
+  };
+}
+
+function readDeliveryReceipt(pathname) {
+  if (!pathname) return null;
+  let receipt;
+  try {
+    receipt = JSON.parse(readFileSync(pathname, "utf8"));
+  } catch (error) {
+    throw new Error(`delivery-receipt is unreadable: ${error.message}`);
+  }
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) {
+    throw new Error("delivery-receipt must contain one delivery object");
+  }
+  const deliveryOutcome = String(receipt.delivery_outcome || "").toLowerCase();
+  if (!new Set(["pass", "fail", "blocked", "unresolved"]).has(deliveryOutcome)) {
+    throw new Error("delivery-receipt requires delivery_outcome pass|fail|blocked|unresolved");
+  }
+  const summary = String(receipt.summary || "").trim();
+  if (!summary || !Array.isArray(receipt.evidence) || !Array.isArray(receipt.artifacts)) {
+    throw new Error("delivery-receipt requires summary, evidence[], and artifacts[]");
+  }
+  if (!String(receipt.next_action || "").trim() || !String(receipt.retry_class || "").trim()) {
+    throw new Error("delivery-receipt requires next_action and retry_class");
+  }
+  if (deliveryOutcome === "pass" && (receipt.evidence.length === 0 || receipt.artifacts.length === 0)) {
+    throw new Error("delivery PASS requires evidence and artifact");
+  }
+  return {
+    delivery_outcome: deliveryOutcome, summary, evidence: receipt.evidence, artifacts: receipt.artifacts,
+    next_action: receipt.next_action, retry_class: receipt.retry_class,
   };
 }
 
@@ -615,16 +647,20 @@ async function main() {
     } catch (error) {
       if (heartbeat) clearInterval(heartbeat);
       eventSeq += 1;
-      recordRuntimeReceipt(options, "assignment_terminal", eventSeq, { terminal_state: "failed", outcome: "failed", summary: error.message, evidence: [], artifacts: [], next_action: "inspect external agent failure", retry_class: "transport_error" });
+      recordRuntimeReceipt(options, "assignment_terminal", eventSeq, { terminal_state: "failed", transport_outcome: "failed", delivery_outcome: "unresolved", summary: error.message, evidence: [], artifacts: [], next_action: "inspect external agent failure", retry_class: "transport_error" });
       throw error;
     }
     if (heartbeat) clearInterval(heartbeat);
     eventSeq += 1;
+    const delivery = code === 0 ? readDeliveryReceipt(options.deliveryReceipt) : null;
     recordRuntimeReceipt(options, "assignment_terminal", eventSeq, {
-      terminal_state: code === 0 ? "completed" : "failed", outcome: code === 0 ? "success" : "failed",
-      summary: code === 0 ? "external agent completed" : `external agent exited ${code}`,
-      evidence: [], artifacts: [], next_action: code === 0 ? "none" : "inspect external agent output",
-      retry_class: code === 0 ? "none" : "provider_exit",
+      terminal_state: code === 0 ? "completed" : "failed",
+      transport_outcome: code === 0 ? "completed" : "failed",
+      delivery_outcome: delivery?.delivery_outcome || "unresolved",
+      summary: delivery?.summary || (code === 0 ? "external agent process completed" : `external agent exited ${code}`),
+      evidence: delivery?.evidence || [], artifacts: delivery?.artifacts || [],
+      next_action: delivery?.next_action || (code === 0 ? "inspect delivery" : "inspect external agent output"),
+      retry_class: delivery?.retry_class || (code === 0 ? "none" : "provider_exit"),
     });
     process.exitCode = code;
   } catch (error) {
