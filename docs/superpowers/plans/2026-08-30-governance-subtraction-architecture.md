@@ -257,119 +257,216 @@ git commit -m "fix: derive lifecycle actions from current snapshot"
 
 ---
 
-### Task 5: Consolidate the three machine gates and remove obsolete duplicated semantics
+### Task 5: Derive runnable work before BLOCKED or yield
 
 **Files:**
-- Modify: `references/agent-delivery-contract.md`
-- Modify: `references/long-task-governance.md`
-- Modify: `SKILL.md`
-- Modify: `tests/test_skill_structure.py`
-- Modify: any implementation file only where dead duplicated logic is proven obsolete by Tasks 1–4.
+- Modify: `scripts/controller_state.py`
+- Modify: `scripts/control_event_guard.py`
+- Modify: `scripts/preblock_guard.py`
+- Modify: `scripts/lifecycle_hook.py`
+- Modify: `tests/test_controller_state.py`
+- Modify: `tests/test_governance.py`
 
 **Interfaces:**
-- Produces: one documented model with `Dispatch Gate`, `Delivery Gate`, and `Integration Gate`; all existing mechanisms are internal evidence to exactly one gate.
+- Consumes: current canonical Task rows plus Git/runtime/candidate/authorization facts already available to the controller snapshot.
+- Produces: a machine-derived `runnable_task_ids` projection and Stop/Yield decisions that do not trust READY labels alone.
 
-- [ ] **Step 1: Add failing structure assertions**
+- [ ] **Step 1: Write failing regressions for mislabeled PENDING work**
 
-Assert the skill/docs expose exactly the three controller-facing gates and explicitly map ACK/rule handshake/lineage budget to Dispatch, delivery receipt/evidence to Delivery, and candidate/review/main regression to Integration.
+Create a project snapshot where Task A is BLOCKED and Task B is still `PENDING` in the ledger but has satisfied dependencies, no file/environment conflict, no integration ordering constraint, and no authorization blocker. Assert Task B is mechanically runnable and controller yield is rejected.
 
-- [ ] **Step 2: Run structure tests RED**
+- [ ] **Step 2: Verify RED**
 
-Run: `python3 -m unittest tests.test_skill_structure -v`
-Expected: FAIL until documentation is consolidated.
+Run: `python3 -m unittest tests.test_controller_state tests.test_governance -k 'runnable or yield' -v`
+Expected: FAIL because current guards inspect declared READY rows rather than deriving readiness from all open Tasks.
 
-- [ ] **Step 3: Rewrite controller-facing guidance by subtraction**
+- [ ] **Step 3: Add one pure runnable derivation helper**
 
-Remove duplicated language that asks the controller to manually reconcile Assignment identity, runtime success, and ledger Task state independently. Keep the detailed machine evidence references, but nest them under the three gates.
+Implement a pure helper in the existing controller-state projection layer. It must derive from the canonical Task table and existing machine facts; it must not create a second state database or controller-authored readiness field. Return exact runnable Task IDs plus structured exclusion reasons for non-runnable open Tasks.
 
-- [ ] **Step 4: Delete dead duplicate code paths only when covered**
+- [ ] **Step 4: Feed the same derived set into control and preblock gates**
 
-If Tasks 1–4 make any previous compatibility branch or duplicate trigger state obsolete, remove it in the same task with a regression test. Do not refactor unrelated code.
+`control_event_guard.py`, `preblock_guard.py`, and lifecycle Stop handling consume the same projection. Any runnable counterexample rejects project idle/block even when the ledger has not yet been rewritten to READY.
 
-- [ ] **Step 5: Run structure tests GREEN**
+- [ ] **Step 5: Add true-block negative control**
 
-Run: `python3 -m unittest tests.test_skill_structure -v`
-Expected: PASS.
+Prove a project where every open Task waits on the same real external condition may still pass project-level BLOCKED/yield.
 
-- [ ] **Step 6: Commit Task 5**
+- [ ] **Step 6: Run focused tests GREEN and commit**
 
-```bash
-git add SKILL.md references/agent-delivery-contract.md references/long-task-governance.md tests/test_skill_structure.py scripts tests
-git commit -m "docs: collapse controller governance into three gates"
-```
+Run: `python3 -m unittest tests.test_controller_state tests.test_governance -v`
+Commit: `fix: derive runnable work before controller yield`
 
 ---
 
-### Task 6: Full regression, real B-01→B-05 counterexample, independent review, and release
+### Task 6: Centralize authorized provider fallback in Dispatch Gate
 
 **Files:**
-- Modify only if verification reveals a defect covered by this spec.
-- Test: full Python and Node suites.
+- Modify: `references/agent-model-routing.md`
+- Modify: `scripts/run_external_agent.mjs`
+- Create only if needed for single responsibility: `scripts/dispatch_route.py` or `scripts/dispatch_route.mjs`
+- Modify: `tests/external-agent-routing.test.mjs`
+- Modify: `tests/test_skill_structure.py`
 
 **Interfaces:**
-- Consumes: candidate revision produced by Tasks 1–5.
-- Produces: exact candidate with full tests, independent non-author review, main integration, install manifest, and SelfAlone controller machine ACK.
+- Consumes: preferred route, task category, complexity/risk, reasoning effort policy, failure classification, authorization constraints.
+- Produces: one normalized route decision: `preferred`, `fallback`, or `blocked`, with exact provider/model/reasoning effort and structured reason.
 
-- [ ] **Step 1: Run full Python suite**
+- [ ] **Step 1: Write failing route-decision tests**
 
-Run: `python3 -m unittest discover -s tests -v`
+Cover: safe Grok failure -> authorized Codex fallback; safe Kimi failure -> authorized Codex fallback; simple work -> Luna, normal implementation/debug/review -> Terra, architecture/high-risk/root-cause -> Sol; unknown result/possible partial write, billing/credential boundary, or explicit provider pin -> no automatic fallback.
+
+- [ ] **Step 2: Verify RED**
+
+Run: `node --test tests/external-agent-routing.test.mjs --test-name-pattern='fallback|route decision'`
+Expected: FAIL because fallback is not currently a single machine decision.
+
+- [ ] **Step 3: Implement one shared resolver**
+
+Keep provider authorization policy explicit. The resolver may select only routes already authorized by the project policy; it must not silently cross billing, credential, side-effect, or user/provider-pin boundaries.
+
+- [ ] **Step 4: Replace contradictory controller-facing routing prose**
+
+Update `agent-model-routing.md` so Desktop and Web both defer to the same resolver rather than one host silently downgrading while another blocks.
+
+- [ ] **Step 5: Verify GREEN and commit**
+
+Run: `node --test tests/external-agent-routing.test.mjs` and `python3 -m unittest tests.test_skill_structure -v`.
+Commit: `fix: centralize authorized provider fallback`
+
+---
+
+### Task 7: Make Web native resume preflighted, observable, and fail-closed
+
+**Files:**
+- Modify: `scripts/web_lifecycle_bridge.py`
+- Modify: `tests/test_web_lifecycle_bridge.py`
+- Modify: installer/LaunchAgent generation code only where the existing lifecycle LaunchAgent is authored.
+
+**Interfaces:**
+- Consumes: repo, unique controller registry, Codex path, runtime environment, receipt ID.
+- Produces: explicit `RESUME_PENDING`, `RESUME_CONFIRMED`, or `RESUME_FAILED` state with bounded diagnostics; non-zero resume never closes lifecycle.
+
+- [ ] **Step 1: Write failing 127 preflight regression**
+
+Run the native-resume preflight under a LaunchAgent-like PATH that excludes `/opt/homebrew/bin`. Assert the bridge returns a structured runtime failure naming missing Node/runtime instead of launching into an opaque 127.
+
+- [ ] **Step 2: Write failing success-path and fail-closed tests**
+
+Assert a PATH containing required runtime starts the exact registered thread. Assert a fake Codex returning non-zero persists `RESUME_FAILED`, preserves the pending control condition, and never records normal Stop closure.
+
+- [ ] **Step 3: Write failing diagnostics-retention test**
+
+Assert detached execution no longer routes stderr to `/dev/null`; state retains return code, command metadata, timestamps, and a bounded `stderr_tail`. Exercise log truncation/rotation limits so diagnostics cannot grow without bound.
+
+- [ ] **Step 4: Verify RED**
+
+Run: `python3 -m unittest tests.test_web_lifecycle_bridge.WebLifecycleNativeStopTests -v`
+Expected: failures for missing preflight/fail-closed/bounded diagnostics.
+
+- [ ] **Step 5: Implement preflight and deterministic LaunchAgent environment**
+
+Preflight repository existence, exactly one registered controller, Codex executable, Node/runtime resolution, and lightweight Codex execution. Ensure the authored LaunchAgent PATH contains the runtime search path required by the installed Codex/Node location.
+
+- [ ] **Step 6: Preserve detached execution without discarding diagnostics**
+
+Keep non-blocking/background behavior, but write stdout/stderr to bounded lifecycle diagnostics. Store a short stderr tail in the state receipt. Do not add a second lifecycle database.
+
+- [ ] **Step 7: Implement fail-closed resume state machine as adapter state only**
+
+The bridge adapter may track resume-attempt state but must not create a second project/task state machine. `RESUME_FAILED` leaves lifecycle pending and surfaces `WEB_LIFECYCLE_RESUME_FAILED`; bounded recovery reuses the same registered controller only.
+
+- [ ] **Step 8: Verify GREEN and commit**
+
+Run: `python3 -m unittest tests.test_web_lifecycle_bridge -v`.
+Commit: `fix: fail closed on web controller resume`
+
+---
+
+### Task 8: Collapse controller guidance into four gates and prove Desktop/Web parity
+
+**Files:**
+- Modify: `SKILL.md`
+- Modify: `references/agent-delivery-contract.md`
+- Modify: `references/long-task-governance.md`
+- Modify: `references/agent-model-routing.md`
+- Modify: `tests/test_skill_structure.py`
+- Modify: `tests/test_governance.py`
+- Modify: `tests/test_web_lifecycle_bridge.py`
+
+**Interfaces:**
+- Produces: exactly four controller-facing decisions: Dispatch, Delivery, Integration, Stop/Yield. Desktop native hooks and Web adapter consume the same current-snapshot decisions.
+
+- [ ] **Step 1: Add failing structure assertions**
+
+Assert docs expose exactly the four controller-facing gates and map ACK/rule-handshake/lineage/fallback/runnable derivation to Dispatch, evidence to Delivery, Git/review to Integration, and BLOCKED/rollover/idle/resume closure to Stop/Yield.
+
+- [ ] **Step 2: Add parity fixtures**
+
+Feed equivalent snapshots through Desktop lifecycle decision code and Web translation/resume path. Required outcomes must match for READY, derived-runnable-PENDING, local BLOCKED with alternative work, candidate pending, true project block, and safe/unsafe fallback scenarios.
+
+- [ ] **Step 3: Verify RED**
+
+Run focused structure/governance/Web tests and confirm missing four-gate/parity behavior fails.
+
+- [ ] **Step 4: Rewrite guidance by subtraction**
+
+Delete or collapse duplicated controller instructions rather than layering new prose. Web bridge remains an adapter; no Web-only READY/task database is introduced.
+
+- [ ] **Step 5: Verify GREEN and commit**
+
+Run: `python3 -m unittest tests.test_skill_structure tests.test_governance tests.test_web_lifecycle_bridge -v`.
+Commit: `docs: collapse controller governance into four gates`
+
+---
+
+### Task 9: Full regression, incident replay, independent review, install, and parity acceptance
+
+**Files:**
+- Modify only if verification reveals a defect covered by the approved spec.
+
+**Interfaces:**
+- Consumes: candidate revision from Tasks 1–8.
+- Produces: exact reviewed candidate, full regression evidence, installed revision, and unique SelfAlone controller rule-handshake ACK without redoing accepted product checkpoints.
+
+- [ ] **Step 1: Run full Python and Node suites**
+
+Run: `python3 -m unittest discover -s tests -v` and `node --test tests/external-agent-routing.test.mjs`.
 Expected: all PASS.
 
-- [ ] **Step 2: Run full Node suite**
+- [ ] **Step 2: Run syntax and diff checks**
 
-Run: `node --test tests/external-agent-routing.test.mjs`
-Expected: all PASS.
-
-- [ ] **Step 3: Run syntax/diff checks**
-
-Run:
-`python3 -m py_compile scripts/*.py`
-`git diff --check`
+Run: `python3 -m py_compile scripts/*.py` and `git diff --check`.
 Expected: PASS.
 
-- [ ] **Step 4: Run the exact incident counterexample**
+- [ ] **Step 3: Replay the B-01 -> B-05 false-green/recovery incident**
 
-Using a temporary Git repo/worktree and fake provider, replay five distinct Assignment IDs that share the same effective Checkpoint-B contract. Expected:
+Prove same-lineage budget rejects execution four before provider spawn, exit-0/no-evidence remains delivery unresolved, and only one Task row exists.
 
-```text
-A1 admitted
-A2 admitted as recovery 1
-A3 admitted as recovery 2
-A4 rejected before provider spawn because lineage budget exhausted
-no A5 spawn possible without a genuinely changed strategy fingerprint
-exit-0/no-evidence remains delivery unresolved, never PASS
-ledger contains one Task row only
-READY -> BLOCKED leaves no current READY trigger
-```
+- [ ] **Step 4: Replay local-BLOCKED/global-progress counterexample**
 
-- [ ] **Step 5: Dispatch independent non-author reviewer**
+Prove a BLOCKED Server Gate plus another mechanically runnable open package rejects yield and dispatches/activates the runnable package path.
 
-Reviewer must inspect the exact candidate revision and explicitly attack:
+- [ ] **Step 5: Replay Web 127 incident**
 
-1. Can changing only Assignment ID reset recovery budget?
-2. Can exit code 0 still become delivery PASS without evidence?
-3. Can Assignment IDs force extra ledger Task rows?
-4. Can stale READY survive after BLOCKED?
-5. Did implementation add a second state machine or extra manual controller field?
+With LaunchAgent-like missing PATH, preflight reports missing runtime and preserves lifecycle pending. With corrected environment, native resume starts the exact registered thread. Fake non-zero resume produces `RESUME_FAILED` with bounded stderr evidence and no false Stop closure.
 
-Required verdict: `REVIEW_PASS` or exact failures.
+- [ ] **Step 6: Replay fallback safety matrix**
 
-- [ ] **Step 6: Integrate candidate into `adaptive-delivery main` only after PASS**
+Prove safe external-route failure selects authorized Luna/Terra/Sol by task class, while unknown/partial-write/billing/credential/provider-pin cases block fallback.
 
-Use the existing clean integration path; preserve unrelated work.
+- [ ] **Step 7: Dispatch independent non-author reviewer**
 
-- [ ] **Step 7: Re-run full verification on main**
+Reviewer attacks lineage reset, false success, ledger bloat, stale READY, PENDING-but-runnable omission, unsafe fallback, Web resume false closure, unbounded logging, Desktop/Web divergence, and accidental second state machine/controller.
 
-Repeat Steps 1–4 against exact main revision.
+- [ ] **Step 8: Integrate only after review PASS and rerun exact main verification**
 
-- [ ] **Step 8: Install exact main revision**
+Preserve unrelated work. Do not merge/push without the normal explicit integration boundary.
 
-Run the official `scripts/install_skill.py` path and verify installed manifest revision/file hashes match source.
+- [ ] **Step 9: Install exact verified main revision and verify manifest hashes**
 
-- [ ] **Step 9: Require SelfAlone unique controller machine ACK**
+Use the official installer; verify source revision and installed file hashes match.
 
-The existing unique controller `01a03c61-5dd2-7553-968b-a3bc2f5777c9` must load the exact installed revision and complete rule-handshake ACK + existing ledger rule-version sync. Do not create a second controller and do not restart completed SelfAlone product checkpoints solely because governance changed.
+- [ ] **Step 10: Require the existing unique SelfAlone controller to load and ACK the exact revision**
 
-- [ ] **Step 10: Commit any final verification-only documentation if needed**
-
-Only if required by existing release practice; do not create a new governance report for its own sake.
+Reuse controller `01a03c61-5dd2-7553-968b-a3bc2f5777c9`; do not create a second controller and do not redo accepted SelfAlone checkpoints solely because governance changed.
