@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -142,6 +143,27 @@ def _ledger_has_revision(path: Path | None, revision: str) -> bool:
     return False
 
 
+def _unacked_change_impact(manifest: dict[str, Any], loaded_revision: str | None) -> tuple[str, list[str]]:
+    declared = str(manifest.get("impact", "")).strip() or "live_assignments"
+    installed = str(manifest.get("revision", "")).strip()
+    if not loaded_revision or not installed or loaded_revision == installed:
+        changed = list(manifest.get("changed_files", [])) if isinstance(manifest.get("changed_files"), list) else []
+        return declared, changed
+    source_text = str(manifest.get("source_root", "")).strip()
+    if not source_text:
+        return "live_assignments", []
+    source = Path(source_text).expanduser().resolve()
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(source), "diff", "--name-only", f"{loaded_revision}..{installed}"],
+            check=True, capture_output=True, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "live_assignments", []
+    changed = sorted(line.strip() for line in completed.stdout.splitlines() if line.strip())
+    return ("live_assignments" if set(changed) & CRITICAL_WAKE_FILES else "none"), changed
+
+
 def _manifest_details(manifest: dict[str, Any]) -> dict[str, Any]:
     return {
         "installed_revision": str(manifest.get("revision", "")).strip() or None,
@@ -166,18 +188,24 @@ def evaluate_rule_handshake(
     if not manifest:
         return {"state": "unmanaged", "blocking": False, "installed_revision": None, "loaded_revision": None}
     details = _manifest_details(manifest)
-    impact = details["impact"]
     errors = installation_integrity_errors(skill_root, manifest)
     state = load_rule_state(repo)
     loaded = str(state.get("loaded_revision", "")).strip() or None
-    result = {**details, "loaded_revision": loaded, "controller_session_id": state.get("controller_session_id")}
+    effective_impact, unacked_changed_files = _unacked_change_impact(manifest, loaded)
+    result = {
+        **details,
+        "effective_impact": effective_impact,
+        "unacked_changed_files": unacked_changed_files,
+        "loaded_revision": loaded,
+        "controller_session_id": state.get("controller_session_id"),
+    }
     if errors:
         return {**result, "state": "integrity_error", "blocking": True, "errors": errors}
     installed = details["installed_revision"]
     if not installed or loaded != installed:
-        return {**result, "state": "pending_ack", "blocking": impact == "live_assignments"}
+        return {**result, "state": "pending_ack", "blocking": effective_impact == "live_assignments"}
     if not _ledger_has_revision(_ledger_path(repo, ledger), installed):
-        return {**result, "state": "ledger_stale", "blocking": impact == "live_assignments"}
+        return {**result, "state": "ledger_stale", "blocking": effective_impact == "live_assignments"}
     return {**result, "state": "current", "blocking": False, "manifest_sha256": _sha256(manifest_path)}
 
 

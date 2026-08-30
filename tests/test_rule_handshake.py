@@ -125,6 +125,81 @@ class RuleHandshakeTests(unittest.TestCase):
             current_from_wt = evaluate_rule_handshake(wt, ledger=ledger, skill_root=target, registry_path=registry)
             self.assertEqual(current_from_wt["loaded_revision"], revision)
 
+    def test_later_nonimpacting_install_cannot_clear_unacked_live_impact_debt(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, revision1 = make_source(base)
+            target = base / "installed"
+            repo = make_project(base, revision_text=revision1)
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+
+            install_skill(source, target, summary="baseline", impact="none", stop_condition="none", now=NOW)
+            acknowledge_rule_revision(repo, "controller-1", revision1, skill_root=target, registry_path=registry, now=NOW)
+
+            critical = source / "scripts" / "run_external_agent.mjs"
+            critical.write_text("export const route = 2;\n", encoding="utf-8")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "live routing change")
+            revision2 = git(source, "rev-parse", "HEAD")
+            install_skill(
+                source, target, summary="live routing", impact="live_assignments",
+                stop_condition="ack before launch", previous_revision=revision1, now=NOW,
+            )
+
+            (source / "README.md").write_text("docs only\n", encoding="utf-8")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "docs only")
+            revision3 = git(source, "rev-parse", "HEAD")
+            install_skill(
+                source, target, summary="docs only", impact="none", stop_condition="next turn",
+                previous_revision=revision2, now=NOW,
+            )
+
+            result = evaluate_rule_handshake(repo, skill_root=target, registry_path=registry)
+            self.assertEqual(result["loaded_revision"], revision1)
+            self.assertEqual(result["installed_revision"], revision3)
+            self.assertEqual(result["state"], "pending_ack")
+            self.assertTrue(result["blocking"])
+            self.assertEqual(result["effective_impact"], "live_assignments")
+            self.assertIn("scripts/run_external_agent.mjs", result["unacked_changed_files"])
+
+    def test_loaded_controller_with_only_unacked_nonimpacting_changes_stays_nonblocking(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, revision1 = make_source(base)
+            target = base / "installed"
+            repo = make_project(base, revision_text=revision1)
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            install_skill(source, target, summary="baseline", impact="none", stop_condition="none", now=NOW)
+            acknowledge_rule_revision(repo, "controller-1", revision1, skill_root=target, registry_path=registry, now=NOW)
+
+            (source / "README.md").write_text("docs only\n", encoding="utf-8")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "docs only")
+            revision2 = git(source, "rev-parse", "HEAD")
+            install_skill(source, target, summary="docs only", impact="none", stop_condition="next turn", previous_revision=revision1, now=NOW)
+
+            result = evaluate_rule_handshake(repo, skill_root=target, registry_path=registry)
+            self.assertEqual(result["installed_revision"], revision2)
+            self.assertEqual(result["effective_impact"], "none")
+            self.assertFalse(result["blocking"])
+
+    def test_unverifiable_cumulative_change_range_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, revision = make_source(base)
+            target = base / "installed"
+            repo = make_project(base)
+            install_skill(source, target, summary="docs only", impact="none", stop_condition="next turn", now=NOW)
+            state_path = rule_state_path(repo)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps({"loaded_revision": "missing-old-revision", "controller_session_id": "controller-1"}), encoding="utf-8")
+            result = evaluate_rule_handshake(repo, skill_root=target, registry_path=base / "missing.json")
+            self.assertEqual(result["effective_impact"], "live_assignments")
+            self.assertTrue(result["blocking"])
+
     def test_nonimpacting_update_surfaces_drift_without_blocking_launch(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
