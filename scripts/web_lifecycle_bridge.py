@@ -356,6 +356,86 @@ def dispatch_event(event: dict[str, Any]) -> int:
     return completed.returncode
 
 
+def rule_wake_schedule_decision(lifecycle_state: dict[str, Any]) -> str:
+    policy = str(lifecycle_state.get("rule_wake_policy", "")).strip()
+    if policy == "immediate":
+        return "schedule_now"
+    if policy == "next_turn":
+        return "natural_turn"
+    if policy != "after_event":
+        return "none"
+    triggers = {str(item) for item in lifecycle_state.get("triggers", [])}
+    non_rule = {
+        item for item in triggers
+        if not item.startswith(("rule_update_pending:", "rule_ledger_stale:", "rule_install_integrity_error:"))
+    }
+    return "wait_for_event" if non_rule else "schedule_now"
+
+
+def _rule_revision_from_state(lifecycle_state: dict[str, Any]) -> str | None:
+    snapshot = lifecycle_state.get("snapshot")
+    if isinstance(snapshot, dict):
+        handshake = snapshot.get("rule_handshake")
+        if isinstance(handshake, dict):
+            revision = str(handshake.get("installed_revision", "")).strip()
+            if revision:
+                return revision
+    for trigger in lifecycle_state.get("triggers", []):
+        text = str(trigger)
+        if text.startswith("rule_update_pending:"):
+            revision = text.split(":", 1)[1].strip()
+            if revision:
+                return revision
+    return None
+
+
+def maybe_schedule_rule_wake(
+    *,
+    lifecycle_state: dict[str, Any],
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    codex: str,
+    delay_seconds: float,
+    state_path: Path,
+    capture_path: Path | None = None,
+    runtime_path: str | None = None,
+) -> str:
+    decision = rule_wake_schedule_decision(lifecycle_state)
+    if decision != "schedule_now":
+        return decision
+    revision = _rule_revision_from_state(lifecycle_state)
+    if not revision:
+        return "none"
+    receipt_id = f"rule-update:{revision}"
+    existing = load_json(state_path)
+    if existing.get("receipt_id") == receipt_id and existing.get("state") in {"RESUME_PENDING", "RESUME_CONFIRMED"}:
+        return "already_scheduled"
+    schedule_auto_native_stop(
+        session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry, codex=codex,
+        delay_seconds=delay_seconds, state_path=state_path, capture_path=capture_path, runtime_path=runtime_path,
+    )
+    return "scheduled"
+
+
+def refresh_rule_wake_state(*, session_id: str, repo: Path) -> dict[str, Any]:
+    try:
+        import lifecycle_hook as lifecycle
+    except ModuleNotFoundError:
+        from scripts import lifecycle_hook as lifecycle
+    snapshot = lifecycle.project_snapshot(repo)
+    if snapshot is None:
+        return {}
+    path = lifecycle.state_path(session_id)
+    prior = lifecycle.load_json(path)
+    event = post_tool_event(
+        session_id=session_id, repo=repo, command="adaptive-delivery rule wake check", exit_code=0
+    )
+    _, next_state = lifecycle.evaluate_event(event, snapshot=snapshot, prior_state=prior)
+    lifecycle.write_json(path, next_state)
+    return next_state
+
+
 def default_auto_stop_state_path(session_id: str) -> Path:
     return (
         Path.home()
@@ -673,6 +753,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     capture_path=Path(args.capture_auto_stop).expanduser() if args.capture_auto_stop else None,
                     runtime_path=args.runtime_path,
                 )
+        if receipts and args.auto_native_stop:
+            lifecycle_state = refresh_rule_wake_state(session_id=args.session_id, repo=repo)
+            state_path = (
+                Path(args.auto_stop_state).expanduser()
+                if args.auto_stop_state
+                else default_auto_stop_state_path(args.session_id)
+            )
+            maybe_schedule_rule_wake(
+                lifecycle_state=lifecycle_state,
+                session_id=args.session_id, repo=repo, registry=Path(args.registry).expanduser(),
+                codex=args.codex, delay_seconds=max(0.0, args.auto_stop_delay_seconds),
+                state_path=state_path,
+                capture_path=Path(args.capture_auto_stop).expanduser() if args.capture_auto_stop else None,
+                runtime_path=args.runtime_path,
+            )
         return 0
 
     if args.command_name == "arm-computer":

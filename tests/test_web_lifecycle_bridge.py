@@ -12,6 +12,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "scripts" / "web_lifecycle_bridge.py"
+_SPEC = importlib.util.spec_from_file_location("web_lifecycle_bridge_under_test", BRIDGE)
+assert _SPEC and _SPEC.loader
+web_bridge = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(web_bridge)
 
 
 class WebLifecycleBridgeTests(unittest.TestCase):
@@ -231,6 +235,75 @@ class WebLifecycleAuditTests(unittest.TestCase):
             self.assertIn("control_event_guard.py", events[0]["tool_input"]["command"])
             self.assertIn("control-event: allowed", events[0]["tool_response"]["output"])
             self.assertEqual(json.loads(cursor.read_text())["offset"], audit.stat().st_size)
+
+    def test_rule_wake_schedule_immediate_is_ready_now(self) -> None:
+        decision = web_bridge.rule_wake_schedule_decision({
+            "rule_wake_policy": "immediate",
+            "triggers": ["rule_update_pending:rev-new", "agent_session_terminal:T1"],
+        })
+        self.assertEqual(decision, "schedule_now")
+
+    def test_rule_wake_schedule_after_event_waits_for_nonrule_control_work(self) -> None:
+        waiting = web_bridge.rule_wake_schedule_decision({
+            "rule_wake_policy": "after_event",
+            "triggers": ["rule_update_pending:rev-new", "candidate_queue_changed"],
+        })
+        ready = web_bridge.rule_wake_schedule_decision({
+            "rule_wake_policy": "after_event",
+            "triggers": ["rule_update_pending:rev-new"],
+        })
+        self.assertEqual(waiting, "wait_for_event")
+        self.assertEqual(ready, "schedule_now")
+
+    def test_rule_wake_schedule_next_turn_never_forces_resume(self) -> None:
+        decision = web_bridge.rule_wake_schedule_decision({
+            "rule_wake_policy": "next_turn",
+            "triggers": ["rule_update_pending:rev-docs"],
+        })
+        self.assertEqual(decision, "natural_turn")
+
+    def test_rule_wake_scheduler_uses_same_controller_and_exact_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            state_path = base / "auto-stop.json"
+            capture = base / "capture.json"
+            result = web_bridge.maybe_schedule_rule_wake(
+                lifecycle_state={
+                    "rule_wake_policy": "immediate",
+                    "triggers": ["rule_update_pending:rev-new"],
+                    "snapshot": {"rule_handshake": {"installed_revision": "rev-new"}},
+                },
+                session_id="controller-1", repo=repo, registry=registry, codex="/opt/homebrew/bin/codex",
+                delay_seconds=0, state_path=state_path, capture_path=capture, runtime_path="/opt/homebrew/bin:/usr/bin:/bin",
+            )
+            self.assertEqual(result, "scheduled")
+            command = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertIn("controller-1", command)
+            self.assertIn("rule-update:rev-new", command)
+
+    def test_rule_wake_scheduler_does_not_force_next_turn_or_mid_event_after_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            for name, lifecycle_state in {
+                "next": {"rule_wake_policy": "next_turn", "triggers": ["rule_update_pending:rev-docs"]},
+                "after": {"rule_wake_policy": "after_event", "triggers": ["rule_update_pending:rev-new", "candidate_queue_changed"]},
+            }.items():
+                capture = base / f"{name}.json"
+                result = web_bridge.maybe_schedule_rule_wake(
+                    lifecycle_state=lifecycle_state,
+                    session_id="controller-1", repo=repo, registry=registry, codex="/opt/homebrew/bin/codex",
+                    delay_seconds=0, state_path=base / f"{name}.state.json", capture_path=capture, runtime_path="/opt/homebrew/bin:/usr/bin:/bin",
+                )
+                self.assertNotEqual(result, "scheduled")
+                self.assertFalse(capture.exists())
 
     def test_audit_once_schedules_native_stop_after_allowed_guard_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

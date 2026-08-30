@@ -19,6 +19,41 @@ except ModuleNotFoundError:
 UTC = timezone.utc
 MANIFEST_NAME = ".adaptive-delivery-install.json"
 LEDGER_NAMES = ("TASK_LEDGER.md", "PROJECT_STATUS.md")
+CRITICAL_WAKE_FILES = {
+    "scripts/assignment_runtime.py",
+    "scripts/assignment_lease_guard.py",
+    "scripts/control_event_guard.py",
+    "scripts/lifecycle_hook.py",
+    "scripts/rule_handshake.py",
+    "scripts/run_external_agent.mjs",
+    "scripts/web_lifecycle_bridge.py",
+    "references/agent-delivery-contract.md",
+    "references/agent-model-routing.md",
+}
+
+
+def derive_rule_wake_policy(
+    status: dict[str, Any],
+    *,
+    assignment_liveness: dict[str, Any] | None = None,
+) -> str | None:
+    if str(status.get("state", "")) != "pending_ack":
+        return None
+    if str(status.get("impact", "")) != "live_assignments":
+        return "next_turn"
+    changed = {str(item) for item in status.get("changed_files", []) if str(item).strip()}
+    live = assignment_liveness if isinstance(assignment_liveness, dict) else {}
+    has_live_assignment = any(
+        isinstance(value, dict)
+        and str(value.get("ledger_state", "")).upper() in {"ACTIVE", "RECOVERING"}
+        and str(value.get("state", "")).lower() != "terminal"
+        for value in live.values()
+    )
+    if has_live_assignment and bool(changed & CRITICAL_WAKE_FILES):
+        return "immediate"
+    return "after_event"
+
+
 DEFAULT_REGISTRY = Path(
     os.environ.get(
         "AD_CONTROLLER_REGISTRY",

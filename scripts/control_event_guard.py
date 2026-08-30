@@ -750,7 +750,9 @@ def validate_snapshot(
     return errors
 
 
-def canonical_rule_handshake_errors(repo: Path, ledger: Path) -> list[str]:
+def canonical_rule_handshake_errors(
+    repo: Path, ledger: Path, *, snapshot: dict[str, Any] | None = None
+) -> list[str]:
     try:
         try:
             from rule_handshake import evaluate_rule_handshake
@@ -760,6 +762,20 @@ def canonical_rule_handshake_errors(repo: Path, ledger: Path) -> list[str]:
     except (OSError, ValueError) as error:
         return [f"rule handshake integrity check failed: {error}"]
     if status.get("blocking") is True:
+        try:
+            try:
+                from rule_handshake import derive_rule_wake_policy
+            except ModuleNotFoundError:
+                from scripts.rule_handshake import derive_rule_wake_policy
+            event_snapshot = snapshot if isinstance(snapshot, dict) else {}
+            wake_policy = derive_rule_wake_policy(
+                status, assignment_liveness=event_snapshot.get("assignment_liveness", {})
+            )
+            new_assignments = event_snapshot.get("new_assignments", [])
+            if wake_policy == "after_event" and isinstance(new_assignments, list) and not new_assignments:
+                return []
+        except (OSError, ValueError):
+            pass
         revision = status.get("installed_revision") or "unknown"
         return [f"rule handshake {status.get('state')} for installed revision {revision}"]
     return []
@@ -843,7 +859,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         derived_runnable_ids=derived_runnable_ids,
     )
     if repo_root is not None:
-        errors.extend(canonical_rule_handshake_errors(repo_root, ledger))
+        errors.extend(canonical_rule_handshake_errors(repo_root, ledger, snapshot=snapshot))
     from ledger_consistency_guard import validate_ledger
 
     errors.extend(

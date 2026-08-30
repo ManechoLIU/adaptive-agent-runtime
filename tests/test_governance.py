@@ -209,6 +209,116 @@ class GovernanceTests(unittest.TestCase):
         )
         self.assertFalse(any(t.startswith("rule_update_pending:") or t.startswith("rule_ledger_stale:") for t in current_state["triggers"]))
 
+    def test_rule_wake_policy_is_immediate_only_for_critical_change_hitting_live_assignment(self) -> None:
+        handshake = {
+            "state": "pending_ack", "impact": "live_assignments",
+            "changed_files": ["scripts/run_external_agent.mjs"],
+        }
+        policy = lifecycle_hook.derive_rule_wake_policy(
+            handshake,
+            assignment_liveness={"T1": {"ledger_state": "ACTIVE", "state": "healthy"}},
+        )
+        self.assertEqual(policy, "immediate")
+
+    def test_rule_wake_policy_defers_live_impact_until_current_event_boundary(self) -> None:
+        handshake = {
+            "state": "pending_ack", "impact": "live_assignments",
+            "changed_files": ["references/context-governance.md"],
+        }
+        policy = lifecycle_hook.derive_rule_wake_policy(
+            handshake, assignment_liveness={}
+        )
+        self.assertEqual(policy, "after_event")
+
+    def test_rule_wake_policy_uses_next_natural_turn_for_nonimpacting_update(self) -> None:
+        handshake = {
+            "state": "pending_ack", "impact": "none",
+            "changed_files": ["references/context-governance.md"],
+        }
+        policy = lifecycle_hook.derive_rule_wake_policy(
+            handshake, assignment_liveness={}
+        )
+        self.assertEqual(policy, "next_turn")
+
+    def test_after_event_rule_update_allows_current_control_receipt_without_new_assignment(self) -> None:
+        from unittest.mock import patch
+        with patch("scripts.rule_handshake.evaluate_rule_handshake", return_value={
+            "state": "pending_ack", "blocking": True, "impact": "live_assignments",
+            "installed_revision": "rev-new", "changed_files": ["references/context-governance.md"],
+        }):
+            self.assertEqual(
+                control_event_guard.canonical_rule_handshake_errors(
+                    Path("."), Path("TASK_LEDGER.md"),
+                    snapshot={"assignment_liveness": {}, "new_assignments": []},
+                ),
+                [],
+            )
+
+    def test_immediate_rule_update_still_blocks_current_control_receipt(self) -> None:
+        from unittest.mock import patch
+        with patch("scripts.rule_handshake.evaluate_rule_handshake", return_value={
+            "state": "pending_ack", "blocking": True, "impact": "live_assignments",
+            "installed_revision": "rev-new", "changed_files": ["scripts/run_external_agent.mjs"],
+        }):
+            errors = control_event_guard.canonical_rule_handshake_errors(
+                Path("."), Path("TASK_LEDGER.md"),
+                snapshot={
+                    "assignment_liveness": {"T1": {"ledger_state": "ACTIVE", "state": "healthy"}},
+                    "new_assignments": [],
+                },
+            )
+        self.assertIn("rule handshake pending_ack for installed revision rev-new", errors)
+
+    def test_next_turn_rule_update_does_not_interrupt_existing_post_tool_event(self) -> None:
+        snapshot = {
+            "head": "abc", "ledger_sha256": "l", "worktree_status_sha256": "s",
+            "ready_ids": [], "runnable_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {},
+            "rule_handshake": {
+                "state": "pending_ack", "blocking": False, "installed_revision": "rev-docs",
+                "impact": "none", "changed_files": ["references/context-governance.md"],
+            },
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "PostToolUse", "session_id": "controller-1", "tool_input": {}, "tool_response": {}},
+            snapshot=snapshot,
+            prior_state={
+                "snapshot": {**snapshot, "rule_handshake": {"state": "current", "blocking": False}},
+                "pending_control_event": False, "triggers": [], "stop_continuations": 0,
+            },
+        )
+        self.assertEqual(output, {})
+        self.assertEqual(state["rule_wake_policy"], "next_turn")
+        self.assertFalse(state["pending_control_event"])
+
+    def test_after_event_control_receipt_clears_old_event_but_keeps_rule_wake_pending(self) -> None:
+        snapshot = {
+            "head": "abc", "ledger_sha256": "l", "worktree_status_sha256": "s",
+            "ready_ids": [], "runnable_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {},
+            "rule_handshake": {
+                "state": "pending_ack", "blocking": True, "installed_revision": "rev-new",
+                "impact": "live_assignments", "changed_files": ["references/context-governance.md"],
+            },
+        }
+        event = {
+            "hook_event_name": "PostToolUse", "session_id": "controller-1",
+            "tool_input": {"command": "python3 scripts/control_event_guard.py event.json --ledger TASK_LEDGER.md --repo ."},
+            "tool_response": {"exit_code": 0, "output": "control-event: allowed"},
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            event, snapshot=snapshot,
+            prior_state={
+                "snapshot": snapshot, "pending_control_event": True,
+                "triggers": ["candidate_queue_changed", "rule_update_pending:rev-new"],
+                "stop_continuations": 1,
+            },
+        )
+        self.assertEqual(output, {})
+        self.assertTrue(state["pending_control_event"])
+        self.assertEqual(state["triggers"], ["rule_update_pending:rev-new"])
+        self.assertEqual(state["rule_wake_policy"], "after_event")
+
     def test_lifecycle_rule_install_integrity_error_is_blocking(self) -> None:
         snapshot = {
             "head": "abc", "ledger_sha256": "l", "worktree_status_sha256": "s",

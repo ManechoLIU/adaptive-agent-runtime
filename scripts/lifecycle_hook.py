@@ -17,9 +17,9 @@ except ModuleNotFoundError:
     from scripts.controller_state import derive_runnable_tasks, project_task_state
 
 try:
-    from rule_handshake import evaluate_rule_handshake
+    from rule_handshake import derive_rule_wake_policy, evaluate_rule_handshake
 except ModuleNotFoundError:
-    from scripts.rule_handshake import evaluate_rule_handshake
+    from scripts.rule_handshake import derive_rule_wake_policy, evaluate_rule_handshake
 
 
 STATE_ROOT = Path(
@@ -132,7 +132,11 @@ def successful_control_receipt(
 ) -> bool:
     handshake = snapshot.get("rule_handshake", {}) if isinstance(snapshot, dict) else {}
     if isinstance(handshake, dict) and handshake.get("blocking") is True:
-        return False
+        policy = derive_rule_wake_policy(
+            handshake, assignment_liveness=(snapshot or {}).get("assignment_liveness", {})
+        )
+        if policy != "after_event":
+            return False
     if event.get("hook_event_name") != "PostToolUse":
         return False
     tool_input = event.get("tool_input")
@@ -213,6 +217,13 @@ def lifecycle_triggers(
     return sorted(set(triggers))
 
 
+def _non_rule_triggers(triggers: list[str] | set[str]) -> set[str]:
+    return {
+        str(item) for item in triggers
+        if not str(item).startswith(("rule_update_pending:", "rule_ledger_stale:", "rule_install_integrity_error:"))
+    }
+
+
 def continuation_reason(
     triggers: list[str],
     ready_ids: list[str],
@@ -275,6 +286,16 @@ def evaluate_event(
     event_host = str(event.get("controller_host", "")).strip()
     state["controller_host"] = event_host if event_host in {"web", "desktop_codex"} else "desktop_codex"
     event_name = event.get("hook_event_name")
+    handshake = snapshot.get("rule_handshake", {}) if isinstance(snapshot.get("rule_handshake"), dict) else {}
+    prior_nonrule_pending = bool(_non_rule_triggers(set((prior_state or {}).get("triggers", []))))
+    wake_policy = derive_rule_wake_policy(
+        handshake,
+        assignment_liveness=snapshot.get("assignment_liveness", {}),
+    )
+    if wake_policy:
+        state["rule_wake_policy"] = wake_policy
+    else:
+        state.pop("rule_wake_policy", None)
 
     if event_name == "SessionStart":
         triggers = lifecycle_triggers(snapshot, None)
@@ -315,13 +336,22 @@ def evaluate_event(
         return {}, state
 
     if successful_control_receipt(event, snapshot) and not snapshot.get("runnable_ids", snapshot.get("ready_ids")):
-        state.update(
-            {
-                "pending_control_event": False,
-                "triggers": [],
+        if wake_policy == "after_event" and str(handshake.get("state", "")) == "pending_ack":
+            rule_triggers = [item for item in lifecycle_triggers(snapshot, None) if item.startswith("rule_update_pending:")]
+            state.update({
+                "pending_control_event": bool(rule_triggers),
+                "triggers": rule_triggers,
                 "stop_continuations": 0,
-            }
-        )
+                "rule_wake_policy": "after_event",
+            })
+        else:
+            state.update(
+                {
+                    "pending_control_event": False,
+                    "triggers": [],
+                    "stop_continuations": 0,
+                }
+            )
         return {}, state
 
     detected = lifecycle_triggers(snapshot, prior_state)
@@ -343,6 +373,10 @@ def evaluate_event(
     }
     triggers = sorted(prior_triggers | set(detected))
     pending = bool(state.get("pending_control_event")) or bool(triggers)
+    if wake_policy == "next_turn" and event_name != "SessionStart" and not _non_rule_triggers(triggers):
+        pending = False
+    if wake_policy == "after_event" and prior_nonrule_pending:
+        pending = True
     state.update({"pending_control_event": pending, "triggers": triggers})
 
     if event_name == "PostToolUse":
