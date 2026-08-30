@@ -331,6 +331,48 @@ class GovernanceTests(unittest.TestCase):
         self.assertNotIn("recovery_stalled:F1", state["triggers"])
         self.assertIn("READY:F1", state["triggers"])
 
+    def test_lifecycle_current_snapshot_drops_ready_trigger_after_task_blocks(self) -> None:
+        prior_snapshot = {
+            "head": "abc", "ledger_sha256": "ledger-old", "worktree_status_sha256": "status",
+            "ready_ids": ["F1"], "candidate_revisions": [], "ledger_errors": [], "assignment_liveness": {},
+        }
+        prior_state = {
+            "snapshot": prior_snapshot, "pending_control_event": True,
+            "triggers": ["READY:F1"], "stop_continuations": 0,
+        }
+        current_snapshot = {
+            "head": "abc", "ledger_sha256": "ledger-new", "worktree_status_sha256": "status",
+            "ready_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {"F1": {"ledger_state": "BLOCKED", "state": "terminal", "reason": "external blocker"}},
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "PostToolUse", "session_id": "s", "tool_input": {}, "tool_response": {}},
+            snapshot=current_snapshot, prior_state=prior_state,
+        )
+        self.assertNotIn("READY:F1", state["triggers"])
+        self.assertNotIn("READY 派发", str(output))
+
+    def test_lifecycle_current_snapshot_drops_terminal_trigger_after_task_blocks(self) -> None:
+        prior_snapshot = {
+            "head": "abc", "ledger_sha256": "ledger-old", "worktree_status_sha256": "status",
+            "ready_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {"F1": {"ledger_state": "ACTIVE", "state": "terminal", "reason": "terminal:failed"}},
+        }
+        prior_state = {
+            "snapshot": prior_snapshot, "pending_control_event": True,
+            "triggers": ["agent_session_terminal:F1"], "stop_continuations": 0,
+        }
+        current_snapshot = {
+            "head": "abc", "ledger_sha256": "ledger-new", "worktree_status_sha256": "status",
+            "ready_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {"F1": {"ledger_state": "BLOCKED", "state": "terminal", "reason": "external blocker"}},
+        }
+        _, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "PostToolUse", "session_id": "s", "tool_input": {}, "tool_response": {}},
+            snapshot=current_snapshot, prior_state=prior_state,
+        )
+        self.assertNotIn("agent_session_terminal:F1", state["triggers"])
+
     def test_lifecycle_keeps_terminal_trigger_while_task_is_still_active(self) -> None:
         snapshot = {
             "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",

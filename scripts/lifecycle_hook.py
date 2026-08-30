@@ -240,11 +240,16 @@ def continuation_reason(
     elif state == "integrity_error":
         errors = "; ".join(str(item) for item in handshake.get("errors", []))
         rule_text = f" Adaptive Delivery 安装完整性失败：{errors}；禁止 ACK 或启动受影响 Assignment。"
+    actions = ["请立即核对真实 main / 台账 / live Agent"]
+    if candidate_revisions:
+        actions.append("处理候选审查、集成、验收")
+    if ready_ids:
+        actions.append("处理 READY 派发与 ACK；若客观上无法派发，必须把对应任务明确转为 BLOCKED 并记录可验证原因")
+    actions.append("随后用 control_event_guard.py 生成通过收据")
     return (
         "Adaptive Delivery 生命周期门检测到尚未闭合的控制事件。"
         f"触发：{trigger_text}；当前 READY：{ready}；候选：{candidates}。"
-        "请立即核对真实 main / 台账 / live Agent，处理候选审查、集成、验收、"
-        "READY 派发与 ACK；若客观上无法派发，必须把对应任务明确转为 BLOCKED 并记录可验证原因；随后用 control_event_guard.py 生成通过收据。"
+        + "；".join(actions) + "。"
         "不得仅把动作写成下一事件后停止。" + rule_text
     )
 
@@ -317,6 +322,13 @@ def evaluate_event(
         "active_without_progress:", "recovery_stalled:", "recovery_budget_exhausted:",
     )
     prior_triggers = {item for item in prior_triggers if not item.startswith(transient_prefixes)}
+    current_ready = {str(item) for item in snapshot.get("ready_ids", [])}
+    current_candidates = {str(item) for item in snapshot.get("candidate_revisions", [])}
+    prior_triggers = {
+        item for item in prior_triggers
+        if not (item.startswith("READY:") and item.removeprefix("READY:") not in current_ready)
+        and not (item.startswith("CANDIDATE:") and item.removeprefix("CANDIDATE:") not in current_candidates)
+    }
     triggers = sorted(prior_triggers | set(detected))
     pending = bool(state.get("pending_control_event")) or bool(triggers)
     state.update({"pending_control_event": pending, "triggers": triggers})
