@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +22,9 @@ DEFAULT_AUDIT_LOG = (
     / "activity.redacted.jsonl"
 )
 AI_BRIDGE_EXECUTABLE = "/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge"
+DEFAULT_RUNTIME_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+STDERR_TAIL_LIMIT = 8192
+LAUNCHER_LOG_LIMIT = 262144
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -230,6 +235,74 @@ def default_computer_lease_path(session_id: str) -> Path:
     )
 
 
+def bounded_tail(value: str, limit: int = STDERR_TAIL_LIMIT) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    marker = "\n...[diagnostic truncated]...\n"
+    head_size = min(1024, max(1, limit // 4))
+    tail_size = max(1, limit - head_size - len(marker))
+    return text[:head_size] + marker + text[-tail_size:]
+
+
+def native_runtime_env(runtime_path: str | None = None) -> dict[str, str]:
+    env = dict(os.environ)
+    env["PATH"] = runtime_path or DEFAULT_RUNTIME_PATH
+    return env
+
+
+def codex_requires_node(codex: Path) -> bool:
+    try:
+        first = codex.open("r", encoding="utf-8", errors="ignore").readline(512)
+    except OSError:
+        return False
+    return "/usr/bin/env node" in first
+
+
+def write_auto_stop_state(state_path: Path, value: dict[str, Any]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = state_path.with_suffix(state_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(state_path)
+
+
+def preflight_native_resume(
+    *, session_id: str, repo: Path, registry: Path, codex: str, runtime_path: str | None = None
+) -> tuple[bool, str, dict[str, str]]:
+    env = native_runtime_env(runtime_path)
+    if not repo.is_dir():
+        return False, f"repository does not exist: {repo}", env
+    try:
+        registered = registered_controller_for_repo(repo, registry)
+    except ValueError as exc:
+        return False, str(exc), env
+    if registered != session_id:
+        return False, f"session {session_id} is not the registered controller for {repo}", env
+    codex_path = Path(codex).expanduser()
+    if not codex_path.is_file() or not os.access(codex_path, os.X_OK):
+        return False, f"codex executable unavailable: {codex_path}", env
+    if codex_requires_node(codex_path) and shutil.which("node", path=env["PATH"]) is None:
+        return False, f"missing node runtime in PATH for {codex_path}: {env['PATH']}", env
+    completed = subprocess.run(
+        [str(codex_path), "--version"], check=False, capture_output=True, text=True, env=env, timeout=15
+    )
+    if completed.returncode != 0:
+        detail = bounded_tail(completed.stderr or completed.stdout)
+        return False, f"codex preflight failed ({completed.returncode}): {detail}", env
+    return True, "", env
+
+
+def rotate_launcher_log(path: Path, max_bytes: int = LAUNCHER_LOG_LIMIT) -> None:
+    try:
+        if not path.exists() or path.stat().st_size < max_bytes:
+            return
+        previous = path.with_suffix(path.suffix + ".1")
+        previous.unlink(missing_ok=True)
+        path.replace(previous)
+    except OSError:
+        return
+
+
 def native_resume_command(*, codex: str, session_id: str, repo: Path) -> list[str]:
     prompt = (
         "Adaptive Delivery Web Stop checkpoint. Continue this existing registered controller "
@@ -302,15 +375,17 @@ def schedule_auto_native_stop(
     delay_seconds: float,
     state_path: Path,
     capture_path: Path | None = None,
+    runtime_path: str | None = None,
 ) -> None:
     value = {
         "receipt_id": receipt_id,
         "session_id": session_id,
         "repo": str(repo.resolve()),
         "scheduled_at_unix_ms": int(time.time() * 1000),
+        "state": "RESUME_PENDING",
+        "pending_control_event": True,
     }
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_auto_stop_state(state_path, value)
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -329,18 +404,28 @@ def schedule_auto_native_stop(
         str(delay_seconds),
         "--state",
         str(state_path),
+        "--runtime-path",
+        runtime_path or DEFAULT_RUNTIME_PATH,
     ]
     if capture_path is not None:
         capture_path.write_text(json.dumps(command, ensure_ascii=False) + "\n", encoding="utf-8")
         return
-    subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
+    launcher_log = state_path.with_suffix(state_path.suffix + ".launcher.log")
+    rotate_launcher_log(launcher_log)
+    launcher_log.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = launcher_log.open("ab", buffering=0)
+    try:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=log_handle,
+            env=native_runtime_env(runtime_path),
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_handle.close()
 
 
 def run_auto_native_stop(
@@ -352,30 +437,66 @@ def run_auto_native_stop(
     codex: str,
     delay_seconds: float,
     state_path: Path,
+    runtime_path: str | None = None,
 ) -> int:
     if delay_seconds > 0:
         time.sleep(delay_seconds)
     state = load_json(state_path)
     if state.get("receipt_id") != receipt_id:
         return 0
+    command = native_resume_command(codex=codex, session_id=session_id, repo=repo)
+    latest = dict(state)
+    latest.update({
+        "state": "RESUME_PENDING",
+        "pending_control_event": True,
+        "started_at_unix_ms": int(time.time() * 1000),
+        "command": command,
+        "runtime_path": runtime_path or DEFAULT_RUNTIME_PATH,
+    })
+    write_auto_stop_state(state_path, latest)
+
     try:
-        registered = registered_controller_for_repo(repo, registry)
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
-    if registered != session_id:
-        return 0
+        ok, preflight_error, env = preflight_native_resume(
+            session_id=session_id, repo=repo, registry=registry, codex=codex, runtime_path=runtime_path
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        ok, preflight_error, env = False, f"native resume preflight error: {exc}", native_runtime_env(runtime_path)
+    if not ok:
+        latest = load_json(state_path)
+        if latest.get("receipt_id") == receipt_id:
+            latest.update({
+                "state": "RESUME_FAILED",
+                "pending_control_event": True,
+                "completed_at_unix_ms": int(time.time() * 1000),
+                "returncode": 78,
+                "stderr_tail": bounded_tail(preflight_error),
+                "error_code": "WEB_LIFECYCLE_RESUME_FAILED",
+            })
+            write_auto_stop_state(state_path, latest)
+        print(preflight_error, file=sys.stderr)
+        return 78
+
     completed = subprocess.run(
-        native_resume_command(codex=codex, session_id=session_id, repo=repo),
-        check=False,
+        command, check=False, capture_output=True, text=True, env=env
     )
     latest = load_json(state_path)
     if latest.get("receipt_id") == receipt_id:
-        latest["completed_at_unix_ms"] = int(time.time() * 1000)
-        latest["returncode"] = completed.returncode
-        state_path.write_text(
-            json.dumps(latest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+        confirmed = completed.returncode == 0
+        latest.update({
+            "state": "RESUME_CONFIRMED" if confirmed else "RESUME_FAILED",
+            "pending_control_event": not confirmed,
+            "completed_at_unix_ms": int(time.time() * 1000),
+            "returncode": completed.returncode,
+            "stdout_tail": bounded_tail(completed.stdout),
+            "stderr_tail": bounded_tail(completed.stderr),
+        })
+        if not confirmed:
+            latest["error_code"] = "WEB_LIFECYCLE_RESUME_FAILED"
+        else:
+            latest.pop("error_code", None)
+        write_auto_stop_state(state_path, latest)
+    if completed.stderr:
+        print(bounded_tail(completed.stderr), file=sys.stderr, end="" if completed.stderr.endswith("\n") else "\n")
     return completed.returncode
 
 
@@ -434,6 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit_once.add_argument("--auto-stop-state")
     audit_once.add_argument("--capture-auto-stop")
     audit_once.add_argument("--codex", default="/opt/homebrew/bin/codex")
+    audit_once.add_argument("--runtime-path", default=DEFAULT_RUNTIME_PATH)
 
     arm_computer = subparsers.add_parser("arm-computer")
     arm_computer.add_argument("--cwd", required=True)
@@ -447,6 +569,7 @@ def build_parser() -> argparse.ArgumentParser:
     native_stop.add_argument("--repo", required=True)
     native_stop.add_argument("--registry", default=str(DEFAULT_REGISTRY))
     native_stop.add_argument("--codex", default="/opt/homebrew/bin/codex")
+    native_stop.add_argument("--runtime-path", default=DEFAULT_RUNTIME_PATH)
     native_stop.add_argument("--dry-run", action="store_true")
 
     auto_stop = subparsers.add_parser("auto-native-stop")
@@ -455,6 +578,7 @@ def build_parser() -> argparse.ArgumentParser:
     auto_stop.add_argument("--receipt-id", required=True)
     auto_stop.add_argument("--registry", default=str(DEFAULT_REGISTRY))
     auto_stop.add_argument("--codex", default="/opt/homebrew/bin/codex")
+    auto_stop.add_argument("--runtime-path", default=DEFAULT_RUNTIME_PATH)
     auto_stop.add_argument("--delay-seconds", type=float, default=5.0)
     auto_stop.add_argument("--state")
 
@@ -546,6 +670,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     delay_seconds=max(0.0, args.auto_stop_delay_seconds),
                     state_path=state_path,
                     capture_path=Path(args.capture_auto_stop).expanduser() if args.capture_auto_stop else None,
+                    runtime_path=args.runtime_path,
                 )
         return 0
 
@@ -603,7 +728,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             print(json.dumps(command, ensure_ascii=False))
             return 0
-        completed = subprocess.run(command, check=False)
+        ok, error, env = preflight_native_resume(
+            session_id=args.session_id, repo=repo, registry=Path(args.registry).expanduser(), codex=args.codex, runtime_path=args.runtime_path
+        )
+        if not ok:
+            print(error, file=sys.stderr)
+            return 78
+        completed = subprocess.run(command, check=False, env=env)
         return completed.returncode
 
     if args.command_name == "auto-native-stop":
@@ -621,6 +752,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             codex=args.codex,
             delay_seconds=max(0.0, args.delay_seconds),
             state_path=state_path,
+            runtime_path=args.runtime_path,
         )
 
     if args.command_name == "print-zshenv-block":

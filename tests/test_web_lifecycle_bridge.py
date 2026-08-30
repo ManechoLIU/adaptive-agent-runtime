@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -466,3 +467,101 @@ class WebLifecycleNativeStopTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("registered controller", result.stderr)
+
+
+class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
+    def run_bridge(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["/usr/bin/python3", str(BRIDGE), *args], text=True, capture_output=True, check=False
+        )
+
+    def make_repo_registry(self, root: Path) -> tuple[Path, Path]:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+        return repo, registry
+
+    def test_auto_native_stop_preflight_names_missing_node_in_launchagent_like_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry = self.make_repo_registry(root)
+            codex = root / "codex"
+            codex.write_text("#!/usr/bin/env node\nprocess.exit(0)\n", encoding="utf-8")
+            codex.chmod(0o755)
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({"receipt_id":"r1","session_id":"controller-1","repo":str(repo.resolve()),"state":"RESUME_PENDING","pending_control_event":True}), encoding="utf-8")
+            empty_bin = root / "empty-bin"; empty_bin.mkdir()
+
+            result = self.run_bridge(
+                "auto-native-stop", "--session-id", "controller-1", "--repo", str(repo),
+                "--receipt-id", "r1", "--registry", str(registry), "--state", str(state),
+                "--delay-seconds", "0", "--codex", str(codex), "--runtime-path", str(empty_bin),
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["state"], "RESUME_FAILED")
+            self.assertTrue(saved["pending_control_event"])
+            self.assertIn("missing node runtime", saved["stderr_tail"].lower())
+            self.assertNotEqual(saved.get("returncode"), 127)
+
+    def test_auto_native_stop_failure_is_fail_closed_and_keeps_bounded_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry = self.make_repo_registry(root)
+            codex = root / "codex"
+            codex.write_text(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo codex-test; exit 0; fi\nprintf 'resume exploded:' >&2\npython3 - <<'EOF' >&2\nprint('x'*20000)\nEOF\nexit 7\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({"receipt_id":"r2","session_id":"controller-1","repo":str(repo.resolve()),"state":"RESUME_PENDING","pending_control_event":True}), encoding="utf-8")
+
+            result = self.run_bridge(
+                "auto-native-stop", "--session-id", "controller-1", "--repo", str(repo),
+                "--receipt-id", "r2", "--registry", str(registry), "--state", str(state),
+                "--delay-seconds", "0", "--codex", str(codex),
+            )
+
+            self.assertEqual(result.returncode, 7)
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["state"], "RESUME_FAILED")
+            self.assertTrue(saved["pending_control_event"])
+            self.assertEqual(saved["returncode"], 7)
+            self.assertIn("resume exploded", saved["stderr_tail"])
+            self.assertLessEqual(len(saved["stderr_tail"]), 8192)
+            self.assertIn("command", saved)
+
+    def test_auto_native_stop_success_confirms_same_controller_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry = self.make_repo_registry(root)
+            codex = root / "codex"
+            marker = root / "resume.txt"
+            codex.write_text(
+                f"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo codex-test; exit 0; fi\nprintf '%s\n' \"$*\" > {marker}\nexit 0\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({"receipt_id":"r3","session_id":"controller-1","repo":str(repo.resolve()),"state":"RESUME_PENDING","pending_control_event":True}), encoding="utf-8")
+
+            result = self.run_bridge(
+                "auto-native-stop", "--session-id", "controller-1", "--repo", str(repo),
+                "--receipt-id", "r3", "--registry", str(registry), "--state", str(state),
+                "--delay-seconds", "0", "--codex", str(codex),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["state"], "RESUME_CONFIRMED")
+            self.assertFalse(saved["pending_control_event"])
+            self.assertIn("resume controller-1", marker.read_text())
+
+    def test_detached_scheduler_does_not_discard_stderr_to_devnull(self) -> None:
+        source = BRIDGE.read_text(encoding="utf-8")
+        self.assertNotIn("stderr=subprocess.DEVNULL", source)
+        self.assertNotIn("stdout=subprocess.DEVNULL", source)
+        self.assertIn("rotate_launcher_log", source)
+        self.assertIn(".launcher.log", source)
+        self.assertIn("stderr_tail", source)
