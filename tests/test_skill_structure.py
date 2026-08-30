@@ -339,6 +339,23 @@ class SkillStructureTests(unittest.TestCase):
         for phrase in ("工作流 / 档位 / 证据 / 授权门", "不使用单一最高值", "共同关键路径"):
             self.assertIn(phrase, methods)
 
+    def test_controller_governance_collapses_to_exactly_four_named_gates(self):
+        entrypoint = read_entrypoint()
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+        routing = REFERENCE_PATHS["agent-routing"].read_text(encoding="utf-8")
+        delivery = REFERENCE_PATHS["agent-delivery"].read_text(encoding="utf-8")
+        scenarios = (ROOT / "tests" / "behavioral-scenarios.md").read_text(encoding="utf-8")
+
+        self.assertIn("四个控制门", entrypoint)
+        for gate in ("Dispatch Gate", "Delivery Gate", "Integration Gate", "Stop/Yield Gate"):
+            self.assertIn(gate, entrypoint)
+        self.assertNotIn("三个临时机器门", scenarios)
+        self.assertIn("Dispatch Gate", routing)
+        self.assertIn("Delivery Gate", delivery)
+        self.assertIn("Integration Gate", delivery)
+        self.assertIn("Stop/Yield Gate", long_task)
+        self.assertIn("同一份机器投影", entrypoint)
+
     def test_external_agent_routes_pin_the_selected_reasoning_effort(self):
         routing = REFERENCE_PATHS["agent-routing"].read_text(encoding="utf-8")
         external = REFERENCE_PATHS["external-agent"].read_text(encoding="utf-8")

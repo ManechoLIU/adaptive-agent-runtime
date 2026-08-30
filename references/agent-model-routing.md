@@ -56,7 +56,7 @@ Adaptive Delivery 负责把项目目标拆成可验收工作包，为每个工�
 - Grok 的两种认证模式都经 Grok Build CLI 执行。OAuth 使用 `grok login` 的可刷新会话；API 模式必须隔离 OAuth 会话后注入 `XAI_API_KEY`，从而保证不会因为本机已有登录而走错计费通道。
 - 外部模型执行前确认：运行器存在、模型标识可解析、认证已配置、工作目录与文件所有权正确、工具权限和停止条件明确。
 - API/订阅可能计费。未获得本轮付费授权时，只验证配置、命令发现、假服务或 dry-run，不发送真实推理请求。
-- 首选外部通道失败后统一调用 `scripts/run_external_agent.mjs --resolve-route`。只有 `provider_unavailable / cli_unavailable / transport_failure_before_write / no_valid_result` 这类已知无副作用的安全失败可自动降级到 Codex；机械窄任务选 `gpt-5.6-luna`，常规实现 / 调试 / 审查选 `gpt-5.6-terra`，架构 / 复杂根因 / 高风险选 `gpt-5.6-sol`，并由 resolver 给出推理强度。若用户固定 provider、结果未知、可能部分写入、存在计费边界或授权边界变化，必须 `blocked`，禁止自动 fallback。实际 fallback 路由与原因写入 Assignment / 交付收据，不静默降级。
+- Desktop / Web 等宿主使用 same current-snapshot 路由事实，并在首选外部通道失败后统一调用 `scripts/run_external_agent.mjs --resolve-route`。只有 `provider_unavailable / cli_unavailable / transport_failure_before_write / no_valid_result` 这类已知无副作用的安全失败可自动降级到 Codex；机械窄任务选 `gpt-5.6-luna`，常规实现 / 调试 / 审查选 `gpt-5.6-terra`，架构 / 复杂根因 / 高风险选 `gpt-5.6-sol`，并由 resolver 给出推理强度。若用户固定 provider、结果未知、可能部分写入、存在计费边界或授权边界变化，必须 `blocked`，禁止自动 fallback。实际 fallback 路由与原因写入 Assignment / 交付收据，不静默降级。
 - 外部 Agent 的修改视为候选交付。主 Agent仍须核对实际 diff、运行本项目验证，并完成真实入口验收。
 
 ## 外部执行可见性

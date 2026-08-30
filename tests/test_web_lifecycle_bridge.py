@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -565,3 +567,72 @@ class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
         self.assertIn("rotate_launcher_log", source)
         self.assertIn(".launcher.log", source)
         self.assertIn("stderr_tail", source)
+
+
+class DesktopWebLifecycleParityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        scripts_dir = str(ROOT / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        spec = importlib.util.spec_from_file_location("task8_lifecycle_hook", ROOT / "scripts" / "lifecycle_hook.py")
+        assert spec is not None and spec.loader is not None
+        cls.lifecycle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.lifecycle)
+
+    def stop_result(self, snapshot: dict, triggers: list[str], *, web: bool) -> dict:
+        event = {
+            "hook_event_name": "Stop",
+            "session_id": "controller-1",
+            "turn_id": "web-resume" if web else "desktop-native",
+        }
+        output, _ = self.lifecycle.evaluate_event(
+            event, snapshot=snapshot,
+            prior_state={"pending_control_event": bool(triggers), "triggers": triggers, "stop_continuations": 1, "snapshot": snapshot},
+        )
+        return output
+
+    def test_desktop_and_web_resume_share_stop_yield_decision_for_runnable_and_candidate_cases(self) -> None:
+        cases = [
+            ({"head":"h","ledger_sha256":"l","worktree_status_sha256":"s","ready_ids":["READY-1"],"runnable_ids":["READY-1"],"candidate_revisions":[]}, ["READY:READY-1"]),
+            ({"head":"h","ledger_sha256":"l","worktree_status_sha256":"s","ready_ids":[],"runnable_ids":["PENDING-RUNNABLE"],"candidate_revisions":[]}, ["RUNNABLE:PENDING-RUNNABLE"]),
+            ({"head":"h","ledger_sha256":"l","worktree_status_sha256":"s","ready_ids":[],"runnable_ids":[],"candidate_revisions":["candidate-1"]}, ["CANDIDATE:candidate-1"]),
+        ]
+        for snapshot, triggers in cases:
+            with self.subTest(snapshot=snapshot):
+                self.assertEqual(self.stop_result(snapshot, triggers, web=False), self.stop_result(snapshot, triggers, web=True))
+
+    def test_desktop_and_web_resume_both_allow_true_quiescent_snapshot(self) -> None:
+        snapshot = {"head":"h","ledger_sha256":"l","worktree_status_sha256":"s","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]}
+        self.assertEqual(self.stop_result(snapshot, [], web=False), self.stop_result(snapshot, [], web=True))
+        self.assertEqual(self.stop_result(snapshot, [], web=True), {})
+
+    def test_desktop_and_web_hosts_use_the_same_dispatch_resolver_for_safe_and_unsafe_fallback(self) -> None:
+        adapter = ROOT / "scripts" / "run_external_agent.mjs"
+        def resolve(*extra: str) -> dict:
+            result = subprocess.run([
+                "node", str(adapter), "--resolve-route", "--engine", "grok-build", "--category", "backend",
+                "--failure-class", "provider_unavailable", "--work-type", "implementation", "--complexity", "normal",
+                *extra,
+            ], text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        desktop_safe = resolve()
+        web_safe = resolve()
+        self.assertEqual(desktop_safe, web_safe)
+        self.assertEqual(desktop_safe["decision"], "fallback")
+        self.assertEqual(desktop_safe["model"], "gpt-5.6-terra")
+
+        desktop_unsafe = resolve("--partial-write-possible")
+        web_unsafe = resolve("--partial-write-possible")
+        self.assertEqual(desktop_unsafe, web_unsafe)
+        self.assertEqual(desktop_unsafe, {"decision": "blocked", "reason": "partial_write_possible"})
+
+    def test_web_adapter_reuses_shared_dispatch_and_lifecycle_instead_of_defining_web_policy(self) -> None:
+        source = BRIDGE.read_text(encoding="utf-8")
+        routing = (ROOT / "references" / "agent-model-routing.md").read_text(encoding="utf-8")
+        self.assertIn("control_event_guard", source)
+        self.assertIn("same current-snapshot", routing)
+        self.assertNotIn("WEB_READY", source)
+        self.assertNotIn("web_runnable", source)
