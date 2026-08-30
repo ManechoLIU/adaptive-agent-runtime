@@ -71,11 +71,27 @@ RECOVERY_ACTION_EVIDENCE = re.compile(
 )
 
 
+def marked_assignment_ids(value: str, declared_ids: set[str]) -> set[str]:
+    assignment_ids: set[str] = set()
+    for match in re.finditer(
+        r"\bAssignment\b\s*`?([A-Z][A-Z0-9]*(?:-[A-Z0-9]+){2,})`?",
+        value,
+        re.IGNORECASE,
+    ):
+        identifier = match.group(1)
+        if any(identifier.startswith(f"{task_id}-") for task_id in declared_ids):
+            assignment_ids.add(identifier)
+    return assignment_ids
+
+
 def undeclared_next_task_ids(record: dict[str, str], declared_ids: set[str]) -> set[str]:
+    assignment_ids = marked_assignment_ids(record["next_action"], declared_ids)
     return {
         match.group(1)
         for match in TASK_LIKE_ID.finditer(record["next_action"])
-        if looks_like_task_id(match.group(1)) and match.group(1) not in declared_ids
+        if looks_like_task_id(match.group(1))
+        and match.group(1) not in declared_ids
+        and match.group(1) not in assignment_ids
     }
 
 
@@ -126,9 +142,14 @@ def validate_ledger(text: str) -> list[str]:
     else:
         if open_ids and not referenced_ids(checkpoint, open_ids):
             errors.append("next visible checkpoint must reference at least one open task ID")
+        assignment_ids = marked_assignment_ids(checkpoint, declared_ids)
         for match in TASK_LIKE_ID.finditer(checkpoint):
             checkpoint_id = match.group(1)
-            if looks_like_task_id(checkpoint_id) and checkpoint_id not in declared_ids:
+            if (
+                looks_like_task_id(checkpoint_id)
+                and checkpoint_id not in declared_ids
+                and checkpoint_id not in assignment_ids
+            ):
                 errors.append(
                     f"checkpoint references undeclared task ID {checkpoint_id}; add an explicit task row before dispatch"
                 )

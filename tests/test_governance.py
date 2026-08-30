@@ -1900,6 +1900,37 @@ class GovernanceTests(unittest.TestCase):
             any("undeclared task ID M2-F2-DEV-WEREAD-QA-01" in error for error in errors)
         )
 
+    def test_ledger_consistency_allows_assignment_id_without_extra_task_row(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：`M1-F4-C-SERVER-GATE` 完成后端门禁
+- 下一可见检查点：`M1-F4-C-SERVER-GATE` 的 Assignment `M1-F4-C-SERVER-GATE-B-01` 返回候选
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| M1-F4-C-SERVER-GATE | `ACTIVE` / Agent B | 当前 Assignment `M1-F4-C-SERVER-GATE-B-01` delivered ACK；等待候选 |
+"""
+
+        self.assertEqual(ledger_consistency_guard.validate_ledger(text), [])
+
+    def test_ledger_consistency_assignment_exemption_requires_declared_parent(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：`M1-F4-C-SERVER-GATE` 完成后端门禁
+- 下一可见检查点：`M1-F4-C-SERVER-GATE` 等待 Assignment `M9-UNKNOWN-B-01`
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| M1-F4-C-SERVER-GATE | `ACTIVE` / Agent B | 等待外部执行 |
+"""
+
+        errors = ledger_consistency_guard.validate_ledger(text)
+        self.assertTrue(any("undeclared task ID M9-UNKNOWN-B-01" in error for error in errors))
+
     def test_ledger_consistency_rejects_implicit_task_in_visible_checkpoint(self) -> None:
         text = """# Ledger
 
