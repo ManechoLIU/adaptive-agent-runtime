@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ EVIDENCE_FINGERPRINT_FIELDS = (
     "blocker_evidence_fingerprint",
 )
 LINEAGE_CONTRACT_FIELDS = ("primary_goal", "success_criteria", "owned_scope", "strategy")
+LINEAGE_WHITESPACE_RE = re.compile(r"[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
 
 @dataclass(frozen=True)
 class RuntimePolicy:
@@ -54,7 +56,7 @@ def runtime_state_path(repo: str | Path) -> Path:
     return adaptive_delivery_state_dir(repo) / "runtime-assignments.json"
 
 def _normalized_contract_text(value: str) -> str:
-    return " ".join(value.strip().split())
+    return LINEAGE_WHITESPACE_RE.sub(" ", str(value)).strip(" ")
 
 def execution_lineage_id(*, task_id: str, primary_goal: str, success_criteria: list[str], owned_scope: list[str], strategy: str) -> str:
     canonical = json.dumps({

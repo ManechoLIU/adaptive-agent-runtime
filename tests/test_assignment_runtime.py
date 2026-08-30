@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scripts.assignment_runtime import (
-    RuntimePolicy, apply_receipt, evaluate_lease, load_runtime_state, save_runtime_state, runtime_state_path,
+    RuntimePolicy, apply_receipt, evaluate_lease, execution_lineage_id, load_runtime_state, save_runtime_state, runtime_state_path,
 )
 
 UTC=timezone.utc
@@ -255,6 +255,17 @@ class ExecutionLineageTests(unittest.TestCase):
         self.assertEqual(state["leases"]["B-03"].get("recovery_count"), 2)
         self.assertEqual(state["lineages"][first_lineage]["recovery_count"], 2)
 
+    def test_lineage_normalization_uses_explicit_cross_language_whitespace_set(self):
+        base = dict(
+            task_id="T1",
+            success_criteria=["green"],
+            owned_scope=["scripts/run_external_agent.mjs"],
+            strategy="engine=grok-build;model=grok-4.6;auth_mode=oauth;reasoning_effort=low",
+        )
+        ordinary = execution_lineage_id(primary_goal="a b", **base)
+        self.assertEqual(execution_lineage_id(primary_goal="a\u001cb", **base), ordinary)
+        self.assertEqual(execution_lineage_id(primary_goal="a\ufeffb", **base), ordinary)
+
     def test_provider_strategy_change_starts_a_new_execution_lineage(self):
         state = apply_receipt({}, self.start("B-01", 0), now=T0)
         state = apply_receipt(state, self.start("B-02", 1, strategy="kimi-code:kimi-k3:api:low"), now=T0 + timedelta(minutes=1))
@@ -264,6 +275,18 @@ class ExecutionLineageTests(unittest.TestCase):
             state["leases"]["B-02"].get("execution_lineage_id"),
         )
         self.assertEqual(state["leases"]["B-02"].get("recovery_count"), 0)
+
+    def test_lineage_normalization_uses_explicit_shared_whitespace_semantics(self):
+        def lineage(primary_goal: str) -> str:
+            return execution_lineage_id(
+                task_id="T1", primary_goal=primary_goal, success_criteria=["green"],
+                owned_scope=["scripts/assignment_runtime.py"], strategy="grok-build:grok-4.6:oauth:low",
+            )
+
+        expected = lineage("a b")
+        self.assertEqual(lineage("a\u001cb"), expected)
+        self.assertEqual(lineage("a\ufeffb"), expected)
+        self.assertNotEqual(lineage("普通 Unicode 合同"), lineage("普通Unicode合同"))
 
     def test_fourth_same_lineage_execution_is_rejected_without_runtime_mutation(self):
         state = apply_receipt({}, self.start("B-01", 0), now=T0)

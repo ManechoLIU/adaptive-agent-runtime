@@ -566,3 +566,32 @@ test("same lineage B-01 through B-04 shares the recovery budget before provider 
   assert.equal((await readFile(marker, "utf8")).trim().split("\n").length, 3);
   assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")), before);
 });
+
+test("Python and Node normalize lineage information separators consistently while preserving ordinary Unicode", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-lineage-normalization-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const env = {
+    ...process.env,
+    PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`,
+    GROK_HOME: grokHome,
+  };
+
+  for (const [assignmentId, primaryGoal] of [
+    ["unicode-ordinary", "修复 普通 Unicode 合同"],
+    ["unicode-information-separator", "a\u001cb"],
+    ["unicode-bom", "a\ufeffb"],
+  ]) {
+    const ack = await assignmentAckFile(bin, { assignment_id: assignmentId, primary_goal: primaryGoal }, repo);
+    const result = spawnSync(process.execPath, [adapter,
+      "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+      "--assignment-id", assignmentId, "--task-id", "T1", "--agent-id", "writer", "--session-id", `session-${assignmentId}`,
+      "--assignment-ack", ack,
+    ], { encoding: "utf8", input: "bounded contract", env });
+    assert.equal(result.status, 0, result.stderr);
+  }
+});
