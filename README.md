@@ -290,6 +290,16 @@ python3 ~/.agents/skills/adaptive-delivery/scripts/lifecycle_hook.py \
 
 然后在 `~/.codex/hooks.json` 合并四个 command handler，命令都指向安装副本的 `scripts/lifecycle_hook.py`：`SessionStart`、`PostToolUse`（matcher `*`）、`SubagentStop` 和 `Stop`。Codex 的非托管 Hook 还必须在 CLI 的 `/hooks` 中审核并信任精确定义；未显示 Active 就不能声称自动门禁已生效。
 
+总控履职评分另有独立的机器门。安装副本就绪后执行：
+
+```bash
+python3 ~/.agents/skills/adaptive-delivery/scripts/controller_scoring_hook.py --install-hooks
+```
+
+该命令在保留现有 Hook 的前提下增加 `UserPromptSubmit` 与 `Stop`：评分请求进入时，`UserPromptSubmit` 自动把**当前安装的** `references/controller-performance-scoring.md` 正文和 SHA-256 注入模型上下文；`Stop` 在最终回复前复核同一精确模型，模型中途变化则阻止结束并自动注入新版本要求重算。Hook 的模型根固定为其自身安装目录，调用方不能用 `--skill-root` 切换到另一份评分表。仍须在 Codex `/hooks` 中确认这两个 handler 为 Active / trusted；未激活时不能声称机器门已生效。
+
+不提供 `UserPromptSubmit / Stop` 的宿主（包括无法暴露最终文本生命周期事件的 Web 宿主）无法由本机 Codex Hook 强制拦截最终回复。此时只能走 `controller_scoring_guard.py record-read --repo <project>` → `score-guard --repo <project>` 的 fail-closed 路径；任一步未通过就禁止输出分数，不能把这条兼容路径描述成宿主级自动拦截。
+
 ChatGPT Web + AI-Bridge 需要额外的 Web bridge，因为 Web 工具调用不会天然触发 Codex Hook。`scripts/web_lifecycle_bridge.py` 可把**唯一 registered controller** 项目下由 AI-Bridge 启动的 shell 调用桥接为 `PostToolUse`，并从 AI-Bridge 审计收据确认 `control_event_guard.py` 的真实 `control-event: allowed` 输出。未登记项目静默跳过；同一 repo 若登记多个 controller 则拒绝映射；没有 repo 归属的 `computer` 事件不自动猜测归属。Web 平台没有可验证的“最终文字回复已结束”本地事件，因此 bridge 不伪造这个信号：在真实 allowed 控制收据后做短 debounce，并可自动调用 `native-stop`，复用原 controller session 走 Codex 原生生命周期；更新的收据会使旧延迟 Stop 失效，不会 fork 第二 controller。
 
 `computer` 收据本身没有 repo / Web session ID，因此只允许**短租约归属**：先在 canonical repo 内运行 `python3 scripts/web_lifecycle_bridge.py arm-computer --cwd <repo>`，默认只授权接下来 90 秒内 1 次 GUI 收据，可显式设置 `--ttl-seconds 5..300` 与 `--uses 1..8`；租约过期或耗尽即删除，租约外 `computer` 静默忽略。需要硬 Stop 时使用 `python3 scripts/web_lifecycle_bridge.py native-stop --session-id <registered-controller> --repo <repo>`；命令先核对 registry 精确匹配，再通过 `codex exec resume` 续接**同一 thread**，不会 fork 或创建第二 controller。常驻 `audit-once` 可加 `--auto-native-stop --auto-stop-delay-seconds 5`：每个真实 `control-event: allowed` 收据会安排一次延迟 native Stop，同 session 的更新收据会覆盖旧计划。Goal 收口事件同时必须在临时控制 JSON 中声明 `goal_rollover`，否则 `control_event_guard.py` 直接拒绝收据。

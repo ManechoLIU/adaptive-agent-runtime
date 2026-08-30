@@ -83,17 +83,17 @@ def main() -> int:
     for name in ("record-read", "score-guard"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--repo", required=True)
-        cmd.add_argument("--skill-root", default=str(Path(__file__).resolve().parents[1]))
     args = parser.parse_args()
+    installed_skill_root = Path(__file__).resolve().parents[1]
     if args.command == "record-read":
-        model = scoring_model_path(args.skill_root)
+        model = scoring_model_path(installed_skill_root)
         content = model.read_text(encoding="utf-8")
-        receipt = record_model_read(args.repo, skill_root=args.skill_root)
+        receipt = record_model_read(args.repo, skill_root=installed_skill_root)
         print(content, end="" if content.endswith("\n") else "\n")
         print("--- controller-scoring-model-read-receipt ---")
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
         return 0
-    errors = score_guard_errors(args.repo, skill_root=args.skill_root)
+    errors = score_guard_errors(args.repo, skill_root=installed_skill_root)
     if errors:
         for error in errors:
             print(error)

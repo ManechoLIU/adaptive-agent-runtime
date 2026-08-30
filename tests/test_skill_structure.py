@@ -267,6 +267,15 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("--register-controller", readme)
         self.assertIn("/hooks", readme)
 
+    def test_controller_scoring_machine_gate_is_packaged_and_documented(self):
+        entrypoint = read_entrypoint()
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertTrue((ROOT / "scripts" / "controller_scoring_hook.py").is_file())
+        for phrase in ("UserPromptSubmit", "controller_scoring_hook.py", "score-guard", "未通过", "禁止输出分数"):
+            self.assertIn(phrase, entrypoint + "\n" + readme)
+        self.assertIn("不提供 UserPromptSubmit / Stop", entrypoint)
+        self.assertIn("不能声称机器门已生效", readme)
+
     def test_long_task_governance_bounds_event_append_and_agent_reuse(self):
         long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
 

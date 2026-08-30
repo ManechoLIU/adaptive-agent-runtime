@@ -73,11 +73,19 @@ class ControllerScoringGuardTests(unittest.TestCase):
             import subprocess
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             completed = subprocess.run([
-                "python3", str(SCRIPT), "record-read", "--repo", str(repo), "--skill-root", str(ROOT)
+                "python3", str(SCRIPT), "record-read", "--repo", str(repo)
             ], check=True, capture_output=True, text=True)
             self.assertIn("# Controller Performance Scoring", completed.stdout)
             self.assertIn("七维评分模型", completed.stdout)
             self.assertIn('"model_sha256"', completed.stdout)
+
+    def test_cli_rejects_skill_root_override(self):
+        import subprocess
+        completed = subprocess.run([
+            "python3", str(SCRIPT), "score-guard", "--repo", str(ROOT), "--skill-root", "/tmp/alternate"
+        ], capture_output=True, text=True)
+        self.assertNotEqual(0, completed.returncode)
+        self.assertIn("unrecognized arguments", completed.stderr)
 
 
 if __name__ == "__main__":
