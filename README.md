@@ -296,7 +296,7 @@ python3 ~/.agents/skills/adaptive-delivery/scripts/lifecycle_hook.py \
 python3 ~/.agents/skills/adaptive-delivery/scripts/controller_scoring_hook.py --install-hooks
 ```
 
-该命令在保留现有 Hook 的前提下增加 `UserPromptSubmit` 与 `Stop`：评分请求进入时，`UserPromptSubmit` 自动把**当前安装的** `references/controller-performance-scoring.md` 正文和 SHA-256 注入模型上下文；`Stop` 在最终回复前复核同一精确模型，模型中途变化则阻止结束并自动注入新版本要求重算。Hook 的模型根固定为其自身安装目录，调用方不能用 `--skill-root` 切换到另一份评分表。仍须在 Codex `/hooks` 中确认这两个 handler 为 Active / trusted；未激活时不能声称机器门已生效。
+该命令在保留现有 Hook 的前提下增加 `UserPromptSubmit` 与 `Stop`：评分/履职审计请求进入时，`UserPromptSubmit` 自动把**当前安装的** `references/controller-performance-scoring.md` 正文和 SHA-256 完整注入模型上下文；`Stop` 在最终回复前复核同一精确模型。若模型中途变化，`Stop` 必须 fail closed，且不得把受长度限制的 Stop 文本冒充“完整重载”；必须重新提交评分/审计请求，由新的 `UserPromptSubmit` 完整注入当前版本后才能输出评分。评分门状态无法持久化时同样 fail closed。Hook 的模型根固定为其自身安装目录，调用方不能用 `--skill-root` 切换到另一份评分表。仍须在 Codex `/hooks` 中确认这两个 handler 为 Active / trusted；未激活时不能声称机器门已生效。
 
 不提供 `UserPromptSubmit / Stop` 的宿主（包括无法暴露最终文本生命周期事件的 Web 宿主）无法由本机 Codex Hook 强制拦截最终回复。此时只能走 `controller_scoring_guard.py record-read --repo <project>` → `score-guard --repo <project>` 的 fail-closed 路径；任一步未通过就禁止输出分数，不能把这条兼容路径描述成宿主级自动拦截。
 

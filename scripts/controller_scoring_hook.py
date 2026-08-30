@@ -29,7 +29,7 @@ _CONTROLLER_TERMS = re.compile(r"(?:总控|项目总控|controller|orchestrator)
 _OUTPUT_SCORE = re.compile(r"(?:总控|项目总控|controller|orchestrator).{0,40}?(?:\b(?:100|[1-9]?\d)(?:\.\d+)?\s*/\s*100\b|(?:100|[1-9]?\d)(?:\.\d+)?\s*分)", re.IGNORECASE | re.DOTALL)
 
 _SCORE_TERMS = re.compile(
-    r"(?:评分|打分|分数|多少分|履职评估|履职评分|performance\s+(?:score|scoring|evaluation)|score\s+(?:the\s+)?(?:controller|orchestrator)|rate\s+(?:the\s+)?(?:controller|orchestrator))",
+    r"(?:评分|打分|分数|多少分|履职评估|履职评分|审计|比较近期(?:总控)?表现|假繁荣|performance\s+(?:score|scoring|evaluation)|score\s+(?:the\s+)?(?:controller|orchestrator)|rate\s+(?:the\s+)?(?:controller|orchestrator))",
     re.IGNORECASE,
 )
 
@@ -158,14 +158,15 @@ def evaluate_event(
         if not repo_text:
             return {"decision": "block", "reason": "controller scoring blocked: score-guard repo binding is missing."}, state
         if state.get("model_sha256") != installed_digest or Path(str(state.get("model_path", ""))).resolve() != installed_path:
-            context = _model_context(skill_root, installed_digest)
-            receipt = record_model_read(Path(repo_text), skill_root=skill_root)
-            state.update({"model_sha256": installed_digest, "model_path": str(installed_path), "receipt_sha256": receipt.get("model_sha256", "")})
+            # Stop continuation text is size-limited by Codex. Do not pretend the new
+            # rubric was fully injected here and do not advance the recorded digest.
+            # A fresh UserPromptSubmit is required so the unlimited-context hook can
+            # inject the complete installed model and mint a matching receipt.
             return {
                 "decision": "block",
                 "reason": (
                     "controller scoring blocked: installed scoring model changed after prompt injection; "
-                    "已自动重新加载当前评分模型。必须按下面的新模型重新计算后再输出评分。\n\n" + context
+                    "当前评分正文不再有效。请重新提交总控评分/审计请求，让 UserPromptSubmit 完整注入当前安装评分模型后再计算。"
                 ),
             }, state
         errors = score_guard_errors(Path(repo_text), skill_root=skill_root)
@@ -240,7 +241,21 @@ def run_hook() -> int:
         skill_root=Path(__file__).resolve().parents[1],
         prior_state=_read_state(path),
     )
-    _write_state(path, state)
+    try:
+        _write_state(path, state)
+    except OSError as error:
+        scoring_related = (
+            bool(state.get("pending_scoring"))
+            or is_controller_scoring_request(str(event.get("prompt", "")))
+            or looks_like_controller_score_output(str(event.get("last_assistant_message", "")))
+            or output.get("decision") == "block"
+        )
+        if scoring_related:
+            print(json.dumps({
+                "decision": "block",
+                "reason": f"controller scoring blocked: scoring gate state could not persist safely: {error}",
+            }, ensure_ascii=False))
+        return 0
     if output:
         print(json.dumps(output, ensure_ascii=False))
     return 0

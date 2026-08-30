@@ -53,6 +53,9 @@ class ControllerScoringHookTests(unittest.TestCase):
             "给总控评分",
             "评估下总控履职能力，给出具体评分",
             "现在总控多少分",
+            "审计一下项目总控履职",
+            "比较近期总控表现",
+            "检查总控是不是假繁荣",
             "score the controller performance",
         ]
         for prompt in prompts:
@@ -92,9 +95,47 @@ class ControllerScoringHookTests(unittest.TestCase):
                 skill_root=skill, prior_state=state,
             )
             self.assertEqual("block", output["decision"])
-            self.assertIn("重新加载", output["reason"])
-            self.assertIn("model v2", output["reason"])
+            self.assertIn("重新提交", output["reason"])
+            self.assertNotIn("model v2", output["reason"])
             self.assertTrue(state["pending_scoring"])
+            self.assertNotEqual(hook.scoring_model_sha256(skill), state["model_sha256"])
+
+            _, refreshed = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": str(repo), "prompt": "给总控评分"},
+                skill_root=skill, prior_state=state,
+            )
+            self.assertEqual(hook.scoring_model_sha256(skill), refreshed["model_sha256"])
+            allowed, refreshed = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "s1", "cwd": str(repo), "last_assistant_message": "总控评分：80/100"},
+                skill_root=skill, prior_state=refreshed,
+            )
+            self.assertEqual({}, allowed)
+            self.assertFalse(refreshed["pending_scoring"])
+
+
+    def test_run_hook_blocks_when_scoring_state_cannot_be_persisted(self):
+        import json
+        import os
+        import subprocess
+        event = {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "cwd": str(ROOT),
+            "prompt": "给总控评分",
+        }
+        env = dict(os.environ)
+        env["AD_SCORING_STATE_DIR"] = "/dev/null"
+        completed = subprocess.run(
+            ["python3", str(SCRIPT)],
+            input=json.dumps(event, ensure_ascii=False),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(0, completed.returncode)
+        output = json.loads(completed.stdout)
+        self.assertEqual("block", output["decision"])
+        self.assertIn("persist", output["reason"])
 
     def test_install_hooks_preserves_existing_stop_and_adds_scoring_handlers_idempotently(self):
         hook = load_module()
