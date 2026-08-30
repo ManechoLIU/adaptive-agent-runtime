@@ -569,6 +569,23 @@ class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
         self.assertIn("stderr_tail", source)
 
 
+class ControllerHostTrackingTests(WebLifecycleBridgeTests):
+    def test_web_bridge_marks_translated_events_as_web_host(self) -> None:
+        receipt = {
+            "receiptId": "host-web-1", "childTool": "shell_command", "state": "succeeded",
+            "rootLabel": str(Path.home() / "Documents" / "SelfAlone"),
+            "targetLabel": "git status --short",
+            "detail": "命令：git status --short · 工作目录：~/Documents/SelfAlone\n\n命令输出：\n",
+        }
+        result = self.run_bridge(
+            "translate-receipt", "--session-id", "controller-1",
+            "--repo", str(Path.home() / "Documents" / "SelfAlone"),
+            stdin=json.dumps(receipt),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        event = json.loads(result.stdout)
+        self.assertEqual(event["controller_host"], "web")
+
 class DesktopWebLifecycleParityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -613,7 +630,7 @@ class DesktopWebLifecycleParityTests(unittest.TestCase):
             result = subprocess.run([
                 "node", str(adapter), "--resolve-route", "--engine", "grok-build", "--category", "backend",
                 "--failure-class", "provider_unavailable", "--work-type", "implementation", "--complexity", "normal",
-                *extra,
+                "--controller-host", "web", *extra,
             ], text=True, capture_output=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             return json.loads(result.stdout)

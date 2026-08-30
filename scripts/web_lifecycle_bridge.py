@@ -78,6 +78,7 @@ def post_tool_event(
         response["exit_code"] = exit_code
     return {
         "hook_event_name": "PostToolUse",
+        "controller_host": "web",
         "session_id": session_id,
         "turn_id": turn_id,
         "cwd": str(repo),

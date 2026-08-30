@@ -2277,3 +2277,19 @@ class GovernanceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ControllerHostLifecycleTests(unittest.TestCase):
+    def test_native_lifecycle_defaults_current_host_to_desktop_codex(self) -> None:
+        snapshot = {"head":"h","ledger_sha256":"l","worktree_status_sha256":"s","ready_ids":[],"runnable_ids":[],"candidate_revisions":[],"rule_handshake":{}}
+        _, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name":"SessionStart","session_id":"controller-1"}, snapshot=snapshot, prior_state=None
+        )
+        self.assertEqual(state["controller_host"], "desktop_codex")
+
+    def test_explicit_web_event_updates_same_controller_host(self) -> None:
+        snapshot = {"head":"h","ledger_sha256":"l","worktree_status_sha256":"s","ready_ids":[],"runnable_ids":[],"candidate_revisions":[],"rule_handshake":{}}
+        _, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name":"PostToolUse","session_id":"controller-1","controller_host":"web"}, snapshot=snapshot, prior_state={"controller_host":"desktop_codex"}
+        )
+        self.assertEqual(state["controller_host"], "web")

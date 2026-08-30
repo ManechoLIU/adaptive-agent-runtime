@@ -356,6 +356,16 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("Stop/Yield Gate", long_task)
         self.assertIn("同一份机器投影", entrypoint)
 
+    def test_routing_documents_dual_host_fallback_without_cross_host_guessing(self):
+        routing = REFERENCE_PATHS["agent-routing"].read_text(encoding="utf-8")
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+        delivery = REFERENCE_PATHS["agent-delivery"].read_text(encoding="utf-8")
+        for phrase in ("双宿主兜底", "controller_host=web|desktop_codex", "peer_host_available", "peer_host_unavailable", "同一模型档位"):
+            self.assertIn(phrase, routing)
+        self.assertIn("controller_host", long_task)
+        self.assertIn("host_fallback_level", delivery)
+        self.assertIn("Moving Web→Desktop or Desktop→Web never resets", delivery)
+
     def test_external_agent_routes_pin_the_selected_reasoning_effort(self):
         routing = REFERENCE_PATHS["agent-routing"].read_text(encoding="utf-8")
         external = REFERENCE_PATHS["external-agent"].read_text(encoding="utf-8")

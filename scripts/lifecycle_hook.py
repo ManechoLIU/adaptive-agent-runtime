@@ -272,6 +272,8 @@ def evaluate_event(
     state = dict(prior_state or {})
     state["snapshot"] = snapshot
     state["session_id"] = str(event.get("session_id", ""))
+    event_host = str(event.get("controller_host", "")).strip()
+    state["controller_host"] = event_host if event_host in {"web", "desktop_codex"} else "desktop_codex"
     event_name = event.get("hook_event_name")
 
     if event_name == "SessionStart":

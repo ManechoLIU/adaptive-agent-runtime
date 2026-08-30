@@ -26,10 +26,36 @@ const SAFE_FALLBACK_FAILURES = new Set([
   "transport_failure_before_write",
   "no_valid_result",
 ]);
+const CONTROLLER_HOSTS = new Set(["web", "desktop_codex"]);
+const CURRENT_HOST_FALLBACK_FAILURES = new Set([
+  "usage_limit_exceeded",
+  "quota_exhausted",
+  "model_unavailable",
+  "service_unavailable",
+  "auth_invalid",
+  "runtime_unavailable",
+]);
+
+function peerHost(controllerHost) {
+  return controllerHost === "web" ? "desktop_codex" : "web";
+}
+
+function fallbackModel({ workType, complexity, highRisk }) {
+  const normalizedType = String(workType || "").trim().toLowerCase();
+  const normalizedComplexity = String(complexity || "").trim().toLowerCase();
+  if (highRisk || normalizedComplexity === "high" || new Set(["architecture", "root-cause", "root_cause", "high-risk", "high_risk"]).has(normalizedType)) {
+    return { model: "gpt-5.6-sol", reasoningEffort: "xhigh" };
+  }
+  if (normalizedComplexity === "low" && new Set(["mechanical", "narrow", "repetitive", "routine"]).has(normalizedType)) {
+    return { model: "gpt-5.6-luna", reasoningEffort: "low" };
+  }
+  return { model: "gpt-5.6-terra", reasoningEffort: "medium" };
+}
 
 export function resolveDispatchRoute({
   preferredEngine, category, failureClass, workType = "implementation", complexity = "normal", highRisk = false,
   providerPinned = false, resultUnknown = false, partialWritePossible = false, billingBoundary = false, authorizationBoundary = false,
+  controllerHost = null, currentHostFailureClass = null, peerHostAvailable = false,
 }) {
   if (!routes[preferredEngine]) throw new Error(`Unsupported preferred engine: ${preferredEngine}`);
   if (!CARD_CATEGORIES.has(category)) throw new Error(`Unsupported category: ${category}`);
@@ -45,16 +71,37 @@ export function resolveDispatchRoute({
   if (!SAFE_FALLBACK_FAILURES.has(String(failureClass || "").trim())) {
     return { decision: "blocked", reason: "failure_not_safe_for_fallback" };
   }
-  const normalizedType = String(workType || "").trim().toLowerCase();
-  const normalizedComplexity = String(complexity || "").trim().toLowerCase();
-  if (highRisk || normalizedComplexity === "high" || new Set(["architecture", "root-cause", "root_cause", "high-risk", "high_risk"]).has(normalizedType)) {
-    return { decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-sol", reasoningEffort: "xhigh", reason: "safe_external_failure" };
+  if (controllerHost !== null && !CONTROLLER_HOSTS.has(controllerHost)) {
+    return { decision: "blocked", reason: "unknown_controller_host" };
   }
-  if (normalizedComplexity === "low" && new Set(["mechanical", "narrow", "repetitive", "routine"]).has(normalizedType)) {
-    return { decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-luna", reasoningEffort: "low", reason: "safe_external_failure" };
+  const tier = fallbackModel({ workType, complexity, highRisk });
+  if (!currentHostFailureClass) {
+    if (!controllerHost) {
+      return { decision: "blocked", reason: "controller_host_required" };
+    }
+    return {
+      decision: "fallback", executionRoute: "native-subagent", ...tier,
+      controllerHost, executionHost: controllerHost, hostFallbackLevel: 1, reason: "safe_external_failure",
+    };
   }
-  return { decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-terra", reasoningEffort: "medium", reason: "safe_external_failure" };
+  if (!controllerHost) {
+    return { decision: "blocked", reason: "controller_host_required" };
+  }
+  const normalizedHostFailure = String(currentHostFailureClass).trim().toLowerCase();
+  if (!CURRENT_HOST_FALLBACK_FAILURES.has(normalizedHostFailure)) {
+    return { decision: "blocked", reason: "current_host_failure_not_fallback_eligible" };
+  }
+  const requestedPeerHost = peerHost(controllerHost);
+  if (!peerHostAvailable) {
+    return { decision: "blocked", reason: "peer_host_unavailable", controllerHost, requestedPeerHost };
+  }
+  return {
+    decision: "fallback", executionRoute: "native-subagent", ...tier,
+    controllerHost, executionHost: requestedPeerHost, hostFallbackLevel: 2,
+    reason: `${controllerHost}_internal_${normalizedHostFailure}`,
+  };
 }
+
 
 const routes = {
   "kimi-code": {
@@ -157,7 +204,7 @@ export function parseArgs(argv) {
     workPackage: null, category: null, status: null, detail: null,
     assignmentId: null, taskId: null, agentId: null, sessionId: null,
     attempt: 1, leaseId: null, runtimeReceipts: null, assignmentAck: null, deliveryReceipt: null,
-    workType: null, complexity: null, failureClass: null, highRisk: false, providerPinned: false, resultUnknown: false, partialWritePossible: false, billingBoundary: false, authorizationBoundary: false,
+    workType: null, complexity: null, failureClass: null, controllerHost: null, currentHostFailureClass: null, peerHostAvailable: false, highRisk: false, providerPinned: false, resultUnknown: false, partialWritePossible: false, billingBoundary: false, authorizationBoundary: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -176,7 +223,8 @@ export function parseArgs(argv) {
     else if (argument === "--partial-write-possible") options.partialWritePossible = true;
     else if (argument === "--billing-boundary") options.billingBoundary = true;
     else if (argument === "--authorization-boundary") options.authorizationBoundary = true;
-    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--work-package", "--category", "--status", "--detail", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts", "--assignment-ack", "--delivery-receipt", "--work-type", "--complexity", "--failure-class"].includes(argument)) {
+    else if (argument === "--peer-host-available") options.peerHostAvailable = true;
+    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--work-package", "--category", "--status", "--detail", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts", "--assignment-ack", "--delivery-receipt", "--work-type", "--complexity", "--failure-class", "--controller-host", "--current-host-failure-class"].includes(argument)) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`Missing value for ${argument}`);
       if (argument === "--auth-mode") options.authMode = value;
@@ -194,6 +242,8 @@ export function parseArgs(argv) {
       else if (argument === "--work-type") options.workType = value;
       else if (argument === "--complexity") options.complexity = value;
       else if (argument === "--failure-class") options.failureClass = value;
+      else if (argument === "--controller-host") options.controllerHost = value;
+      else if (argument === "--current-host-failure-class") options.currentHostFailureClass = value;
       else options[argument.slice(2)] = value;
       index += 1;
     } else {
@@ -214,6 +264,7 @@ export function parseArgs(argv) {
       workType: options.workType, complexity: options.complexity, highRisk: options.highRisk,
       providerPinned: options.providerPinned, resultUnknown: options.resultUnknown, partialWritePossible: options.partialWritePossible,
       billingBoundary: options.billingBoundary, authorizationBoundary: options.authorizationBoundary,
+      controllerHost: options.controllerHost, currentHostFailureClass: options.currentHostFailureClass, peerHostAvailable: options.peerHostAvailable,
     });
     options.routeDecision = decision;
     return options;

@@ -19,6 +19,8 @@ For Assignment-bound external execution, delivered ACK is a **launch gate**, not
 
 All execution transports (native subagent, Grok/Kimi runner, future A2A transport) keep **transport completion** separate from the **delivery verdict** in the runtime terminal receipt. New terminal receipts use:
 
+Host fallback is part of execution lineage, not a new Assignment identity. When host routing is involved, the dispatch/delivery evidence additionally records `controller_host`, `execution_host`, `host_fallback_level`, and the machine reason for crossing hosts. Moving Web→Desktop or Desktop→Web never resets attempt/recovery budget and never upgrades model tier merely because the host changed.
+
 `task_id + assignment_id + attempt + lease_id + terminal_state + transport_outcome + delivery_outcome + summary + evidence[] + artifacts[] + next_action + retry_class`
 
 `transport_outcome` answers only whether the provider/process completed, failed, was cancelled, or was transport-blocked. `delivery_outcome` is independently `pass | fail | blocked | unresolved`. Provider exit code `0` means transport completed only; without an explicit validated delivery receipt the delivery remains `unresolved`, never PASS. Legacy receipts with one `outcome` remain readable during migration but must not be emitted by new runner writes.

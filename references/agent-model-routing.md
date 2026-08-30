@@ -56,7 +56,10 @@ Adaptive Delivery 负责把项目目标拆成可验收工作包，为每个工�
 - Grok 的两种认证模式都经 Grok Build CLI 执行。OAuth 使用 `grok login` 的可刷新会话；API 模式必须隔离 OAuth 会话后注入 `XAI_API_KEY`，从而保证不会因为本机已有登录而走错计费通道。
 - 外部模型执行前确认：运行器存在、模型标识可解析、认证已配置、工作目录与文件所有权正确、工具权限和停止条件明确。
 - API/订阅可能计费。未获得本轮付费授权时，只验证配置、命令发现、假服务或 dry-run，不发送真实推理请求。
-- Desktop / Web 等宿主使用 same current-snapshot 路由事实，并在首选外部通道失败后统一调用 `scripts/run_external_agent.mjs --resolve-route`。只有 `provider_unavailable / cli_unavailable / transport_failure_before_write / no_valid_result` 这类已知无副作用的安全失败可自动降级到 Codex；机械窄任务选 `gpt-5.6-luna`，常规实现 / 调试 / 审查选 `gpt-5.6-terra`，架构 / 复杂根因 / 高风险选 `gpt-5.6-sol`，并由 resolver 给出推理强度。若用户固定 provider、结果未知、可能部分写入、存在计费边界或授权边界变化，必须 `blocked`，禁止自动 fallback。实际 fallback 路由与原因写入 Assignment / 交付收据，不静默降级。
+- Desktop / Web 等宿主使用 same current-snapshot 路由事实，并在首选外部通道失败后统一调用 `scripts/run_external_agent.mjs --resolve-route`。只有 `provider_unavailable / cli_unavailable / transport_failure_before_write / no_valid_result` 这类已知无副作用的外部失败可自动降级；机械窄任务选 `gpt-5.6-luna`，常规实现 / 调试 / 审查选 `gpt-5.6-terra`，架构 / 复杂根因 / 高风险选 `gpt-5.6-sol`，模型档位与宿主切换是两个独立决策。
+- **双宿主兜底**：resolver 必须收到机器事实 `controller_host=web|desktop_codex`。第一层 Codex fallback 永远继承当前 controller host：Web 总控先用 Web 内部 GPT，Desktop Codex 总控先用桌面 Codex 内部 GPT。只有当前内部宿主明确返回 `usage_limit_exceeded / quota_exhausted / model_unavailable / service_unavailable / auth_invalid / runtime_unavailable`，且当前 attempt 已明确终止、无 unknown result、无 partial write、无新增 billing / authorization 边界时，才允许第二层切到 peer host，并保持同一模型档位与同一 execution lineage。普通测试失败、实现错误或不确定超时不得冒充额度耗尽来换端。
+- 跨宿主不是“理论可用”即放行：`peer_host_available` 必须来自真实执行 adapter 的 preflight。Web→Desktop 可由已验证的本机 Codex CLI adapter 提供；Desktop→Web 只有在存在可机器调用、可回收 receipt 的 Web GPT execution adapter 时才可标 available。没有真实 adapter 就 `blocked: peer_host_unavailable`，禁止用浏览器 UI 自动输入冒充 Web 子 Agent。跨宿主决策必须记录 `controllerHost / executionHost / hostFallbackLevel / reason`，用户未明确另行授权时也不得跳过本端直接消耗另一端额度。
+- 若用户固定 provider、结果未知、可能部分写入、存在计费边界或授权边界变化，必须 `blocked`，禁止自动 fallback。实际 fallback 路由、宿主和原因写入 Assignment / 交付收据，不静默降级。
 - 外部 Agent 的修改视为候选交付。主 Agent仍须核对实际 diff、运行本项目验证，并完成真实入口验收。
 
 ## 外部执行可见性

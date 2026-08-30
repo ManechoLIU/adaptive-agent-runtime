@@ -88,26 +88,89 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
 
 
 test("safe external failures resolve to authorized Codex fallback by task complexity", () => {
-  const base = { preferredEngine: "grok-build", category: "backend", failureClass: "provider_unavailable" };
+  const base = { preferredEngine: "grok-build", category: "backend", failureClass: "provider_unavailable", controllerHost: "desktop_codex" };
   assert.deepEqual(resolveDispatchRoute({ ...base, workType: "mechanical", complexity: "low" }), {
     decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-luna", reasoningEffort: "low",
-    reason: "safe_external_failure",
+    controllerHost: "desktop_codex", executionHost: "desktop_codex", hostFallbackLevel: 1, reason: "safe_external_failure",
   });
   assert.deepEqual(resolveDispatchRoute({ ...base, workType: "implementation", complexity: "normal" }), {
     decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-terra", reasoningEffort: "medium",
-    reason: "safe_external_failure",
+    controllerHost: "desktop_codex", executionHost: "desktop_codex", hostFallbackLevel: 1, reason: "safe_external_failure",
   });
   assert.deepEqual(resolveDispatchRoute({ ...base, workType: "root-cause", complexity: "high", highRisk: true }), {
     decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-sol", reasoningEffort: "xhigh",
-    reason: "safe_external_failure",
+    controllerHost: "desktop_codex", executionHost: "desktop_codex", hostFallbackLevel: 1, reason: "safe_external_failure",
   });
-  const frontend = resolveDispatchRoute({ preferredEngine: "kimi-code", category: "frontend", failureClass: "no_valid_result", workType: "review", complexity: "normal" });
+  const frontend = resolveDispatchRoute({ preferredEngine: "kimi-code", category: "frontend", failureClass: "no_valid_result", workType: "review", complexity: "normal", controllerHost: "web" });
   assert.equal(frontend.decision, "fallback");
   assert.equal(frontend.model, "gpt-5.6-terra");
 });
 
+
+test("safe external failure falls back to the current controller host first", () => {
+  const web = resolveDispatchRoute({
+    preferredEngine: "grok-build", category: "backend", failureClass: "provider_unavailable",
+    workType: "implementation", complexity: "normal", controllerHost: "web",
+  });
+  assert.deepEqual(web, {
+    decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-terra", reasoningEffort: "medium",
+    controllerHost: "web", executionHost: "web", hostFallbackLevel: 1, reason: "safe_external_failure",
+  });
+  const desktop = resolveDispatchRoute({
+    preferredEngine: "grok-build", category: "backend", failureClass: "provider_unavailable",
+    workType: "implementation", complexity: "normal", controllerHost: "desktop_codex",
+  });
+  assert.equal(desktop.controllerHost, "desktop_codex");
+  assert.equal(desktop.executionHost, "desktop_codex");
+  assert.equal(desktop.hostFallbackLevel, 1);
+  assert.equal(desktop.model, "gpt-5.6-terra");
+});
+
+test("current-host quota or service exhaustion falls back to the peer host with the same model tier", () => {
+  const base = {
+    preferredEngine: "grok-build", category: "backend", failureClass: "provider_unavailable",
+    workType: "implementation", complexity: "normal", peerHostAvailable: true,
+  };
+  const webToDesktop = resolveDispatchRoute({ ...base, controllerHost: "web", currentHostFailureClass: "usage_limit_exceeded" });
+  assert.deepEqual(webToDesktop, {
+    decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-terra", reasoningEffort: "medium",
+    controllerHost: "web", executionHost: "desktop_codex", hostFallbackLevel: 2,
+    reason: "web_internal_usage_limit_exceeded",
+  });
+  const desktopToWeb = resolveDispatchRoute({ ...base, controllerHost: "desktop_codex", currentHostFailureClass: "quota_exhausted" });
+  assert.equal(desktopToWeb.executionHost, "web");
+  assert.equal(desktopToWeb.hostFallbackLevel, 2);
+  assert.equal(desktopToWeb.model, "gpt-5.6-terra");
+  assert.equal(desktopToWeb.reason, "desktop_codex_internal_quota_exhausted");
+});
+
+test("cross-host fallback is blocked for unknown execution or unavailable peer adapter", () => {
+  const base = {
+    preferredEngine: "kimi-code", category: "frontend", failureClass: "no_valid_result",
+    workType: "review", complexity: "normal", controllerHost: "web", currentHostFailureClass: "model_unavailable",
+  };
+  assert.deepEqual(resolveDispatchRoute({ ...base, peerHostAvailable: false }), {
+    decision: "blocked", reason: "peer_host_unavailable", controllerHost: "web", requestedPeerHost: "desktop_codex",
+  });
+  assert.deepEqual(resolveDispatchRoute({ ...base, peerHostAvailable: true, resultUnknown: true }), {
+    decision: "blocked", reason: "result_unknown",
+  });
+  assert.deepEqual(resolveDispatchRoute({ ...base, peerHostAvailable: true, partialWritePossible: true }), {
+    decision: "blocked", reason: "partial_write_possible",
+  });
+});
+
+test("ordinary task failure does not masquerade as host exhaustion", () => {
+  const decision = resolveDispatchRoute({
+    preferredEngine: "grok-build", category: "backend", failureClass: "provider_unavailable",
+    workType: "implementation", complexity: "normal", controllerHost: "web",
+    currentHostFailureClass: "test_failed", peerHostAvailable: true,
+  });
+  assert.deepEqual(decision, { decision: "blocked", reason: "current_host_failure_not_fallback_eligible" });
+});
+
 test("unsafe or pinned external failures remain blocked instead of silently falling back", () => {
-  const base = { preferredEngine: "grok-build", category: "backend", failureClass: "provider_unavailable", workType: "implementation", complexity: "normal" };
+  const base = { preferredEngine: "grok-build", category: "backend", failureClass: "provider_unavailable", workType: "implementation", complexity: "normal", controllerHost: "web" };
   for (const [field, reason] of [
     ["providerPinned", "provider_pinned"],
     ["resultUnknown", "result_unknown"],
@@ -125,17 +188,30 @@ test("route decision CLI exposes the same resolver without a model call", () => 
   const output = execFileSync(process.execPath, [adapter,
     "--resolve-route", "--engine", "grok-build", "--category", "backend",
     "--failure-class", "provider_unavailable", "--work-type", "implementation", "--complexity", "normal",
+    "--controller-host", "web",
   ], { encoding: "utf8" });
   assert.deepEqual(JSON.parse(output), {
     decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-terra", reasoningEffort: "medium",
-    reason: "safe_external_failure",
+    controllerHost: "web", executionHost: "web", hostFallbackLevel: 1, reason: "safe_external_failure",
+  });
+});
+
+test("route decision CLI exposes peer-host fallback only after an eligible local-host failure", () => {
+  const output = execFileSync(process.execPath, [adapter,
+    "--resolve-route", "--engine", "grok-build", "--category", "backend",
+    "--failure-class", "provider_unavailable", "--work-type", "implementation", "--complexity", "normal",
+    "--controller-host", "web", "--current-host-failure-class", "usage_limit_exceeded", "--peer-host-available",
+  ], { encoding: "utf8" });
+  assert.deepEqual(JSON.parse(output), {
+    decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-terra", reasoningEffort: "medium",
+    controllerHost: "web", executionHost: "desktop_codex", hostFallbackLevel: 2, reason: "web_internal_usage_limit_exceeded",
   });
 });
 
 test("non-safe failure classes do not trigger automatic fallback", () => {
   const decision = resolveDispatchRoute({
     preferredEngine: "kimi-code", category: "frontend", failureClass: "delivery_failed",
-    workType: "implementation", complexity: "normal",
+    workType: "implementation", complexity: "normal", controllerHost: "web",
   });
   assert.deepEqual(decision, { decision: "blocked", reason: "failure_not_safe_for_fallback" });
 });
