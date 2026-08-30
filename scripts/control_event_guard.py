@@ -11,7 +11,11 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
-from lint_governance import task_rows
+from lint_governance import task_records, task_rows
+try:
+    from controller_state import derive_runnable_tasks
+except ModuleNotFoundError:
+    from scripts.controller_state import derive_runnable_tasks
 
 DECISIONS = {"active", "deferred", "blocked"}
 CANDIDATE_DECISIONS = {
@@ -543,6 +547,7 @@ def validate_snapshot(
     ledger_open_ids: set[str] | None = None,
     ledger_goal_ids: set[str] | None = None,
     ledger_work_in_flight: dict[str, str] | None = None,
+    derived_runnable_ids: set[str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     contract = snapshot.get("event_contract")
@@ -659,11 +664,16 @@ def validate_snapshot(
 
     if ledger_ready_ids is not None:
         missing = sorted(ledger_ready_ids - snapshot_ready_ids)
-        extra = sorted(snapshot_ready_ids - ledger_ready_ids)
+        allowed_dispatch_ids = set(ledger_ready_ids) | set(derived_runnable_ids or set())
+        extra = sorted(snapshot_ready_ids - allowed_dispatch_ids)
         if missing:
             errors.append("control event omitted READY packages: " + ", ".join(missing))
         if extra:
-            errors.append("control event contains non-READY packages: " + ", ".join(extra))
+            errors.append("control event contains non-runnable packages: " + ", ".join(extra))
+    if derived_runnable_ids is not None:
+        missing_derived = sorted(set(derived_runnable_ids) - snapshot_ready_ids)
+        if missing_derived:
+            errors.append("control event omitted derived runnable packages: " + ", ".join(missing_derived))
 
     raw_reviews = snapshot.get("required_reviews", [])
     if not isinstance(raw_reviews, list):
@@ -798,6 +808,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not ledger.is_file():
             raise ValueError("ledger path must be an existing file")
         ready_ids = ready_ledger_package_ids(ledger)
+        derived_runnable_ids = set(derive_runnable_tasks(task_records(ledger.read_text(encoding="utf-8")))["runnable_task_ids"])
         open_ids = open_ledger_package_ids(ledger)
         goal_ids = current_goal_ledger_ids(ledger, open_ids)
         work_in_flight = work_in_flight_ledger_packages(ledger)
@@ -829,6 +840,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ledger_open_ids=open_ids,
         ledger_goal_ids=goal_ids,
         ledger_work_in_flight=work_in_flight,
+        derived_runnable_ids=derived_runnable_ids,
     )
     if repo_root is not None:
         errors.extend(canonical_rule_handshake_errors(repo_root, ledger))

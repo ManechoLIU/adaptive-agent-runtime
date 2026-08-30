@@ -10,11 +10,11 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
-from lint_governance import task_rows
+from lint_governance import task_records, task_rows
 try:
-    from controller_state import project_task_state
+    from controller_state import derive_runnable_tasks, project_task_state
 except ModuleNotFoundError:
-    from scripts.controller_state import project_task_state
+    from scripts.controller_state import derive_runnable_tasks, project_task_state
 
 try:
     from rule_handshake import evaluate_rule_handshake
@@ -71,6 +71,8 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         for identifier, status in task_rows(text)
         if status == "READY"
     )
+    runnable_projection = derive_runnable_tasks(task_records(text))
+    runnable_ids = list(runnable_projection["runnable_task_ids"])
     status = run_git(root, "status", "--porcelain=v1", "--untracked-files=no")
     from control_event_guard import unmerged_worktree_candidates
 
@@ -115,6 +117,8 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         "ledger_sha256": sha256_bytes(ledger.read_bytes()),
         "worktree_status_sha256": sha256_bytes(status.encode("utf-8")),
         "ready_ids": ready_ids,
+        "runnable_ids": runnable_ids,
+        "runnable_exclusions": runnable_projection["exclusions"],
         "candidate_revisions": sorted(candidates.values()),
         "ledger_errors": ledger_errors,
         "assignment_liveness": assignment_liveness,
@@ -159,6 +163,7 @@ def lifecycle_triggers(
         return current - {str(item) for item in previous.get(field, [])}
 
     triggers = [f"READY:{identifier}" for identifier in newly_present("ready_ids")]
+    triggers.extend(f"RUNNABLE:{identifier}" for identifier in newly_present("runnable_ids") if identifier not in set(snapshot.get("ready_ids", [])))
     triggers.extend(
         f"CANDIDATE:{revision}" for revision in newly_present("candidate_revisions")
     )
@@ -212,12 +217,14 @@ def continuation_reason(
     triggers: list[str],
     ready_ids: list[str],
     candidate_revisions: list[str],
+    runnable_ids: list[str] | None = None,
     *,
     rule_handshake: dict[str, Any] | None = None,
     root: str | None = None,
     session_id: str | None = None,
 ) -> str:
-    ready = ", ".join(ready_ids) if ready_ids else "无新增 READY"
+    runnable_ids = list(runnable_ids or ready_ids)
+    ready = ", ".join(runnable_ids) if runnable_ids else "无可执行工作"
     trigger_text = ", ".join(triggers) if triggers else "未闭合控制事件"
     candidates = ", ".join(revision[:9] for revision in candidate_revisions) or "无未处理候选"
     rule_text = ""
@@ -243,12 +250,12 @@ def continuation_reason(
     actions = ["请立即核对真实 main / 台账 / live Agent"]
     if candidate_revisions:
         actions.append("处理候选审查、集成、验收")
-    if ready_ids:
-        actions.append("处理 READY 派发与 ACK；若客观上无法派发，必须把对应任务明确转为 BLOCKED 并记录可验证原因")
+    if runnable_ids:
+        actions.append("处理可执行工作派发与 ACK；若客观上无法派发，必须把对应任务明确转为 BLOCKED 并记录可验证原因")
     actions.append("随后用 control_event_guard.py 生成通过收据")
     return (
         "Adaptive Delivery 生命周期门检测到尚未闭合的控制事件。"
-        f"触发：{trigger_text}；当前 READY：{ready}；候选：{candidates}。"
+        f"触发：{trigger_text}；当前可执行：{ready}；候选：{candidates}。"
         + "；".join(actions) + "。"
         "不得仅把动作写成下一事件后停止。" + rule_text
     )
@@ -282,6 +289,7 @@ def evaluate_event(
             triggers,
             list(snapshot.get("ready_ids", [])),
             list(snapshot.get("candidate_revisions", [])),
+            runnable_ids=list(snapshot.get("runnable_ids", snapshot.get("ready_ids", []))),
             rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
         )
         return {
@@ -304,7 +312,7 @@ def evaluate_event(
         )
         return {}, state
 
-    if successful_control_receipt(event, snapshot) and not snapshot.get("ready_ids"):
+    if successful_control_receipt(event, snapshot) and not snapshot.get("runnable_ids", snapshot.get("ready_ids")):
         state.update(
             {
                 "pending_control_event": False,
@@ -323,10 +331,12 @@ def evaluate_event(
     )
     prior_triggers = {item for item in prior_triggers if not item.startswith(transient_prefixes)}
     current_ready = {str(item) for item in snapshot.get("ready_ids", [])}
+    current_runnable = {str(item) for item in snapshot.get("runnable_ids", snapshot.get("ready_ids", []))}
     current_candidates = {str(item) for item in snapshot.get("candidate_revisions", [])}
     prior_triggers = {
         item for item in prior_triggers
         if not (item.startswith("READY:") and item.removeprefix("READY:") not in current_ready)
+        and not (item.startswith("RUNNABLE:") and item.removeprefix("RUNNABLE:") not in current_runnable)
         and not (item.startswith("CANDIDATE:") and item.removeprefix("CANDIDATE:") not in current_candidates)
     }
     triggers = sorted(prior_triggers | set(detected))
@@ -349,6 +359,7 @@ def evaluate_event(
             triggers,
             list(snapshot.get("ready_ids", [])),
             list(snapshot.get("candidate_revisions", [])),
+            runnable_ids=list(snapshot.get("runnable_ids", snapshot.get("ready_ids", []))),
             rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
         )
         return {
@@ -365,9 +376,10 @@ def evaluate_event(
             triggers,
             list(snapshot.get("ready_ids", [])),
             list(snapshot.get("candidate_revisions", [])),
+            runnable_ids=list(snapshot.get("runnable_ids", snapshot.get("ready_ids", []))),
             rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
         )
-        if snapshot.get("ready_ids") or continuations <= 1:
+        if snapshot.get("runnable_ids", snapshot.get("ready_ids")) or continuations <= 1:
             return {"decision": "block", "reason": reason}, state
         return {
             "continue": False,

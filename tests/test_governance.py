@@ -1675,6 +1675,82 @@ class GovernanceTests(unittest.TestCase):
 
         self.assertIn("candidate-1 queued requires next_checkpoint", errors)
 
+
+    def test_control_event_guard_requires_derived_runnable_pending_package(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 1,
+            "ready_packages": [],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), derived_runnable_ids={"PENDING-RUNNABLE"}
+        )
+        self.assertTrue(any("derived runnable" in error and "PENDING-RUNNABLE" in error for error in errors))
+
+    def test_control_event_guard_accepts_derived_runnable_pending_package_decision(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 1,
+            "ready_packages": [{"id": "PENDING-RUNNABLE", "decision": "active", "task_id": "assignment-1", "delivered_ack": True}],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), derived_runnable_ids={"PENDING-RUNNABLE"}
+        )
+        self.assertEqual(errors, [])
+
+    def test_successful_control_receipt_does_not_clear_derived_runnable(self) -> None:
+        snapshot = {
+            "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
+            "ready_ids": [], "runnable_ids": ["PENDING-RUNNABLE"], "candidate_revisions": [],
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        event = {
+            "hook_event_name": "PostToolUse", "session_id": "s",
+            "tool_input": {"command": "python3 control_event_guard.py receipt --ledger TASK_LEDGER.md"},
+            "tool_response": {"exit_code": 0, "stdout": "control-event: allowed"},
+        }
+        _, state = lifecycle_hook.evaluate_event(
+            event, snapshot=snapshot,
+            prior_state={"pending_control_event": True, "triggers": ["RUNNABLE:PENDING-RUNNABLE"], "snapshot": snapshot},
+        )
+        self.assertTrue(state["pending_control_event"])
+        self.assertIn("RUNNABLE:PENDING-RUNNABLE", state["triggers"])
+
+    def test_preblock_guard_rejects_derived_runnable_pending_package(self) -> None:
+        snapshot = {
+            "project_scope_scan": True,
+            "ledger_revision": "abc123",
+            "open_packages": [{
+                "id": "BLOCKED-A", "state": "BLOCKED", "can_progress": False,
+                "reason": "waiting for credential", "external_condition_id": "credential",
+            }, {
+                "id": "PENDING-RUNNABLE", "state": "PENDING", "can_progress": False,
+                "reason": "not promoted yet", "external_condition_id": "credential",
+            }],
+            "live_tasks": 0, "pending_candidates": 0, "controller_actions": 0,
+        }
+        errors = preblock_guard.validate_snapshot(
+            snapshot, ledger_package_ids={"BLOCKED-A", "PENDING-RUNNABLE"},
+            derived_runnable_ids={"PENDING-RUNNABLE"},
+        )
+        self.assertTrue(any("derived runnable" in error and "PENDING-RUNNABLE" in error for error in errors))
+
+    def test_lifecycle_stop_blocks_on_derived_runnable_even_when_ready_is_empty(self) -> None:
+        snapshot = {
+            "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",
+            "ready_ids": [], "runnable_ids": ["PENDING-RUNNABLE"], "candidate_revisions": [],
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "Stop", "session_id": "session-1", "turn_id": "turn-1"},
+            snapshot=snapshot,
+            prior_state={"pending_control_event": True, "triggers": ["RUNNABLE:PENDING-RUNNABLE"], "stop_continuations": 1},
+        )
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("PENDING-RUNNABLE", output["reason"])
+        self.assertTrue(state["pending_control_event"])
+
     def test_preblock_guard_rejects_ready_work_outside_current_goal(self) -> None:
         snapshot = {
             "project_scope_scan": True,

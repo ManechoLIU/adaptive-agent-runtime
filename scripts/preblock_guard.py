@@ -8,6 +8,12 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from lint_governance import task_records
+try:
+    from controller_state import derive_runnable_tasks
+except ModuleNotFoundError:
+    from scripts.controller_state import derive_runnable_tasks
+
 
 PROGRESS_STATES = {"READY", "ACTIVE", "RECOVERING", "VERIFY"}
 OPEN_STATES = PROGRESS_STATES | {"PENDING", "BLOCKED"}
@@ -31,7 +37,7 @@ def open_ledger_package_ids(ledger: Path) -> set[str]:
 
 
 def validate_snapshot(
-    snapshot: dict[str, Any], *, ledger_package_ids: set[str] | None = None
+    snapshot: dict[str, Any], *, ledger_package_ids: set[str] | None = None, derived_runnable_ids: set[str] | None = None
 ) -> list[str]:
     errors: list[str] = []
     if snapshot.get("project_scope_scan") is not True:
@@ -56,6 +62,9 @@ def validate_snapshot(
             errors.append("scan omitted ledger packages: " + ", ".join(missing))
         if extra:
             errors.append("scan contains packages absent from ledger: " + ", ".join(extra))
+    if derived_runnable_ids:
+        for task_id in sorted(derived_runnable_ids):
+            errors.append(f"{task_id} is derived runnable from current ledger facts")
 
     external_conditions: set[str] = set()
     for index, package in enumerate(packages):
@@ -126,11 +135,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not ledger.is_file():
             raise ValueError("ledger path must be an existing file")
         ledger_package_ids = open_ledger_package_ids(ledger)
+        derived_runnable_ids = set(derive_runnable_tasks(task_records(ledger.read_text(encoding="utf-8")))["runnable_task_ids"])
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"preblock: invalid snapshot: {error}")
         return 2
 
-    errors = validate_snapshot(snapshot, ledger_package_ids=ledger_package_ids)
+    errors = validate_snapshot(snapshot, ledger_package_ids=ledger_package_ids, derived_runnable_ids=derived_runnable_ids)
     for error in errors:
         print(f"preblock: blocked: {error}")
     if errors:
