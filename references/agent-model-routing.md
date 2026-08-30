@@ -46,7 +46,7 @@ Adaptive Delivery 负责把项目目标拆成可验收工作包，为每个工�
 - 外部模型合同必须显式填写 `auth_mode: oauth | api`。OAuth/会员与 API Key 是不同的认证、额度和计费路线，执行器不得自行选择。
 - 先采用项目规则或用户本轮明确选择。若两种模式都可用但合同未指定，必须在真实调用前请用户选择；不得把“已有登录”或“检测到 Key”当成计费授权。
 - 同一种模型也可能支持两条通道：模型 ID 不足以证明实际计费路线，必须同时核对 `agent_type`、`auth_mode` 和凭据来源。
-- 一条通道不可用时停在对应门禁前。除非路由合同明确授权，不得从 OAuth 自动切到 API、从 API 自动切到 OAuth，或改用另一个模型。
+- OAuth 与 API 仍是不同计费 / 认证边界：不得从 OAuth 自动切到 API、从 API 自动切到 OAuth。外部首选通道发生**安全失败**时，Dispatch Gate 可自动降级到项目已授权的 Codex 原生模型；这不是认证通道切换。
 - 当前用户的本地默认选择是：Kimi K3 使用 `api`，Grok 4.6 使用 `oauth`。项目或本轮的新选择可以覆盖它；该偏好不是公开插件对其他用户的默认值。
 - 需要登录、凭据配置、无调用预检或真实执行时，读取 [External Agent authentication and execution](external-agent-auth.md)。这些能力由 Adaptive Delivery 自己提供，不要求安装 Task Navigator 或 Codex Continuity。
 
@@ -56,7 +56,7 @@ Adaptive Delivery 负责把项目目标拆成可验收工作包，为每个工�
 - Grok 的两种认证模式都经 Grok Build CLI 执行。OAuth 使用 `grok login` 的可刷新会话；API 模式必须隔离 OAuth 会话后注入 `XAI_API_KEY`，从而保证不会因为本机已有登录而走错计费通道。
 - 外部模型执行前确认：运行器存在、模型标识可解析、认证已配置、工作目录与文件所有权正确、工具权限和停止条件明确。
 - API/订阅可能计费。未获得本轮付费授权时，只验证配置、命令发现、假服务或 dry-run，不发送真实推理请求。
-- 首选通道不可用时，默认停在该工作包的外部门禁前并报告缺失项；只有用户或项目规则明确允许降级时，才能改走通用模型，并在路由合同和交付中记录实际模型，禁止静默降级。
+- 首选外部通道失败后统一调用 `scripts/run_external_agent.mjs --resolve-route`。只有 `provider_unavailable / cli_unavailable / transport_failure_before_write / no_valid_result` 这类已知无副作用的安全失败可自动降级到 Codex；机械窄任务选 `gpt-5.6-luna`，常规实现 / 调试 / 审查选 `gpt-5.6-terra`，架构 / 复杂根因 / 高风险选 `gpt-5.6-sol`，并由 resolver 给出推理强度。若用户固定 provider、结果未知、可能部分写入、存在计费边界或授权边界变化，必须 `blocked`，禁止自动 fallback。实际 fallback 路由与原因写入 Assignment / 交付收据，不静默降级。
 - 外部 Agent 的修改视为候选交付。主 Agent仍须核对实际 diff、运行本项目验证，并完成真实入口验收。
 
 ## 外部执行可见性

@@ -7,7 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, renderExternalAgentCard } from "../scripts/run_external_agent.mjs";
+import { parseArgs, renderExternalAgentCard, resolveDispatchRoute } from "../scripts/run_external_agent.mjs";
 
 const skillRoot = fileURLToPath(new URL("../", import.meta.url));
 const adapter = path.join(skillRoot, "scripts", "run_external_agent.mjs");
@@ -85,6 +85,60 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
 `);
   await chmod(target, 0o755);
 }
+
+
+test("safe external failures resolve to authorized Codex fallback by task complexity", () => {
+  const base = { preferredEngine: "grok-build", category: "backend", failureClass: "provider_unavailable" };
+  assert.deepEqual(resolveDispatchRoute({ ...base, workType: "mechanical", complexity: "low" }), {
+    decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-luna", reasoningEffort: "low",
+    reason: "safe_external_failure",
+  });
+  assert.deepEqual(resolveDispatchRoute({ ...base, workType: "implementation", complexity: "normal" }), {
+    decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-terra", reasoningEffort: "medium",
+    reason: "safe_external_failure",
+  });
+  assert.deepEqual(resolveDispatchRoute({ ...base, workType: "root-cause", complexity: "high", highRisk: true }), {
+    decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-sol", reasoningEffort: "xhigh",
+    reason: "safe_external_failure",
+  });
+  const frontend = resolveDispatchRoute({ preferredEngine: "kimi-code", category: "frontend", failureClass: "no_valid_result", workType: "review", complexity: "normal" });
+  assert.equal(frontend.decision, "fallback");
+  assert.equal(frontend.model, "gpt-5.6-terra");
+});
+
+test("unsafe or pinned external failures remain blocked instead of silently falling back", () => {
+  const base = { preferredEngine: "grok-build", category: "backend", failureClass: "provider_unavailable", workType: "implementation", complexity: "normal" };
+  for (const [field, reason] of [
+    ["providerPinned", "provider_pinned"],
+    ["resultUnknown", "result_unknown"],
+    ["partialWritePossible", "partial_write_possible"],
+    ["billingBoundary", "billing_boundary"],
+    ["authorizationBoundary", "authorization_boundary"],
+  ]) {
+    const decision = resolveDispatchRoute({ ...base, [field]: true });
+    assert.equal(decision.decision, "blocked");
+    assert.equal(decision.reason, reason);
+  }
+});
+
+test("route decision CLI exposes the same resolver without a model call", () => {
+  const output = execFileSync(process.execPath, [adapter,
+    "--resolve-route", "--engine", "grok-build", "--category", "backend",
+    "--failure-class", "provider_unavailable", "--work-type", "implementation", "--complexity", "normal",
+  ], { encoding: "utf8" });
+  assert.deepEqual(JSON.parse(output), {
+    decision: "fallback", executionRoute: "native-subagent", model: "gpt-5.6-terra", reasoningEffort: "medium",
+    reason: "safe_external_failure",
+  });
+});
+
+test("non-safe failure classes do not trigger automatic fallback", () => {
+  const decision = resolveDispatchRoute({
+    preferredEngine: "kimi-code", category: "frontend", failureClass: "delivery_failed",
+    workType: "implementation", complexity: "normal",
+  });
+  assert.deepEqual(decision, { decision: "blocked", reason: "failure_not_safe_for_fallback" });
+});
 
 test("route parsing requires explicit auth mode and the Kimi Open Platform model id", () => {
   assert.throws(() => parseArgs([
