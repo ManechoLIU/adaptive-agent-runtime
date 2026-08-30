@@ -1,7 +1,7 @@
 # Governance Subtraction Architecture Design
 
 Date: 2026-08-30
-Status: Proposed / user-approved direction, pending written-spec review
+Status: User-approved direction; amended for Web/Desktop parity root-fix review
 
 ## 1. Problem Statement
 
@@ -27,6 +27,10 @@ This design removes duplicated state ownership instead of adding another guard l
 5. Reduce controller-authored governance data and total number of concepts the controller must actively manage.
 6. Preserve the useful safety properties already gained: pre-spawn ACK validation, shared Git-common-dir runtime, rule handshake, bounded recovery, evidence-aware progress, independent review, and integration verification.
 7. Preserve accepted checkpoints during recovery; do not force rework of already verified stages.
+8. Make Desktop Codex and Web controller continuation converge on the same machine-derived runnable set, fallback decision, and Stop/Yield decision.
+9. Prevent a locally BLOCKED package from turning into project-wide idle while any open package is mechanically runnable.
+10. Make authorized provider fallback a Dispatch decision rather than a model-memory behavior.
+11. Make Web native resume fail closed, observable, and diagnosable; a bridge failure must never be indistinguishable from a legitimate controller yield.
 
 ## 3. Non-Goals
 
@@ -35,7 +39,7 @@ This design removes duplicated state ownership instead of adding another guard l
 - Do not require ordinary short Assignments to author checkpoint metadata.
 - Do not move product implementation details into Adaptive Delivery.
 - Do not weaken ACK, ownership, rule-handshake, review, or integration gates.
-- Do not automatically authorize provider/model route changes that remain project/user authorization decisions.
+- Do not cross explicit provider, billing, credential, or side-effect authorization boundaries automatically. Safe fallback inside an already-authorized project routing policy is allowed and should be machine-derived rather than left to controller memory.
 
 ## 4. Target Architecture
 
@@ -163,7 +167,7 @@ No runtime or ledger text may substitute for candidate ancestry or current-main 
 
 ## 5. Simplified Machine Gates
 
-Controller-facing governance is reduced to three gates.
+Controller-facing governance is reduced to four gates.
 
 ### 5.1 Dispatch Gate
 
@@ -171,13 +175,17 @@ Question: **May this execution start?**
 
 Internally checks:
 
+- project-wide runnable derivation from the current ledger/Git/runtime/authorization snapshot;
 - Task is dispatchable / valid owner;
 - delivered ACK matches exact task/repo/head/scope;
 - rule handshake is current where required;
 - ownership/worktree rules are satisfied;
-- execution lineage recovery budget is available.
+- execution lineage recovery budget is available;
+- preferred provider route health and the shared fallback resolver.
 
-Controller sees one result: allowed or blocked with one structured reason.
+The fallback resolver may select an authorized Codex-native route by task type, complexity, risk, and reasoning effort when the preferred external route fails safely. It must refuse automatic fallback when result state is unknown, partial writes or external side effects may have occurred, billing/credential semantics would change, or the project/user explicitly pins the provider.
+
+Controller sees one result: allowed, fallback-selected, or blocked with one structured reason.
 
 ### 5.2 Delivery Gate
 
@@ -204,6 +212,20 @@ A provider process exiting 0 is not sufficient for PASS.
 Question: **Can this delivery safely change main/project state?**
 
 Checks candidate/review/main ancestry/regression evidence. This preserves current review/integration guarantees without exposing every internal receipt as a controller-managed state.
+
+### 5.4 Stop / Yield Gate
+
+Question: **May the controller stop now?**
+
+Before any normal yield, and after any Task becomes BLOCKED, the gate derives a fresh project-wide runnable set rather than trusting existing READY labels. It rejects Stop when any of the following exists:
+
+- a mechanically runnable open Task, even if the ledger still labels it PENDING;
+- READY work lacking dispatch ACK;
+- ACTIVE/RECOVERING work requiring a controller recovery action;
+- VERIFY work, pending review, candidate, or integration action;
+- Goal rollover or another controller-owned closure action.
+
+Project-level BLOCKED is valid only when the project-wide scan proves that all remaining open work waits on the same real external condition or otherwise has no internal recovery path. A locally BLOCKED package therefore cannot implicitly idle the project.
 
 ## 6. Ledger Simplification
 
@@ -236,7 +258,11 @@ Current-state trigger rules:
 
 `pending_control_event` may persist until the controller closes the current discrepancy, but the human/system guidance is regenerated from the fresh snapshot every time.
 
-This removes stale combinations such as `BLOCKED + READY:<same-task>`.
+Before any yield, lifecycle invokes the Stop / Yield Gate. READY is not merely read from the ledger: runnable work is derived first from every open Task and current dependency, scope, environment, integration, and authorization facts. This closes the gap where work that should be READY remains mislabeled PENDING and the controller otherwise appears idle.
+
+Web is a lifecycle adapter, not a second state machine. Its compensated Stop path must resume the same registered controller thread and must fail closed if that resume cannot be confirmed.
+
+This removes stale combinations such as `BLOCKED + READY:<same-task>` and prevents `subtask BLOCKED -> silent project idle`.
 
 ## 8. Recovery Semantics
 
@@ -249,14 +275,29 @@ Flow:
 3. Delivery Gate returns PASS / FAIL / BLOCKED / UNRESOLVED.
 4. PASS moves to Integration Gate.
 5. FAIL/UNRESOLVED may recover within the same lineage while budget remains.
-6. Budget exhaustion requires one of:
-   - a genuinely changed strategy/contract -> new lineage;
-   - a real BLOCKED condition with wake evidence;
-   - explicit termination/supersession.
+6. Budget exhaustion or preferred-route failure first goes through the Dispatch fallback resolver.
+7. The resolver may choose a materially different authorized route/strategy -> new lineage, or return a real BLOCKED condition with wake evidence.
+8. If no authorized safe fallback exists, explicit termination/supersession remains available.
 
-The controller may not claim "strategy changed" merely because the prompt says "do it for real this time" or changes the Agent/session name.
+The controller may not claim "strategy changed" merely because the prompt says "do it for real this time" or changes the Agent/session name. Provider fallback is machine-derived from the authorized routing policy, not invented ad hoc by the model.
 
-## 9. Evidence Semantics
+## 9. Web Lifecycle Adapter and Runtime Preflight
+
+The Web bridge compensates for the browser host's lack of a native local Stop callback. It must remain a thin adapter into the same controller lifecycle, not a Web-specific governance system.
+
+The observed `returncode=127` incident had a concrete runtime cause: the LaunchAgent invoked `/opt/homebrew/bin/codex`, whose shebang uses `/usr/bin/env node`, from an environment whose PATH did not contain `/opt/homebrew/bin`; `node` therefore could not be resolved. The bridge also redirected the detached process stdout/stderr to `/dev/null`, discarding the diagnostic `env: node: No such file or directory`.
+
+Root-fix requirements:
+
+1. LaunchAgent/runtime environment must include the required executable search path, including Homebrew where Codex/Node are installed.
+2. Before native resume, perform a small preflight for: repository existence, exactly one registered controller for that repo, Codex executable availability, Node/runtime availability, and a successful lightweight `codex --version`-style execution check.
+3. Auto native resume uses the same registered controller thread only; it must never fork or create a second controller.
+4. Resume state is explicit: `RESUME_PENDING -> RESUME_CONFIRMED` on success; non-zero execution becomes `RESUME_FAILED` and leaves lifecycle unclosed.
+5. A non-zero resume cannot be treated as a successful Stop. The system preserves the pending control condition, performs only bounded safe recovery, and surfaces a structured `WEB_LIFECYCLE_RESUME_FAILED` blocker if recovery remains unavailable.
+6. Detached execution may remain non-blocking, but stdout/stderr must not be discarded. Use bounded/rotated diagnostic logs plus a small `stderr_tail`/return code/command/timestamp summary in the state receipt. Logs must have size/rotation limits so observability does not create unbounded governance storage.
+7. Desktop and Web parity tests must feed equivalent project facts into the shared lifecycle logic and expect identical runnable/fallback/yield decisions.
+
+## 10. Evidence Semantics
 
 For code/versioned artifacts, a Delivery PASS must bind to authoritative evidence. Minimum default behavior:
 
@@ -268,7 +309,7 @@ For code/versioned artifacts, a Delivery PASS must bind to authoritative evidenc
 
 The exact evidence policy remains risk-tailored; this architecture does not force heavy tests on ordinary low-risk tasks.
 
-## 10. Complexity Budget / Deletion Requirement
+## 11. Complexity Budget / Deletion Requirement
 
 This change is successful only if it reduces controller-facing complexity.
 
@@ -280,19 +321,19 @@ Implementation constraints:
 - do not create a second ledger/runtime database;
 - prefer replacing/removing old outcome/trigger logic over layering new parallel checks;
 - delete or simplify obsolete code paths made unnecessary by the new model;
-- documentation must present the three gates as the primary controller mental model.
+- documentation must present the four gates as the primary controller mental model.
 
 A patch that merely adds lineage metadata while preserving all old duplicate success/trigger semantics does not satisfy this design.
 
-## 11. Compatibility and Migration
+## 12. Compatibility and Migration
 
 Runtime state schema may be extended compatibly. Existing leases without lineage metadata are treated as legacy lineages and may be normalized when next touched; no project worktree is discarded solely for migration.
 
 Existing Assignment receipts remain audit history. The implementation must not retroactively reinterpret old provider exits as verified delivery PASS.
 
-Current `M1-F4-C-SERVER-GATE` remains BLOCKED under its existing authorization gate until a legitimate backend route/strategy is available. Implementing this governance architecture must not silently resume or redo Checkpoint A.
+Current product state is not rewritten merely by installing this governance architecture. Once the amended authorized routing policy is loaded, future dispatch decisions use the shared fallback resolver. Migration must not silently redo any previously accepted checkpoint, and it must not create a second SelfAlone controller.
 
-## 12. Test Strategy
+## 13. Test Strategy
 
 Required failing tests before implementation:
 
@@ -307,8 +348,17 @@ Required failing tests before implementation:
 9. Lifecycle must not retain stale terminal/READY triggers after the source condition resolves.
 10. Existing rule-handshake, ACK-before-spawn, cross-worktree runtime, independent-review and integration tests must remain green.
 11. Regression scenario matching the real `M1-F4-C-SERVER-GATE B-01...B-05` pattern must demonstrate that the new architecture stops repeated same-lineage execution after the configured budget.
+12. A BLOCKED subtask with another mechanically runnable open Task must reject controller yield even when that other Task is still labeled PENDING.
+13. A true project-wide external blocker with no runnable counterexample must permit BLOCKED/yield.
+14. Preferred Grok/Kimi safe failure under an authorized fallback policy must select the appropriate Codex-native route; unknown-result/partial-write/billing-boundary cases must refuse automatic fallback.
+15. Web native resume under a LaunchAgent-like PATH without Node must fail preflight with a structured reason rather than an opaque 127.
+16. Web native resume with the required runtime PATH must start the exact registered thread.
+17. Non-zero native resume must persist `RESUME_FAILED`, keep lifecycle pending, and never be recorded as a normal Stop closure.
+18. Diagnostic stderr must be retained in bounded logs/state summary; tests must prove logs rotate or truncate rather than grow without bound.
+19. Desktop and Web adapters given the same current snapshot must produce the same runnable/fallback/yield decision.
+20. Web preflight must fail closed for missing repo, ambiguous/missing controller registration, missing Codex, or missing Node/runtime.
 
-## 13. Acceptance Criteria
+## 14. Acceptance Criteria
 
 The architecture is complete when all are true:
 
@@ -317,13 +367,18 @@ The architecture is complete when all are true:
 - provider exit 0 cannot create a false delivery success;
 - ledger remains one Task row for repeated execution attempts;
 - lifecycle guidance cannot contradict the current Task state;
+- project-wide runnable derivation prevents a locally BLOCKED package from causing silent global idle;
+- authorized fallback selection is shared by Desktop and Web and refuses unsafe/unauthorized route changes;
+- Stop/Yield is rejected whenever runnable/review/integration/recovery work exists;
+- Web native resume performs runtime preflight, preserves bounded diagnostics, and fails closed on non-zero exit;
+- Desktop and Web lifecycle parity tests pass;
 - existing safety gates remain functional;
 - full Python/Node governance suites pass;
 - independent non-author review attacks lineage reset, false-success, stale-trigger, and ledger-bloat counterexamples;
 - installed Adaptive Delivery revision is synchronized and loaded by the unique SelfAlone controller through the existing machine handshake;
 - no existing accepted SelfAlone product checkpoint is redone solely because of this governance migration.
 
-## 14. Expected Operational Result
+## 15. Expected Operational Result
 
 The same incident should become:
 
@@ -337,4 +392,4 @@ The same incident should become:
 → lineage budget exhausted
 → controller must choose a materially new authorized strategy or BLOCKED.
 
-The ledger remains one `SERVER-GATE` row throughout. Runtime retains the execution evidence. The controller handles three decisions—dispatch, delivery, integration—rather than reconciling several overlapping state systems.
+The ledger remains one `SERVER-GATE` row throughout. Runtime retains the execution evidence. If another project package is runnable, Stop/Yield rejects idle and Dispatch continues that work. If the preferred provider fails safely, Dispatch selects an authorized fallback; if resume infrastructure itself fails, the Web lifecycle remains pending with a structured blocker and bounded diagnostics. The controller handles four decisions—dispatch, delivery, integration, stop/yield—rather than reconciling several overlapping state systems.
