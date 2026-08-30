@@ -79,6 +79,41 @@ class ControllerScoringGuardTests(unittest.TestCase):
             self.assertIn("七维评分模型", completed.stdout)
             self.assertIn('"model_sha256"', completed.stdout)
 
+
+    def test_score_guard_rejects_expired_receipt_and_successful_cli_guard_consumes_it(self):
+        guard = load_module()
+        import json, subprocess
+        from datetime import datetime, timedelta, timezone
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            guard.record_model_read(repo, skill_root=ROOT)
+            target = guard.receipt_path(repo)
+            value = json.loads(target.read_text(encoding="utf-8"))
+            value["read_at"] = (datetime.now(timezone.utc) - timedelta(seconds=guard.RECEIPT_MAX_AGE_SECONDS + 1)).isoformat()
+            target.write_text(json.dumps(value), encoding="utf-8")
+            self.assertTrue(any("expired" in error for error in guard.score_guard_errors(repo, skill_root=ROOT)))
+
+            guard.record_model_read(repo, skill_root=ROOT)
+            self.assertEqual([], guard.consume_score_guard(repo, skill_root=ROOT))
+            self.assertFalse(target.exists())
+            self.assertTrue(guard.score_guard_errors(repo, skill_root=ROOT))
+
+    def test_read_and_record_uses_the_same_model_bytes_for_output_and_receipt(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as sd:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            skill = Path(sd)
+            (skill / "references").mkdir()
+            model = skill / "references" / "controller-performance-scoring.md"
+            model.write_text("one exact model\n", encoding="utf-8")
+            content, receipt = guard.read_and_record_model(repo, skill_root=skill)
+            self.assertEqual(b"one exact model\n", content)
+            import hashlib
+            self.assertEqual(hashlib.sha256(content).hexdigest(), receipt["model_sha256"])
+
     def test_cli_rejects_skill_root_override(self):
         import subprocess
         completed = subprocess.run([

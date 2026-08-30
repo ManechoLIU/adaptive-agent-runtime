@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from controller_scoring_guard import record_model_read, receipt_path, score_guard_errors
+    from controller_scoring_guard import consume_score_guard, read_and_record_model, receipt_path
 except ModuleNotFoundError:
-    from scripts.controller_scoring_guard import record_model_read, receipt_path, score_guard_errors
+    from scripts.controller_scoring_guard import consume_score_guard, read_and_record_model, receipt_path
 
 MODEL_RELATIVE_PATH = Path("references/controller-performance-scoring.md")
 STATE_ROOT = Path(
@@ -28,7 +28,7 @@ STATE_ROOT = Path(
 _CONTROLLER_TERMS = re.compile(r"(?:总控|项目总控|controller|orchestrator)", re.IGNORECASE)
 _SCORE_VALUE = r"(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)"
 _OUTPUT_SCORE = re.compile(
-    rf"(?:(?:总分|评分|得分|score).{{0,24}}?{_SCORE_VALUE}|(?:总控|项目总控|controller|orchestrator).{{0,40}}?(?:评分|得分|score).{{0,20}}?{_SCORE_VALUE})",
+    rf"(?:总控|项目总控|controller|orchestrator).{{0,80}}?(?:评分|得分|score|performance).{{0,40}}?{_SCORE_VALUE}",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -37,7 +37,7 @@ _SCORE_TERMS = re.compile(
     re.IGNORECASE,
 )
 _PERFORMANCE_WORKFLOW = re.compile(
-    r"(?:审计.{0,12}(?:项目总控|总控).{0,12}(?:履职|表现)|(?:项目总控|总控).{0,12}(?:履职|表现).{0,12}审计|比较.{0,12}(?:项目总控|总控).{0,12}表现|(?:检查|核对).{0,12}(?:项目总控|总控).{0,12}假繁荣|评估.{0,12}(?:项目总控|总控).{0,12}履职)",
+    r"(?:审计.{0,16}(?:项目总控|总控).{0,16}(?:履职|表现)|(?:项目总控|总控).{0,16}(?:履职|表现).{0,16}审计|(?:比较|评估|评价).{0,16}(?:项目总控|总控).{0,16}(?:履职|表现)|(?:项目总控|总控).{0,16}(?:履职|表现).{0,16}(?:比较|评估|评价)|(?:检查|核对).{0,16}(?:项目总控|总控).{0,16}假繁荣|(?:audit|evaluate|assess|review|compare).{0,30}(?:controller|orchestrator).{0,30}(?:performance|duty|execution)|(?:controller|orchestrator).{0,30}(?:performance|duty|execution).{0,30}(?:audit|evaluate|assess|review|compare))",
     re.IGNORECASE,
 )
 
@@ -112,23 +112,27 @@ def evaluate_event(
     if event_name == "UserPromptSubmit":
         prompt = str(event.get("prompt", ""))
         if not is_controller_scoring_request(prompt):
+            current_turn = str(event.get("turn_id", ""))
+            if state.get("pending_scoring") and str(state.get("turn_id", "")) != current_turn:
+                state.update({"pending_scoring": False, "reinject_required": False, "turn_id": current_turn})
             return {}, state
         try:
-            model = scoring_model_path(skill_root)
-            digest = scoring_model_sha256(skill_root)
-            context = _model_context(skill_root, digest)
-        except OSError as error:
-            return {
-                "decision": "block",
-                "reason": f"controller scoring blocked: installed scoring model cannot be loaded: {error}",
-            }, state
-        try:
             repo = _repo_root(str(event.get("cwd", "") or Path.cwd()))
-            receipt = record_model_read(repo, skill_root=skill_root)
-        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            model = scoring_model_path(skill_root)
+            content, receipt = read_and_record_model(repo, skill_root=skill_root)
+            digest = str(receipt["model_sha256"])
+            context = (
+                "Adaptive Delivery controller-scoring machine gate is active. "
+                "The following is the exact installed scoring model and is authoritative for this scoring turn. "
+                "Do not substitute another rubric. The Stop gate will fail closed if this exact model changes before the response completes.\n"
+                f"installed_scoring_model_sha256={digest}\n"
+                f"installed_scoring_model_path={model}\n\n"
+                + content.decode("utf-8")
+            )
+        except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as error:
             return {
                 "decision": "block",
-                "reason": f"controller scoring blocked: score-guard could not record the exact installed scoring model read: {error}",
+                "reason": f"controller scoring blocked: score-guard could not load and record the exact installed scoring model read: {error}",
             }, state
         state.update(
             {
@@ -140,6 +144,7 @@ def evaluate_event(
                 "receipt_path": str(receipt_path(repo)),
                 "receipt_sha256": str(receipt.get("model_sha256", "")),
                 "reinject_required": False,
+                "turn_id": str(event.get("turn_id", "")),
             }
         )
         return {
@@ -151,6 +156,9 @@ def evaluate_event(
 
     if event_name == "Stop":
         message = str(event.get("last_assistant_message", ""))
+        current_turn = str(event.get("turn_id", ""))
+        if state.get("pending_scoring") and str(state.get("turn_id", "")) != current_turn:
+            state.update({"pending_scoring": False, "reinject_required": False, "turn_id": current_turn})
         if looks_like_controller_score_output(message) and not state.get("pending_scoring"):
             return {
                 "decision": "block",
@@ -183,7 +191,13 @@ def evaluate_event(
                     "当前评分正文不再有效。本回合只能说明阻塞，不能输出分数；请用户重新提交总控评分/审计请求，让新的 UserPromptSubmit 完整注入当前安装评分模型。"
                 ),
             }, state
-        errors = score_guard_errors(Path(repo_text), skill_root=skill_root)
+        try:
+            errors = consume_score_guard(Path(repo_text), skill_root=skill_root)
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            return {
+                "decision": "block",
+                "reason": f"controller scoring blocked: score-guard validation failed safely: {error}",
+            }, state
         if errors:
             return {
                 "decision": "block",

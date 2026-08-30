@@ -57,6 +57,10 @@ class ControllerScoringHookTests(unittest.TestCase):
             "比较近期总控表现",
             "检查总控是不是假繁荣",
             "score the controller performance",
+            "Audit the controller's recent performance",
+            "Evaluate the orchestrator's recent performance",
+            "评估一下总控最近表现",
+            "评价一下总控最近履职情况",
         ]
         for prompt in prompts:
             with self.subTest(prompt=prompt):
@@ -133,6 +137,42 @@ class ControllerScoringHookTests(unittest.TestCase):
             self.assertFalse(refreshed["pending_scoring"])
 
 
+    def test_scoring_state_is_bound_to_turn_id_and_stale_turn_is_cleared(self):
+        hook = load_module()
+        _, state = hook.evaluate_event(
+            {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "turn_id": "score-turn", "cwd": str(ROOT), "prompt": "给总控评分"},
+            skill_root=ROOT, prior_state={},
+        )
+        self.assertEqual("score-turn", state["turn_id"])
+        output, state = hook.evaluate_event(
+            {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "turn_id": "next-turn", "cwd": str(ROOT), "prompt": "现在项目进度怎么样"},
+            skill_root=ROOT, prior_state=state,
+        )
+        self.assertEqual({}, output)
+        self.assertFalse(state.get("pending_scoring", False))
+        self.assertEqual("next-turn", state.get("turn_id"))
+        output, _ = hook.evaluate_event(
+            {"hook_event_name": "Stop", "session_id": "s1", "turn_id": "next-turn", "cwd": str(ROOT), "last_assistant_message": "Overall: 82/100"},
+            skill_root=ROOT, prior_state=state,
+        )
+        self.assertEqual({}, output)
+
+    def test_stop_blocks_when_receipt_validation_raises(self):
+        hook = load_module()
+        from unittest.mock import patch
+        _, state = hook.evaluate_event(
+            {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "turn_id": "t1", "cwd": str(ROOT), "prompt": "给总控评分"},
+            skill_root=ROOT, prior_state={},
+        )
+        with patch.object(hook, "consume_score_guard", side_effect=OSError("receipt vanished")):
+            output, state = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "s1", "turn_id": "t1", "cwd": str(ROOT), "last_assistant_message": "当前总控履职评分：82/100。"},
+                skill_root=ROOT, prior_state=state,
+            )
+        self.assertEqual("block", output["decision"])
+        self.assertIn("score-guard", output["reason"])
+        self.assertTrue(state["pending_scoring"])
+
     def test_run_hook_blocks_when_scoring_state_cannot_be_persisted(self):
         import json
         import os
@@ -203,8 +243,10 @@ class ControllerScoringHookTests(unittest.TestCase):
 class ControllerScoringOutputGateTests(unittest.TestCase):
     def test_output_detector_requires_scoring_semantics(self):
         hook = load_module()
-        self.assertTrue(hook.looks_like_controller_score_output("总分：82/100。"))
+        self.assertFalse(hook.looks_like_controller_score_output("总分：82/100。"))
         self.assertTrue(hook.looks_like_controller_score_output("当前总控履职评分：82/100。"))
+        self.assertTrue(hook.looks_like_controller_score_output("Controller performance score: 82/100."))
+        self.assertFalse(hook.looks_like_controller_score_output("Benchmark score: 82/100."))
         self.assertFalse(hook.looks_like_controller_score_output("controller failed in 50/100 requests"))
 
     def test_stop_blocks_scoring_output_when_no_scoring_state_exists(self):
