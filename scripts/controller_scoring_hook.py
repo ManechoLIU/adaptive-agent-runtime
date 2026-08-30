@@ -26,10 +26,18 @@ STATE_ROOT = Path(
 ).expanduser()
 
 _CONTROLLER_TERMS = re.compile(r"(?:总控|项目总控|controller|orchestrator)", re.IGNORECASE)
-_OUTPUT_SCORE = re.compile(r"(?:总控|项目总控|controller|orchestrator).{0,40}?(?:\b(?:100|[1-9]?\d)(?:\.\d+)?\s*/\s*100\b|(?:100|[1-9]?\d)(?:\.\d+)?\s*分)", re.IGNORECASE | re.DOTALL)
+_SCORE_VALUE = r"(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)"
+_OUTPUT_SCORE = re.compile(
+    rf"(?:(?:总分|评分|得分|score).{{0,24}}?{_SCORE_VALUE}|(?:总控|项目总控|controller|orchestrator).{{0,40}}?(?:评分|得分|score).{{0,20}}?{_SCORE_VALUE})",
+    re.IGNORECASE | re.DOTALL,
+)
 
 _SCORE_TERMS = re.compile(
-    r"(?:评分|打分|分数|多少分|履职评估|履职评分|审计|比较近期(?:总控)?表现|假繁荣|performance\s+(?:score|scoring|evaluation)|score\s+(?:the\s+)?(?:controller|orchestrator)|rate\s+(?:the\s+)?(?:controller|orchestrator))",
+    r"(?:评分|打分|分数|多少分|履职评估|履职评分|performance\s+(?:score|scoring|evaluation)|score\s+(?:the\s+)?(?:controller|orchestrator)|rate\s+(?:the\s+)?(?:controller|orchestrator))",
+    re.IGNORECASE,
+)
+_PERFORMANCE_WORKFLOW = re.compile(
+    r"(?:审计.{0,12}(?:项目总控|总控).{0,12}(?:履职|表现)|(?:项目总控|总控).{0,12}(?:履职|表现).{0,12}审计|比较.{0,12}(?:项目总控|总控).{0,12}表现|(?:检查|核对).{0,12}(?:项目总控|总控).{0,12}假繁荣|评估.{0,12}(?:项目总控|总控).{0,12}履职)",
     re.IGNORECASE,
 )
 
@@ -44,7 +52,10 @@ def scoring_model_sha256(skill_root: str | Path) -> str:
 
 def is_controller_scoring_request(prompt: str) -> bool:
     text = str(prompt or "").strip()
-    return bool(_CONTROLLER_TERMS.search(text) and _SCORE_TERMS.search(text))
+    return bool(
+        (_CONTROLLER_TERMS.search(text) and _SCORE_TERMS.search(text))
+        or _PERFORMANCE_WORKFLOW.search(text)
+    )
 
 
 def looks_like_controller_score_output(message: str) -> bool:
@@ -128,6 +139,7 @@ def evaluate_event(
                 "repo_root": str(repo),
                 "receipt_path": str(receipt_path(repo)),
                 "receipt_sha256": str(receipt.get("model_sha256", "")),
+                "reinject_required": False,
             }
         )
         return {
@@ -160,13 +172,15 @@ def evaluate_event(
         if state.get("model_sha256") != installed_digest or Path(str(state.get("model_path", ""))).resolve() != installed_path:
             # Stop continuation text is size-limited by Codex. Do not pretend the new
             # rubric was fully injected here and do not advance the recorded digest.
-            # A fresh UserPromptSubmit is required so the unlimited-context hook can
-            # inject the complete installed model and mint a matching receipt.
+            # Release this turn from the scoring state so the assistant can explain the
+            # block without a Stop loop; any score-shaped output remains fail-closed.
+            state["pending_scoring"] = False
+            state["reinject_required"] = True
             return {
                 "decision": "block",
                 "reason": (
                     "controller scoring blocked: installed scoring model changed after prompt injection; "
-                    "当前评分正文不再有效。请重新提交总控评分/审计请求，让 UserPromptSubmit 完整注入当前安装评分模型后再计算。"
+                    "当前评分正文不再有效。本回合只能说明阻塞，不能输出分数；请用户重新提交总控评分/审计请求，让新的 UserPromptSubmit 完整注入当前安装评分模型。"
                 ),
             }, state
         errors = score_guard_errors(Path(repo_text), skill_root=skill_root)
@@ -236,16 +250,18 @@ def run_hook() -> int:
         return 0
     session_id = str(event.get("session_id", "")).strip()
     path = _state_path(session_id)
+    prior_state = _read_state(path)
     output, state = evaluate_event(
         event,
         skill_root=Path(__file__).resolve().parents[1],
-        prior_state=_read_state(path),
+        prior_state=prior_state,
     )
     try:
         _write_state(path, state)
     except OSError as error:
         scoring_related = (
-            bool(state.get("pending_scoring"))
+            bool(prior_state.get("pending_scoring") or prior_state.get("reinject_required"))
+            or bool(state.get("pending_scoring") or state.get("reinject_required"))
             or is_controller_scoring_request(str(event.get("prompt", "")))
             or looks_like_controller_score_output(str(event.get("last_assistant_message", "")))
             or output.get("decision") == "block"

@@ -62,6 +62,17 @@ class ControllerScoringHookTests(unittest.TestCase):
             with self.subTest(prompt=prompt):
                 self.assertTrue(hook.is_controller_scoring_request(prompt))
 
+    def test_unrelated_controller_audits_do_not_activate_scoring_gate(self):
+        hook = load_module()
+        prompts = [
+            "审计 controller_scoring_hook.py 的安全性",
+            "项目总控要求审计第三方依赖",
+            "请审计 Orchestrator API 的权限边界",
+        ]
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertFalse(hook.is_controller_scoring_request(prompt))
+
     def test_stop_allows_and_clears_pending_state_when_exact_model_is_unchanged(self):
         hook = load_module()
         _, state = hook.evaluate_event(
@@ -97,13 +108,22 @@ class ControllerScoringHookTests(unittest.TestCase):
             self.assertEqual("block", output["decision"])
             self.assertIn("重新提交", output["reason"])
             self.assertNotIn("model v2", output["reason"])
-            self.assertTrue(state["pending_scoring"])
+            self.assertFalse(state["pending_scoring"])
+            self.assertTrue(state["reinject_required"])
             self.assertNotEqual(hook.scoring_model_sha256(skill), state["model_sha256"])
+
+            exit_output, state = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "s1", "cwd": str(repo), "last_assistant_message": "评分模型已变化，请重新提交评分请求。"},
+                skill_root=skill, prior_state=state,
+            )
+            self.assertEqual({}, exit_output)
+            self.assertTrue(state["reinject_required"])
 
             _, refreshed = hook.evaluate_event(
                 {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": str(repo), "prompt": "给总控评分"},
                 skill_root=skill, prior_state=state,
             )
+            self.assertFalse(refreshed.get("reinject_required", False))
             self.assertEqual(hook.scoring_model_sha256(skill), refreshed["model_sha256"])
             allowed, refreshed = hook.evaluate_event(
                 {"hook_event_name": "Stop", "session_id": "s1", "cwd": str(repo), "last_assistant_message": "总控评分：80/100"},
@@ -137,6 +157,32 @@ class ControllerScoringHookTests(unittest.TestCase):
         self.assertEqual("block", output["decision"])
         self.assertIn("persist", output["reason"])
 
+    def test_run_hook_blocks_if_successful_scoring_stop_cannot_persist_clear_state(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        hook = load_module()
+        _, prior = hook.evaluate_event(
+            {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": str(ROOT), "prompt": "给总控评分"},
+            skill_root=ROOT, prior_state={},
+        )
+        event = {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "cwd": str(ROOT),
+            "last_assistant_message": "总分：82/100。",
+        }
+        stdout = io.StringIO()
+        with patch.object(hook, "_read_state", return_value=prior), \
+             patch.object(hook, "_write_state", side_effect=OSError("disk full")), \
+             patch.object(hook.sys, "stdin", io.StringIO(json.dumps(event, ensure_ascii=False))), \
+             redirect_stdout(stdout):
+            self.assertEqual(0, hook.run_hook())
+        output = json.loads(stdout.getvalue())
+        self.assertEqual("block", output["decision"])
+        self.assertIn("persist", output["reason"])
+
     def test_install_hooks_preserves_existing_stop_and_adds_scoring_handlers_idempotently(self):
         hook = load_module()
         with tempfile.TemporaryDirectory() as td:
@@ -155,6 +201,12 @@ class ControllerScoringHookTests(unittest.TestCase):
 
 
 class ControllerScoringOutputGateTests(unittest.TestCase):
+    def test_output_detector_requires_scoring_semantics(self):
+        hook = load_module()
+        self.assertTrue(hook.looks_like_controller_score_output("总分：82/100。"))
+        self.assertTrue(hook.looks_like_controller_score_output("当前总控履职评分：82/100。"))
+        self.assertFalse(hook.looks_like_controller_score_output("controller failed in 50/100 requests"))
+
     def test_stop_blocks_scoring_output_when_no_scoring_state_exists(self):
         hook = load_module()
         output, _ = hook.evaluate_event(
