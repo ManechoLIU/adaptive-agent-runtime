@@ -35,6 +35,27 @@ class ControllerPerformanceScoringContractTests(unittest.TestCase):
         self.assertIn("人工介入 / 自主续作结论", self.text)
         self.assertIn("视觉基线核对结论", self.text)
 
+    def test_scoring_requires_explicit_responsibility_attribution(self) -> None:
+        for marker in ("controller-caused", "governance-caused", "external-caused", "mixed"):
+            self.assertIn(marker, self.text)
+        self.assertIn("责任归因", self.text)
+        self.assertIn("不得把治理基础设施导致的停滞直接记为总控失职", self.text)
+
+    def test_difficult_environment_is_not_an_automatic_bonus(self) -> None:
+        self.assertIn("困难环境本身不加分", self.text)
+        self.assertIn("不得设置困难系数", self.text)
+
+    def test_adaptation_credit_requires_verifiable_autonomous_recovery(self) -> None:
+        self.assertIn("适应能力", self.text)
+        self.assertIn("主动 reconcile", self.text)
+        self.assertIn("不需要用户实质接管", self.text)
+        self.assertIn("异常恢复与任务流转", self.text)
+        self.assertIn("调度与执行效率", self.text)
+        self.assertIn("控制面一致性与可审计性", self.text)
+
+    def test_standard_output_requires_attribution_conclusion(self) -> None:
+        self.assertIn("责任归因结论", self.text)
+
 
 if __name__ == "__main__":
     unittest.main()
