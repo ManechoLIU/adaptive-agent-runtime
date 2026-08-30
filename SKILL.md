@@ -50,7 +50,7 @@ description: Use when initializing or governing a long-running project, choosing
 - 选择方法、标准/严格档调度、初始化档案或跨会话续接：读 [methods](references/methods.md)；多问题、多 Agent 或共享事实源任务使用其中的“质量保真加速协议”。
 - 子 Agent 分派、前后端模型选择、模型降级或并发配置：读 [Agent and model routing](references/agent-model-routing.md) 与 [Agent delivery contract](references/agent-delivery-contract.md)。需要配置、登录、预检或执行 Kimi/Grok 外部 Agent 时，再读 [External Agent authentication and execution](references/external-agent-auth.md)；该流程由 Adaptive Delivery 直接执行，不依赖任务生命周期插件。
 - 长期项目、Goal、台账粒度、候选分支或共享环境治理：读 [long-task governance](references/long-task-governance.md)。
-- 用户要求审计 / 评分项目总控履职、比较近期总控表现或检查“假繁荣”时：读 [controller performance scoring](references/controller-performance-scoring.md)，按固定窗口、七维权重、防刷分和总分封顶规则评分。
+- 用户要求审计 / 评分项目总控履职、比较近期总控表现或检查“假繁荣”时：必须先执行 `scripts/controller_scoring_guard.py record-read --repo <project>`；该命令把当前安装的 [controller performance scoring](references/controller-performance-scoring.md) 正文输出到当前工具上下文，并在 Git common-dir 记录其精确摘要。输出任何分数前再执行 `score-guard`，未通过则禁止输出分数。通过后按固定窗口、七维权重、防刷分和总分封顶规则评分。
 - 上下文、Compact、Raw Sources、Wiki、长期记忆、知识目录初始化或资料摄取：读 [context governance](references/context-governance.md)。
 - 涉及风险证据、外部服务、本地/Web 发布或恢复：读 [Harness and release](references/harness-and-release.md)。
 - 用户明确认可视觉参考，或任务涉及视觉基线：读 [visual reference governance](references/visual-reference-governance.md)。
