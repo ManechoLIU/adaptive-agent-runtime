@@ -300,6 +300,17 @@ function deriveExecutionLineage(options, assignment) {
   };
 }
 
+const PASS_EVIDENCE_SCHEMES = new Set(["test-log", "green-test", "receipt", "git", "file", "artifact"]);
+const PASS_ARTIFACT_SCHEMES = new Set(["git", "file", "artifact"]);
+
+function isTraceableLocator(value, schemes) {
+  if (typeof value !== "string") return false;
+  const token = value.trim();
+  const separator = token.indexOf(":");
+  if (separator <= 0) return false;
+  return schemes.has(token.slice(0, separator)) && token.slice(separator + 1).trim().length > 0;
+}
+
 function readDeliveryReceipt(pathname) {
   if (!pathname) return null;
   let receipt;
@@ -324,6 +335,9 @@ function readDeliveryReceipt(pathname) {
   }
   if (deliveryOutcome === "pass" && (receipt.evidence.length === 0 || receipt.artifacts.length === 0)) {
     throw new Error("delivery PASS requires evidence and artifact");
+  }
+  if (deliveryOutcome === "pass" && (!receipt.evidence.every((item) => isTraceableLocator(item, PASS_EVIDENCE_SCHEMES)) || !receipt.artifacts.every((item) => isTraceableLocator(item, PASS_ARTIFACT_SCHEMES)))) {
+    throw new Error("delivery PASS requires traceable evidence and artifact");
   }
   return {
     delivery_outcome: deliveryOutcome, summary, evidence: receipt.evidence, artifacts: receipt.artifacts,
@@ -652,16 +666,25 @@ async function main() {
     }
     if (heartbeat) clearInterval(heartbeat);
     eventSeq += 1;
-    const delivery = code === 0 ? readDeliveryReceipt(options.deliveryReceipt) : null;
+    let delivery = null;
+    let deliveryError = null;
+    if (code === 0) {
+      try {
+        delivery = readDeliveryReceipt(options.deliveryReceipt);
+      } catch (error) {
+        deliveryError = error;
+      }
+    }
     recordRuntimeReceipt(options, "assignment_terminal", eventSeq, {
       terminal_state: code === 0 ? "completed" : "failed",
       transport_outcome: code === 0 ? "completed" : "failed",
       delivery_outcome: delivery?.delivery_outcome || "unresolved",
-      summary: delivery?.summary || (code === 0 ? "external agent process completed" : `external agent exited ${code}`),
+      summary: delivery?.summary || deliveryError?.message || (code === 0 ? "external agent process completed" : `external agent exited ${code}`),
       evidence: delivery?.evidence || [], artifacts: delivery?.artifacts || [],
-      next_action: delivery?.next_action || (code === 0 ? "inspect delivery" : "inspect external agent output"),
-      retry_class: delivery?.retry_class || (code === 0 ? "none" : "provider_exit"),
+      next_action: delivery?.next_action || (deliveryError ? "repair delivery receipt" : code === 0 ? "inspect delivery" : "inspect external agent output"),
+      retry_class: delivery?.retry_class || (deliveryError ? "none" : code === 0 ? "none" : "provider_exit"),
     });
+    if (deliveryError) throw deliveryError;
     process.exitCode = code;
   } catch (error) {
     process.stderr.write(`adaptive-delivery-external-agent: ${error.message}\n`);

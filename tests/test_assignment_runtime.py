@@ -82,6 +82,17 @@ class RuntimeTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "delivery PASS requires evidence and artifact"):
             apply_receipt(state, invalid, now=T0 + timedelta(minutes=1))
+    def test_delivery_pass_rejects_prose_only_evidence_and_artifact(self):
+        state = apply_receipt({}, receipt("assignment_started"), now=T0)
+        invalid = receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), event_seq=2,
+            terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
+            summary="sounds good", evidence=["tests passed yesterday"], artifacts=["some changed file"],
+            next_action="review", retry_class="none",
+        )
+        with self.assertRaisesRegex(ValueError, "traceable evidence and artifact"):
+            apply_receipt(state, invalid, now=T0 + timedelta(minutes=1))
+
     def test_identity_mismatch_fails_closed(self):
         state=apply_receipt({},receipt("assignment_started"),now=T0)
         with self.assertRaises(ValueError): apply_receipt(state,receipt("assignment_heartbeat",T0+timedelta(minutes=1),session_id="other"),now=T0+timedelta(minutes=1))

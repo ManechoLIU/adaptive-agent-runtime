@@ -404,14 +404,14 @@ test("delivery verdict preserves transport failure and explicit evidence-backed 
   await fakeRunner(bin, "grok", "version");
   const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome };
 
-  const run = async ({ assignmentId, exitCode = 0, deliveryReceipt }) => {
+  const run = async ({ assignmentId, exitCode = 0, deliveryReceipt, primaryGoal = "finish bounded task" }) => {
     const receipts = path.join(bin, `${assignmentId}.jsonl`);
     const deliveryPath = path.join(bin, `${assignmentId}-delivery.json`);
     const args = [adapter,
       "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
       "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
       "--assignment-id", assignmentId, "--task-id", "T1", "--agent-id", "writer", "--session-id", `session-${assignmentId}`,
-      "--assignment-ack", await assignmentAckFile(bin, { assignment_id: assignmentId }, repo),
+      "--assignment-ack", await assignmentAckFile(bin, { assignment_id: assignmentId, primary_goal: primaryGoal }, repo),
       "--runtime-receipts", receipts,
     ];
     if (deliveryReceipt) {
@@ -429,6 +429,24 @@ test("delivery verdict preserves transport failure and explicit evidence-backed 
   assert.equal(failed.result.status, 1, failed.result.stderr);
   assert.equal(failed.terminal.transport_outcome, "failed");
   assert.equal(failed.terminal.delivery_outcome, "unresolved");
+
+  const invalidDelivery = await run({
+    assignmentId: "invalid-delivery",
+    primaryGoal: "validate an invalid delivery receipt",
+    deliveryReceipt: { delivery_outcome: "pass", summary: "missing artifact", evidence: ["green-test:42"], artifacts: [], next_action: "review", retry_class: "none" },
+  });
+  assert.equal(invalidDelivery.result.status, 1, invalidDelivery.result.stderr);
+  assert.equal(invalidDelivery.terminal.transport_outcome, "completed");
+  assert.equal(invalidDelivery.terminal.delivery_outcome, "unresolved");
+
+  const proseOnlyPass = await run({
+    assignmentId: "prose-only-pass",
+    primaryGoal: "reject prose-only pass evidence",
+    deliveryReceipt: { delivery_outcome: "pass", summary: "sounds good", evidence: ["tests passed yesterday"], artifacts: ["some changed file"], next_action: "review", retry_class: "none" },
+  });
+  assert.equal(proseOnlyPass.result.status, 1, proseOnlyPass.result.stderr);
+  assert.equal(proseOnlyPass.terminal.transport_outcome, "completed");
+  assert.equal(proseOnlyPass.terminal.delivery_outcome, "unresolved");
 
   const explicitFail = await run({
     assignmentId: "explicit-fail",
