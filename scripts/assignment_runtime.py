@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -31,6 +32,7 @@ EVIDENCE_FINGERPRINT_FIELDS = (
     "artifact_fingerprint",
     "blocker_evidence_fingerprint",
 )
+LINEAGE_CONTRACT_FIELDS = ("primary_goal", "success_criteria", "owned_scope", "strategy")
 
 @dataclass(frozen=True)
 class RuntimePolicy:
@@ -51,10 +53,23 @@ def _iso(value: datetime) -> str:
 def runtime_state_path(repo: str | Path) -> Path:
     return adaptive_delivery_state_dir(repo) / "runtime-assignments.json"
 
+def _normalized_contract_text(value: str) -> str:
+    return " ".join(value.strip().split())
+
+def execution_lineage_id(*, task_id: str, primary_goal: str, success_criteria: list[str], owned_scope: list[str], strategy: str) -> str:
+    canonical = json.dumps({
+        "task_id": _normalized_contract_text(task_id),
+        "primary_goal": _normalized_contract_text(primary_goal),
+        "success_criteria": sorted(_normalized_contract_text(item) for item in success_criteria),
+        "owned_scope": sorted(_normalized_contract_text(item) for item in owned_scope),
+        "strategy": _normalized_contract_text(strategy),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
 def load_runtime_state(repo: str | Path) -> dict[str, Any]:
     path = runtime_state_path(repo)
     if not path.exists():
-        return {"schema_version": 1, "leases": {}}
+        return {"schema_version": 2, "leases": {}, "lineages": {}}
     return json.loads(path.read_text(encoding="utf-8"))
 
 def save_runtime_state(repo: str | Path, state: dict[str, Any]) -> None:
@@ -75,7 +90,7 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
     missing = [f for f in IDENTITY_FIELDS if not receipt.get(f)]
     if missing: raise ValueError("runtime receipt missing identity: " + ", ".join(missing))
     issued = _dt(receipt.get("issued_at") or now)
-    out = json.loads(json.dumps(state or {"schema_version": 1, "leases": {}})); out.setdefault("schema_version", 1); leases = out.setdefault("leases", {})
+    out = json.loads(json.dumps(state or {"schema_version": 2, "leases": {}, "lineages": {}})); out.setdefault("schema_version", 2); leases = out.setdefault("leases", {}); lineages = out.setdefault("lineages", {})
     aid = receipt["assignment_id"]; existing = leases.get(aid)
     attempt = int(receipt.get("attempt", 1)); lease_id = str(receipt.get("lease_id") or f"{aid}:attempt:{attempt}"); event_seq = int(receipt.get("event_seq", 1))
     if attempt < 1 or event_seq < 1: raise ValueError("attempt and event_seq must be positive")
@@ -87,19 +102,44 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
         if attempt == current_attempt and lease_id != existing.get("lease_id"): raise ValueError("runtime lease_id mismatch")
         if attempt == current_attempt and event_seq <= int(existing.get("last_event_seq", 0)): raise ValueError("runtime event_seq must increase")
     if event == "assignment_started":
+        missing_contract = [field for field in LINEAGE_CONTRACT_FIELDS if field not in receipt]
+        if missing_contract:
+            raise ValueError("runtime start receipt missing lineage contract: " + ", ".join(missing_contract))
+        lineage_id = execution_lineage_id(
+            task_id=receipt["task_id"], primary_goal=receipt["primary_goal"],
+            success_criteria=receipt["success_criteria"], owned_scope=receipt["owned_scope"], strategy=receipt["strategy"],
+        )
+        if receipt.get("execution_lineage_id") not in (None, lineage_id):
+            raise ValueError("runtime receipt execution lineage mismatch")
+        if existing and existing.get("execution_lineage_id") not in (None, lineage_id):
+            raise ValueError("runtime receipt execution lineage mismatch")
         if not existing and attempt != 1:
             raise ValueError("new Assignment must start at attempt 1")
         if existing:
             current_attempt = int(existing.get("attempt", 1))
             if attempt != current_attempt + 1:
                 raise ValueError("recovery attempt must increment by exactly one")
-            if int(existing.get("recovery_count", 0)) >= policy.max_recoveries:
-                raise ValueError("recovery budget exhausted; strategy change requires a new Assignment")
-        previous_recovery_count = int(existing.get("recovery_count", 0)) if existing else 0
-        recovery_count = previous_recovery_count + 1 if existing else 0
+        lineage = lineages.get(lineage_id)
+        if lineage is None and existing:
+            legacy_recoveries = int(existing.get("recovery_count", 0))
+            lineage = {
+                "execution_lineage_id": lineage_id,
+                "execution_count": legacy_recoveries + 1,
+                "recovery_count": legacy_recoveries,
+            }
+        if lineage and int(lineage.get("recovery_count", 0)) >= policy.max_recoveries:
+            raise ValueError("recovery budget exhausted; strategy change requires a new execution lineage")
+        previous_recovery_count = int(lineage.get("recovery_count", 0)) if lineage else 0
+        recovery_count = previous_recovery_count + 1 if lineage else 0
+        lineages[lineage_id] = {
+            "execution_lineage_id": lineage_id,
+            "execution_count": int(lineage.get("execution_count", previous_recovery_count + 1)) + 1 if lineage else 1,
+            "recovery_count": recovery_count,
+        }
         lease = {f: receipt[f] for f in IDENTITY_FIELDS}
         lease.update({
             "schema_version": 1,
+            "execution_lineage_id": lineage_id,
             "attempt": attempt,
             "lease_id": lease_id,
             "last_event_seq": event_seq,

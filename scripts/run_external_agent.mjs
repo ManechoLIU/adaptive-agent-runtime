@@ -254,6 +254,47 @@ function validateAssignmentLaunch(options) {
   if (result.status !== 0) {
     throw new Error(`assignment-ack validation failed: ${(result.stdout || result.stderr).trim()}`);
   }
+  return assignment;
+}
+
+function normalizeLineageText(value) {
+  return String(value).trim().replace(/\s+/gu, " ");
+}
+
+function compareCodePoints(left, right) {
+  const leftPoints = Array.from(left);
+  const rightPoints = Array.from(right);
+  for (let index = 0; index < Math.min(leftPoints.length, rightPoints.length); index += 1) {
+    const difference = leftPoints[index].codePointAt(0) - rightPoints[index].codePointAt(0);
+    if (difference !== 0) return difference;
+  }
+  return leftPoints.length - rightPoints.length;
+}
+
+function deriveExecutionLineage(options, assignment) {
+  const discriminator = assignment.strategy_discriminator === undefined ? "" : normalizeLineageText(assignment.strategy_discriminator);
+  const strategy = [
+    `engine=${options.engine}`,
+    `model=${options.model}`,
+    `auth_mode=${options.authMode}`,
+    `reasoning_effort=${options.reasoningEffort}`,
+    discriminator && `discriminator=${discriminator}`,
+  ].filter(Boolean).join(";");
+  const contract = {
+    owned_scope: assignment.owned_scope.map(normalizeLineageText).sort(compareCodePoints),
+    primary_goal: normalizeLineageText(assignment.primary_goal),
+    strategy: normalizeLineageText(strategy),
+    success_criteria: assignment.success_criteria.map(normalizeLineageText).sort(compareCodePoints),
+    task_id: normalizeLineageText(options.taskId),
+  };
+  const canonical = JSON.stringify(contract);
+  return {
+    primary_goal: contract.primary_goal,
+    success_criteria: contract.success_criteria,
+    owned_scope: contract.owned_scope,
+    strategy: contract.strategy,
+    execution_lineage_id: createHash("sha256").update(canonical).digest("hex"),
+  };
 }
 
 function validateRuleHandshake(options) {
@@ -274,7 +315,8 @@ function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
     agent_id: options.agentId, provider: options.engine, session_id: options.sessionId,
     worktree: options.cwd, issued_at: new Date().toISOString(), attempt: options.attempt,
     lease_id: options.leaseId || `${options.assignmentId}:attempt:${options.attempt}`, event_seq: eventSeq,
-    receipt_id: `${options.assignmentId}:${options.attempt}:${eventSeq}`, ...extra,
+    receipt_id: `${options.assignmentId}:${options.attempt}:${eventSeq}`,
+    ...(eventType === "assignment_started" ? options.executionLineage : {}), ...extra,
   };
 }
 
@@ -537,7 +579,8 @@ async function main() {
       process.exitCode = await loginExternalAgent(options);
       return;
     }
-    validateAssignmentLaunch(options);
+    const assignment = validateAssignmentLaunch(options);
+    if (assignment) options.executionLineage = deriveExecutionLineage(options, assignment);
     validateRuleHandshake(options);
     let eventSeq = 1;
     let previousSnapshot = runtimeGitSnapshot(options.cwd);

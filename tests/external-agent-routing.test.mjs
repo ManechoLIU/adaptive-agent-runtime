@@ -526,3 +526,43 @@ test("same assignment attempt four is rejected from another linked worktree befo
   assert.match(result.stderr, /recovery budget exhausted/i);
   await assert.rejects(readFile(marker, "utf8"));
 });
+
+test("same lineage B-01 through B-04 shares the recovery budget before provider spawn", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-lineage-budget-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const env = {
+    ...process.env,
+    PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`,
+    GROK_HOME: grokHome,
+    SPAWN_MARKER: marker,
+  };
+
+  const launch = async (assignmentId) => {
+    const ack = await assignmentAckFile(bin, { assignment_id: assignmentId }, repo);
+    return spawnSync(process.execPath, [adapter,
+      "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+      "--assignment-id", assignmentId, "--task-id", "T1", "--agent-id", "writer", "--session-id", `session-${assignmentId}`,
+      "--assignment-ack", ack,
+    ], { encoding: "utf8", input: "bounded contract", env });
+  };
+
+  for (const assignmentId of ["B-01", "B-02", "B-03"]) {
+    const result = await launch(assignmentId);
+    assert.equal(result.status, 0, result.stderr);
+  }
+  const common = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
+  const statePath = path.join(path.resolve(repo, common), "adaptive-delivery", "runtime-assignments.json");
+  const before = JSON.parse(await readFile(statePath, "utf8"));
+
+  const blocked = await launch("B-04");
+  assert.equal(blocked.status, 1);
+  assert.match(blocked.stderr, /recovery budget exhausted/i);
+  assert.equal((await readFile(marker, "utf8")).trim().split("\n").length, 3);
+  assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")), before);
+});

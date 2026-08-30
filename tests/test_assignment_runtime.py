@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -11,7 +12,7 @@ UTC=timezone.utc
 T0=datetime(2026,8,29,10,0,tzinfo=UTC)
 
 def receipt(event, at=T0, **extra):
-    base={"event_type":event,"assignment_id":"a1","task_id":"T1","agent_id":"grok-writer","provider":"grok","session_id":"s1","worktree":"/tmp/wt","issued_at":at.isoformat()}
+    base={"event_type":event,"assignment_id":"a1","task_id":"T1","agent_id":"grok-writer","provider":"grok","session_id":"s1","worktree":"/tmp/wt","issued_at":at.isoformat(),"primary_goal":"finish bounded task","success_criteria":["green"],"owned_scope":["scripts/assignment_runtime.py"],"strategy":"grok-build:grok-4.6:oauth:low"}
     base.update(extra); return base
 
 class RuntimeTests(unittest.TestCase):
@@ -218,20 +219,61 @@ class RecoveryBudgetLaunchGateTests(unittest.TestCase):
                 now=T0 + timedelta(minutes=minute),
             )
         self.assertEqual(evaluate_lease(state["leases"]["a1"], now=T0 + timedelta(minutes=5))["state"], "budget_exhausted")
-        with self.assertRaisesRegex(ValueError, "recovery budget exhausted.*new Assignment"):
+        with self.assertRaisesRegex(ValueError, "recovery budget exhausted.*new execution lineage"):
             apply_receipt(
                 state,
                 receipt("assignment_started", T0 + timedelta(minutes=6), attempt=4, lease_id="l4", event_seq=1),
                 now=T0 + timedelta(minutes=6),
             )
 
-    def test_budget_exhausted_lineage_does_not_block_a_new_assignment(self):
+    def test_budget_exhausted_lineage_blocks_a_new_assignment_with_the_same_contract(self):
         old = apply_receipt({}, receipt("assignment_started", attempt=1, lease_id="l1", event_seq=1), now=T0)
-        old["leases"]["a1"]["recovery_count"] = 2
-        old["leases"]["a1"]["terminal_state"] = "failed"
+        old = apply_receipt(old, receipt("assignment_started", T0 + timedelta(minutes=1), attempt=2, lease_id="l2", event_seq=1), now=T0 + timedelta(minutes=1))
+        old = apply_receipt(old, receipt("assignment_started", T0 + timedelta(minutes=2), attempt=3, lease_id="l3", event_seq=1), now=T0 + timedelta(minutes=2))
         new_receipt = receipt("assignment_started", assignment_id="a2", task_id="T1", attempt=1, lease_id="a2-l1", event_seq=1)
-        state = apply_receipt(old, new_receipt, now=T0 + timedelta(minutes=1))
-        self.assertEqual(state["leases"]["a2"]["recovery_count"], 0)
+        with self.assertRaisesRegex(ValueError, "recovery budget exhausted"):
+            apply_receipt(old, new_receipt, now=T0 + timedelta(minutes=3))
+
+class ExecutionLineageTests(unittest.TestCase):
+    def start(self, assignment_id: str, minute: int, *, strategy: str = "grok-build:grok-4.6:oauth:low"):
+        return receipt(
+            "assignment_started", T0 + timedelta(minutes=minute), assignment_id=assignment_id,
+            session_id=f"session-{assignment_id}", attempt=1, lease_id=f"{assignment_id}:attempt:1",
+            event_seq=1, primary_goal="close the bounded task", success_criteria=["focused tests pass", "scope-only diff"],
+            owned_scope=["scripts/assignment_runtime.py", "scripts/run_external_agent.mjs"], strategy=strategy,
+        )
+
+    def test_different_assignment_ids_share_the_same_contract_lineage_and_recovery_budget(self):
+        state = apply_receipt({}, self.start("B-01", 0), now=T0)
+        first_lineage = state["leases"]["B-01"].get("execution_lineage_id")
+        self.assertIsNotNone(first_lineage)
+
+        state = apply_receipt(state, self.start("B-02", 1), now=T0 + timedelta(minutes=1))
+        state = apply_receipt(state, self.start("B-03", 2), now=T0 + timedelta(minutes=2))
+
+        self.assertEqual(state["leases"]["B-02"].get("execution_lineage_id"), first_lineage)
+        self.assertEqual(state["leases"]["B-03"].get("recovery_count"), 2)
+        self.assertEqual(state["lineages"][first_lineage]["recovery_count"], 2)
+
+    def test_provider_strategy_change_starts_a_new_execution_lineage(self):
+        state = apply_receipt({}, self.start("B-01", 0), now=T0)
+        state = apply_receipt(state, self.start("B-02", 1, strategy="kimi-code:kimi-k3:api:low"), now=T0 + timedelta(minutes=1))
+
+        self.assertNotEqual(
+            state["leases"]["B-01"].get("execution_lineage_id"),
+            state["leases"]["B-02"].get("execution_lineage_id"),
+        )
+        self.assertEqual(state["leases"]["B-02"].get("recovery_count"), 0)
+
+    def test_fourth_same_lineage_execution_is_rejected_without_runtime_mutation(self):
+        state = apply_receipt({}, self.start("B-01", 0), now=T0)
+        state = apply_receipt(state, self.start("B-02", 1), now=T0 + timedelta(minutes=1))
+        state = apply_receipt(state, self.start("B-03", 2), now=T0 + timedelta(minutes=2))
+        before = json.loads(json.dumps(state, sort_keys=True))
+
+        with self.assertRaisesRegex(ValueError, "recovery budget exhausted"):
+            apply_receipt(state, self.start("B-04", 3), now=T0 + timedelta(minutes=3))
+        self.assertEqual(state, before)
 
 class RuntimeAttemptSequenceTests(unittest.TestCase):
     def test_new_assignment_must_start_at_attempt_one(self):
@@ -308,7 +350,7 @@ class RuntimeCliCommonStateTests(unittest.TestCase):
             self.assertEqual(load_runtime_state(wt), before)
 
             new_assignment = event("assignment_started", 1, 1)
-            new_assignment.update({"assignment_id": "shared-a2", "lease_id": "shared-a2:attempt:1"})
+            new_assignment.update({"assignment_id": "shared-a2", "lease_id": "shared-a2:attempt:1", "strategy": "kimi-code:kimi-k3:api:low"})
             allowed = apply(wt, new_assignment)
             self.assertEqual(allowed.returncode, 0, allowed.stderr + allowed.stdout)
             self.assertIn("shared-a2", load_runtime_state(repo)["leases"])
