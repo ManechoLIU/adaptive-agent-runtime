@@ -404,7 +404,7 @@ test("delivery verdict preserves transport failure and explicit evidence-backed 
   await fakeRunner(bin, "grok", "version");
   const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome };
 
-  const run = async ({ assignmentId, exitCode = 0, deliveryReceipt, primaryGoal = "finish bounded task" }) => {
+  const run = async ({ assignmentId, exitCode = 0, deliveryReceipt, rawDeliveryReceipt, primaryGoal = "finish bounded task" }) => {
     const receipts = path.join(bin, `${assignmentId}.jsonl`);
     const deliveryPath = path.join(bin, `${assignmentId}-delivery.json`);
     const args = [adapter,
@@ -414,8 +414,8 @@ test("delivery verdict preserves transport failure and explicit evidence-backed 
       "--assignment-ack", await assignmentAckFile(bin, { assignment_id: assignmentId, primary_goal: primaryGoal }, repo),
       "--runtime-receipts", receipts,
     ];
-    if (deliveryReceipt) {
-      await writeFile(deliveryPath, JSON.stringify(deliveryReceipt));
+    if (deliveryReceipt || rawDeliveryReceipt !== undefined) {
+      await writeFile(deliveryPath, rawDeliveryReceipt !== undefined ? rawDeliveryReceipt : JSON.stringify(deliveryReceipt));
       args.push("--delivery-receipt", deliveryPath);
     }
     const result = spawnSync(process.execPath, args, {
@@ -447,6 +447,16 @@ test("delivery verdict preserves transport failure and explicit evidence-backed 
   assert.equal(proseOnlyPass.result.status, 1, proseOnlyPass.result.stderr);
   assert.equal(proseOnlyPass.terminal.transport_outcome, "completed");
   assert.equal(proseOnlyPass.terminal.delivery_outcome, "unresolved");
+
+  const malformedDelivery = await run({
+    assignmentId: "malformed-delivery",
+    primaryGoal: "close runtime after malformed delivery receipt",
+    rawDeliveryReceipt: "{not-json",
+  });
+  assert.equal(malformedDelivery.result.status, 1, malformedDelivery.result.stderr);
+  assert.equal(malformedDelivery.terminal.transport_outcome, "completed");
+  assert.equal(malformedDelivery.terminal.delivery_outcome, "unresolved");
+  assert.match(malformedDelivery.terminal.summary, /delivery-receipt is unreadable/);
 
   const explicitFail = await run({
     assignmentId: "explicit-fail",

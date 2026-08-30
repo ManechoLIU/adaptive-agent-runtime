@@ -37,6 +37,8 @@ EVIDENCE_FINGERPRINT_FIELDS = (
 )
 LINEAGE_CONTRACT_FIELDS = ("primary_goal", "success_criteria", "owned_scope", "strategy")
 LINEAGE_WHITESPACE_RE = re.compile(r"[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
+PASS_EVIDENCE_SCHEMES = {"test-log", "green-test", "receipt", "git", "file", "artifact"}
+PASS_ARTIFACT_SCHEMES = {"git", "file", "artifact"}
 
 @dataclass(frozen=True)
 class RuntimePolicy:
@@ -59,6 +61,15 @@ def runtime_state_path(repo: str | Path) -> Path:
 
 def _normalized_contract_text(value: str) -> str:
     return LINEAGE_WHITESPACE_RE.sub(" ", str(value)).strip(" ")
+
+def _traceable_locator(value: Any, schemes: set[str]) -> bool:
+    if not isinstance(value, str):
+        return False
+    token = value.strip()
+    if ":" not in token:
+        return False
+    scheme, locator = token.split(":", 1)
+    return scheme in schemes and bool(locator.strip())
 
 def execution_lineage_id(*, task_id: str, primary_goal: str, success_criteria: list[str], owned_scope: list[str], strategy: str) -> str:
     canonical = json.dumps({
@@ -209,6 +220,8 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
                     raise ValueError("delivery PASS requires completed transport")
                 if not receipt["evidence"] or not receipt["artifacts"]:
                     raise ValueError("delivery PASS requires evidence and artifact")
+                if not all(_traceable_locator(item, PASS_EVIDENCE_SCHEMES) for item in receipt["evidence"]) or not all(_traceable_locator(item, PASS_ARTIFACT_SCHEMES) for item in receipt["artifacts"]):
+                    raise ValueError("delivery PASS requires traceable evidence and artifact")
         lease["terminal_state"] = terminal; lease["terminal_at"] = _iso(issued); lease["summary"] = summary
         if transport_outcome is None and delivery_outcome is None:
             lease["outcome"] = legacy_outcome
