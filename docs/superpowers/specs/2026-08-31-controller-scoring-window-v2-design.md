@@ -4,7 +4,7 @@
 Make long-term controller scoring less sensitive to the last two events while keeping the controller's self-check lightweight and non-numeric.
 
 ## Formal scoring window
-The default formal score uses the most recent 24 hours as the time boundary and selects at most five valid control events inside that boundary. If fewer than five exist, use all available valid events. A valid control event must have enough machine-verifiable evidence to evaluate controller behavior; noisy hook invocations or repeated reminders without a distinct controller decision are not separate events.
+The default formal score uses the most recent 24 hours as the time boundary and selects the five most recent valid control events, capped at five inside that boundary. If fewer than five exist, use all available valid events. A valid control event must have enough machine-verifiable evidence to evaluate controller behavior; noisy hook invocations or repeated reminders without a distinct controller decision are not separate events.
 
 Current major unresolved anomalies and critical-path stalls are inspected separately from the event sample. They may affect dimensions and caps, but must not be double-counted as extra events.
 
