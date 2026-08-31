@@ -76,7 +76,7 @@ class SkillStructureTests(unittest.TestCase):
 
         self.assertIn("# Adaptive Agent Runtime", entrypoint)
         self.assertIn("adaptive-delivery", readme)
-        self.assertIn("legacy alias", readme.casefold())
+        self.assertIn("legacy machine identifier", readme.casefold())
         self.assertIn(' / "adaptive-delivery"', project_state)
         self.assertNotIn(' / "adaptive-agent-runtime"', project_state)
 
