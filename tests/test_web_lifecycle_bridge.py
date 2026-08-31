@@ -703,6 +703,14 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
         self.assertFalse(classified["fallback_eligible"])
         self.assertTrue(classified["pending_control_event"])
 
+    def test_active_writer_message_without_thread_store_prefix_is_still_deferred(self) -> None:
+        classified = web_bridge.classify_native_resume_failure(
+            1, "", "thread abc already has an active writer"
+        )
+        self.assertEqual(classified["state"], "RESUME_DEFERRED_ACTIVE_WRITER")
+        self.assertEqual(classified["failure_class"], "active_writer_present")
+        self.assertFalse(classified["fallback_eligible"])
+
     def test_session_start_cli_emits_restore_payload_for_unique_registered_controller(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

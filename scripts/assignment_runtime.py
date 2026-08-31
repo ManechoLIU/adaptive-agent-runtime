@@ -245,9 +245,14 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
                     raise ValueError("delivery PASS requires evidence and artifact")
                 if not all(_traceable_locator(item, PASS_EVIDENCE_SCHEMES) for item in receipt["evidence"]) or not all(_traceable_locator(item, PASS_ARTIFACT_SCHEMES) for item in receipt["artifacts"]):
                     raise ValueError("delivery PASS requires traceable evidence and artifact")
-        result_unknown = bool(receipt.get("result_unknown", False))
-        if lease.get("side_effect") and "result_unknown" not in receipt:
-            raise ValueError("side-effect terminal receipt requires explicit result_unknown")
+        if lease.get("side_effect"):
+            if "result_unknown" not in receipt:
+                raise ValueError("side-effect terminal receipt requires explicit result_unknown")
+            if not isinstance(receipt.get("result_unknown"), bool):
+                raise ValueError("result_unknown must be a boolean")
+        elif "result_unknown" in receipt and not isinstance(receipt.get("result_unknown"), bool):
+            raise ValueError("result_unknown must be a boolean")
+        result_unknown = receipt.get("result_unknown", False)
         lease["result_unknown"] = result_unknown
         lease["terminal_state"] = terminal; lease["terminal_at"] = _iso(issued); lease["summary"] = summary
         if transport_outcome is None and delivery_outcome is None:

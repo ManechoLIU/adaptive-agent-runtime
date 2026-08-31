@@ -195,6 +195,18 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
         self.assertEqual(recovered["leases"]["a1"]["attempt"], 2)
         self.assertEqual(recovered["leases"]["a1"]["idempotency_key"], "publish:release-42")
 
+    def test_side_effect_terminal_requires_boolean_result_unknown(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1, side_effect=True
+        ), now=T0)
+        with self.assertRaisesRegex(ValueError, "result_unknown.*boolean"):
+            apply_receipt(state, receipt(
+                "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+                terminal_state="failed", transport_outcome="failed", delivery_outcome="unresolved",
+                summary="unknown result", evidence=[], artifacts=[], next_action="reconcile",
+                retry_class="transport_error", side_effect=True, result_unknown="false",
+            ), now=T0 + timedelta(minutes=1))
+
     def test_side_effect_or_idempotency_contract_cannot_drift_during_recovery(self):
         state = apply_receipt({}, receipt(
             "assignment_started", attempt=1, lease_id="lease-1", event_seq=1,

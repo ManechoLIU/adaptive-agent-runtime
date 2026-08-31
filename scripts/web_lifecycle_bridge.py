@@ -190,7 +190,7 @@ def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, An
 
 def classify_native_resume_failure(returncode: int, stdout: str, stderr: str) -> dict[str, Any]:
     combined = f"{stdout}\n{stderr}".casefold()
-    if "thread-store conflict" in combined and "active writer" in combined:
+    if "already has an active writer" in combined:
         return {
             "state": "RESUME_DEFERRED_ACTIVE_WRITER",
             "pending_control_event": True,
