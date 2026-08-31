@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Productize `adaptive-delivery` as Adaptive Agent Runtime without breaking current installations, while adding host capability detection, Web restore/fallback, Controller Self-Check, side-effect idempotency protection, and Assignment strategy freezing.
+**Goal:** Productize `adaptive-delivery` as Adaptive Agent Runtime without breaking current installations, while adding host capability detection, Web restore/fallback, Controller Self-Check, and side-effect idempotency protection while reusing the existing execution-lineage strategy freeze.
 
 **Architecture:** Keep the existing four-Gate/canonical-runtime architecture as the only execution truth. Add compatibility metadata and adapters around it, then add two narrow machine guards inside existing Assignment/Delivery semantics. Do not add a second task state machine, outbox, or Web-specific ledger.
 
@@ -32,14 +32,14 @@
 - Create/Modify: `tests/test_install_skill.py` if a focused installer test file is clearer.
 
 **Interfaces:**
-- Produces canonical product metadata for `Adaptive Agent Runtime` and legacy alias `adaptive-delivery`.
+- Produces `Adaptive Agent Runtime` product metadata while keeping `adaptive-delivery` as the stable technical Skill ID and only canonical machine identity.
 - Produces an installer capability report with `enabled/degraded/blocked` status without changing canonical runtime location.
 
-- [ ] Write failing tests proving the public name/new preferred ID and legacy alias coexist while `.git/adaptive-delivery` remains the single canonical state root.
-- [ ] Run focused tests and confirm RED.
-- [ ] Implement minimal identity metadata/installer capability detection; do not rename existing machine-state paths.
-- [ ] Run focused tests and confirm GREEN.
-- [ ] Commit locally.
+- [x] Write failing tests proving the public product name/slug coexist with the stable `adaptive-delivery` technical ID while `.git/adaptive-delivery` remains the single canonical state root.
+- [x] Run focused tests and confirm RED.
+- [x] Implement minimal identity metadata/installer capability detection; do not rename existing machine-state paths.
+- [x] Run focused tests and confirm GREEN.
+- [x] Commit locally.
 
 ### Task 2: Side-effect idempotency retry guard
 
@@ -54,32 +54,19 @@
 - Produces `side_effect_retry_decision(...)` or equivalent deterministic decision used by existing recovery paths.
 - Consumes current terminal outcome/retry class, idempotency facts, and recovery budget.
 
-- [ ] Write failing tests: unknown/ambiguous terminal outcome + non-idempotent side effect must not auto-retry; explicit idempotency guarantee may retry only within existing recovery budget.
-- [ ] Run focused tests and confirm RED.
-- [ ] Implement the smallest deterministic guard in existing runtime semantics.
-- [ ] Run focused Python/Node tests and confirm GREEN.
-- [ ] Commit locally.
+- [x] Write failing tests: unknown/ambiguous terminal outcome + non-idempotent side effect must not auto-retry; explicit idempotency guarantee may retry only within existing recovery budget.
+- [x] Run focused tests and confirm RED.
+- [x] Implement the smallest deterministic guard in existing runtime semantics.
+- [x] Run focused Python/Node tests and confirm GREEN.
+- [x] Commit locally.
 
-### Task 3: Assignment execution strategy freeze
+### Task 3: Assignment execution strategy freeze — existing machine rule verified
 
-**Files:**
-- Modify: `scripts/assignment_runtime.py`
-- Modify: `scripts/run_external_agent.mjs`
-- Modify: `references/agent-delivery-contract.md`
-- Modify: `references/agent-model-routing.md`
-- Modify: `tests/test_assignment_runtime.py`
-- Modify: `tests/external-agent-routing.test.mjs`
+**Ruling:** No new strategy snapshot/state is added. Existing `deriveExecutionLineage` already freezes engine/model/auth/reasoning strategy into the execution lineage; canonical runtime rejects same-Assignment lineage drift, and provider identity is already fenced. Existing host-fallback rules preserve lineage/recovery budget. Adding another snapshot would duplicate machine truth.
 
-**Interfaces:**
-- Stores a deterministic `strategy_snapshot`/digest on first Assignment start.
-- Rejects same-Assignment recovery if provider/model/tier/core transport drifts outside the frozen contract.
-- Allows explicitly authorized peer-host fallback when host policy is frozen as allowed and records actual execution host.
-
-- [ ] Write failing tests for silent provider/model drift and allowed host-only fallback.
-- [ ] Run focused tests and confirm RED.
-- [ ] Implement strategy snapshot/digest validation in canonical runtime and runner receipt generation.
-- [ ] Run focused tests and confirm GREEN.
-- [ ] Commit locally.
+- [x] Inspect existing runner/runtime implementation and regression tests.
+- [x] Verify provider/model strategy changes create a new execution lineage and same-Assignment drift fails closed.
+- [x] Keep existing mechanism; add no parallel state.
 
 ### Task 4: Controller Self-Check derived from formal scoring model
 
@@ -97,11 +84,11 @@
 - Exposes no numeric score or dimension score to the controller.
 - Lifecycle injection uses current installed model and fails closed on model mismatch when self-check is required.
 
-- [ ] Write failing tests that require checklist criteria but reject numeric score exposure.
-- [ ] Run focused tests and confirm RED.
-- [ ] Implement derivation/injection with exact installed model binding and no new scoring state machine.
-- [ ] Run focused tests and confirm GREEN.
-- [ ] Commit locally.
+- [x] Write failing tests that require checklist criteria but reject numeric score exposure.
+- [x] Run focused tests and confirm RED.
+- [x] Implement derivation/injection with exact installed model binding and no new scoring state machine.
+- [x] Run focused tests and confirm GREEN.
+- [x] Commit locally.
 
 ### Task 5: Host adapter capability abstraction and Web restore/fallback
 
@@ -119,11 +106,11 @@
 - Adds a deterministic Web SessionStart-equivalent restore payload bound to repo/controller when such binding is available.
 - Handles `active writer` resume conflict as a machine-classified condition and uses existing same-controller/peer-host rules rather than creating a second controller.
 
-- [ ] Write failing tests for no-AI-Bridge degraded mode, restore payload order, and active-writer classification/fallback behavior.
-- [ ] Run focused tests and confirm RED.
-- [ ] Implement adapter/capability helpers and same-controller resume/fallback behavior without new project state.
-- [ ] Run focused tests and confirm GREEN.
-- [ ] Commit locally.
+- [x] Write failing tests for no-AI-Bridge degraded mode, restore payload order, and active-writer classification/fallback behavior.
+- [x] Run focused tests and confirm RED.
+- [x] Implement adapter/capability helpers and same-controller resume/fallback behavior without new project state.
+- [x] Run focused tests and confirm GREEN.
+- [x] Commit locally.
 
 ### Task 6: Backward-compatible migration and install verification
 
@@ -137,8 +124,8 @@
 
 **Interfaces:**
 - Existing install is upgraded in place without duplicating runtime/controller/receipt stores.
-- Fresh install exposes new product identity while preserving legacy command alias.
-- Old manifest/handshake remains consumable.
+- Fresh install exposes new product name/slug while retaining the stable technical Skill ID `adaptive-delivery`.
+- Old manifest/handshake remains consumable, and install-time capabilities are reported as enabled/degraded/blocked.
 
 - [ ] Write clean-install and existing-install migration RED tests in temporary homes/repos.
 - [ ] Run focused tests and confirm RED.

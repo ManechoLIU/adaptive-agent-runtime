@@ -192,6 +192,7 @@ def install_skill(
         "impact": impact,
         "stop_condition": stop_condition.strip(),
         "changed_files": _changed_files(source_path, prior_revision, revision, tracked),
+        "capabilities": detect_host_capabilities(),
         "files": hashes,
     }
     _write_json_atomic(target_path / MANIFEST_NAME, manifest)
