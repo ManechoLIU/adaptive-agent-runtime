@@ -161,8 +161,8 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
                 existing_key = str(existing.get("idempotency_key") or "").strip() or None
                 if existing.get("side_effect") != side_effect or existing_key != idempotency_key:
                     raise ValueError("side-effect contract drift requires a new Assignment")
-                if bool(existing.get("side_effect")) and bool(existing.get("result_unknown")) and existing_key is None:
-                    raise ValueError("non-idempotent unknown side effect blocks automatic recovery")
+                if bool(existing.get("side_effect")) and bool(existing.get("result_unknown")):
+                    raise ValueError("unknown side effect requires reconciliation before recovery")
             elif bool(existing.get("result_unknown")):
                 raise ValueError("legacy unknown side-effect result requires a new Assignment before recovery")
         lineage = lineages.get(lineage_id)
@@ -336,8 +336,8 @@ def retry_decision(
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     stable_key = str(idempotency_key or "").strip() or None
-    if side_effect and result_unknown and stable_key is None:
-        return {"retry": False, "reason": "non_idempotent_unknown_outcome"}
+    if side_effect and result_unknown:
+        return {"retry": False, "reason": "unknown_side_effect_requires_reconciliation"}
     retry = retry_class in TRANSIENT_RETRY_CLASSES and attempt < MAX_ATTEMPTS
     if not retry:
         return {"retry": False, "reason": "non_retryable" if retry_class not in TRANSIENT_RETRY_CLASSES else "attempt_budget_exhausted"}

@@ -485,10 +485,8 @@ def install_skill(
 
     stage = Path(tempfile.mkdtemp(prefix=f".{target_path.name}.stage-", dir=target_path.parent))
     try:
-        if target_path.exists():
-            shutil.copytree(target_path, stage, symlinks=True, dirs_exist_ok=True)
-        for relative in prior_files:
-            _remove_path(stage / relative) if (stage / relative).exists() or (stage / relative).is_symlink() else None
+        # The installed skill directory is machine-owned. Build it solely from the frozen
+        # revision so incomplete/legacy manifests cannot preserve stale executable files.
         tracked = _materialize_revision(source_path, revision, stage)
         hashes = {relative: _sha256(stage / relative) for relative in tracked}
         installed_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
@@ -524,6 +522,54 @@ def install_skill(
     return manifest
 
 
+
+def _snapshot_path(path: Path, backup_root: Path, label: str) -> dict[str, Any]:
+    path = path.expanduser().resolve(strict=False)
+    exists = path.exists() or path.is_symlink()
+    state: dict[str, Any] = {"exists": exists, "path": str(path), "kind": "missing", "backup": None}
+    if not exists:
+        return state
+    backup = backup_root / label
+    if path.is_symlink():
+        state.update({"kind": "symlink", "target": os.readlink(path)})
+    elif path.is_dir():
+        shutil.copytree(path, backup, symlinks=True)
+        state.update({"kind": "dir", "backup": str(backup)})
+    else:
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, backup, follow_symlinks=False)
+        state.update({"kind": "file", "backup": str(backup)})
+    return state
+
+
+def _restore_snapshot(state: dict[str, Any]) -> None:
+    path = Path(str(state["path"]))
+    if path.exists() or path.is_symlink():
+        _remove_path(path)
+    if not state.get("exists"):
+        return
+    kind = state.get("kind")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "symlink":
+        os.symlink(str(state["target"]), path)
+    elif kind == "dir":
+        shutil.copytree(Path(str(state["backup"])), path, symlinks=True)
+    elif kind == "file":
+        shutil.copy2(Path(str(state["backup"])), path, follow_symlinks=False)
+    else:
+        raise ValueError(f"unsupported snapshot kind: {kind}")
+
+
+def _rollback_install_transaction(states: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    for state in reversed(states):
+        try:
+            _restore_snapshot(state)
+        except (OSError, ValueError) as exc:
+            errors.append(f"{state.get('path')}: {exc}")
+    return errors
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install an exact Adaptive Agent Runtime revision with manifest and host-adapter evidence.")
     parser.add_argument("--source", required=True)
@@ -538,36 +584,48 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--hooks-file", default=str(DEFAULT_CODEX_HOOKS))
     parser.add_argument("--zshenv-file", default=str(DEFAULT_ZSHENV))
     args = parser.parse_args(argv)
-    try:
-        manifest = install_skill(
-            args.source,
-            args.target,
-            summary=args.summary,
-            impact=args.impact,
-            stop_condition=args.stop_condition,
-            previous_revision=args.previous_revision,
-        )
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
-        print(f"adaptive-delivery-install: blocked: {error}")
-        return 1
-    if not args.no_configure_host_adapters:
+
+    if args.no_configure_host_adapters:
         try:
+            manifest = install_skill(
+                args.source, args.target, summary=args.summary, impact=args.impact,
+                stop_condition=args.stop_condition, previous_revision=args.previous_revision,
+            )
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            print(f"adaptive-agent-runtime-install: blocked: {error}")
+            return 1
+        print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    target_path = Path(args.target).expanduser().resolve(strict=False)
+    hooks_path = Path(args.hooks_file).expanduser().resolve(strict=False)
+    zshenv_path = Path(args.zshenv_file).expanduser().resolve(strict=False)
+    with tempfile.TemporaryDirectory(prefix="adaptive-agent-runtime-install-rollback-") as backup_dir:
+        backup_root = Path(backup_dir)
+        snapshots = [
+            _snapshot_path(target_path, backup_root, "target"),
+            _snapshot_path(hooks_path, backup_root, "hooks"),
+            _snapshot_path(zshenv_path, backup_root, "zshenv"),
+        ]
+        try:
+            manifest = install_skill(
+                args.source, target_path, summary=args.summary, impact=args.impact,
+                stop_condition=args.stop_condition, previous_revision=args.previous_revision,
+            )
             manifest["capabilities"] = configure_host_adapters(
-                args.target,
+                target_path,
                 codex_executable=args.codex,
                 ai_bridge_executable=args.ai_bridge,
-                hooks_file=args.hooks_file,
-                zshenv_file=args.zshenv_file,
+                hooks_file=hooks_path,
+                zshenv_file=zshenv_path,
             )
-            _write_json_atomic(Path(args.target).expanduser().resolve() / MANIFEST_NAME, manifest)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            print(f"adaptive-agent-runtime-install: host adapter configuration degraded: {error}")
-            manifest["capabilities"] = detect_host_capabilities(
-                codex_executable=args.codex, ai_bridge_executable=args.ai_bridge,
-                hooks_file=args.hooks_file, zshenv_file=args.zshenv_file,
-                skill_root=args.target,
-            )
-            _write_json_atomic(Path(args.target).expanduser().resolve() / MANIFEST_NAME, manifest)
+            _write_json_atomic(target_path / MANIFEST_NAME, manifest)
+        except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
+            rollback_errors = _rollback_install_transaction(snapshots)
+            suffix = f"; rollback errors: {'; '.join(rollback_errors)}" if rollback_errors else ""
+            print(f"adaptive-agent-runtime-install: blocked and rolled back: {error}{suffix}")
+            return 1
+
     print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
     return 0
 

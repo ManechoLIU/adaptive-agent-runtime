@@ -54,7 +54,7 @@
 - Produces `side_effect_retry_decision(...)` or equivalent deterministic decision used by existing recovery paths.
 - Consumes current terminal outcome/retry class, idempotency facts, and recovery budget.
 
-- [x] Write failing tests: unknown/ambiguous terminal outcome + non-idempotent side effect must not auto-retry; explicit idempotency guarantee may retry only within existing recovery budget.
+- [x] Write failing tests: unknown/ambiguous side effect must not auto-retry unless a concrete provider/API adapter can machine-prove idempotency at the mutation boundary; carrying a key in prompt/environment alone is insufficient.
 - [x] Run focused tests and confirm RED.
 - [x] Implement the smallest deterministic guard in existing runtime semantics.
 - [x] Run focused Python/Node tests and confirm GREEN.

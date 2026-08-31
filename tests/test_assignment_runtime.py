@@ -141,20 +141,15 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
             "transport_error", attempt=1, side_effect=True, result_unknown=True, idempotency_key=None
         )
         self.assertFalse(decision["retry"])
-        self.assertEqual(decision["reason"], "non_idempotent_unknown_outcome")
+        self.assertEqual(decision["reason"], "unknown_side_effect_requires_reconciliation")
 
-    def test_unknown_side_effect_with_stable_idempotency_key_respects_existing_budget(self):
+    def test_unknown_side_effect_with_stable_key_still_requires_reconciliation_without_provider_proof(self):
         from scripts.assignment_runtime import retry_decision
-        allowed = retry_decision(
+        decision = retry_decision(
             "transport_error", attempt=1, side_effect=True, result_unknown=True, idempotency_key="publish:release-42"
         )
-        exhausted = retry_decision(
-            "transport_error", attempt=3, side_effect=True, result_unknown=True, idempotency_key="publish:release-42"
-        )
-        self.assertTrue(allowed["retry"])
-        self.assertEqual(allowed["idempotency_key"], "publish:release-42")
-        self.assertFalse(exhausted["retry"])
-        self.assertEqual(exhausted["reason"], "attempt_budget_exhausted")
+        self.assertFalse(decision["retry"])
+        self.assertEqual(decision["reason"], "unknown_side_effect_requires_reconciliation")
 
     def test_legacy_v1_initial_start_without_side_effect_contract_remains_readable(self):
         legacy = receipt("assignment_started", attempt=1, lease_id="legacy-1", event_seq=1)
@@ -187,12 +182,12 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
             summary="connection lost after write may have occurred", evidence=[], artifacts=[],
             next_action="reconcile external state", retry_class="transport_error", side_effect=True, result_unknown=True,
         ), now=T0 + timedelta(minutes=1))
-        with self.assertRaisesRegex(ValueError, "non-idempotent unknown side effect"):
+        with self.assertRaisesRegex(ValueError, "unknown side effect requires reconciliation"):
             apply_receipt(state, receipt(
                 "assignment_started", T0 + timedelta(minutes=2), attempt=2, lease_id="lease-2", event_seq=1, side_effect=True
             ), now=T0 + timedelta(minutes=2))
 
-    def test_unknown_side_effect_with_original_stable_key_allows_next_attempt(self):
+    def test_unknown_side_effect_with_original_stable_key_blocks_next_attempt_without_provider_proof(self):
         state = apply_receipt({}, receipt(
             "assignment_started", attempt=1, lease_id="lease-1", event_seq=1,
             side_effect=True, idempotency_key="publish:release-42"
@@ -200,15 +195,14 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
         state = apply_receipt(state, receipt(
             "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
             terminal_state="failed", transport_outcome="failed", delivery_outcome="unresolved",
-            summary="connection lost", evidence=[], artifacts=[], next_action="retry with same key",
+            summary="connection lost", evidence=[], artifacts=[], next_action="reconcile external state",
             retry_class="transport_error", side_effect=True, idempotency_key="publish:release-42", result_unknown=True,
         ), now=T0 + timedelta(minutes=1))
-        recovered = apply_receipt(state, receipt(
-            "assignment_started", T0 + timedelta(minutes=2), attempt=2, lease_id="lease-2", event_seq=1,
-            side_effect=True, idempotency_key="publish:release-42"
-        ), now=T0 + timedelta(minutes=2))
-        self.assertEqual(recovered["leases"]["a1"]["attempt"], 2)
-        self.assertEqual(recovered["leases"]["a1"]["idempotency_key"], "publish:release-42")
+        with self.assertRaisesRegex(ValueError, "unknown side effect requires reconciliation"):
+            apply_receipt(state, receipt(
+                "assignment_started", T0 + timedelta(minutes=2), attempt=2, lease_id="lease-2", event_seq=1,
+                side_effect=True, idempotency_key="publish:release-42"
+            ), now=T0 + timedelta(minutes=2))
 
     def test_side_effect_terminal_requires_boolean_result_unknown(self):
         state = apply_receipt({}, receipt(

@@ -159,6 +159,22 @@ class InstallMigrationContractTests(unittest.TestCase):
             self.assertEqual(set(manifest["capabilities"]), {"core", "desktop_adapter", "web_local_adapter"})
 
 
+    def test_legacy_install_with_incomplete_manifest_drops_obsolete_files_not_in_selected_revision(self):
+        import json
+        from scripts.install_skill import MANIFEST_NAME, install_skill
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            target = root / "installed" / "adaptive-delivery"
+            (target / "scripts").mkdir(parents=True)
+            (target / "scripts" / "obsolete_runtime.py").write_text("dangerous old behavior\n", encoding="utf-8")
+            (target / MANIFEST_NAME).write_text(json.dumps({"schema_version": 1, "files": {}}), encoding="utf-8")
+
+            install_skill(source, target, summary="clean legacy install", impact="none", stop_condition="exact revision only")
+
+            self.assertFalse((target / "scripts" / "obsolete_runtime.py").exists())
+            self.assertTrue((target / "SKILL.md").is_file())
+
     def test_install_materializes_recorded_revision_even_if_source_changes_after_head_resolution(self):
         import subprocess
         from unittest.mock import patch
@@ -339,22 +355,29 @@ class HostAdapterInstallationTests(unittest.TestCase):
             self.assertEqual(report["web_local_adapter"]["status"], "enabled")
             self.assertTrue(hooks.is_file())
             self.assertTrue(zshenv.is_file())
-    def test_install_cli_persists_degraded_capabilities_when_adapter_configuration_partially_fails(self):
+    def test_install_cli_rolls_back_target_and_host_files_when_adapter_configuration_partially_fails(self):
         import contextlib
         import io
-        import json
         from unittest.mock import patch
-        from scripts.install_skill import MANIFEST_NAME, main
+        from scripts.install_skill import main
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source = InstallMigrationContractTests().make_source(root)
             target = root / "installed" / "adaptive-delivery"
+            target.mkdir(parents=True)
+            (target / "old.txt").write_text("old install", encoding="utf-8")
             codex = root / "codex"; codex.write_text("#!/bin/sh\n", encoding="utf-8"); codex.chmod(0o755)
             bridge = root / "ai-bridge"; bridge.write_text("#!/bin/sh\n", encoding="utf-8"); bridge.chmod(0o755)
-            hooks = root / "hooks.json"
-            zshenv = root / ".zshenv"
+            hooks = root / "hooks.json"; hooks.write_text('{"keep":"hooks"}\n', encoding="utf-8")
+            zshenv = root / ".zshenv"; zshenv.write_text("export KEEP=1\n", encoding="utf-8")
             output = io.StringIO()
-            with patch("scripts.install_skill.configure_host_adapters", side_effect=OSError("zshenv write failed")):
+
+            def partial_failure(*args, **kwargs):
+                hooks.write_text('{"mutated":true}\n', encoding="utf-8")
+                zshenv.write_text("BROKEN=1\n", encoding="utf-8")
+                raise OSError("zshenv write failed after partial mutation")
+
+            with patch("scripts.install_skill.configure_host_adapters", side_effect=partial_failure):
                 with contextlib.redirect_stdout(output):
                     code = main([
                         "--source", str(source), "--target", str(target),
@@ -363,11 +386,13 @@ class HostAdapterInstallationTests(unittest.TestCase):
                         "--ai-bridge", str(bridge), "--hooks-file", str(hooks),
                         "--zshenv-file", str(zshenv),
                     ])
-            payload = json.loads(output.getvalue().splitlines()[-1])
-            persisted = json.loads((target / MANIFEST_NAME).read_text(encoding="utf-8"))
 
-        self.assertEqual(code, 0)
-        self.assertEqual(persisted["capabilities"], payload["capabilities"])
+            self.assertNotEqual(code, 0)
+            self.assertEqual((target / "old.txt").read_text(encoding="utf-8"), "old install")
+            self.assertFalse((target / "SKILL.md").exists())
+            self.assertEqual(hooks.read_text(encoding="utf-8"), '{"keep":"hooks"}\n')
+            self.assertEqual(zshenv.read_text(encoding="utf-8"), "export KEEP=1\n")
+            self.assertIn("rolled back", output.getvalue().lower())
 
     def test_install_cli_configures_available_host_adapters_in_one_entrypoint(self):
         import contextlib

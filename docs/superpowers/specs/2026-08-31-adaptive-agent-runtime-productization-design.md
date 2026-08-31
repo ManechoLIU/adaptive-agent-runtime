@@ -52,7 +52,7 @@ AI-Bridge 只是 Web 本地能力 Adapter，不是核心前提。没有 AI-Bridg
 
 - 明确 `side_effect` 与 `idempotency` 事实。
 - 结果 uncertain/unknown 时，无幂等保障禁止自动 retry/fallback 触发重复副作用。
-- 有稳定 idempotency key 或业务接口明确保证幂等时，可在既有 recovery budget 内重试。
+- 稳定 idempotency key 仅作为执行契约传递；只有具体 side-effect adapter 能机器证明 provider/API 在真实写入边界应用了幂等保障时，unknown outcome 才有资格在既有 recovery budget 内重试。当前通用外部 Agent adapter 不具备该证明，因此 unknown side effect 一律先对账、禁止自动重试。
 - 该能力进入现有 Delivery/Dispatch 决策，不创建第二任务状态机。
 
 ### Assignment execution strategy freeze

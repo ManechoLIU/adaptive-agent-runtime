@@ -400,7 +400,7 @@ python3 scripts/install_skill.py \
   --stop-condition "installation verified"
 ```
 
-安装器保持技术 Skill ID 与机器状态路径 `adaptive-delivery` 不变，但 manifest 对外记录 `Adaptive Agent Runtime / adaptive-agent-runtime`。安装时先冻结精确 HEAD revision，再直接从该 commit 的 Git objects 物化到同目录 staging，校验 hash 后整体替换安装目录；后续即使源工作树或 HEAD 并发变化，也不会让 manifest revision 与实际安装文件错配。检测到 Codex 时会幂等合并 lifecycle + scoring hooks；检测到 AI-Bridge 时会幂等安装 Web shell bridge；已有 Hook 和 `.zshenv` 其他内容不会被覆盖。Codex 非托管 Hook 的 **Active / trusted** 仍必须由宿主自身确认，因此即使配置已写入，能力报告在无法机器验证 trust 时仍为 `degraded`，不会虚报完全启用。没有 AI-Bridge 时安装本身仍成功，Web 本地能力明确降级为 `pure_web_file`。如只需要复制 Core、明确不希望安装器修改宿主配置，可加 `--no-configure-host-adapters`。
+安装器保持技术 Skill ID 与机器状态路径 `adaptive-delivery` 不变，但 manifest 对外记录 `Adaptive Agent Runtime / adaptive-agent-runtime`。安装目录属于机器管理内容：安装时先冻结精确 HEAD revision，再只从该 commit 的 Git objects 重建同目录 staging，校验 hash 后整体替换，因此旧版/缺失 manifest 也不会把已删除的陈旧脚本带进新安装；后续即使源工作树或 HEAD 并发变化，也不会让 manifest revision 与实际安装文件错配。检测到 Codex 时会幂等合并 lifecycle + scoring hooks；检测到 AI-Bridge 时会幂等安装 Web shell bridge；已有 Hook 和 `.zshenv` 其他内容不会被覆盖。默认的一键安装把目标 Skill、hooks 与 `.zshenv` 视为同一安装事务：任一 Host Adapter 配置失败会恢复三者的安装前快照并以非零状态阻塞，不会把部分激活配置当作 degraded success。Codex 非托管 Hook 的 **Active / trusted** 仍必须由宿主自身确认，因此即使配置已写入，能力报告在无法机器验证 trust 时仍为 `degraded`，不会虚报完全启用。没有 AI-Bridge 时安装本身仍成功，Web 本地能力明确降级为 `pure_web_file`。如只需要复制 Core、明确不希望安装器修改宿主配置，可加 `--no-configure-host-adapters`。
 
 ### Codex
 
