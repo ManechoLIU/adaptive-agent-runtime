@@ -25,6 +25,8 @@ AI_BRIDGE_EXECUTABLE = "/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge"
 DEFAULT_RUNTIME_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 STDERR_TAIL_LIMIT = 8192
 LAUNCHER_LOG_LIMIT = 262144
+RESTORE_DOCUMENT_NAMES = ("AGENTS.md", "TASK_LEDGER.md", "MEMORY.md", "WIKI_INDEX.md")
+RESTORE_DOCUMENT_LIMIT = 32768
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -127,6 +129,84 @@ def translate_receipt(
         turn_id=f"web-audit:{receipt_id}",
     )
 
+
+
+def _git_common_dir(repo: Path) -> Path:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
+        check=True, capture_output=True, text=True,
+    )
+    value = Path(completed.stdout.strip())
+    return (repo / value).resolve() if not value.is_absolute() else value.resolve()
+
+
+def _restore_document(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    content = path.read_text(encoding="utf-8")
+    truncated = len(content.encode("utf-8")) > RESTORE_DOCUMENT_LIMIT
+    if truncated:
+        encoded = content.encode("utf-8")[:RESTORE_DOCUMENT_LIMIT]
+        content = encoded.decode("utf-8", errors="ignore")
+    return {"name": path.name, "path": str(path.resolve()), "content": content, "truncated": truncated}
+
+
+def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, Any]:
+    root = canonical_root(repo)
+    controller = registered_controller_for_repo(root, registry_path)
+    if controller is None:
+        raise ValueError(f"no registered controller for {root}")
+    documents = [item for name in RESTORE_DOCUMENT_NAMES if (item := _restore_document(root / name)) is not None]
+    head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    runtime_state = _git_common_dir(root) / "adaptive-delivery" / "runtime-assignments.json"
+    return {
+        "product": "Adaptive Agent Runtime",
+        "project_root": str(root),
+        "controller_session": controller,
+        "restore_order": ["AGENTS.md", "TASK_LEDGER.md", "MEMORY.md", "WIKI_INDEX.md", "git_runtime"],
+        "documents": documents,
+        "git": {
+            "head": head,
+            "status_sha256": __import__("hashlib").sha256(status.encode("utf-8")).hexdigest(),
+        },
+        "runtime_state_path": str(runtime_state),
+        "compact": "not restored unless an explicit handoff/compact is available",
+    }
+
+
+def classify_native_resume_failure(returncode: int, stdout: str, stderr: str) -> dict[str, Any]:
+    combined = f"{stdout}\n{stderr}".casefold()
+    if "thread-store conflict" in combined and "active writer" in combined:
+        return {
+            "state": "RESUME_DEFERRED_ACTIVE_WRITER",
+            "pending_control_event": True,
+            "failure_class": "active_writer_present",
+            "fallback_eligible": False,
+            "error_code": "WEB_LIFECYCLE_ACTIVE_WRITER",
+        }
+    failure_patterns = (
+        ("usage_limit_exceeded", ("usage limit", "usage_limit_exceeded")),
+        ("quota_exhausted", ("quota exhausted", "quota_exhausted")),
+        ("model_unavailable", ("model unavailable", "model_unavailable")),
+        ("service_unavailable", ("service unavailable", "service_unavailable")),
+        ("auth_invalid", ("authentication", "auth_invalid", "unauthorized")),
+        ("runtime_unavailable", ("runtime unavailable", "runtime_unavailable")),
+    )
+    failure_class = next((name for name, patterns in failure_patterns if any(pattern in combined for pattern in patterns)), "resume_failed")
+    return {
+        "state": "RESUME_FAILED",
+        "pending_control_event": True,
+        "failure_class": failure_class,
+        "fallback_eligible": failure_class != "resume_failed",
+        "error_code": "WEB_LIFECYCLE_RESUME_FAILED",
+        "returncode": returncode,
+    }
 
 def audit_receipts_from_cursor(audit_log: Path, cursor_path: Path) -> list[dict[str, Any]]:
     state = load_json(cursor_path)
@@ -563,18 +643,27 @@ def run_auto_native_stop(
     latest = load_json(state_path)
     if latest.get("receipt_id") == receipt_id:
         confirmed = completed.returncode == 0
-        latest.update({
-            "state": "RESUME_CONFIRMED" if confirmed else "RESUME_FAILED",
-            "pending_control_event": not confirmed,
-            "completed_at_unix_ms": int(time.time() * 1000),
-            "returncode": completed.returncode,
-            "stdout_tail": bounded_tail(completed.stdout),
-            "stderr_tail": bounded_tail(completed.stderr),
-        })
-        if not confirmed:
-            latest["error_code"] = "WEB_LIFECYCLE_RESUME_FAILED"
-        else:
+        if confirmed:
+            latest.update({
+                "state": "RESUME_CONFIRMED",
+                "pending_control_event": False,
+                "completed_at_unix_ms": int(time.time() * 1000),
+                "returncode": completed.returncode,
+                "stdout_tail": bounded_tail(completed.stdout),
+                "stderr_tail": bounded_tail(completed.stderr),
+            })
             latest.pop("error_code", None)
+            latest.pop("failure_class", None)
+            latest.pop("fallback_eligible", None)
+        else:
+            classification = classify_native_resume_failure(completed.returncode, completed.stdout, completed.stderr)
+            latest.update(classification)
+            latest.update({
+                "completed_at_unix_ms": int(time.time() * 1000),
+                "returncode": completed.returncode,
+                "stdout_tail": bounded_tail(completed.stdout),
+                "stderr_tail": bounded_tail(completed.stderr),
+            })
         write_auto_stop_state(state_path, latest)
     if completed.stderr:
         print(bounded_tail(completed.stderr), file=sys.stderr, end="" if completed.stderr.endswith("\n") else "\n")
@@ -615,6 +704,10 @@ def build_parser() -> argparse.ArgumentParser:
     translate = subparsers.add_parser("translate-receipt")
     translate.add_argument("--session-id", required=True)
     translate.add_argument("--repo", required=True)
+
+    session_start = subparsers.add_parser("session-start")
+    session_start.add_argument("--repo", required=True)
+    session_start.add_argument("--registry", default=str(DEFAULT_REGISTRY))
 
     post_shell = subparsers.add_parser("post-shell")
     post_shell.add_argument("--cwd", required=True)
@@ -682,6 +775,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         event = translate_receipt(receipt, session_id=args.session_id, repo=repo)
         if event is not None:
             print(json.dumps(event, ensure_ascii=False))
+        return 0
+
+    if args.command_name == "session-start":
+        repo = canonical_root(args.repo)
+        try:
+            payload = web_session_restore_payload(repo, Path(args.registry).expanduser())
+        except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps(payload, ensure_ascii=False))
         return 0
 
     if args.command_name == "post-shell":

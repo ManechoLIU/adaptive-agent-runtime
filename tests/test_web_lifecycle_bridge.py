@@ -642,6 +642,66 @@ class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
         self.assertIn("stderr_tail", source)
 
 
+
+class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
+    def test_restore_payload_binds_unique_controller_and_restores_authoritative_files_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            for name, text in (("AGENTS.md", "agent rules"), ("TASK_LEDGER.md", "task ledger"), ("MEMORY.md", "stable memory"), ("WIKI_INDEX.md", "wiki index")):
+                (repo / name).write_text(text + "\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+
+            payload = web_bridge.web_session_restore_payload(repo, registry)
+
+        self.assertEqual(payload["controller_session"], "controller-1")
+        self.assertEqual(payload["restore_order"], ["AGENTS.md", "TASK_LEDGER.md", "MEMORY.md", "WIKI_INDEX.md", "git_runtime"])
+        self.assertEqual([item["name"] for item in payload["documents"]], ["AGENTS.md", "TASK_LEDGER.md", "MEMORY.md", "WIKI_INDEX.md"])
+        self.assertIn("agent rules", payload["documents"][0]["content"])
+        self.assertIn("adaptive-delivery", payload["runtime_state_path"])
+        self.assertNotIn("adaptive-agent-runtime", payload["runtime_state_path"])
+
+    def test_active_writer_resume_conflict_is_deferred_not_treated_as_peer_host_failure(self) -> None:
+        classified = web_bridge.classify_native_resume_failure(
+            1,
+            "",
+            "failed to initialize thread persistence: thread-store conflict: thread abc already has an active writer",
+        )
+        self.assertEqual(classified["state"], "RESUME_DEFERRED_ACTIVE_WRITER")
+        self.assertEqual(classified["failure_class"], "active_writer_present")
+        self.assertFalse(classified["fallback_eligible"])
+        self.assertTrue(classified["pending_control_event"])
+
+    def test_session_start_cli_emits_restore_payload_for_unique_registered_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "TASK_LEDGER.md").write_text("task ledger\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            result = subprocess.run(
+                ["/usr/bin/python3", str(BRIDGE), "session-start", "--repo", str(repo), "--registry", str(registry)],
+                text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["controller_session"], "controller-1")
+        self.assertEqual(payload["restore_order"][-1], "git_runtime")
+
+
 class ControllerHostTrackingTests(WebLifecycleBridgeTests):
     def test_web_bridge_marks_translated_events_as_web_host(self) -> None:
         receipt = {

@@ -380,6 +380,12 @@ python3 scripts/visual_evidence_guard.py path/to/visual-receipt.json
 
 这些动作分别在实际发生前确认。未获授权的高风险步骤停在门前，不阻塞其他不依赖它的工作。
 
+### Web Adapter 与无 AI-Bridge 降级
+
+Adaptive Agent Runtime 的 Core 不依赖 AI-Bridge。检测到 AI-Bridge 时，Web Adapter 可以把明确归属到唯一 registered controller repo 的本地工具事件桥接进同一生命周期，并用 `scripts/web_lifecycle_bridge.py session-start --repo <repo>` 生成 `AGENTS → TASK_LEDGER/PROJECT_STATUS → MEMORY → WIKI_INDEX → Git/runtime` 的恢复载荷。没有 AI-Bridge 或其他本地桥时，Web 进入 `pure_web_file` 降级模式：仍可按 Core 规则工作，但不能声称看得到本地 Git/runtime、自动唤醒本地 controller 或执行本地 shell。
+
+同一 controller thread resume 若返回 `active writer` 冲突，会保持 pending 并标记为 deferred；它不等同于宿主失效，因此不会为了“恢复”再创建第二 controller。
+
 ## 安装
 
 安装整个仓库，不要只复制 `SKILL.md`；否则会缺少 references、scripts 和测试。
