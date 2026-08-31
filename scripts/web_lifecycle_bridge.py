@@ -152,6 +152,26 @@ def _restore_document(path: Path) -> dict[str, Any] | None:
     return {"name": path.name, "path": str(path.resolve()), "content": content, "truncated": truncated}
 
 
+def _bounded_text(value: str, limit: int = RESTORE_DOCUMENT_LIMIT) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value, False
+    return encoded[:limit].decode("utf-8", errors="ignore"), True
+
+
+def _bounded_runtime_state(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"present": False, "path": str(path), "content": "", "truncated": False}
+    content, truncated = _bounded_text(path.read_text(encoding="utf-8"))
+    return {
+        "present": True,
+        "path": str(path),
+        "content": content,
+        "truncated": truncated,
+        "sha256": __import__("hashlib").sha256(path.read_bytes()).hexdigest(),
+    }
+
+
 def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, Any]:
     root = canonical_root(repo)
     controller = registered_controller_for_repo(root, registry_path)
@@ -171,7 +191,12 @@ def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, An
         ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
         check=True, capture_output=True, text=True,
     ).stdout
+    status_content, status_truncated = _bounded_text(status)
+    branch = subprocess.run(
+        ["git", "-C", str(root), "branch", "--show-current"], check=True, capture_output=True, text=True
+    ).stdout.strip()
     runtime_state = _git_common_dir(root) / "adaptive-delivery" / "runtime-assignments.json"
+    runtime = _bounded_runtime_state(runtime_state)
     return {
         "product": "Adaptive Agent Runtime",
         "project_root": str(root),
@@ -181,8 +206,12 @@ def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, An
         "authoritative_documents": authoritative_documents,
         "git": {
             "head": head,
+            "branch": branch,
+            "status": status_content,
+            "status_truncated": status_truncated,
             "status_sha256": __import__("hashlib").sha256(status.encode("utf-8")).hexdigest(),
         },
+        "runtime": runtime,
         "runtime_state_path": str(runtime_state),
         "compact": "not restored unless an explicit handoff/compact is available",
     }

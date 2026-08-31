@@ -669,6 +669,34 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
         self.assertIn("adaptive-delivery", payload["runtime_state_path"])
         self.assertNotIn("adaptive-agent-runtime", payload["runtime_state_path"])
 
+    def test_restore_payload_contains_bounded_dirty_git_and_runtime_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "TASK_LEDGER.md").write_text("task ledger\n", encoding="utf-8")
+            (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+            (repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+            runtime_dir = repo / ".git" / "adaptive-delivery"
+            runtime_dir.mkdir(parents=True)
+            runtime = {"schema_version": 2, "leases": {"a1": {"assignment_id": "a1", "task_id": "T1", "terminal_state": None}}}
+            (runtime_dir / "runtime-assignments.json").write_text(json.dumps(runtime), encoding="utf-8")
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+
+            payload = web_bridge.web_session_restore_payload(repo, registry)
+
+        self.assertIn("tracked.txt", payload["git"]["status"])
+        self.assertFalse(payload["git"]["status_truncated"])
+        self.assertTrue(payload["runtime"]["present"])
+        self.assertIn('"assignment_id": "a1"', payload["runtime"]["content"])
+        self.assertFalse(payload["runtime"]["truncated"])
+
     def test_restore_payload_uses_legacy_project_status_when_it_is_the_only_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

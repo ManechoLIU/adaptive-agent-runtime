@@ -26,6 +26,35 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertEqual(report["web_local_adapter"]["status"], "degraded")
         self.assertEqual(report["web_local_adapter"]["mode"], "pure_web_file")
 
+    def test_capability_report_rejects_stale_web_bridge_block_from_another_install(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            bridge = root / "ai-bridge"
+            bridge.write_text("#!/bin/sh\n", encoding="utf-8")
+            bridge.chmod(0o755)
+            skill_root = root / "adaptive-delivery"
+            (skill_root / "scripts").mkdir(parents=True)
+            current_script = skill_root / "scripts" / "web_lifecycle_bridge.py"
+            current_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            zshenv = root / ".zshenv"
+            zshenv.write_text(
+                "# >>> adaptive-delivery web lifecycle bridge >>>\n"
+                f'_ad_web_parent="{bridge}"\n'
+                '"/usr/bin/python3" "/old/install/scripts/web_lifecycle_bridge.py" post-shell --cwd "$PWD"\n'
+                "# <<< adaptive-delivery web lifecycle bridge <<<\n",
+                encoding="utf-8",
+            )
+            report = detect_host_capabilities(
+                codex_executable=root / "missing-codex",
+                ai_bridge_executable=bridge,
+                hooks_file=root / "hooks.json",
+                zshenv_file=zshenv,
+                skill_root=skill_root,
+            )
+
+        self.assertEqual(report["web_local_adapter"]["status"], "degraded")
+        self.assertFalse(report["web_local_adapter"]["configured"])
+
     def test_capability_report_enables_detected_ai_bridge_without_making_it_core_dependency(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -54,6 +83,11 @@ class InstallMigrationContractTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.com"], check=True)
         subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
         (source / "SKILL.md").write_text("---\nname: adaptive-delivery\n---\n# Adaptive Agent Runtime\n", encoding="utf-8")
+        (source / "scripts").mkdir()
+        for name in ("web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py"):
+            script = source / "scripts" / name
+            script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            script.chmod(0o755)
         subprocess.run(["git", "-C", str(source), "add", "."], check=True)
         subprocess.run(["git", "-C", str(source), "commit", "-m", "initial"], check=True, capture_output=True)
         return source
@@ -153,6 +187,10 @@ class HostAdapterInstallationTests(unittest.TestCase):
             root = Path(d)
             target = root / "adaptive-delivery"
             (target / "scripts").mkdir(parents=True)
+            for name in ("web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py"):
+                script = target / "scripts" / name
+                script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+                script.chmod(0o755)
             codex = root / "codex"; codex.write_text("#!/bin/sh\n", encoding="utf-8"); codex.chmod(0o755)
             bridge = root / "ai-bridge"; bridge.write_text("#!/bin/sh\n", encoding="utf-8"); bridge.chmod(0o755)
             hooks = root / "hooks.json"

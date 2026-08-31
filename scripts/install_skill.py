@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -38,12 +39,34 @@ def _hooks_contain(path: Path, needle: str) -> bool:
     return needle in json.dumps(data, ensure_ascii=False)
 
 
-def _zshenv_has_web_bridge(path: Path) -> bool:
+def _zshenv_has_web_bridge(
+    path: Path, *, skill_root: Path | None = None, ai_bridge_executable: Path | None = None
+) -> bool:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return False
-    return WEB_BLOCK_START in text and WEB_BLOCK_END in text
+    start = text.find(WEB_BLOCK_START)
+    end = text.find(WEB_BLOCK_END, start + len(WEB_BLOCK_START)) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return False
+    block = text[start:end + len(WEB_BLOCK_END)]
+    match = re.search(r'^\s*"([^"]+)"\s+"([^"]+)"\s+post-shell\b', block, re.MULTILINE)
+    if match is None:
+        return False
+    python_path = Path(match.group(1)).expanduser()
+    script_path = Path(match.group(2)).expanduser()
+    if not python_path.is_file() or not os.access(python_path, os.X_OK) or not script_path.is_file():
+        return False
+    if skill_root is not None:
+        expected_script = (skill_root / "scripts" / "web_lifecycle_bridge.py").expanduser().resolve()
+        if script_path.resolve() != expected_script:
+            return False
+    if ai_bridge_executable is not None:
+        expected_bridge = str(ai_bridge_executable.expanduser().resolve())
+        if expected_bridge not in block:
+            return False
+    return True
 
 
 def detect_host_capabilities(
@@ -52,6 +75,7 @@ def detect_host_capabilities(
     ai_bridge_executable: str | Path = DEFAULT_AI_BRIDGE_EXECUTABLE,
     hooks_file: str | Path = DEFAULT_CODEX_HOOKS,
     zshenv_file: str | Path = DEFAULT_ZSHENV,
+    skill_root: str | Path | None = None,
 ) -> dict[str, dict[str, Any]]:
     codex_path = Path(codex_executable).expanduser() if codex_executable else None
     if codex_path is None:
@@ -60,6 +84,7 @@ def detect_host_capabilities(
     bridge_path = Path(ai_bridge_executable).expanduser()
     hooks_path = Path(hooks_file).expanduser()
     zshenv_path = Path(zshenv_file).expanduser()
+    skill_root_path = Path(skill_root).expanduser().resolve() if skill_root is not None else None
 
     codex_available = bool(codex_path and codex_path.is_file() and os.access(codex_path, os.X_OK))
     lifecycle_configured = _hooks_contain(hooks_path, "lifecycle_hook.py")
@@ -81,7 +106,9 @@ def detect_host_capabilities(
         }
 
     bridge_available = bridge_path.is_file() and os.access(bridge_path, os.X_OK)
-    bridge_configured = _zshenv_has_web_bridge(zshenv_path)
+    bridge_configured = _zshenv_has_web_bridge(
+        zshenv_path, skill_root=skill_root_path, ai_bridge_executable=bridge_path
+    )
     if bridge_available and bridge_configured:
         web = {
             "status": "enabled", "adapter": "ai-bridge", "mode": "local_bridge",
@@ -256,6 +283,7 @@ def configure_host_adapters(
         ai_bridge_executable=bridge,
         hooks_file=hooks_file,
         zshenv_file=zshenv_file,
+        skill_root=target_path,
     )
 
 
@@ -381,7 +409,7 @@ def install_skill(
         "impact": impact,
         "stop_condition": stop_condition.strip(),
         "changed_files": _changed_files(source_path, prior_revision, revision, tracked),
-        "capabilities": detect_host_capabilities(),
+        "capabilities": detect_host_capabilities(skill_root=target_path),
         "files": hashes,
     }
     _write_json_atomic(target_path / MANIFEST_NAME, manifest)
@@ -433,6 +461,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             manifest["capabilities"] = detect_host_capabilities(
                 codex_executable=args.codex, ai_bridge_executable=args.ai_bridge,
                 hooks_file=args.hooks_file, zshenv_file=args.zshenv_file,
+                skill_root=args.target,
             )
             _write_json_atomic(Path(args.target).expanduser().resolve() / MANIFEST_NAME, manifest)
     print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
