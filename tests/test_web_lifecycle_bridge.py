@@ -445,6 +445,7 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             event = json.loads(capture.read_text().splitlines()[0])
             self.assertEqual(event["tool_name"], "AI-Bridge.computer")
+            self.assertEqual(event["controller_host"], "web")
             self.assertIn("click", event["tool_input"]["detail"])
             self.assertFalse(lease.exists())
 
@@ -667,6 +668,29 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
         self.assertIn("agent rules", payload["documents"][0]["content"])
         self.assertIn("adaptive-delivery", payload["runtime_state_path"])
         self.assertNotIn("adaptive-agent-runtime", payload["runtime_state_path"])
+
+    def test_restore_payload_uses_legacy_project_status_when_it_is_the_only_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "AGENTS.md").write_text("rules\n", encoding="utf-8")
+            (repo / "PROJECT_STATUS.md").write_text("legacy ledger\n", encoding="utf-8")
+            (repo / "SPEC.md").write_text("product contract\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+
+            payload = web_bridge.web_session_restore_payload(repo, registry)
+
+        self.assertIn("PROJECT_STATUS.md", payload["restore_order"])
+        self.assertNotIn("TASK_LEDGER.md", payload["restore_order"])
+        self.assertIn("PROJECT_STATUS.md", [item["name"] for item in payload["documents"]])
+        self.assertIn("SPEC.md", [item["name"] for item in payload["authoritative_documents"]])
 
     def test_active_writer_resume_conflict_is_deferred_not_treated_as_peer_host_failure(self) -> None:
         classified = web_bridge.classify_native_resume_failure(

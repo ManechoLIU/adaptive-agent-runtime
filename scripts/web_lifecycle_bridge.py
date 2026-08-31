@@ -25,7 +25,8 @@ AI_BRIDGE_EXECUTABLE = "/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge"
 DEFAULT_RUNTIME_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 STDERR_TAIL_LIMIT = 8192
 LAUNCHER_LOG_LIMIT = 262144
-RESTORE_DOCUMENT_NAMES = ("AGENTS.md", "TASK_LEDGER.md", "MEMORY.md", "WIKI_INDEX.md")
+RESTORE_STATIC_DOCUMENT_NAMES = ("AGENTS.md", "MEMORY.md", "WIKI_INDEX.md")
+AUTHORITATIVE_DOCUMENT_NAMES = ("SKILL.md", "SPEC.md", "DESIGN.md", "TECHNICAL.md", "EVOLUTION.md")
 RESTORE_DOCUMENT_LIMIT = 32768
 
 
@@ -156,7 +157,13 @@ def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, An
     controller = registered_controller_for_repo(root, registry_path)
     if controller is None:
         raise ValueError(f"no registered controller for {root}")
-    documents = [item for name in RESTORE_DOCUMENT_NAMES if (item := _restore_document(root / name)) is not None]
+    ledger_name = "TASK_LEDGER.md" if (root / "TASK_LEDGER.md").is_file() else ("PROJECT_STATUS.md" if (root / "PROJECT_STATUS.md").is_file() else "TASK_LEDGER.md")
+    restore_names = ("AGENTS.md", ledger_name, "MEMORY.md", "WIKI_INDEX.md")
+    documents = [item for name in restore_names if (item := _restore_document(root / name)) is not None]
+    authoritative_documents = [
+        item for name in AUTHORITATIVE_DOCUMENT_NAMES
+        if (item := _restore_document(root / name)) is not None
+    ]
     head = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
@@ -169,8 +176,9 @@ def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, An
         "product": "Adaptive Agent Runtime",
         "project_root": str(root),
         "controller_session": controller,
-        "restore_order": ["AGENTS.md", "TASK_LEDGER.md", "MEMORY.md", "WIKI_INDEX.md", "git_runtime"],
+        "restore_order": ["AGENTS.md", ledger_name, "MEMORY.md", "WIKI_INDEX.md", "git_runtime"],
         "documents": documents,
+        "authoritative_documents": authoritative_documents,
         "git": {
             "head": head,
             "status_sha256": __import__("hashlib").sha256(status.encode("utf-8")).hexdigest(),
@@ -271,6 +279,7 @@ def computer_event_from_receipt(
     target = receipt.get("targetLabel")
     event = {
         "hook_event_name": "PostToolUse",
+        "controller_host": "web",
         "session_id": session_id,
         "turn_id": f"web-audit:{receipt.get('receiptId') or 'computer'}",
         "cwd": str(repo.resolve()),
