@@ -6,7 +6,7 @@
 
 ### Controller scoring window
 
-Formal long-term controller scoring defaults to the most recent 24 hours, using at most five valid control events plus a separate inspection of all current major unresolved anomalies and critical-path stalls. Sparse windows are disclosed rather than backfilled with older convenient events. Controller Self-Check remains lightweight, non-numeric, and does not execute the full formal scoring window.
+Formal long-term controller scoring defaults to the most recent 24 hours, using the five most recent valid control events, capped at five plus a separate inspection of all current major unresolved anomalies and critical-path stalls. Sparse windows are disclosed rather than backfilled with older convenient events. Controller Self-Check remains lightweight, non-numeric, and does not execute the full formal scoring window.
 
 ## 产品身份与兼容性
 
