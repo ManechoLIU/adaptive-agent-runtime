@@ -346,8 +346,15 @@ function validateAssignmentLaunch(options) {
   if (!new Set(["ACKED", "ACTIVE"]).has(state)) {
     throw new Error("assignment-ack launch state must be ACKED or ACTIVE");
   }
-  if (typeof assignment.side_effect !== "boolean") {
+  const contractVersion = assignment.assignment_contract_version === undefined ? 1 : Number(assignment.assignment_contract_version);
+  if (!Number.isInteger(contractVersion) || contractVersion < 1) {
+    throw new Error("assignment-ack assignment_contract_version must be a positive integer");
+  }
+  if (contractVersion >= 2 && typeof assignment.side_effect !== "boolean") {
     throw new Error("assignment-ack requires explicit side_effect contract");
+  }
+  if (assignment.side_effect !== undefined && typeof assignment.side_effect !== "boolean") {
+    throw new Error("assignment-ack side_effect must be boolean when provided");
   }
   if (assignment.idempotency_key !== null && assignment.idempotency_key !== undefined && typeof assignment.idempotency_key !== "string") {
     throw new Error("assignment-ack idempotency_key must be a string or null");
@@ -355,6 +362,10 @@ function validateAssignmentLaunch(options) {
   if (typeof assignment.idempotency_key === "string" && assignment.idempotency_key.trim().length === 0) {
     throw new Error("assignment-ack idempotency_key cannot be blank");
   }
+  if (contractVersion < 2 && assignment.idempotency_key !== null && assignment.idempotency_key !== undefined) {
+    throw new Error("legacy assignment-ack cannot declare idempotency_key without v2 side-effect contract");
+  }
+  assignment.assignment_contract_version = contractVersion;
   const repositoryRoot = gitFact(options.cwd, ["rev-parse", "--show-toplevel"], "launch repository");
   const branch = gitFact(options.cwd, ["branch", "--show-current"], "launch branch");
   const head = gitFact(options.cwd, ["rev-parse", "HEAD"], "launch revision");
@@ -482,9 +493,11 @@ function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
     worktree: options.cwd, issued_at: new Date().toISOString(), attempt: options.attempt,
     lease_id: options.leaseId || `${options.assignmentId}:attempt:${options.attempt}`, event_seq: eventSeq,
     receipt_id: `${options.assignmentId}:${options.attempt}:${eventSeq}`,
-    assignment_contract_version: 2,
-    side_effect: Boolean(options.sideEffect),
-    idempotency_key: options.idempotencyKey || null,
+    assignment_contract_version: options.assignmentContractVersion || 1,
+    ...(Number(options.assignmentContractVersion || 1) >= 2 ? {
+      side_effect: Boolean(options.sideEffect),
+      idempotency_key: options.idempotencyKey || null,
+    } : {}),
     ...(eventType === "assignment_started" ? options.executionLineage : {}), ...extra,
   };
 }
@@ -667,10 +680,13 @@ async function loginExternalAgent({ cwd, engine, region, deviceAuth }) {
   return await runAttached(executable, args, { cwd, env: process.env });
 }
 
-async function executeExternalAgent({ cwd, engine, model, reasoningEffort, authMode }) {
+async function executeExternalAgent({ cwd, engine, model, reasoningEffort, authMode, sideEffect, idempotencyKey }) {
   assertDirectory(cwd);
-  const prompt = await readStdin();
-  if (!prompt) throw new Error("A bounded routing contract prompt is required on stdin");
+  const rawPrompt = await readStdin();
+  if (!rawPrompt) throw new Error("A bounded routing contract prompt is required on stdin");
+  const prompt = sideEffect && idempotencyKey
+    ? `[Adaptive Agent Runtime side-effect contract] Any external side effect in this execution MUST use the exact idempotency key: ${idempotencyKey}. Do not perform the side effect without applying this key through the provider/API mechanism.\n\n${rawPrompt}`
+    : rawPrompt;
 
   const executable = resolveExecutable(routes[engine]);
   let args;
@@ -724,6 +740,9 @@ async function executeExternalAgent({ cwd, engine, model, reasoningEffort, authM
     env = sanitizedEnvironment([], ["XAI_API_KEY"]);
   }
 
+  if (sideEffect && idempotencyKey) {
+    env.ADAPTIVE_AGENT_IDEMPOTENCY_KEY = idempotencyKey;
+  }
   try {
     return await runAttached(executable, args, { cwd, env });
   } finally {
@@ -754,7 +773,8 @@ async function main() {
     }
     const assignment = validateAssignmentLaunch(options);
     if (assignment) {
-      options.sideEffect = assignment.side_effect;
+      options.assignmentContractVersion = assignment.assignment_contract_version || 1;
+      options.sideEffect = typeof assignment.side_effect === "boolean" ? assignment.side_effect : null;
       options.idempotencyKey = typeof assignment.idempotency_key === "string" ? assignment.idempotency_key.trim() : null;
       options.executionLineage = deriveExecutionLineage(options, assignment);
     }

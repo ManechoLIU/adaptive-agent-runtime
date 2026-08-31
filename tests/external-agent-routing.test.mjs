@@ -18,7 +18,7 @@ async function assignmentAckFile(directory, overrides = {}, repositoryRoot = ski
   const assignment = {
     assignment_id: "a1", task_id: "T1", agent_id: "writer", state: "ACKED",
     primary_goal: "finish bounded task", success_criteria: ["green"], owned_scope: ["scripts/run_external_agent.mjs"],
-    side_effect: false, idempotency_key: null,
+    assignment_contract_version: 2, side_effect: false, idempotency_key: null,
     forbidden_scope: [], parallelizable: true, observed_modified_files: [],
     ack: { repository_root: repositoryRoot, branch, head, status: "clean", owned_files: ["scripts/run_external_agent.mjs"], first_red: "red", stop_condition: "candidate" },
     ...overrides,
@@ -76,6 +76,7 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
     kimiThinkingEffort: process.env.KIMI_MODEL_THINKING_EFFORT || null,
     hasXaiApiKey: Boolean(process.env.XAI_API_KEY),
     grokHome: process.env.GROK_HOME || null,
+    adaptiveIdempotencyKey: process.env.ADAPTIVE_AGENT_IDEMPOTENCY_KEY || null,
   }) + "\\n");
   if (process.env.SPAWN_MARKER) fs.appendFileSync(process.env.SPAWN_MARKER, "spawned\\n");
   if (process.env.FAKE_RUNNER_TOUCH_FILE) fs.writeFileSync(process.env.FAKE_RUNNER_TOUCH_FILE, "changed\\n");
@@ -479,6 +480,43 @@ test("assignment-bound execute rejects stale or mismatched ACK before spawn", as
     assert.equal(result.status, 1);
   }
   await assert.rejects(readFile(marker, "utf8"));
+});
+
+test("legacy v1 assignment ACK without side-effect fields can resume", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-legacy-ack-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, { assignment_contract_version: undefined, side_effect: undefined, idempotency_key: undefined }, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack,
+  ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("v2 side-effect execution propagates stable idempotency key to provider contract", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-idempotency-propagation-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, { side_effect: true, idempotency_key: "publish:release-42" }, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack,
+  ], { encoding: "utf8", input: "publish once", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout.trim().split("\n").find((line) => line.startsWith("{")));
+  assert.equal(payload.adaptiveIdempotencyKey, "publish:release-42");
+  assert.match(payload.args.join(" "), /publish:release-42/);
 });
 
 test("assignment-bound execute rejects missing side-effect contract before spawn", async () => {
