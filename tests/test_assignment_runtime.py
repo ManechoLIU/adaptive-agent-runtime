@@ -172,6 +172,33 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "side_effect contract"):
             apply_receipt({}, start, now=T0)
 
+    def test_inflight_side_effect_is_unknown_until_terminal_receipt_proves_outcome(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1, side_effect=True
+        ), now=T0)
+        lease = state["leases"]["a1"]
+        self.assertTrue(lease["result_unknown"])
+        with self.assertRaisesRegex(ValueError, "unknown side effect requires reconciliation"):
+            apply_receipt(state, receipt(
+                "assignment_started", T0 + timedelta(minutes=40), attempt=2, lease_id="lease-2", event_seq=1, side_effect=True
+            ), now=T0 + timedelta(minutes=40))
+
+    def test_terminal_receipt_can_clear_inflight_unknown_for_known_side_effect_failure(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1, side_effect=True
+        ), now=T0)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+            terminal_state="failed", transport_outcome="failed", delivery_outcome="fail",
+            summary="provider proved no mutation committed", evidence=[], artifacts=[], next_action="retry",
+            retry_class="transport_error", side_effect=True, result_unknown=False,
+        ), now=T0 + timedelta(minutes=1))
+        self.assertFalse(state["leases"]["a1"]["result_unknown"])
+        recovered = apply_receipt(state, receipt(
+            "assignment_started", T0 + timedelta(minutes=2), attempt=2, lease_id="lease-2", event_seq=1, side_effect=True
+        ), now=T0 + timedelta(minutes=2))
+        self.assertEqual(recovered["leases"]["a1"]["attempt"], 2)
+
     def test_unknown_non_idempotent_side_effect_blocks_next_attempt_at_runtime_gate(self):
         state = apply_receipt({}, receipt(
             "assignment_started", attempt=1, lease_id="lease-1", event_seq=1, side_effect=True
