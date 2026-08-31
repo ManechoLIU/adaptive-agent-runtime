@@ -236,6 +236,39 @@ class WebLifecycleAuditTests(unittest.TestCase):
             self.assertIn("control-event: allowed", events[0]["tool_response"]["output"])
             self.assertEqual(json.loads(cursor.read_text())["offset"], audit.stat().st_size)
 
+    def test_audit_consumer_waits_for_cross_process_cursor_lock_before_dispatch(self) -> None:
+        import fcntl, time
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            audit = root / "audit.jsonl"; cursor = root / "cursor.json"
+            receipt = {
+                "receiptId":"guard-lock-1", "childTool":"shell_command", "state":"succeeded",
+                "rootLabel":str(repo), "targetLabel":"python3 scripts/control_event_guard.py event.json",
+                "detail":f"命令：python3 scripts/control_event_guard.py event.json · 工作目录：{repo}\n\n命令输出：\ncontrol-event: allowed; done\n",
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            lock_path = cursor.with_suffix(cursor.suffix + ".consumer.lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            holder = lock_path.open("a+")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            released = []
+            import threading
+            def release_later():
+                time.sleep(0.35)
+                fcntl.flock(holder.fileno(), fcntl.LOCK_UN); holder.close(); released.append(True)
+            thread = threading.Thread(target=release_later); thread.start()
+            started = time.monotonic()
+            with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch:
+                code = web_bridge.main(["audit-once", "--session-id", "controller-1", "--repo", str(repo),
+                    "--audit-log", str(audit), "--cursor", str(cursor)])
+            elapsed = time.monotonic() - started
+            thread.join()
+        self.assertEqual(code, 0)
+        self.assertTrue(released)
+        self.assertGreater(elapsed, 0.25)
+        self.assertEqual(dispatch.call_count, 1)
+
     def test_audit_dispatch_failure_does_not_advance_cursor_and_replay_is_fail_closed(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:

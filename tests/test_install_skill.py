@@ -394,6 +394,40 @@ class HostAdapterInstallationTests(unittest.TestCase):
             self.assertEqual(zshenv.read_text(encoding="utf-8"), "export KEEP=1\n")
             self.assertIn("rolled back", output.getvalue().lower())
 
+    def test_different_targets_sharing_host_files_use_common_resource_lock(self):
+        import subprocess, sys, time
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = InstallMigrationContractTests().make_source(root)
+            target1 = root / "one" / "adaptive-delivery"
+            target2 = root / "two" / "adaptive-delivery"
+            hooks = root / "shared" / "hooks.json"
+            zshenv = root / "shared" / ".zshenv"
+            hooks.parent.mkdir(parents=True)
+            hooks.write_text('{"hooks":{}}\n', encoding="utf-8")
+            zshenv.write_text("export KEEP=1\n", encoding="utf-8")
+            # Hold the lock for a shared host file. A different target must still be blocked.
+            shared_lock = hooks.parent / f".{hooks.name}.adaptive-agent-runtime.lock"
+            ready = root / "ready"
+            holder = subprocess.Popen([sys.executable, "-c",
+                "import fcntl,time,sys,pathlib; p=pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True,exist_ok=True); f=open(p,'a+'); fcntl.flock(f.fileno(),fcntl.LOCK_EX); pathlib.Path(sys.argv[2]).write_text('1'); time.sleep(2)",
+                str(shared_lock), str(ready)])
+            for _ in range(100):
+                if ready.exists(): break
+                time.sleep(0.01)
+            installer = Path(__file__).resolve().parents[1] / "scripts" / "install_skill.py"
+            result = subprocess.run([sys.executable, str(installer), "--source", str(source), "--target", str(target2),
+                "--summary", "shared lock", "--impact", "none", "--stop-condition", "blocked",
+                "--hooks-file", str(hooks), "--zshenv-file", str(zshenv),
+                "--ai-bridge", str(root / "missing-bridge"), "--codex", str(root / "missing-codex")],
+                text=True, capture_output=True)
+            holder.wait(timeout=3)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("installer", result.stdout.lower())
+            self.assertFalse(target2.exists())
+            self.assertEqual(hooks.read_text(encoding="utf-8"), '{"hooks":{}}\n')
+            self.assertEqual(zshenv.read_text(encoding="utf-8"), "export KEEP=1\n")
+
     def test_install_cli_rejects_concurrent_installer_without_mutating_target(self):
         import subprocess, sys, time
         with tempfile.TemporaryDirectory() as d:

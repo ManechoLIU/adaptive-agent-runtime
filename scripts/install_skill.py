@@ -571,6 +571,45 @@ def _rollback_install_transaction(states: list[dict[str, Any]]) -> list[str]:
     return errors
 
 
+def _install_resource_lock_paths(target: Path, hooks: Path, zshenv: Path) -> list[Path]:
+    paths = [
+        target.parent / f".{target.name}.install.lock",
+        hooks.parent / f".{hooks.name}.adaptive-agent-runtime.lock",
+        zshenv.parent / f".{zshenv.name}.adaptive-agent-runtime.lock",
+    ]
+    return sorted(set(path.resolve(strict=False) for path in paths), key=lambda item: str(item))
+
+
+def _acquire_install_resource_locks(paths: list[Path]):
+    handles = []
+    try:
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a+")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                raise
+            handles.append(handle)
+        return handles
+    except Exception:
+        for handle in reversed(handles):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+        raise
+
+
+def _release_install_resource_locks(handles) -> None:
+    for handle in reversed(handles):
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install an exact Adaptive Agent Runtime revision with manifest and host-adapter evidence.")
     parser.add_argument("--source", required=True)
@@ -589,14 +628,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     target_path = Path(args.target).expanduser().resolve(strict=False)
     hooks_path = Path(args.hooks_file).expanduser().resolve(strict=False)
     zshenv_path = Path(args.zshenv_file).expanduser().resolve(strict=False)
-    install_lock_path = target_path.parent / f".{target_path.name}.install.lock"
-    install_lock_path.parent.mkdir(parents=True, exist_ok=True)
-    install_lock = install_lock_path.open("a+")
+    lock_paths = _install_resource_lock_paths(target_path, hooks_path, zshenv_path)
     try:
         try:
-            fcntl.flock(install_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            install_locks = _acquire_install_resource_locks(lock_paths)
         except BlockingIOError:
-            print(f"adaptive-agent-runtime-install: blocked: another installer is active for {target_path}")
+            print(f"adaptive-agent-runtime-install: blocked: another installer is active for shared install resources: {target_path}")
             return 1
         if args.no_configure_host_adapters:
             try:
@@ -611,7 +648,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         return _run_install_transaction(args, target_path, hooks_path, zshenv_path)
     finally:
-        install_lock.close()
+        if 'install_locks' in locals():
+            _release_install_resource_locks(install_locks)
 
 
 def _run_install_transaction(args, target_path: Path, hooks_path: Path, zshenv_path: Path) -> int:
