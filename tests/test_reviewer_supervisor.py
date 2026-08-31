@@ -368,6 +368,59 @@ class ReviewerSupervisorForcedCleanupTests(unittest.TestCase):
         self.assertIn("SIGKILL", result.diagnostic)
 
 
+
+class _LeaderExitsDescendantSurvivesProcess(_FakeProcess):
+    def __init__(self):
+        super().__init__([], returncode=0)
+        self.term_sent = False
+
+    def wait(self, timeout=None):
+        if self.term_sent:
+            return 0
+        raise subprocess.TimeoutExpired("codex", timeout or 0)
+
+
+class ReviewerSupervisorProcessGroupCleanupTests(unittest.TestCase):
+    def test_leader_exit_after_term_does_not_make_retry_safe_while_descendant_survives(self):
+        holder = []
+        sent = []
+        group_alive = {4242: True}
+
+        def factory(argv, **kwargs):
+            proc = _LeaderExitsDescendantSurvivesProcess()
+            holder.append(proc)
+            return proc
+
+        def signaler(pgid, sig):
+            sent.append((pgid, sig))
+            if sig == signal.SIGTERM:
+                holder[0].term_sent = True
+            elif sig == signal.SIGKILL:
+                group_alive[pgid] = False
+
+        def group_exists(pgid):
+            return group_alive.get(pgid, False)
+
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "a" * 40, "b" * 40, "schema", root / "events", root / "final")
+        result = run_attempt(
+            contract,
+            0,
+            popen_factory=factory,
+            codex_executable="codex",
+            timeout_seconds=0.01,
+            process_group_killer=signaler,
+            process_group_getter=lambda pid: 4242,
+            process_group_exists=group_exists,
+            termination_grace_seconds=0.01,
+        )
+
+        self.assertEqual(sent, [(4242, signal.SIGTERM), (4242, signal.SIGKILL)])
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertTrue(result.retry_safe)
+        self.assertIn("SIGKILL", result.diagnostic)
+
+
 class ReviewerSupervisorRunTests(unittest.TestCase):
     def setUp(self):
         self._repo_tmp = tempfile.TemporaryDirectory()

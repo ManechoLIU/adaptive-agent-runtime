@@ -158,6 +158,46 @@ class InstallMigrationContractTests(unittest.TestCase):
             self.assertIn("capabilities", manifest)
             self.assertEqual(set(manifest["capabilities"]), {"core", "desktop_adapter", "web_local_adapter"})
 
+
+    def test_install_materializes_recorded_revision_even_if_source_changes_after_head_resolution(self):
+        import subprocess
+        from unittest.mock import patch
+        import scripts.install_skill as installer
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            target = root / "installed" / "adaptive-delivery"
+            original = (source / "SKILL.md").read_text(encoding="utf-8")
+            real_git = installer._git
+            mutated = False
+
+            def racing_git(repo, *args):
+                nonlocal mutated
+                value = real_git(repo, *args)
+                if args == ("rev-parse", "HEAD") and not mutated:
+                    (source / "SKILL.md").write_text(original + "# concurrent mutation\\n", encoding="utf-8")
+                    mutated = True
+                return value
+
+            with patch("scripts.install_skill._git", side_effect=racing_git):
+                manifest = installer.install_skill(
+                    source,
+                    target,
+                    summary="race-safe install",
+                    impact="none",
+                    stop_condition="installed revision is exact",
+                )
+
+            committed = subprocess.check_output(
+                ["git", "-C", str(source), "show", f"{manifest['revision']}:SKILL.md"], text=True
+            )
+            installed = (target / "SKILL.md").read_text(encoding="utf-8")
+
+        self.assertTrue(mutated)
+        self.assertEqual(installed, committed)
+        self.assertNotIn("concurrent mutation", installed)
+
 class HostAdapterInstallationTests(unittest.TestCase):
     def test_codex_hook_install_preserves_existing_hooks_and_is_idempotent(self):
         import json

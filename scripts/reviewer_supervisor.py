@@ -114,45 +114,91 @@ def _session_id_from_event(event: dict) -> Optional[str]:
     return None
 
 
-def _signal_process_group(pid: int, sig: int) -> None:
+def _capture_process_group(pid: int) -> int:
     try:
-        os.killpg(os.getpgid(pid), sig)
+        return os.getpgid(pid)
+    except ProcessLookupError:
+        # start_new_session=True guarantees the child was its own group leader.
+        return pid
+
+
+def _signal_process_group(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
     except ProcessLookupError:
         return
 
 
+def _process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _wait_for_group_exit(process_group_id: int, group_exists: Callable[[int], bool], grace_seconds: float) -> bool:
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while True:
+        try:
+            if not group_exists(process_group_id):
+                return True
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+
+
 def _terminate_process_group(
     process,
+    process_group_id: int,
     process_group_signaler: Callable[[int, int], None],
+    process_group_exists: Callable[[int], bool],
     grace_seconds: float,
     *,
     send_term: bool = True,
 ) -> tuple[int, bool, str]:
     notes: list[str] = []
+    leader_reaped = False
+    exit_code = -signal.SIGTERM
     if send_term:
         try:
-            process_group_signaler(process.pid, signal.SIGTERM)
+            process_group_signaler(process_group_id, signal.SIGTERM)
             notes.append("SIGTERM")
         except (OSError, RuntimeError, ValueError) as exc:
             return -signal.SIGTERM, False, f"SIGTERM signal failed: {exc}"
     try:
-        return process.wait(timeout=grace_seconds), True, "; ".join(notes) or "already exited"
+        exit_code = process.wait(timeout=grace_seconds)
+        leader_reaped = True
     except subprocess.TimeoutExpired:
         notes.append("TERM grace expired")
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         notes.append(f"wait after TERM failed: {exc}")
 
+    group_gone = _wait_for_group_exit(process_group_id, process_group_exists, 0.0)
+    if leader_reaped and group_gone:
+        return exit_code, True, "; ".join(notes) or "already exited"
+
     try:
-        process_group_signaler(process.pid, signal.SIGKILL)
+        process_group_signaler(process_group_id, signal.SIGKILL)
         notes.append("SIGKILL")
     except (OSError, RuntimeError, ValueError) as exc:
         return -signal.SIGKILL, False, "; ".join(notes + [f"SIGKILL signal failed: {exc}"])
-    try:
-        return process.wait(timeout=grace_seconds), True, "; ".join(notes)
-    except subprocess.TimeoutExpired:
-        return -signal.SIGKILL, False, "; ".join(notes + ["process could not be reaped"])
-    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
-        return -signal.SIGKILL, False, "; ".join(notes + [f"final reap failed: {exc}"])
+    if not leader_reaped:
+        try:
+            exit_code = process.wait(timeout=grace_seconds)
+            leader_reaped = True
+        except subprocess.TimeoutExpired:
+            return -signal.SIGKILL, False, "; ".join(notes + ["process could not be reaped"])
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+            return -signal.SIGKILL, False, "; ".join(notes + [f"final reap failed: {exc}"])
+    group_gone = _wait_for_group_exit(process_group_id, process_group_exists, grace_seconds)
+    if not group_gone:
+        return exit_code, False, "; ".join(notes + ["process group still alive after SIGKILL"])
+    return exit_code, leader_reaped, "; ".join(notes)
 
 
 def _review_output_schema(expected_head: str) -> dict:
@@ -179,6 +225,8 @@ def run_attempt(
     codex_executable: str = "codex",
     timeout_seconds: float = 600.0,
     process_group_killer: Callable[[int, int], None] = _signal_process_group,
+    process_group_getter: Callable[[int], int] = _capture_process_group,
+    process_group_exists: Callable[[int], bool] = _process_group_exists,
     termination_grace_seconds: float = 5.0,
 ) -> AttemptResult:
     contract.event_path.parent.mkdir(parents=True, exist_ok=True)
@@ -219,9 +267,16 @@ def run_attempt(
             running_observed=False,
             diagnostic=f"reviewer launch failed: {exc}",
         )
+    try:
+        process_group_id = process_group_getter(process.pid)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return AttemptResult(
+            state="REVIEW_INFRA_FAILED", pid=process.pid, exit_code=70, running_observed=False,
+            diagnostic=f"reviewer process-group capture failed: {exc}", retry_safe=False,
+        )
     if process.stdin is None:
         exit_code, retry_safe, cleanup = _terminate_process_group(
-            process, process_group_killer, termination_grace_seconds, send_term=True
+            process, process_group_id, process_group_killer, process_group_exists, termination_grace_seconds, send_term=True
         )
         return AttemptResult(
             state="REVIEW_INFRA_FAILED",
@@ -279,7 +334,7 @@ def run_attempt(
         exit_code = process.wait(timeout=remaining)
     except subprocess.TimeoutExpired:
         exit_code, retry_safe, cleanup = _terminate_process_group(
-            process, process_group_killer, termination_grace_seconds, send_term=True
+            process, process_group_id, process_group_killer, process_group_exists, termination_grace_seconds, send_term=True
         )
         writer.join(0.05)
         reader.join(0.2)
@@ -295,7 +350,7 @@ def run_attempt(
         )
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         exit_code, retry_safe, cleanup = _terminate_process_group(
-            process, process_group_killer, termination_grace_seconds, send_term=True
+            process, process_group_id, process_group_killer, process_group_exists, termination_grace_seconds, send_term=True
         )
         writer.join(0.05)
         reader.join(0.2)

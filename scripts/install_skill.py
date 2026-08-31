@@ -379,15 +379,6 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
-def _tracked_files(source: Path) -> list[str]:
-    raw = subprocess.run(
-        ["git", "-C", str(source), "ls-files", "-z"],
-        check=True,
-        capture_output=True,
-    ).stdout
-    return sorted(item.decode("utf-8") for item in raw.split(b"\0") if item)
-
-
 def _changed_files(source: Path, previous_revision: str | None, revision: str, tracked: list[str]) -> list[str]:
     if not previous_revision:
         return tracked
@@ -399,6 +390,70 @@ def _changed_files(source: Path, previous_revision: str | None, revision: str, t
         return tracked
     output = _git(source, "diff", "--name-only", f"{previous_revision}..{revision}")
     return sorted(line for line in output.splitlines() if line.strip())
+
+
+
+def _revision_tree_entries(source: Path, revision: str) -> list[tuple[str, str, str, str]]:
+    raw = subprocess.run(
+        ["git", "-C", str(source), "ls-tree", "-rz", "--full-tree", revision],
+        check=True,
+        capture_output=True,
+    ).stdout
+    entries: list[tuple[str, str, str, str]] = []
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        meta, raw_path = record.split(b"\t", 1)
+        mode, kind, object_id = meta.decode("ascii").split(" ", 2)
+        path = raw_path.decode("utf-8")
+        entries.append((mode, kind, object_id, path))
+    return entries
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _materialize_revision(source: Path, revision: str, destination: Path) -> list[str]:
+    entries = _revision_tree_entries(source, revision)
+    tracked: list[str] = []
+    for mode, kind, object_id, relative in entries:
+        if kind != "blob":
+            raise ValueError(f"unsupported tracked object in install revision: {relative} ({kind})")
+        tracked.append(relative)
+        dst = destination / relative
+        if dst.exists() or dst.is_symlink():
+            _remove_path(dst)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        content = subprocess.run(
+            ["git", "-C", str(source), "cat-file", "blob", object_id],
+            check=True,
+            capture_output=True,
+        ).stdout
+        if mode == "120000":
+            os.symlink(content.decode("utf-8"), dst)
+        else:
+            dst.write_bytes(content)
+            dst.chmod(0o755 if mode == "100755" else 0o644)
+    return sorted(tracked)
+
+
+def _promote_staged_install(stage: Path, target: Path) -> None:
+    backup = target.parent / f".{target.name}.backup-{next(tempfile._get_candidate_names())}"
+    had_target = target.exists() or target.is_symlink()
+    if had_target:
+        os.replace(target, backup)
+    try:
+        os.replace(stage, target)
+    except Exception:
+        if had_target and backup.exists():
+            os.replace(backup, target)
+        raise
+    if had_target and backup.exists():
+        shutil.rmtree(backup)
 
 
 def install_skill(
@@ -423,47 +478,45 @@ def install_skill(
         raise ValueError("source repository must be tracked-clean before installation")
 
     revision = _git(source_path, "rev-parse", "HEAD")
-    tracked = _tracked_files(source_path)
-    target_path.mkdir(parents=True, exist_ok=True)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
     prior_manifest = _read_manifest(target_path / MANIFEST_NAME)
     prior_files = prior_manifest.get("files", {}) if isinstance(prior_manifest.get("files"), dict) else {}
     prior_revision = previous_revision or str(prior_manifest.get("revision", "")).strip() or None
 
-    tracked_set = set(tracked)
-    for relative in prior_files:
-        if relative in tracked_set:
-            continue
-        old = target_path / relative
-        if old.is_file() or old.is_symlink():
-            old.unlink()
-
-    hashes: dict[str, str] = {}
-    for relative in tracked:
-        src = source_path / relative
-        dst = target_path / relative
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        hashes[relative] = _sha256(dst)
-
-    installed_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-    manifest: dict[str, Any] = {
-        "schema_version": 1,
-        "product_name": PRODUCT_NAME,
-        "skill_id": SKILL_ID,
-        "product_slug": PRODUCT_SLUG,
-        "legacy_skill_ids": list(LEGACY_SKILL_IDS),
-        "revision": revision,
-        "previous_revision": prior_revision,
-        "installed_at": installed_at,
-        "source_root": str(source_path),
-        "summary": summary.strip(),
-        "impact": impact,
-        "stop_condition": stop_condition.strip(),
-        "changed_files": _changed_files(source_path, prior_revision, revision, tracked),
-        "capabilities": detect_host_capabilities(skill_root=target_path),
-        "files": hashes,
-    }
-    _write_json_atomic(target_path / MANIFEST_NAME, manifest)
+    stage = Path(tempfile.mkdtemp(prefix=f".{target_path.name}.stage-", dir=target_path.parent))
+    try:
+        if target_path.exists():
+            shutil.copytree(target_path, stage, symlinks=True, dirs_exist_ok=True)
+        for relative in prior_files:
+            _remove_path(stage / relative) if (stage / relative).exists() or (stage / relative).is_symlink() else None
+        tracked = _materialize_revision(source_path, revision, stage)
+        hashes = {relative: _sha256(stage / relative) for relative in tracked}
+        installed_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        manifest: dict[str, Any] = {
+            "schema_version": 1,
+            "product_name": PRODUCT_NAME,
+            "skill_id": SKILL_ID,
+            "product_slug": PRODUCT_SLUG,
+            "legacy_skill_ids": list(LEGACY_SKILL_IDS),
+            "revision": revision,
+            "previous_revision": prior_revision,
+            "installed_at": installed_at,
+            "source_root": str(source_path),
+            "summary": summary.strip(),
+            "impact": impact,
+            "stop_condition": stop_condition.strip(),
+            "changed_files": _changed_files(source_path, prior_revision, revision, tracked),
+            "capabilities": detect_host_capabilities(skill_root=target_path),
+            "files": hashes,
+        }
+        _write_json_atomic(stage / MANIFEST_NAME, manifest)
+        for relative, expected in hashes.items():
+            if _sha256(stage / relative) != expected:
+                raise ValueError(f"staged file hash mismatch: {relative}")
+        _promote_staged_install(stage, target_path)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
 
     for relative, expected in hashes.items():
         if _sha256(target_path / relative) != expected:
