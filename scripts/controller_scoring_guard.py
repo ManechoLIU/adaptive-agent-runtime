@@ -15,6 +15,7 @@ RECEIPT_DIRECTORY = "adaptive-delivery"
 RECEIPT_FILE = "controller-scoring-model-read.json"
 RECEIPT_MAX_AGE_SECONDS = 1800
 SCORE_HISTORY_FILE = "controller-score-history.jsonl"
+TERMINAL_CYCLE_STATUSES = {"CLOSED", "FAILED", "BLOCKED", "CANCELLED", "ABSORBED", "PARKED"}
 
 
 def _git_common_dir(repo: Path) -> Path:
@@ -48,15 +49,15 @@ def append_score_history(repo: str | Path, record: dict[str, Any]) -> dict[str, 
     return payload
 
 
-def latest_score_history(repo: str | Path, *, controller_session_id: str) -> dict[str, Any] | None:
+def _score_history_records(repo: str | Path) -> list[dict[str, Any]]:
     target = score_history_path(repo)
     if not target.is_file():
-        return None
-    latest: dict[str, Any] | None = None
+        return []
     try:
         lines = target.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return None
+        return []
+    records: list[dict[str, Any]] = []
     for line in lines:
         if not line.strip():
             continue
@@ -64,12 +65,47 @@ def latest_score_history(repo: str | Path, *, controller_session_id: str) -> dic
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(value, dict):
-            continue
+        if isinstance(value, dict):
+            records.append(value)
+    return records
+
+
+def latest_score_history(repo: str | Path, *, controller_session_id: str) -> dict[str, Any] | None:
+    latest: dict[str, Any] | None = None
+    for value in _score_history_records(repo):
         if str(value.get("controller_session_id", "")) != str(controller_session_id):
+            continue
+        # Backward compatibility: records written before record_kind existed are formal scores.
+        if str(value.get("record_kind", "formal")) != "formal":
             continue
         latest = value
     return latest
+
+
+def cycle_score_extremes(
+    repo: str | Path, *, controller_session_id: str, model_sha256: str
+) -> dict[str, dict[str, Any] | None]:
+    eligible: list[dict[str, Any]] = []
+    for value in _score_history_records(repo):
+        if str(value.get("controller_session_id", "")) != str(controller_session_id):
+            continue
+        if value.get("record_kind") != "cycle":
+            continue
+        if str(value.get("model_sha256", "")) != str(model_sha256):
+            continue
+        if str(value.get("terminal_status", "")).upper() not in TERMINAL_CYCLE_STATUSES:
+            continue
+        try:
+            float(value["score"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        eligible.append(value)
+    if not eligible:
+        return {"best": None, "worst": None}
+    return {
+        "best": max(eligible, key=lambda record: float(record["score"])),
+        "worst": min(eligible, key=lambda record: float(record["score"])),
+    }
 
 
 def scoring_model_path(skill_root: str | Path) -> Path:
@@ -155,11 +191,50 @@ def finalize_score(
         raise ValueError("score-guard failed: " + "; ".join(errors))
     record = {
         "schema_version": 1,
+        "record_kind": "formal",
         "controller_session_id": str(controller_session_id),
         "turn_id": str(turn_id),
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "score": float(score),
         "window_summary": window_summary,
+        "model_sha256": scoring_model_sha256(skill_root),
+        "message_sha256": message_sha256,
+    }
+    return append_score_history(repo, record)
+
+
+def finalize_cycle_score(
+    repo: str | Path,
+    *,
+    skill_root: str | Path,
+    controller_session_id: str,
+    turn_id: str,
+    cycle_id: str,
+    terminal_status: str,
+    score: float,
+    evidence_summary: str | None,
+    message_sha256: str | None,
+) -> dict[str, Any]:
+    status = str(terminal_status).upper().strip()
+    if status not in TERMINAL_CYCLE_STATUSES:
+        raise ValueError("cycle score requires a terminal cycle status")
+    if not str(cycle_id).strip():
+        raise ValueError("cycle score requires a non-empty cycle_id")
+    if not 0 <= float(score) <= 100:
+        raise ValueError("cycle score must be within 0..100")
+    errors = consume_score_guard(repo, skill_root=skill_root)
+    if errors:
+        raise ValueError("score-guard failed: " + "; ".join(errors))
+    record = {
+        "schema_version": 1,
+        "record_kind": "cycle",
+        "controller_session_id": str(controller_session_id),
+        "turn_id": str(turn_id),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "cycle_id": str(cycle_id).strip(),
+        "terminal_status": status,
+        "score": float(score),
+        "evidence_summary": evidence_summary,
         "model_sha256": scoring_model_sha256(skill_root),
         "message_sha256": message_sha256,
     }
@@ -183,6 +258,9 @@ def main() -> int:
     latest = sub.add_parser("latest-score")
     latest.add_argument("--repo", required=True)
     latest.add_argument("--controller-session", required=True)
+    extremes = sub.add_parser("cycle-extremes")
+    extremes.add_argument("--repo", required=True)
+    extremes.add_argument("--controller-session", required=True)
     finalize = sub.add_parser("finalize-score")
     finalize.add_argument("--repo", required=True)
     finalize.add_argument("--controller-session", required=True)
@@ -202,6 +280,13 @@ def main() -> int:
     if args.command == "latest-score":
         record = latest_score_history(args.repo, controller_session_id=args.controller_session)
         print("UNKNOWN" if record is None else json.dumps(record, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.command == "cycle-extremes":
+        payload = cycle_score_extremes(
+            args.repo, controller_session_id=args.controller_session,
+            model_sha256=scoring_model_sha256(installed_skill_root),
+        )
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 0
     if args.command == "finalize-score":
         try:

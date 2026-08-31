@@ -282,6 +282,27 @@ class ControllerScoringHookTests(unittest.TestCase):
             handler = value["hooks"]["UserPromptSubmit"][0]["hooks"][0]
             self.assertEqual(0, handler["additionalContextLimit"])
 
+    def test_single_cycle_score_is_persisted_as_cycle_not_formal_history(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-cycle", "cwd": str(repo), "prompt": "给总控这个单回合闭环评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, state = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-cycle", "cwd": str(repo),
+                 "last_assistant_message": "单回合诊断评分：91/100。\n控制回合：M1-F4-C-SERVER-GATE\n回合终态：CLOSED\n证据摘要：reviewer pass then main。"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual({}, output)
+            self.assertIsNone(hook.latest_score_history(repo, controller_session_id="controller-1"))
+            extremes = hook.cycle_score_extremes(repo, controller_session_id="controller-1", model_sha256=hook.scoring_model_sha256(ROOT))
+            self.assertEqual(91.0, extremes["best"]["score"])
+            self.assertEqual("M1-F4-C-SERVER-GATE", extremes["best"]["cycle_id"])
+
 
 class ControllerScoringOutputGateTests(unittest.TestCase):
     def test_output_detector_requires_scoring_semantics(self):

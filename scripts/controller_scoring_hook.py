@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from controller_scoring_guard import consume_score_guard, finalize_score, latest_score_history, read_and_record_model, receipt_path
+    from controller_scoring_guard import consume_score_guard, cycle_score_extremes, finalize_cycle_score, finalize_score, latest_score_history, read_and_record_model, receipt_path
 except ModuleNotFoundError:
-    from scripts.controller_scoring_guard import consume_score_guard, finalize_score, latest_score_history, read_and_record_model, receipt_path
+    from scripts.controller_scoring_guard import consume_score_guard, cycle_score_extremes, finalize_cycle_score, finalize_score, latest_score_history, read_and_record_model, receipt_path
 
 MODEL_RELATIVE_PATH = Path("references/controller-performance-scoring.md")
 STATE_ROOT = Path(
@@ -27,6 +27,8 @@ STATE_ROOT = Path(
 
 _CONTROLLER_TERMS = re.compile(r"(?:总控|项目总控|controller|orchestrator)", re.IGNORECASE)
 _SCORE_VALUE = r"(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)"
+_CYCLE_REQUEST = re.compile(r"(?:单回合|闭环回合|最佳闭环|最差闭环|single[ -]?cycle)", re.IGNORECASE)
+_CYCLE_OUTPUT_SCORE = re.compile(r"(?:单回合诊断评分|单回合评分|single[ -]?cycle(?: diagnostic)? score).{0,20}?(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)", re.IGNORECASE | re.DOTALL)
 _OUTPUT_SCORE = re.compile(
     rf"(?:总控|项目总控|controller|orchestrator).{{0,80}}?(?:评分|得分|score|performance).{{0,40}}?{_SCORE_VALUE}",
     re.IGNORECASE | re.DOTALL,
@@ -68,6 +70,24 @@ def _extract_score_value(message: str) -> float | None:
         return None
     value = re.search(r"(?:100|[1-9]?\d)(?:\.\d+)?", match.group(0))
     return float(value.group(0)) if value else None
+
+
+def _extract_cycle_score_value(message: str) -> float | None:
+    match = _CYCLE_OUTPUT_SCORE.search(str(message or ""))
+    if not match:
+        return None
+    value = re.search(r"(?:100|[1-9]?\d)(?:\.\d+)?", match.group(0))
+    return float(value.group(0)) if value else None
+
+
+def _extract_labeled_value(message: str, labels: tuple[str, ...]) -> str | None:
+    for raw_line in str(message or "").splitlines():
+        line = raw_line.strip()
+        for label in labels:
+            match = re.match(rf"{label}\s*[：:]\s*(.+)$", line, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()[:500] or None
+    return None
 
 
 def _extract_window_summary(message: str) -> str | None:
@@ -165,6 +185,7 @@ def evaluate_event(
                 "receipt_sha256": str(receipt.get("model_sha256", "")),
                 "reinject_required": False,
                 "turn_id": str(event.get("turn_id", "")),
+                "scoring_mode": "cycle" if _CYCLE_REQUEST.search(prompt) else "formal",
             }
         )
         return {
@@ -211,7 +232,8 @@ def evaluate_event(
                     "当前评分正文不再有效。本回合只能说明阻塞，不能输出分数；请用户重新提交总控评分/审计请求，让新的 UserPromptSubmit 完整注入当前安装评分模型。"
                 ),
             }, state
-        score = _extract_score_value(message)
+        scoring_mode = str(state.get("scoring_mode", "formal"))
+        score = _extract_cycle_score_value(message) if scoring_mode == "cycle" else _extract_score_value(message)
         try:
             if score is None:
                 errors = consume_score_guard(Path(repo_text), skill_root=skill_root)
@@ -220,6 +242,17 @@ def evaluate_event(
                         "decision": "block",
                         "reason": "controller scoring blocked: score-guard failed: " + "; ".join(errors),
                     }, state
+            elif scoring_mode == "cycle":
+                cycle_id = _extract_labeled_value(message, (r"控制回合", r"cycle(?: id)?"))
+                terminal_status = _extract_labeled_value(message, (r"回合终态", r"terminal status"))
+                evidence_summary = _extract_labeled_value(message, (r"证据摘要", r"evidence summary"))
+                finalize_cycle_score(
+                    Path(repo_text), skill_root=skill_root,
+                    controller_session_id=str(event.get("session_id", "")).strip(),
+                    turn_id=current_turn, cycle_id=cycle_id or "", terminal_status=terminal_status or "",
+                    score=score, evidence_summary=evidence_summary,
+                    message_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                )
             else:
                 finalize_score(
                     Path(repo_text), skill_root=skill_root,

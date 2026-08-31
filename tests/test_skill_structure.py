@@ -490,6 +490,15 @@ class SkillStructureTests(unittest.TestCase):
         ):
             self.assertIn(phrase, visual)
 
+    def test_scoring_docs_expose_fixed_raw_scale_and_single_cycle_diagnostics(self):
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for text in (skill, readme):
+            self.assertIn("0–100", text)
+            self.assertIn("单回合", text)
+            self.assertIn("最佳", text)
+            self.assertIn("最差", text)
+
 
 if __name__ == "__main__":
     unittest.main()

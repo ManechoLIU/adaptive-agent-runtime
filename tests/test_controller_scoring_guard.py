@@ -181,6 +181,63 @@ class ControllerScoringGuardTests(unittest.TestCase):
         self.assertNotEqual(0, completed.returncode)
         self.assertIn("unrecognized arguments", completed.stderr)
 
+    def test_cycle_history_extremes_are_separate_from_formal_latest_score(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            model = guard.scoring_model_sha256(ROOT)
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "formal", "score": 88.0, "model_sha256": model})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "good", "terminal_status": "CLOSED", "score": 94.0, "model_sha256": model})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "bad", "terminal_status": "FAILED", "score": 52.0, "model_sha256": model})
+            self.assertEqual(88.0, guard.latest_score_history(repo, controller_session_id="c1")["score"])
+            extremes = guard.cycle_score_extremes(repo, controller_session_id="c1", model_sha256=model)
+            self.assertEqual("good", extremes["best"]["cycle_id"])
+            self.assertEqual("bad", extremes["worst"]["cycle_id"])
+
+    def test_cycle_extremes_ignore_nonterminal_and_other_model_records(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            model = guard.scoring_model_sha256(ROOT)
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "active", "terminal_status": "ACTIVE", "score": 5.0, "model_sha256": model})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "old-model", "terminal_status": "CLOSED", "score": 99.0, "model_sha256": "other"})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "valid", "terminal_status": "BLOCKED", "score": 70.0, "model_sha256": model})
+            extremes = guard.cycle_score_extremes(repo, controller_session_id="c1", model_sha256=model)
+            self.assertEqual("valid", extremes["best"]["cycle_id"])
+            self.assertEqual("valid", extremes["worst"]["cycle_id"])
+
+    def test_finalize_cycle_score_requires_terminal_cycle_and_keeps_formal_history_clean(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            guard.record_model_read(repo, skill_root=ROOT)
+            with self.assertRaisesRegex(ValueError, "terminal"):
+                guard.finalize_cycle_score(repo, skill_root=ROOT, controller_session_id="c1", turn_id="t1", cycle_id="cycle-1", terminal_status="ACTIVE", score=80.0, evidence_summary="still running", message_sha256="x")
+            guard.record_model_read(repo, skill_root=ROOT)
+            record = guard.finalize_cycle_score(repo, skill_root=ROOT, controller_session_id="c1", turn_id="t2", cycle_id="cycle-1", terminal_status="CLOSED", score=82.0, evidence_summary="closed with reviewer", message_sha256="y")
+            self.assertEqual("cycle", record["record_kind"])
+            self.assertIsNone(guard.latest_score_history(repo, controller_session_id="c1"))
+
+    def test_cycle_extremes_cli_reports_best_and_worst_for_current_model(self):
+        guard = load_module()
+        import json, subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            model = guard.scoring_model_sha256(ROOT)
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "best", "terminal_status": "CLOSED", "score": 93.0, "model_sha256": model})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "worst", "terminal_status": "FAILED", "score": 61.0, "model_sha256": model})
+            completed = subprocess.run(["python3", str(SCRIPT), "cycle-extremes", "--repo", str(repo), "--controller-session", "c1"], check=True, capture_output=True, text=True)
+            payload = json.loads(completed.stdout)
+            self.assertEqual("best", payload["best"]["cycle_id"])
+            self.assertEqual("worst", payload["worst"]["cycle_id"])
+
 
 if __name__ == "__main__":
     unittest.main()
