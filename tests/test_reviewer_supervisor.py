@@ -79,6 +79,19 @@ class ReviewerSupervisorCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "critical"):
             validate_verdict(payload, "a" * 40)
 
+    def test_verdict_rejects_additional_keys_independently_of_codex_schema(self):
+        head = "a" * 40
+        payload = {
+            "reviewed_head": head,
+            "verdict": "PASS",
+            "critical": [],
+            "important": [],
+            "minor": [],
+            "unexpected": "must fail closed",
+        }
+        with self.assertRaisesRegex(ValueError, "exact keys"):
+            validate_verdict(payload, head)
+
 
 class _FakeStdin:
     def __init__(self):
@@ -153,6 +166,52 @@ class ReviewerSupervisorLaunchTests(unittest.TestCase):
         self.assertTrue(result.running_observed)
         self.assertEqual(result.session_id, "thread-1")
         self.assertEqual(result.pid, 4242)
+
+
+class _BrokenPipeStdin(_FakeStdin):
+    def write(self, text):
+        raise BrokenPipeError("child exited before stdin delivery")
+
+
+class _BrokenPipeProcess(_FakeProcess):
+    def __init__(self):
+        super().__init__([], returncode=1)
+        self.stdin = _BrokenPipeStdin()
+
+
+class ReviewerSupervisorInfrastructureFailureTests(unittest.TestCase):
+    def _contract(self):
+        root = Path(tempfile.mkdtemp())
+        return ReviewContract(Path.cwd(), "b" * 40, "a" * 40, "review", root / "events", root / "final")
+
+    def test_missing_codex_binary_becomes_infra_result_instead_of_exception(self):
+        def factory(argv, **kwargs):
+            raise FileNotFoundError("codex missing")
+        result = run_attempt(self._contract(), 0, popen_factory=factory, codex_executable="/missing/codex")
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertFalse(result.running_observed)
+        self.assertIn("launch", result.diagnostic.lower())
+
+    def test_broken_pipe_while_delivering_instructions_becomes_infra_result(self):
+        def factory(argv, **kwargs):
+            return _BrokenPipeProcess()
+        result = run_attempt(self._contract(), 0, popen_factory=factory, codex_executable="codex")
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertIn("stdin", result.diagnostic.lower())
+
+    def test_signal_failure_is_fail_closed_and_not_retry_safe(self):
+        holder = []
+        def factory(argv, **kwargs):
+            proc = _TimeoutProcess(stdout=iter([])); holder.append(proc); return proc
+        def signaler(pid, sig):
+            raise PermissionError("cannot signal process group")
+        result = run_attempt(
+            self._contract(), 0, popen_factory=factory, codex_executable="codex",
+            timeout_seconds=0.01, process_group_killer=signaler,
+        )
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertFalse(result.retry_safe)
+        self.assertIn("signal", result.diagnostic.lower())
 
 
 class _SlowStdout:
@@ -301,6 +360,15 @@ class ReviewerSupervisorRunTests(unittest.TestCase):
             return AttemptResult("RUNNING", 1, 0, True, "s")
         result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
         self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+
+    def test_attempt_exception_updates_durable_state_instead_of_leaving_starting(self):
+        def attempt(contract, number):
+            raise OSError("spawn infrastructure exploded")
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        state = json.loads(result.state_path.read_text())
+        self.assertEqual(state["state"], "REVIEW_INFRA_FAILED")
+        self.assertIn("spawn infrastructure exploded", state["diagnostic"])
 
     def test_base_ref_is_resolved_once_to_immutable_commit(self):
         base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()

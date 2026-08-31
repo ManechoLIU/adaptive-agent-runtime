@@ -44,6 +44,9 @@ def build_review_instructions(user_instructions: str, expected_head: str, base_r
 def validate_verdict(payload: dict, expected_head: str) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("verdict payload must be an object")
+    expected_keys = {"reviewed_head", "verdict", "critical", "important", "minor"}
+    if set(payload) != expected_keys:
+        raise ValueError("verdict payload exact keys required")
     if payload.get("reviewed_head") != expected_head:
         raise ValueError("reviewed_head does not match candidate HEAD")
     if payload.get("verdict") not in {"PASS", "FINDINGS"}:
@@ -118,6 +121,31 @@ def _signal_process_group(pid: int, sig: int) -> None:
         return
 
 
+def _terminate_process_group(
+    process,
+    process_group_signaler: Callable[[int, int], None],
+    grace_seconds: float,
+    *,
+    send_term: bool = True,
+) -> tuple[int, bool, str]:
+    if send_term:
+        try:
+            process_group_signaler(process.pid, signal.SIGTERM)
+        except (OSError, RuntimeError) as exc:
+            return -signal.SIGTERM, False, f"SIGTERM signal failed: {exc}"
+    try:
+        return process.wait(timeout=grace_seconds), True, "SIGTERM" if send_term else "already exited"
+    except subprocess.TimeoutExpired:
+        try:
+            process_group_signaler(process.pid, signal.SIGKILL)
+        except (OSError, RuntimeError) as exc:
+            return -signal.SIGKILL, False, f"SIGKILL signal failed: {exc}"
+        try:
+            return process.wait(timeout=grace_seconds), True, "SIGKILL after SIGTERM grace"
+        except subprocess.TimeoutExpired:
+            return -signal.SIGKILL, False, "SIGKILL sent but process could not be reaped"
+
+
 def _review_output_schema(expected_head: str) -> dict:
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -163,20 +191,56 @@ def run_attempt(
         str(contract.final_path),
         "-",
     ]
-    process = popen_factory(
-        argv,
-        cwd=str(contract.repo),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        start_new_session=True,
-    )
+    try:
+        process = popen_factory(
+            argv,
+            cwd=str(contract.repo),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return AttemptResult(
+            state="REVIEW_INFRA_FAILED",
+            pid=-1,
+            exit_code=127,
+            running_observed=False,
+            diagnostic=f"reviewer launch failed: {exc}",
+        )
     if process.stdin is None:
-        raise RuntimeError("reviewer stdin pipe unavailable")
-    process.stdin.write(contract.instructions)
-    process.stdin.close()
+        exit_code, retry_safe, cleanup = _terminate_process_group(
+            process, process_group_killer, termination_grace_seconds, send_term=True
+        )
+        return AttemptResult(
+            state="REVIEW_INFRA_FAILED",
+            pid=process.pid,
+            exit_code=exit_code,
+            running_observed=False,
+            diagnostic=f"reviewer stdin pipe unavailable; cleanup={cleanup}",
+            retry_safe=retry_safe,
+        )
+    try:
+        process.stdin.write(contract.instructions)
+        process.stdin.close()
+    except (BrokenPipeError, OSError, ValueError) as exc:
+        try:
+            exit_code = process.wait(timeout=termination_grace_seconds)
+            retry_safe, cleanup = True, "child already exited"
+        except subprocess.TimeoutExpired:
+            exit_code, retry_safe, cleanup = _terminate_process_group(
+                process, process_group_killer, termination_grace_seconds, send_term=True
+            )
+        return AttemptResult(
+            state="REVIEW_INFRA_FAILED",
+            pid=process.pid,
+            exit_code=exit_code,
+            running_observed=False,
+            diagnostic=f"reviewer stdin delivery failed: {exc}; cleanup={cleanup}",
+            retry_safe=retry_safe,
+        )
 
     observed = {"running": False, "session_id": None}
     diagnostics: list[str] = []
@@ -202,23 +266,10 @@ def run_attempt(
     try:
         exit_code = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
-        process_group_killer(process.pid, signal.SIGTERM)
-        forced_kill = False
-        retry_safe = True
-        try:
-            exit_code = process.wait(timeout=termination_grace_seconds)
-        except subprocess.TimeoutExpired:
-            forced_kill = True
-            process_group_killer(process.pid, signal.SIGKILL)
-            try:
-                exit_code = process.wait(timeout=termination_grace_seconds)
-            except subprocess.TimeoutExpired:
-                exit_code = -signal.SIGKILL
-                retry_safe = False
+        exit_code, retry_safe, cleanup = _terminate_process_group(
+            process, process_group_killer, termination_grace_seconds, send_term=True
+        )
         reader.join(0.2)
-        cleanup = "SIGKILL after SIGTERM grace" if forced_kill else "SIGTERM"
-        if not retry_safe:
-            cleanup += "; process could not be reaped, retry disabled"
         return AttemptResult(
             state="REVIEW_INFRA_FAILED",
             pid=process.pid,
@@ -336,12 +387,21 @@ def run_review(
         event_path = root / f"{run_id}.attempt-{attempt}.events.jsonl"
         final_path = root / f"{run_id}.attempt-{attempt}.final.json"
         contract = ReviewContract(repo, base_revision, head, review_instructions, event_path, final_path)
-        if runner is None:
-            result = run_attempt(
-                contract, attempt, codex_executable=codex, timeout_seconds=timeout_seconds
+        try:
+            if runner is None:
+                result = run_attempt(
+                    contract, attempt, codex_executable=codex, timeout_seconds=timeout_seconds
+                )
+            else:
+                result = runner(contract, attempt)
+        except Exception as exc:
+            result = AttemptResult(
+                state="REVIEW_INFRA_FAILED",
+                pid=-1,
+                exit_code=70,
+                running_observed=False,
+                diagnostic=f"review attempt infrastructure exception: {type(exc).__name__}: {exc}",
             )
-        else:
-            result = runner(contract, attempt)
         snapshot = dict(base_state)
         snapshot.update({
             "retry_count": attempt,
