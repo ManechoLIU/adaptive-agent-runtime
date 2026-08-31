@@ -11,7 +11,12 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
+
+try:
+    from controller_health import decide_controller_wake, derive_controller_health
+except ModuleNotFoundError:
+    from scripts.controller_health import decide_controller_wake, derive_controller_health
 
 
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
@@ -422,17 +427,15 @@ def native_runtime_env(runtime_path: str | None = None) -> dict[str, str]:
 
 def codex_requires_node(codex: Path) -> bool:
     try:
-        first = codex.open("r", encoding="utf-8", errors="ignore").readline(512)
+        with codex.open("r", encoding="utf-8", errors="ignore") as handle:
+            first = handle.readline(512)
     except OSError:
         return False
     return "/usr/bin/env node" in first
 
 
 def write_auto_stop_state(state_path: Path, value: dict[str, Any]) -> None:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = state_path.with_suffix(state_path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(state_path)
+    _write_json_atomic_file(state_path, value)
 
 
 def preflight_native_resume(
@@ -442,9 +445,9 @@ def preflight_native_resume(
     if not repo.is_dir():
         return False, f"repository does not exist: {repo}", env
     try:
-        registered = registered_controller_for_repo(repo, registry)
-    except ValueError as exc:
-        return False, str(exc), env
+        registered = _registered_controller_for_common_dir(repo, registry)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"cannot resolve registered controller common-dir: {exc}", env
     if registered != session_id:
         return False, f"session {session_id} is not the registered controller for {repo}", env
     codex_path = Path(codex).expanduser()
@@ -485,6 +488,274 @@ def native_resume_command(*, codex: str, session_id: str, repo: Path) -> list[st
         "starting unrelated work."
     )
     return [codex, "exec", "-C", str(repo.resolve()), "resume", session_id, prompt]
+
+
+def execute_native_resume(
+    *,
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    codex: str,
+    runtime_path: str | None = None,
+) -> dict[str, Any]:
+    """Run one bounded, preflighted same-thread native resume attempt."""
+    command = native_resume_command(codex=codex, session_id=session_id, repo=repo)
+    try:
+        ok, preflight_error, env = preflight_native_resume(
+            session_id=session_id,
+            repo=repo,
+            registry=registry,
+            codex=codex,
+            runtime_path=runtime_path,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        ok, preflight_error, env = (
+            False,
+            f"native resume preflight error: {exc}",
+            native_runtime_env(runtime_path),
+        )
+    if not ok:
+        return {
+            "operation": "native_resume",
+            "command": command,
+            "result": "FAILED",
+            "state": "RESUME_FAILED",
+            "pending_control_event": True,
+            "returncode": 78,
+            "stderr_tail": bounded_tail(preflight_error),
+            "error_code": "WEB_LIFECYCLE_RESUME_FAILED",
+        }
+
+    try:
+        completed = subprocess.run(
+            command, check=False, capture_output=True, text=True, env=env
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "operation": "native_resume",
+            "command": command,
+            "result": "FAILED",
+            "state": "RESUME_FAILED",
+            "pending_control_event": True,
+            "returncode": 78,
+            "stderr_tail": bounded_tail(f"native resume execution error: {exc}"),
+            "error_code": "WEB_LIFECYCLE_RESUME_FAILED",
+        }
+
+    attempt: dict[str, Any] = {
+        "operation": "native_resume",
+        "command": command,
+        "pending_control_event": True,
+        "returncode": completed.returncode,
+        "stdout_tail": bounded_tail(completed.stdout),
+        "stderr_tail": bounded_tail(completed.stderr),
+    }
+    if completed.returncode == 0:
+        attempt.update({"result": "CONFIRMED", "state": "RESUME_SUCCEEDED"})
+        return attempt
+    attempt.update(classify_native_resume_failure(
+        completed.returncode, completed.stdout, completed.stderr
+    ))
+    attempt["result"] = "DEFERRED" if attempt["state"] == "RESUME_DEFERRED_ACTIVE_WRITER" else "FAILED"
+    return attempt
+
+
+def controller_wake_lock_path(repo: Path) -> Path:
+    return _git_common_dir(repo) / "adaptive-delivery" / "controller-wake.lock"
+
+
+def _registered_controller_for_common_dir(repo: Path, registry_path: Path) -> str | None:
+    common_dir = _git_common_dir(repo)
+    registry = load_json(registry_path)
+    matches: list[str] = []
+    for session_id, registered_repo in registry.items():
+        if not isinstance(session_id, str) or not isinstance(registered_repo, str):
+            continue
+        try:
+            if _git_common_dir(Path(registered_repo).expanduser().resolve()) == common_dir:
+                matches.append(session_id)
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _wake_event_fingerprint(lifecycle_state: dict[str, Any]) -> str:
+    value = {
+        "pending_control_event": lifecycle_state.get("pending_control_event") is True,
+        "triggers": lifecycle_state.get("triggers", []),
+    }
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return __import__("hashlib").sha256(encoded).hexdigest()
+
+
+def _wake_receipt(
+    *,
+    common_dir: Path,
+    session_id: str,
+    event_fingerprint: str,
+    health: dict[str, Any],
+    decision: str,
+    selected_host: str | None,
+    reason: str,
+    operation: str | None,
+    result: str,
+    command: list[str] | None = None,
+    diagnostics: str | None = None,
+) -> dict[str, Any]:
+    now = int(time.time() * 1000)
+    receipt: dict[str, Any] = {
+        "schema_version": 1,
+        "canonical_common_dir": str(common_dir),
+        "controller_session_id": session_id,
+        "event_fingerprint": event_fingerprint,
+        "health": health.get("state"),
+        "preferred_host": health.get("controller_host"),
+        "selected_host": selected_host,
+        "decision": decision,
+        "reason": bounded_tail(reason, 512),
+        "started_at_unix_ms": now,
+        "completed_at_unix_ms": now,
+        "operation": operation,
+        "result": result,
+        # A host confirmation proves only the same-thread launch.  Lifecycle closure
+        # remains the control-event guard's responsibility.
+        "pending_control_event": True,
+    }
+    if command is not None:
+        receipt["command"] = command
+    if diagnostics:
+        receipt["diagnostics"] = bounded_tail(diagnostics)
+    return receipt
+
+
+def wake_existing_controller(
+    *,
+    lifecycle_state: dict[str, Any],
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    codex: str,
+    receipt_path: Path,
+    host_facts: dict[str, Any],
+    resume_adapters: dict[str, Callable[..., dict[str, Any]]] | None = None,
+    runtime_path: str | None = None,
+) -> dict[str, Any]:
+    """Wake only the registered controller, using Task 1's pure decision policy."""
+    repo = repo.resolve()
+    try:
+        common_dir = _git_common_dir(repo)
+    except (OSError, subprocess.SubprocessError) as exc:
+        health = derive_controller_health({})
+        return _wake_receipt(
+            common_dir=repo,
+            session_id=session_id,
+            event_fingerprint=_wake_event_fingerprint(lifecycle_state),
+            health=health,
+            decision="DEAD_BLOCK",
+            selected_host=None,
+            reason=f"cannot resolve Git common-dir: {exc}",
+            operation=None,
+            result="BLOCKED",
+        )
+
+    facts = dict(host_facts) if isinstance(host_facts, dict) else {}
+    facts.update({
+        "registered_controller": session_id,
+        "canonical_common_dir": str(common_dir),
+        "pending_control_event": lifecycle_state.get("pending_control_event") is True,
+    })
+    if _registered_controller_for_common_dir(repo, registry) != session_id:
+        facts.pop("registered_controller", None)
+    health = derive_controller_health(facts)
+    wake = decide_controller_wake(health)
+    decision = str(wake["decision"])
+    selected_host = wake["selected_host"]
+    fingerprint = _wake_event_fingerprint(lifecycle_state)
+    reason = str(facts.get("failure_class") or health["state"])
+
+    lock_path = controller_wake_lock_path(repo)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return _wake_receipt(
+                common_dir=common_dir,
+                session_id=session_id,
+                event_fingerprint=fingerprint,
+                health=health,
+                decision="DEFER",
+                selected_host=None,
+                reason="common_dir_wake_locked",
+                operation=None,
+                result="DEFERRED",
+            )
+
+        if decision == "NOOP_ACTIVE":
+            receipt = _wake_receipt(
+                common_dir=common_dir, session_id=session_id, event_fingerprint=fingerprint,
+                health=health, decision=decision, selected_host=None, reason=reason,
+                operation=None, result="CONFIRMED",
+            )
+        elif decision == "DEFER":
+            receipt = _wake_receipt(
+                common_dir=common_dir, session_id=session_id, event_fingerprint=fingerprint,
+                health=health, decision=decision, selected_host=None, reason=reason,
+                operation=None, result="DEFERRED",
+            )
+        elif decision == "DEAD_BLOCK":
+            receipt = _wake_receipt(
+                common_dir=common_dir, session_id=session_id, event_fingerprint=fingerprint,
+                health=health, decision=decision, selected_host=None, reason=reason,
+                operation=None, result="BLOCKED",
+            )
+        else:
+            adapter = (resume_adapters or {}).get(str(selected_host))
+            if adapter is None and selected_host == health.get("controller_host"):
+                attempt = execute_native_resume(
+                    session_id=session_id, repo=repo, registry=registry, codex=codex,
+                    runtime_path=runtime_path,
+                )
+            elif adapter is None:
+                attempt = {
+                    "operation": None,
+                    "result": "DEFERRED",
+                    "state": "RESUME_DEFERRED",
+                    "stderr_tail": f"no authorized adapter for peer host {selected_host}",
+                }
+            else:
+                try:
+                    attempt = adapter(
+                        session_id=session_id,
+                        repo=repo,
+                        registry=registry,
+                        codex=codex,
+                        runtime_path=runtime_path,
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    attempt = {
+                        "operation": f"{selected_host}_resume",
+                        "result": "FAILED",
+                        "state": "RESUME_FAILED",
+                        "stderr_tail": f"host adapter error: {exc}",
+                    }
+            result = str(attempt.get("result", "FAILED"))
+            receipt = _wake_receipt(
+                common_dir=common_dir, session_id=session_id, event_fingerprint=fingerprint,
+                health=health, decision=decision, selected_host=str(selected_host), reason=reason,
+                operation=attempt.get("operation"), result=result,
+                command=attempt.get("command"), diagnostics=attempt.get("stderr_tail"),
+            )
+        _write_json_atomic_file(receipt_path, receipt)
+        return receipt
+    finally:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock.close()
 
 
 def successful_guard_event_from_receipt(
@@ -705,59 +976,41 @@ def run_auto_native_stop(
         "runtime_path": runtime_path or DEFAULT_RUNTIME_PATH,
     })
     write_auto_stop_state(state_path, latest)
-
-    try:
-        ok, preflight_error, env = preflight_native_resume(
-            session_id=session_id, repo=repo, registry=registry, codex=codex, runtime_path=runtime_path
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        ok, preflight_error, env = False, f"native resume preflight error: {exc}", native_runtime_env(runtime_path)
-    if not ok:
-        latest = load_json(state_path)
-        if latest.get("receipt_id") == receipt_id:
-            latest.update({
-                "state": "RESUME_FAILED",
-                "pending_control_event": True,
-                "completed_at_unix_ms": int(time.time() * 1000),
-                "returncode": 78,
-                "stderr_tail": bounded_tail(preflight_error),
-                "error_code": "WEB_LIFECYCLE_RESUME_FAILED",
-            })
-            write_auto_stop_state(state_path, latest)
-        print(preflight_error, file=sys.stderr)
-        return 78
-
-    completed = subprocess.run(
-        command, check=False, capture_output=True, text=True, env=env
+    attempt = execute_native_resume(
+        session_id=session_id, repo=repo, registry=registry, codex=codex,
+        runtime_path=runtime_path,
     )
     latest = load_json(state_path)
     if latest.get("receipt_id") == receipt_id:
-        confirmed = completed.returncode == 0
-        if confirmed:
+        if attempt["result"] == "CONFIRMED":
             latest.update({
                 "state": "RESUME_CONFIRMED",
-                "pending_control_event": False,
+                "pending_control_event": True,
                 "completed_at_unix_ms": int(time.time() * 1000),
-                "returncode": completed.returncode,
-                "stdout_tail": bounded_tail(completed.stdout),
-                "stderr_tail": bounded_tail(completed.stderr),
+                "returncode": attempt["returncode"],
+                "stdout_tail": attempt.get("stdout_tail", ""),
+                "stderr_tail": attempt.get("stderr_tail", ""),
             })
             latest.pop("error_code", None)
             latest.pop("failure_class", None)
             latest.pop("fallback_eligible", None)
         else:
-            classification = classify_native_resume_failure(completed.returncode, completed.stdout, completed.stderr)
-            latest.update(classification)
             latest.update({
+                "state": attempt["state"],
+                "pending_control_event": True,
                 "completed_at_unix_ms": int(time.time() * 1000),
-                "returncode": completed.returncode,
-                "stdout_tail": bounded_tail(completed.stdout),
-                "stderr_tail": bounded_tail(completed.stderr),
+                "returncode": attempt["returncode"],
+                "stdout_tail": attempt.get("stdout_tail", ""),
+                "stderr_tail": attempt.get("stderr_tail", ""),
             })
+            for key in ("error_code", "failure_class", "fallback_eligible"):
+                if key in attempt:
+                    latest[key] = attempt[key]
         write_auto_stop_state(state_path, latest)
-    if completed.stderr:
-        print(bounded_tail(completed.stderr), file=sys.stderr, end="" if completed.stderr.endswith("\n") else "\n")
-    return completed.returncode
+    stderr_tail = str(attempt.get("stderr_tail", ""))
+    if stderr_tail:
+        print(stderr_tail, file=sys.stderr, end="" if stderr_tail.endswith("\n") else "\n")
+    return int(attempt["returncode"])
 
 
 def zshenv_block() -> str:
