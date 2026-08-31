@@ -797,6 +797,86 @@ def wake_existing_controller(
             lock.close()
 
 
+def default_wake_receipt_path(repo: Path) -> Path:
+    return _git_common_dir(repo) / "adaptive-delivery" / "controller-wake-receipt.json"
+
+
+def _lifecycle_module() -> Any:
+    try:
+        import lifecycle_hook as lifecycle
+    except ModuleNotFoundError:
+        from scripts import lifecycle_hook as lifecycle
+    return lifecycle
+
+
+def _load_lifecycle_state(session_id: str) -> dict[str, Any]:
+    try:
+        lifecycle = _lifecycle_module()
+        loaded = lifecycle.load_json(lifecycle.state_path(session_id))
+    except (OSError, ValueError, ModuleNotFoundError, ImportError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def dispatch_pending_lifecycle_wake(
+    *,
+    lifecycle_state: dict[str, Any],
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    codex: str,
+    receipt_path: Path | None = None,
+    host_facts: dict[str, Any] | None = None,
+    resume_adapters: dict[str, Callable[..., dict[str, Any]]] | None = None,
+    runtime_path: str | None = None,
+) -> dict[str, Any] | None:
+    """Route any pending lifecycle event through the one Wake Supervisor path."""
+    if not isinstance(lifecycle_state, dict) or lifecycle_state.get("pending_control_event") is not True:
+        return None
+    repo = repo.resolve()
+    try:
+        target_receipt = receipt_path or default_wake_receipt_path(repo)
+    except (OSError, subprocess.SubprocessError):
+        if receipt_path is None:
+            return None
+        target_receipt = receipt_path
+    fingerprint = _wake_event_fingerprint(lifecycle_state)
+    prior = load_json(target_receipt)
+    if prior.get("event_fingerprint") == fingerprint and prior.get("result") in {
+        "CONFIRMED",
+        "DEFERRED",
+        "BLOCKED",
+        "FAILED",
+    }:
+        debounced = dict(prior)
+        debounced["debounced"] = True
+        return debounced
+
+    facts = dict(host_facts) if isinstance(host_facts, dict) else {}
+    controller_host = str(lifecycle_state.get("controller_host") or facts.get("controller_host") or "web").strip()
+    if controller_host not in {"web", "desktop_codex"}:
+        controller_host = "web"
+    facts.setdefault("controller_host", controller_host)
+    if (
+        "resume_actionable" not in facts
+        and "resume_state" not in facts
+        and facts.get("controller_execution_active") is not True
+        and facts.get("active_writer") is not True
+    ):
+        facts["resume_actionable"] = True
+    return wake_existing_controller(
+        lifecycle_state=lifecycle_state,
+        session_id=session_id,
+        repo=repo,
+        registry=registry,
+        codex=codex,
+        receipt_path=target_receipt,
+        host_facts=facts,
+        resume_adapters=resume_adapters,
+        runtime_path=runtime_path,
+    )
+
+
 def successful_guard_event_from_receipt(
     receipt: dict[str, Any], *, session_id: str, repo: Path
 ) -> dict[str, Any] | None:
@@ -1192,7 +1272,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 encoding="utf-8",
             )
             return 0
-        return dispatch_event(event)
+        dispatch_code = dispatch_event(event)
+        if dispatch_code != 0:
+            return dispatch_code
+        dispatch_pending_lifecycle_wake(
+            lifecycle_state=_load_lifecycle_state(session_id),
+            session_id=session_id,
+            repo=repo,
+            registry=Path(args.registry).expanduser(),
+            codex="/opt/homebrew/bin/codex",
+        )
+        return 0
 
     if args.command_name == "audit-once":
         repo = Path(args.repo).expanduser().resolve()
@@ -1239,6 +1329,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         if dispatch_code != 0:
                             print(f"web lifecycle dispatch failed for {_audit_receipt_key(receipt)}: exit {dispatch_code}", file=sys.stderr)
                             return dispatch_code
+                        dispatch_pending_lifecycle_wake(
+                            lifecycle_state=_load_lifecycle_state(args.session_id),
+                            session_id=args.session_id,
+                            repo=repo,
+                            registry=Path(args.registry).expanduser(),
+                            codex=args.codex,
+                            runtime_path=args.runtime_path,
+                        )
                     if args.auto_native_stop and guard_event is not None:
                         receipt_id = str(receipt.get("receiptId") or "web-guard")
                         state_path = (
@@ -1339,6 +1437,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             print(json.dumps(command, ensure_ascii=False))
             return 0
+        wake_receipt = dispatch_pending_lifecycle_wake(
+            lifecycle_state=_load_lifecycle_state(args.session_id),
+            session_id=args.session_id,
+            repo=repo,
+            registry=Path(args.registry).expanduser(),
+            codex=args.codex,
+            runtime_path=args.runtime_path,
+        )
+        if wake_receipt is not None:
+            return 0 if wake_receipt.get("result") != "BLOCKED" else 78
         ok, error, env = preflight_native_resume(
             session_id=args.session_id, repo=repo, registry=Path(args.registry).expanduser(), codex=args.codex, runtime_path=args.runtime_path
         )

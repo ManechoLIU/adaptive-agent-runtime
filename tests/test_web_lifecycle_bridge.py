@@ -1048,6 +1048,174 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertTrue(receipt["pending_control_event"])
             self.assertTrue(json.loads(receipt_path.read_text(encoding="utf-8"))["pending_control_event"])
 
+    def test_pending_trigger_classes_share_one_generic_wake_dispatcher(self) -> None:
+        trigger_sets = (
+            ["active_lease_expired:F1"],
+            ["READY:F1"],
+            ["CANDIDATE:candidate-123", "candidate_queue_changed"],
+            ["rule_update_pending:rev-goal"],
+            ["ledger_changed", "main_worktree_changed"],
+        )
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, marker = self.make_controller(root)
+            with patch.object(
+                web_bridge, "execute_native_resume", wraps=web_bridge.execute_native_resume
+            ) as native_resume:
+                for triggers in trigger_sets:
+                    receipt = web_bridge.dispatch_pending_lifecycle_wake(
+                        lifecycle_state={"pending_control_event": True, "triggers": triggers, "controller_host": "web"},
+                        session_id="controller-1",
+                        repo=repo,
+                        registry=registry,
+                        codex=str(codex),
+                        receipt_path=receipt_path,
+                        host_facts={"controller_host": "web", "resume_actionable": True},
+                    )
+                    self.assertEqual(receipt["decision"], "RESUME_CURRENT_HOST")
+                    self.assertEqual(receipt["controller_session_id"], "controller-1")
+                    self.assertTrue(receipt["pending_control_event"])
+            self.assertEqual(native_resume.call_count, len(trigger_sets))
+            self.assertIn("resume controller-1", marker.read_text(encoding="utf-8"))
+
+    def test_unchanged_pending_fingerprint_does_not_storm_duplicate_continuations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, marker = self.make_controller(root)
+            state = {
+                "pending_control_event": True,
+                "triggers": ["active_lease_expired:F1"],
+                "controller_host": "web",
+            }
+            first = web_bridge.dispatch_pending_lifecycle_wake(
+                lifecycle_state=state,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                receipt_path=receipt_path,
+                host_facts={"controller_host": "web", "resume_actionable": True},
+            )
+            second = web_bridge.dispatch_pending_lifecycle_wake(
+                lifecycle_state=state,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                receipt_path=receipt_path,
+                host_facts={"controller_host": "web", "resume_actionable": True},
+            )
+            self.assertEqual(first["result"], "CONFIRMED")
+            self.assertEqual(second["event_fingerprint"], first["event_fingerprint"])
+            self.assertTrue(second.get("debounced") is True)
+            self.assertEqual(marker.read_text(encoding="utf-8").count("resume controller-1"), 1)
+
+    def test_confirmed_wake_stays_pending_until_control_event_guard_closes(self) -> None:
+        spec = importlib.util.spec_from_file_location("task4_lifecycle_hook", ROOT / "scripts" / "lifecycle_hook.py")
+        assert spec is not None and spec.loader is not None
+        lifecycle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lifecycle)
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-2",
+            "worktree_status_sha256": "status-2",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt, receipt_path, _ = self.wake(
+                Path(tmp),
+                lifecycle_state={"pending_control_event": True, "triggers": ["active_lease_expired:F1"]},
+                host_facts={"controller_host": "web", "resume_actionable": True},
+            )
+            self.assertEqual(receipt["result"], "CONFIRMED")
+            self.assertTrue(receipt["pending_control_event"])
+            self.assertTrue(json.loads(receipt_path.read_text(encoding="utf-8"))["pending_control_event"])
+
+            prior = {
+                "pending_control_event": True,
+                "triggers": ["active_lease_expired:F1"],
+                "snapshot": dict(snapshot),
+            }
+            _, still_pending = lifecycle.evaluate_event(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "session_id": "controller-1",
+                    "tool_input": {"command": "git status --short"},
+                    "tool_response": {"output": "", "exit_code": 0},
+                },
+                snapshot=snapshot,
+                prior_state=prior,
+            )
+            self.assertTrue(still_pending["pending_control_event"])
+
+            _, closed = lifecycle.evaluate_event(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "session_id": "controller-1",
+                    "tool_input": {
+                        "command": "python3 scripts/control_event_guard.py receipt.json --ledger TASK_LEDGER.md"
+                    },
+                    "tool_response": {"output": "control-event: allowed", "exit_code": 0},
+                },
+                snapshot=snapshot,
+                prior_state=still_pending,
+            )
+            self.assertFalse(closed["pending_control_event"])
+            self.assertEqual(closed["triggers"], [])
+
+    def test_post_shell_audit_and_native_stop_route_pending_events_through_one_dispatcher(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            calls: list[str] = []
+
+            def capture_dispatch(**kwargs: object) -> dict:
+                state = kwargs.get("lifecycle_state")
+                triggers = state.get("triggers") if isinstance(state, dict) else None
+                calls.append(str(triggers))
+                return {"result": "CONFIRMED", "pending_control_event": True, "decision": "RESUME_CURRENT_HOST"}
+
+            with patch.object(web_bridge, "dispatch_pending_lifecycle_wake", side_effect=capture_dispatch), patch.object(
+                web_bridge, "dispatch_event", return_value=0
+            ):
+                post = web_bridge.main(
+                    [
+                        "post-shell",
+                        "--cwd",
+                        str(repo),
+                        "--command",
+                        "true",
+                        "--exit-code",
+                        "0",
+                        "--registry",
+                        str(registry),
+                    ]
+                )
+                native = web_bridge.main(
+                    [
+                        "native-stop",
+                        "--session-id",
+                        "controller-1",
+                        "--repo",
+                        str(repo),
+                        "--registry",
+                        str(registry),
+                        "--codex",
+                        str(codex),
+                    ]
+                )
+            self.assertEqual(post, 0)
+            self.assertEqual(native, 0)
+            self.assertGreaterEqual(len(calls), 2)
+
 
 
 class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):

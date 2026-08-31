@@ -258,6 +258,32 @@ def lifecycle_triggers(
     return sorted(set(triggers))
 
 
+WAKE_ENTRY_POINT = "wake_existing_controller"
+
+
+def pending_event_fingerprint(state: dict[str, Any]) -> str:
+    value = {
+        "pending_control_event": state.get("pending_control_event") is True,
+        "triggers": state.get("triggers", []),
+    }
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return sha256_bytes(encoded)
+
+
+def pending_wake_request(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Generic wake request for any pending controller event. Trigger type is evidence, not policy."""
+    if not isinstance(state, dict) or state.get("pending_control_event") is not True:
+        return None
+    return {
+        "entry_point": WAKE_ENTRY_POINT,
+        "pending_control_event": True,
+        "triggers": list(state.get("triggers", [])),
+        "event_fingerprint": pending_event_fingerprint(state),
+        "session_id": str(state.get("session_id", "")),
+        "controller_host": state.get("controller_host"),
+    }
+
+
 def _non_rule_triggers(triggers: list[str] | set[str]) -> set[str]:
     return {
         str(item) for item in triggers

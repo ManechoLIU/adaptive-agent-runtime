@@ -2516,3 +2516,157 @@ class ControllerHostLifecycleTests(unittest.TestCase):
             {"hook_event_name":"PostToolUse","session_id":"controller-1","controller_host":"web"}, snapshot=snapshot, prior_state={"controller_host":"desktop_codex"}
         )
         self.assertEqual(state["controller_host"], "web")
+
+
+class PendingLifecycleWakeDispatchTests(unittest.TestCase):
+    GENERIC_WAKE_ENTRY = "wake_existing_controller"
+
+    def base_snapshot(self, **overrides: object) -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        snapshot.update(overrides)
+        return snapshot
+
+    def request_for(
+        self,
+        snapshot: dict[str, object],
+        *,
+        prior_state: dict[str, object] | None = None,
+        event_name: str = "PostToolUse",
+        cwd: str | None = None,
+    ) -> tuple[dict[str, object] | None, dict[str, object]]:
+        event: dict[str, object] = {
+            "hook_event_name": event_name,
+            "session_id": "controller-1",
+            "controller_host": "web",
+            "tool_input": {},
+            "tool_response": {},
+        }
+        if cwd is not None:
+            event["cwd"] = cwd
+        _, state = lifecycle_hook.evaluate_event(
+            event, snapshot=snapshot, prior_state=prior_state
+        )
+        return lifecycle_hook.pending_wake_request(state), state
+
+    def test_active_lease_expired_uses_generic_wake_entry_point(self) -> None:
+        snapshot = self.base_snapshot(
+            assignment_liveness={
+                "F1": {"ledger_state": "ACTIVE", "state": "unhealthy", "reason": "lease_expired"}
+            }
+        )
+        prior = {
+            "snapshot": dict(snapshot),
+            "pending_control_event": False,
+            "triggers": [],
+            "stop_continuations": 0,
+        }
+        request, state = self.request_for(snapshot, prior_state=prior)
+
+        self.assertTrue(state["pending_control_event"])
+        self.assertIn("active_lease_expired:F1", state["triggers"])
+        self.assertIsNotNone(request)
+        self.assertEqual(request["entry_point"], self.GENERIC_WAKE_ENTRY)
+        self.assertEqual(request["event_fingerprint"], lifecycle_hook.pending_event_fingerprint(state))
+        self.assertTrue(request["pending_control_event"])
+
+    def test_ready_candidate_rule_and_bound_worktree_share_the_same_wake_entry(self) -> None:
+        from unittest.mock import patch
+
+        cases = [
+            (self.base_snapshot(ready_ids=["READY-1"], runnable_ids=["READY-1"]), "READY:READY-1"),
+            (self.base_snapshot(candidate_revisions=["candidate-123"]), "CANDIDATE:candidate-123"),
+            (
+                self.base_snapshot(
+                    assignment_liveness={
+                        "F1": {"ledger_state": "ACTIVE", "state": "healthy", "reason": "lease_current"}
+                    },
+                    rule_handshake={
+                        "state": "pending_ack",
+                        "blocking": True,
+                        "installed_revision": "rev-goal",
+                        "impact": "live_assignments",
+                        "changed_files": ["scripts/assignment_runtime.py"],
+                    },
+                ),
+                "rule_update_pending:rev-goal",
+            ),
+        ]
+        entry_points: set[str] = set()
+        for snapshot, expected_trigger in cases:
+            with self.subTest(trigger=expected_trigger):
+                request, state = self.request_for(snapshot)
+                self.assertTrue(state["pending_control_event"])
+                self.assertIn(expected_trigger, state["triggers"])
+                self.assertIsNotNone(request)
+                entry_points.add(str(request["entry_point"]))
+                self.assertEqual(request["event_fingerprint"], lifecycle_hook.pending_event_fingerprint(state))
+        self.assertEqual(entry_points, {self.GENERIC_WAKE_ENTRY})
+
+        main, controller_worktree, writer_worktree, registry = GovernanceTests.lifecycle_worktree_fixture(self)
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", controller_worktree)
+            changed = self.base_snapshot(ledger_sha256="ledger-bound")
+            request, state = self.request_for(
+                changed,
+                prior_state={
+                    "snapshot": self.base_snapshot(),
+                    "pending_control_event": False,
+                    "triggers": [],
+                },
+                cwd=str(controller_worktree),
+            )
+            self.assertTrue(
+                lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "controller-1", "controller_host": "web"},
+                    controller_worktree,
+                    main,
+                )
+            )
+            self.assertFalse(
+                lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "controller-1", "controller_host": "web"},
+                    writer_worktree,
+                    main,
+                )
+            )
+            self.assertIn("ledger_changed", state["triggers"])
+            self.assertEqual(request["entry_point"], self.GENERIC_WAKE_ENTRY)
+
+    def test_unchanged_pending_state_reuses_fingerprint_and_does_not_invent_a_second_policy(self) -> None:
+        snapshot = self.base_snapshot(ready_ids=["READY-1"], runnable_ids=["READY-1"])
+        first, first_state = self.request_for(snapshot)
+        second, second_state = self.request_for(snapshot, prior_state=first_state)
+
+        self.assertEqual(first["entry_point"], self.GENERIC_WAKE_ENTRY)
+        self.assertEqual(second["entry_point"], first["entry_point"])
+        self.assertEqual(second["event_fingerprint"], first["event_fingerprint"])
+        self.assertEqual(second_state["triggers"], first_state["triggers"])
+        self.assertTrue(second_state["pending_control_event"])
+
+    def test_cleared_control_event_does_not_request_a_wake(self) -> None:
+        snapshot = self.base_snapshot()
+        output, next_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "controller-1",
+                "tool_input": {
+                    "command": "python3 scripts/control_event_guard.py receipt.json --ledger TASK_LEDGER.md"
+                },
+                "tool_response": {"output": "control-event: allowed", "exit_code": 0},
+            },
+            snapshot=snapshot,
+            prior_state={"pending_control_event": True, "triggers": ["READY:READY-1"]},
+        )
+        self.assertEqual(output, {})
+        self.assertFalse(next_state["pending_control_event"])
+        self.assertIsNone(lifecycle_hook.pending_wake_request(next_state))
