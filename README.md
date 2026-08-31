@@ -179,6 +179,8 @@ Writer 开始前必须回传可送达总控的 ACK，包括工作树、分支、
 
 主 Agent 不重复实现已经分派的内容；它保留共享接缝、冲突、集成和最终验收。高风险边界、纵向里程碑或发布候选在条件允许时安排非作者审查，但 Reviewer 不能成为第一个真正打开页面或运行功能的人。
 
+需要机器判定的最终 Reviewer 使用 `python3 scripts/reviewer_supervisor.py run --repo <repo> --base <branch>`。Supervisor 直接监督真实 `codex exec review` 子进程并绑定候选 HEAD；PID 存活或 exit 0 单独都不是 Reviewer 已运行/已通过的证据。基础设施失败与代码 findings 分开：前者最多按同一 review 合同自动重试一次，后者不为寻找不同 verdict 自动重试。
+
 ## 台账怎么写才不拖慢开发
 
 台账粒度会动态调整，不是固定模板：
