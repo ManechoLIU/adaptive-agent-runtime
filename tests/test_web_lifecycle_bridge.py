@@ -1400,6 +1400,103 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertNotEqual(native, 0)
             self.assertFalse(marker.exists())
 
+    def test_audit_wake_pending_ignores_capture_mode_and_retries_only_wake(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            audit = root / "audit.jsonl"
+            receipt = {
+                "receiptId": "wake-capture-retry-1", "childTool": "shell_command", "state": "succeeded",
+                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
+                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            cursor = root / "cursor.json"
+            capture = root / "events.jsonl"
+            state = {
+                "pending_control_event": True, "triggers": ["READY:F1"],
+                "snapshot": {"head": "h1", "ledger_sha256": "l1", "worktree_status_sha256": "s1"},
+            }
+            base_args = [
+                "audit-once", "--repo", str(repo), "--session-id", "controller-1",
+                "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry),
+                "--codex", str(codex),
+            ]
+            wake_results = [
+                {"result": "DEFERRED", "decision": "DEFER", "pending_control_event": True},
+                {"result": "CONFIRMED", "decision": "RESUME_CURRENT_HOST", "pending_control_event": True},
+            ]
+            with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch, patch.object(
+                web_bridge, "_load_lifecycle_state", return_value=state
+            ), patch.object(web_bridge, "dispatch_pending_lifecycle_wake", side_effect=wake_results) as wake:
+                first = web_bridge.main(base_args)
+                second = web_bridge.main(base_args + ["--capture-events", str(capture)])
+            self.assertNotEqual(first, 0)
+            self.assertEqual(second, 0)
+            self.assertEqual(dispatch.call_count, 1)
+            self.assertEqual(wake.call_count, 2)
+            self.assertFalse(capture.exists())
+            stored = json.loads(cursor.with_suffix(cursor.suffix + ".receipts.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["receipts"]["wake-capture-retry-1"], "handled")
+            self.assertEqual(json.loads(cursor.read_text(encoding="utf-8"))["offset"], audit.stat().st_size)
+
+    def test_audit_wake_pending_is_strict_wake_only_even_with_capture_events(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            audit = root / "audit.jsonl"
+            receipt = {
+                "receiptId": "wake-only-capture-1", "childTool": "shell_command", "state": "succeeded",
+                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
+                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            cursor = root / "cursor.json"
+            capture = root / "capture.jsonl"
+            lifecycle_state = {
+                "pending_control_event": True, "triggers": ["READY:F1"],
+                "snapshot": {"head": "h1", "ledger_sha256": "l1", "worktree_status_sha256": "s1"},
+            }
+            state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
+            state_path.write_text(json.dumps({
+                "receipts": {"wake-only-capture-1": "wake_pending"},
+                "wake_fingerprints": {
+                    "wake-only-capture-1": web_bridge._wake_event_fingerprint(lifecycle_state)
+                },
+            }), encoding="utf-8")
+            with patch.object(
+                web_bridge, "successful_guard_event_from_receipt",
+                side_effect=AssertionError("wake_pending must not reconstruct event"),
+            ), patch.object(
+                web_bridge, "computer_event_from_receipt",
+                side_effect=AssertionError("wake_pending must not consume computer lease"),
+            ), patch.object(
+                web_bridge, "dispatch_event", side_effect=AssertionError("wake_pending must not redispatch")
+            ), patch.object(
+                web_bridge, "append_captured_event", side_effect=AssertionError("wake_pending must not capture")
+            ), patch.object(
+                web_bridge, "_load_lifecycle_state", return_value=lifecycle_state
+            ), patch.object(
+                web_bridge, "dispatch_pending_lifecycle_wake", return_value={
+                    "result": "CONFIRMED", "decision": "RESUME_CURRENT_HOST", "pending_control_event": True
+                }
+            ) as wake:
+                code = web_bridge.main([
+                    "audit-once", "--repo", str(repo), "--session-id", "controller-1",
+                    "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry),
+                    "--codex", str(codex), "--capture-events", str(capture),
+                ])
+            self.assertEqual(code, 0)
+            self.assertEqual(wake.call_count, 1)
+            self.assertFalse(capture.exists())
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["receipts"]["wake-only-capture-1"], "handled")
+            self.assertEqual(json.loads(cursor.read_text(encoding="utf-8"))["offset"], audit.stat().st_size)
+
     def test_audit_wake_pending_requires_same_generation_and_present_state(self) -> None:
         from unittest.mock import patch
 

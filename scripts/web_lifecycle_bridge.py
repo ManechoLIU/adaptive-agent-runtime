@@ -1344,56 +1344,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _advance_audit_cursor(cursor_path, audit_inode, next_offset)
                     continue
                 if status == "pending":
-                    print(f"web lifecycle receipt outcome unknown; reconcile before replay: {_audit_receipt_key(receipt)}", file=sys.stderr)
-                    return 3
-                retry_wake_only = status == "wake_pending"
-                expected_wake_fingerprint = (
-                    _audit_receipt_wake_fingerprint(cursor_path, receipt) if retry_wake_only else None
-                )
-                guard_event = successful_guard_event_from_receipt(
-                    receipt, session_id=args.session_id, repo=repo
-                )
-                event = guard_event
-                if not retry_wake_only and event is None:
-                    event = computer_event_from_receipt(
-                        receipt, session_id=args.session_id, repo=repo, lease_path=lease_path
+                    print(
+                        f"web lifecycle receipt outcome unknown; reconcile before replay: {_audit_receipt_key(receipt)}",
+                        file=sys.stderr,
                     )
-                if not retry_wake_only and event is None:
-                    _advance_audit_cursor(cursor_path, audit_inode, next_offset)
-                    continue
-                if not retry_wake_only:
-                    _set_audit_receipt_status(cursor_path, receipt, "pending")
-                try:
-                    if args.capture_events:
-                        append_captured_event(Path(args.capture_events), event)
-                    else:
-                        if not retry_wake_only:
-                            dispatch_code = dispatch_event(event)
-                            if dispatch_code != 0:
-                                print(f"web lifecycle dispatch failed for {_audit_receipt_key(receipt)}: exit {dispatch_code}", file=sys.stderr)
-                                return dispatch_code
+                    return 3
+                if status == "wake_pending":
+                    expected_wake_fingerprint = _audit_receipt_wake_fingerprint(cursor_path, receipt)
+                    try:
                         lifecycle_state = _load_lifecycle_state(args.session_id)
-                        if retry_wake_only:
-                            if lifecycle_state.get("pending_control_event") is not True:
-                                print(
-                                    f"web lifecycle wake retry state missing or no longer pending for {_audit_receipt_key(receipt)}",
-                                    file=sys.stderr,
-                                )
-                                return 78
-                            current_fingerprint = _wake_event_fingerprint(lifecycle_state)
-                            if not expected_wake_fingerprint or current_fingerprint != expected_wake_fingerprint:
-                                print(
-                                    f"web lifecycle wake retry generation mismatch for {_audit_receipt_key(receipt)}",
-                                    file=sys.stderr,
-                                )
-                                return 78
-                        elif lifecycle_state.get("pending_control_event") is True:
-                            _set_audit_receipt_status(
-                                cursor_path,
-                                receipt,
-                                "wake_pending",
-                                wake_fingerprint=_wake_event_fingerprint(lifecycle_state),
+                        if lifecycle_state.get("pending_control_event") is not True:
+                            print(
+                                f"web lifecycle wake retry state missing or no longer pending for {_audit_receipt_key(receipt)}",
+                                file=sys.stderr,
                             )
+                            return 78
+                        current_fingerprint = _wake_event_fingerprint(lifecycle_state)
+                        if not expected_wake_fingerprint or current_fingerprint != expected_wake_fingerprint:
+                            print(
+                                f"web lifecycle wake retry generation mismatch for {_audit_receipt_key(receipt)}",
+                                file=sys.stderr,
+                            )
+                            return 78
                         wake_receipt = dispatch_pending_lifecycle_wake(
                             lifecycle_state=lifecycle_state,
                             session_id=args.session_id,
@@ -1402,13 +1374,66 @@ def main(argv: Sequence[str] | None = None) -> int:
                             codex=args.codex,
                             runtime_path=args.runtime_path,
                         )
-                        if (retry_wake_only or lifecycle_state.get("pending_control_event") is True) and not wake_receipt_confirmed(wake_receipt):
+                        if not wake_receipt_confirmed(wake_receipt):
                             result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
                             print(
                                 f"web lifecycle wake not confirmed for {_audit_receipt_key(receipt)}: {result}",
                                 file=sys.stderr,
                             )
                             return 78
+                    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                        print(f"web lifecycle handling failed for {_audit_receipt_key(receipt)}: {exc}", file=sys.stderr)
+                        return 3
+                    _set_audit_receipt_status(cursor_path, receipt, "handled")
+                    _advance_audit_cursor(cursor_path, audit_inode, next_offset)
+                    continue
+
+                guard_event = successful_guard_event_from_receipt(
+                    receipt, session_id=args.session_id, repo=repo
+                )
+                event = guard_event
+                if event is None:
+                    event = computer_event_from_receipt(
+                        receipt, session_id=args.session_id, repo=repo, lease_path=lease_path
+                    )
+                if event is None:
+                    _advance_audit_cursor(cursor_path, audit_inode, next_offset)
+                    continue
+                _set_audit_receipt_status(cursor_path, receipt, "pending")
+                try:
+                    if args.capture_events:
+                        append_captured_event(Path(args.capture_events), event)
+                    else:
+                        dispatch_code = dispatch_event(event)
+                        if dispatch_code != 0:
+                            print(
+                                f"web lifecycle dispatch failed for {_audit_receipt_key(receipt)}: exit {dispatch_code}",
+                                file=sys.stderr,
+                            )
+                            return dispatch_code
+                        lifecycle_state = _load_lifecycle_state(args.session_id)
+                        if lifecycle_state.get("pending_control_event") is True:
+                            _set_audit_receipt_status(
+                                cursor_path,
+                                receipt,
+                                "wake_pending",
+                                wake_fingerprint=_wake_event_fingerprint(lifecycle_state),
+                            )
+                            wake_receipt = dispatch_pending_lifecycle_wake(
+                                lifecycle_state=lifecycle_state,
+                                session_id=args.session_id,
+                                repo=repo,
+                                registry=Path(args.registry).expanduser(),
+                                codex=args.codex,
+                                runtime_path=args.runtime_path,
+                            )
+                            if not wake_receipt_confirmed(wake_receipt):
+                                result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
+                                print(
+                                    f"web lifecycle wake not confirmed for {_audit_receipt_key(receipt)}: {result}",
+                                    file=sys.stderr,
+                                )
+                                return 78
                     if args.auto_native_stop and guard_event is not None:
                         receipt_id = str(receipt.get("receiptId") or "web-guard")
                         state_path = (
