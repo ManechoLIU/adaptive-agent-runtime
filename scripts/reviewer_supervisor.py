@@ -128,22 +128,31 @@ def _terminate_process_group(
     *,
     send_term: bool = True,
 ) -> tuple[int, bool, str]:
+    notes: list[str] = []
     if send_term:
         try:
             process_group_signaler(process.pid, signal.SIGTERM)
-        except (OSError, RuntimeError) as exc:
+            notes.append("SIGTERM")
+        except (OSError, RuntimeError, ValueError) as exc:
             return -signal.SIGTERM, False, f"SIGTERM signal failed: {exc}"
     try:
-        return process.wait(timeout=grace_seconds), True, "SIGTERM" if send_term else "already exited"
+        return process.wait(timeout=grace_seconds), True, "; ".join(notes) or "already exited"
     except subprocess.TimeoutExpired:
-        try:
-            process_group_signaler(process.pid, signal.SIGKILL)
-        except (OSError, RuntimeError) as exc:
-            return -signal.SIGKILL, False, f"SIGKILL signal failed: {exc}"
-        try:
-            return process.wait(timeout=grace_seconds), True, "SIGKILL after SIGTERM grace"
-        except subprocess.TimeoutExpired:
-            return -signal.SIGKILL, False, "SIGKILL sent but process could not be reaped"
+        notes.append("TERM grace expired")
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        notes.append(f"wait after TERM failed: {exc}")
+
+    try:
+        process_group_signaler(process.pid, signal.SIGKILL)
+        notes.append("SIGKILL")
+    except (OSError, RuntimeError, ValueError) as exc:
+        return -signal.SIGKILL, False, "; ".join(notes + [f"SIGKILL signal failed: {exc}"])
+    try:
+        return process.wait(timeout=grace_seconds), True, "; ".join(notes)
+    except subprocess.TimeoutExpired:
+        return -signal.SIGKILL, False, "; ".join(notes + ["process could not be reaped"])
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        return -signal.SIGKILL, False, "; ".join(notes + [f"final reap failed: {exc}"])
 
 
 def _review_output_schema(expected_head: str) -> dict:
@@ -222,53 +231,73 @@ def run_attempt(
             diagnostic=f"reviewer stdin pipe unavailable; cleanup={cleanup}",
             retry_safe=retry_safe,
         )
-    try:
-        process.stdin.write(contract.instructions)
-        process.stdin.close()
-    except (BrokenPipeError, OSError, ValueError) as exc:
-        try:
-            exit_code = process.wait(timeout=termination_grace_seconds)
-            retry_safe, cleanup = True, "child already exited"
-        except subprocess.TimeoutExpired:
-            exit_code, retry_safe, cleanup = _terminate_process_group(
-                process, process_group_killer, termination_grace_seconds, send_term=True
-            )
-        return AttemptResult(
-            state="REVIEW_INFRA_FAILED",
-            pid=process.pid,
-            exit_code=exit_code,
-            running_observed=False,
-            diagnostic=f"reviewer stdin delivery failed: {exc}; cleanup={cleanup}",
-            retry_safe=retry_safe,
-        )
 
     observed = {"running": False, "session_id": None}
     diagnostics: list[str] = []
+    writer_state = {"done": False, "error": None}
+
+    def deliver_stdin() -> None:
+        try:
+            process.stdin.write(contract.instructions)
+            process.stdin.flush()
+            process.stdin.close()
+            writer_state["done"] = True
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            writer_state["error"] = exc
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
 
     def consume_stdout() -> None:
-        with contract.event_path.open("w", encoding="utf-8") as event_log:
-            if process.stdout is None:
-                return
-            for line in process.stdout:
-                event_log.write(line)
-                event_log.flush()
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    diagnostics.append(line.strip())
-                    continue
-                if isinstance(event, dict):
-                    observed["running"] = True
-                    observed["session_id"] = observed["session_id"] or _session_id_from_event(event)
+        try:
+            with contract.event_path.open("w", encoding="utf-8") as event_log:
+                if process.stdout is None:
+                    return
+                for line in process.stdout:
+                    event_log.write(line)
+                    event_log.flush()
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        diagnostics.append(line.strip())
+                        continue
+                    if isinstance(event, dict):
+                        observed["running"] = True
+                        observed["session_id"] = observed["session_id"] or _session_id_from_event(event)
+        except (OSError, ValueError) as exc:
+            diagnostics.append(f"event stream failure: {exc}")
 
+    writer = threading.Thread(target=deliver_stdin, name=f"reviewer-stdin-{attempt}", daemon=True)
     reader = threading.Thread(target=consume_stdout, name=f"reviewer-events-{attempt}", daemon=True)
+    deadline = time.monotonic() + timeout_seconds
+    writer.start()
     reader.start()
+
+    remaining = max(0.0, deadline - time.monotonic())
     try:
-        exit_code = process.wait(timeout=timeout_seconds)
+        exit_code = process.wait(timeout=remaining)
     except subprocess.TimeoutExpired:
         exit_code, retry_safe, cleanup = _terminate_process_group(
             process, process_group_killer, termination_grace_seconds, send_term=True
         )
+        writer.join(0.05)
+        reader.join(0.2)
+        phase = "stdin/process" if not writer_state["done"] else "process"
+        return AttemptResult(
+            state="REVIEW_INFRA_FAILED",
+            pid=process.pid,
+            exit_code=exit_code,
+            running_observed=bool(observed["running"]),
+            session_id=observed["session_id"],
+            diagnostic=f"reviewer {phase} timeout after {timeout_seconds:g}s; cleanup={cleanup}",
+            retry_safe=retry_safe,
+        )
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        exit_code, retry_safe, cleanup = _terminate_process_group(
+            process, process_group_killer, termination_grace_seconds, send_term=True
+        )
+        writer.join(0.05)
         reader.join(0.2)
         return AttemptResult(
             state="REVIEW_INFRA_FAILED",
@@ -276,10 +305,31 @@ def run_attempt(
             exit_code=exit_code,
             running_observed=bool(observed["running"]),
             session_id=observed["session_id"],
-            diagnostic=f"reviewer timeout after {timeout_seconds:g}s; cleanup={cleanup}",
+            diagnostic=f"reviewer wait failed: {exc}; cleanup={cleanup}",
             retry_safe=retry_safe,
         )
+
+    writer.join(0.2)
     reader.join(1.0)
+    if writer_state["error"] is not None:
+        return AttemptResult(
+            state="REVIEW_INFRA_FAILED",
+            pid=process.pid,
+            exit_code=exit_code,
+            running_observed=bool(observed["running"]),
+            session_id=observed["session_id"],
+            diagnostic=f"reviewer stdin delivery failed: {writer_state['error']}",
+        )
+    if not writer_state["done"]:
+        return AttemptResult(
+            state="REVIEW_INFRA_FAILED",
+            pid=process.pid,
+            exit_code=exit_code,
+            running_observed=bool(observed["running"]),
+            session_id=observed["session_id"],
+            diagnostic="reviewer stdin delivery did not complete before child exit",
+            retry_safe=False,
+        )
     if reader.is_alive():
         return AttemptResult(
             state="REVIEW_INFRA_FAILED",
@@ -288,6 +338,7 @@ def run_attempt(
             running_observed=bool(observed["running"]),
             session_id=observed["session_id"],
             diagnostic="reviewer event stream did not close after child exit",
+            retry_safe=False,
         )
 
     running_observed = bool(observed["running"])
@@ -401,6 +452,7 @@ def run_review(
                 exit_code=70,
                 running_observed=False,
                 diagnostic=f"review attempt infrastructure exception: {type(exc).__name__}: {exc}",
+                retry_safe=False,
             )
         snapshot = dict(base_state)
         snapshot.update({

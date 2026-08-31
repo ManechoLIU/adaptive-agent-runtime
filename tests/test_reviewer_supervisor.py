@@ -101,6 +101,9 @@ class _FakeStdin:
     def write(self, text):
         self.value += text
 
+    def flush(self):
+        return None
+
     def close(self):
         self.closed = True
 
@@ -213,6 +216,73 @@ class ReviewerSupervisorInfrastructureFailureTests(unittest.TestCase):
         self.assertFalse(result.retry_safe)
         self.assertIn("signal", result.diagnostic.lower())
 
+
+class _BlockingStdin(_FakeStdin):
+    def write(self, text):
+        time.sleep(0.3)
+        self.value += text
+
+
+class _BlockingStdinProcess(_TimeoutProcess if False else _FakeProcess):
+    def __init__(self):
+        super().__init__([], returncode=-signal.SIGTERM)
+        self.stdin = _BlockingStdin()
+        self.killed = False
+
+    def wait(self, timeout=None):
+        if not self.killed:
+            raise subprocess.TimeoutExpired("codex", timeout or 0)
+        return self._returncode
+
+
+class _WaitErrorProcess(_FakeProcess):
+    def __init__(self):
+        super().__init__([], returncode=-signal.SIGTERM)
+        self.killed = False
+
+    def wait(self, timeout=None):
+        if not self.killed:
+            raise OSError("wait backend failed")
+        return self._returncode
+
+
+class ReviewerSupervisorDeadlineCoverageTests(unittest.TestCase):
+    def _contract(self):
+        root = Path(tempfile.mkdtemp())
+        return ReviewContract(Path.cwd(), "b" * 40, "a" * 40, "review", root / "events", root / "final")
+
+    def test_stdin_delivery_is_bounded_by_attempt_deadline(self):
+        holder = []
+        sent = []
+        def factory(argv, **kwargs):
+            proc = _BlockingStdinProcess(); holder.append(proc); return proc
+        def signaler(pid, sig):
+            sent.append((pid, sig)); holder[0].killed = True
+        started = time.monotonic()
+        result = run_attempt(
+            self._contract(), 0, popen_factory=factory, codex_executable="codex",
+            timeout_seconds=0.03, process_group_killer=signaler, termination_grace_seconds=0.01,
+        )
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertIn("stdin", result.diagnostic.lower())
+        self.assertTrue(sent)
+
+    def test_non_timeout_wait_error_triggers_cleanup_before_retry_can_be_safe(self):
+        holder = []
+        sent = []
+        def factory(argv, **kwargs):
+            proc = _WaitErrorProcess(); holder.append(proc); return proc
+        def signaler(pid, sig):
+            sent.append((pid, sig)); holder[0].killed = True
+        result = run_attempt(
+            self._contract(), 0, popen_factory=factory, codex_executable="codex",
+            timeout_seconds=0.03, process_group_killer=signaler, termination_grace_seconds=0.01,
+        )
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertTrue(sent)
+        self.assertTrue(result.retry_safe)
+        self.assertIn("wait", result.diagnostic.lower())
 
 class _SlowStdout:
     def __iter__(self):
