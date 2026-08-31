@@ -781,6 +781,56 @@ test("assignment-bound execution persists canonical runtime without audit JSONL"
   assert.equal(state.leases["canonical-a1"].terminal_state, "completed");
 });
 
+
+test("synthetic candidate workspace binds runtime to explicit canonical repo", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-runtime-candidate-binding-"));
+  const canonicalRepo = await makeAssignmentRepo(bin);
+  const candidateRepo = await makeAssignmentRepo(bin);
+  const candidateGitDir = path.join(candidateRepo, ".git-candidate");
+  execFileSync("mv", [path.join(candidateRepo, ".git"), candidateGitDir]);
+  await writeFile(path.join(candidateRepo, ".git"), `gitdir: ${candidateGitDir}\n`);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, { assignment_id: "candidate-review-a1", agent_id: "reviewer" }, candidateRepo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", candidateRepo,
+    "--runtime-repo", canonicalRepo,
+    "--assignment-id", "candidate-review-a1", "--task-id", "T1", "--agent-id", "reviewer", "--session-id", "s1",
+    "--assignment-ack", ack,
+  ], { encoding: "utf8", input: "review bounded candidate", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
+  assert.equal(result.status, 0, result.stderr);
+  const canonicalCommon = execFileSync("git", ["-C", canonicalRepo, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
+  const canonicalState = JSON.parse(await readFile(path.join(path.resolve(canonicalRepo, canonicalCommon), "adaptive-delivery", "runtime-assignments.json"), "utf8"));
+  assert.equal(canonicalState.leases["candidate-review-a1"].terminal_state, "completed");
+  await assert.rejects(readFile(path.join(candidateGitDir, "adaptive-delivery", "runtime-assignments.json"), "utf8"));
+});
+
+test("assignment-bound synthetic candidate workspace fails closed without runtime repo", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-runtime-candidate-no-binding-"));
+  const candidateRepo = await makeAssignmentRepo(bin);
+  const candidateGitDir = path.join(candidateRepo, ".git-candidate");
+  execFileSync("mv", [path.join(candidateRepo, ".git"), candidateGitDir]);
+  await writeFile(path.join(candidateRepo, ".git"), `gitdir: ${candidateGitDir}\n`);
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, { assignment_id: "candidate-review-a2", agent_id: "reviewer" }, candidateRepo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", candidateRepo,
+    "--assignment-id", "candidate-review-a2", "--task-id", "T1", "--agent-id", "reviewer", "--session-id", "s2",
+    "--assignment-ack", ack,
+  ], { encoding: "utf8", input: "review bounded candidate", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /runtime repo.*required|canonical runtime/i);
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
 test("pending live rule handshake blocks before external agent spawn", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-rule-pending-"));
   const repo = await makeAssignmentRepo(bin);
