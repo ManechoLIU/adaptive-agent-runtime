@@ -12,8 +12,12 @@ class ControllerScoringWindowContractTests(unittest.TestCase):
 
     def test_default_window_is_24_hours_with_at_most_five_valid_events(self):
         self.assertIn("最近 24 小时", self.text)
-        self.assertRegex(self.text, r"最多\s*5\s*个.*有效控制事件")
+        self.assertRegex(self.text, r"最近\s*5\s*个有效控制事件")
         self.assertNotIn("最近 2 个已经形成明确状态收口的控制事件", self.text)
+
+    def test_more_than_five_events_must_select_the_five_most_recent_not_cherry_pick(self):
+        self.assertIn("超过 5 个时取时间上最近的 5 个", self.text)
+        self.assertIn("不得在 24 小时内挑选更漂亮的 5 个", self.text)
 
     def test_unresolved_major_anomalies_are_separate_and_not_double_counted(self):
         self.assertIn("当前所有重大未闭环异常", self.text)
