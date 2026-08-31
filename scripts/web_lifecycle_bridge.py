@@ -59,19 +59,24 @@ def canonical_root(path: str | Path) -> Path:
 
 
 def registered_controller_for_repo(repo: Path, registry_path: Path) -> str | None:
+    repo = repo.resolve()
     registry = load_json(registry_path)
-    matches = [
-        session_id
-        for session_id, value in registry.items()
-        if isinstance(value, str) and Path(value).expanduser().resolve() == repo
-    ]
+    matches: set[str] = set()
+    for session_id, value in registry.items():
+        if session_id == "__controller_surfaces__" or not isinstance(session_id, str):
+            continue
+        if isinstance(value, str) and Path(value).expanduser().resolve() == repo:
+            matches.add(session_id)
+    surfaces = registry.get("__controller_surfaces__")
+    if isinstance(surfaces, dict):
+        for session_id, value in surfaces.items():
+            if isinstance(session_id, str) and isinstance(value, str) and Path(value).expanduser().resolve() == repo:
+                matches.add(session_id)
     if not matches:
         return None
     if len(matches) != 1:
-        raise ValueError(
-            f"expected exactly one registered controller for {repo}, found {len(matches)}"
-        )
-    return matches[0]
+        raise ValueError(f"expected exactly one registered controller for {repo}, found {len(matches)}")
+    return next(iter(matches))
 
 
 def post_tool_event(
@@ -1156,11 +1161,12 @@ if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* ]]; then
   _ad_web_lifecycle_exit() {{
     local _ad_web_exit_code=$?
     trap - EXIT
-    "$_ad_web_bridge_python" "$_ad_web_bridge_script" post-shell \\
-      --cwd "$_ad_web_cwd" \\
-      --command "$_ad_web_command" \\
-      --exit-code "$_ad_web_exit_code" || true
-    exit "$_ad_web_exit_code"
+    "$_ad_web_bridge_python" "$_ad_web_bridge_script" post-shell \\n      --cwd "$_ad_web_cwd" \\n      --command "$_ad_web_command" \\n      --exit-code "$_ad_web_exit_code"
+    local _ad_web_bridge_exit_code=$?
+    if [[ "$_ad_web_exit_code" -ne 0 ]]; then
+      exit "$_ad_web_exit_code"
+    fi
+    exit "$_ad_web_bridge_exit_code"
   }}
   trap _ad_web_lifecycle_exit EXIT
 fi
@@ -1468,18 +1474,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             codex=args.codex,
             runtime_path=args.runtime_path,
         )
-        if lifecycle_state.get("pending_control_event") is True:
-            return 0 if wake_receipt_confirmed(wake_receipt) else 78
-        if wake_receipt is not None:
-            return 0 if wake_receipt_confirmed(wake_receipt) else 78
-        ok, error, env = preflight_native_resume(
-            session_id=args.session_id, repo=repo, registry=Path(args.registry).expanduser(), codex=args.codex, runtime_path=args.runtime_path
-        )
-        if not ok:
-            print(error, file=sys.stderr)
+        if wake_receipt is None:
+            print("web lifecycle wake supervisor produced no receipt", file=sys.stderr)
             return 78
-        completed = subprocess.run(command, check=False, env=env)
-        return completed.returncode
+        return 0 if wake_receipt_confirmed(wake_receipt) else 78
 
     if args.command_name == "auto-native-stop":
         repo = canonical_root(args.repo)

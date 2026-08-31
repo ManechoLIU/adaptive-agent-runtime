@@ -170,6 +170,38 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("exactly one registered controller", result.stderr)
 
+    def test_post_shell_resolves_explicit_bound_controller_worktree_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main = root / "repo"
+            main.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(main)], check=True)
+            subprocess.run(["git", "-C", str(main), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(main), "config", "user.name", "Test"], check=True)
+            (main / "seed").write_text("x", encoding="utf-8")
+            subprocess.run(["git", "-C", str(main), "add", "seed"], check=True)
+            subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "seed"], check=True)
+            surface = root / "controller-surface"
+            subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", "-b", "controller-surface", str(surface)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(main.resolve()),
+                "__controller_surfaces__": {"controller-1": str(surface.resolve())},
+            }), encoding="utf-8")
+            capture = root / "capture.json"
+            result = self.run_bridge(
+                "post-shell", "--cwd", str(surface), "--command", "git status --short",
+                "--exit-code", "0", "--registry", str(registry), "--capture-event", str(capture),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(capture.read_text(encoding="utf-8"))["session_id"], "controller-1")
+
+    def test_zshenv_exit_bridge_propagates_lifecycle_failure_over_successful_shell(self) -> None:
+        block = web_bridge.zshenv_block()
+        self.assertNotIn("|| true", block)
+        self.assertIn("_ad_web_bridge_exit_code", block)
+        self.assertIn('exit "$_ad_web_bridge_exit_code"', block)
+
     def test_print_zshenv_block_is_scoped_to_ai_bridge_parent(self) -> None:
         result = self.run_bridge("print-zshenv-block")
 
@@ -560,6 +592,29 @@ class WebLifecycleNativeStopTests(unittest.TestCase):
                 ["/opt/homebrew/bin/codex", "exec", "-C", str(repo.resolve()), "resume", "controller-1"],
             )
             self.assertNotIn("fork", argv)
+
+    def test_native_stop_missing_lifecycle_state_does_not_direct_resume(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            codex = root / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            codex.chmod(0o755)
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value={}), patch.object(
+                web_bridge, "dispatch_pending_lifecycle_wake", return_value=None
+            ), patch.object(
+                web_bridge, "preflight_native_resume", side_effect=AssertionError("direct resume must not run")
+            ):
+                code = web_bridge.main([
+                    "native-stop", "--session-id", "controller-1", "--repo", str(repo),
+                    "--registry", str(registry), "--codex", str(codex),
+                ])
+            self.assertNotEqual(code, 0)
 
     def test_auto_native_stop_skips_stale_superseded_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
