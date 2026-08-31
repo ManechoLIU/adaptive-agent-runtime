@@ -235,7 +235,10 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
         if existing_contract_version >= 2:
             if "side_effect" not in receipt or not isinstance(receipt.get("side_effect"), bool):
                 raise ValueError("terminal receipt requires side_effect contract")
-            terminal_key = str(receipt.get("idempotency_key") or "").strip() or None
+            terminal_key_raw = receipt.get("idempotency_key")
+            if terminal_key_raw is not None and not isinstance(terminal_key_raw, str):
+                raise ValueError("idempotency_key must be a string when provided")
+            terminal_key = str(terminal_key_raw or "").strip() or None
             existing_key = str(existing.get("idempotency_key") or "").strip() or None
             if receipt.get("side_effect") != existing.get("side_effect") or terminal_key != existing_key:
                 raise ValueError("side-effect contract drift requires a new Assignment")

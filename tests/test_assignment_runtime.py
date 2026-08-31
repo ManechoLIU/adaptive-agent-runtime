@@ -222,6 +222,19 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
                 retry_class="transport_error", side_effect=True, result_unknown="false",
             ), now=T0 + timedelta(minutes=1))
 
+    def test_terminal_rejects_non_string_idempotency_key(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1,
+            side_effect=True, idempotency_key="42"
+        ), now=T0)
+        with self.assertRaisesRegex(ValueError, "idempotency_key.*string"):
+            apply_receipt(state, receipt(
+                "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+                terminal_state="failed", outcome="recoverable_failure", summary="unknown external result",
+                evidence=[], artifacts=[], next_action="reconcile external state", retry_class="transport_error",
+                side_effect=True, idempotency_key=42, result_unknown=True,
+            ), now=T0 + timedelta(minutes=1))
+
     def test_side_effect_or_idempotency_contract_cannot_drift_during_recovery(self):
         state = apply_receipt({}, receipt(
             "assignment_started", attempt=1, lease_id="lease-1", event_seq=1,
