@@ -144,6 +144,12 @@ Goal 不是必须由用户每次手动开启。用户明确要求长期持续推
 
 每次只闭合一组因果相关动作，然后结束本轮等待下一事件。是否能顺手追加，不看动作多少：只有同一工作包、同一候选且为保持当前状态一致、安全、可恢复所必需的动作可以留下；另一任务、新实现或未来输入必须排到下一事件。但只要当前事件还有可立即执行的审查、集成、验收、ACK 追问、恢复或台账同步，就不能提前结束。
 
+### Controller Health 与自动唤醒
+
+Adaptive Agent Runtime 的 `Controller Health` 只从现有机器事实派生，`Wake Supervisor` 只负责把待处理控制事件送回**同一个** registered controller；technical Skill ID/path remain `adaptive-delivery`，no second controller，no mutable health ledger。main 与已明确绑定的总控 worktree 以 `Git common-dir` 共享同一所有权，但 controller worktree events require binding proof，普通 Writer / Reviewer worktree 不会变成总控。
+
+所有 `pending_control_event` 复用同一唤醒路径：`ACTIVE` 不重复启动，`DEFERRED` 保持 pending，宿主恢复走 same-controller continuation；只有既有安全条件满足才允许授权 peer-host fallback。`DEAD` 不会自动更换总控，而是 fail closed 并要求 explicit Resume/Replace handling。wake success does not clear pending；只有总控完成原控制事件并产生既有闭合证据后才清除 pending。
+
 ### 候选不能无限堆积
 
 每条顺序集成流的未处理候选 WIP 上限为 1：

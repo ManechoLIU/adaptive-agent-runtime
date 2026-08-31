@@ -40,6 +40,7 @@ REGISTRY_PATH = Path(
     )
 ).expanduser()
 LEDGER_NAMES = ("TASK_LEDGER.md", "PROJECT_STATUS.md")
+CONTROLLER_SURFACES_KEY = "__controller_surfaces__"
 
 
 
@@ -64,13 +65,39 @@ def run_git(root: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def project_snapshot(cwd: Path) -> dict[str, Any] | None:
+def git_common_dir(cwd: Path) -> Path | None:
     try:
-        root = Path(run_git(cwd, "rev-parse", "--show-toplevel")).resolve()
-        branch = run_git(root, "branch", "--show-current")
+        value = run_git(cwd, "rev-parse", "--git-common-dir")
     except (OSError, subprocess.CalledProcessError, ValueError):
         return None
-    if branch != "main":
+    if not value:
+        return None
+    path = Path(value)
+    return (path if path.is_absolute() else cwd / path).resolve()
+
+
+def canonical_main_root(cwd: Path) -> Path | None:
+    try:
+        worktrees = run_git(cwd, "worktree", "list", "--porcelain")
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return None
+    worktree: Path | None = None
+    for line in worktrees.splitlines():
+        if line.startswith("worktree "):
+            worktree = Path(line.removeprefix("worktree ")).resolve()
+        elif line == "branch refs/heads/main" and worktree is not None:
+            return worktree
+    return None
+
+
+def project_snapshot(cwd: Path) -> dict[str, Any] | None:
+    try:
+        invocation_root = Path(run_git(cwd, "rev-parse", "--show-toplevel")).resolve()
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return None
+    common_dir = git_common_dir(invocation_root)
+    root = canonical_main_root(invocation_root)
+    if common_dir is None or root is None or git_common_dir(root) != common_dir:
         return None
     ledger = next((root / name for name in LEDGER_NAMES if (root / name).is_file()), None)
     if ledger is None:
@@ -125,6 +152,7 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         rule_handshake = {"state": "integrity_error", "blocking": True, "installed_revision": None, "errors": [str(error)]}
     return {
         "root": str(root),
+        "git_common_dir": str(common_dir),
         "ledger": str(ledger),
         "head": run_git(root, "rev-parse", "HEAD"),
         "ledger_sha256": sha256_bytes(ledger.read_bytes()),
@@ -230,6 +258,33 @@ def lifecycle_triggers(
     return sorted(set(triggers))
 
 
+WAKE_ENTRY_POINT = "wake_existing_controller"
+
+
+def pending_event_fingerprint(state: dict[str, Any]) -> str:
+    value = {
+        "pending_control_event": state.get("pending_control_event") is True,
+        "triggers": state.get("triggers", []),
+        "wake_generation": int(state.get("wake_generation", 0) or 0),
+    }
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return sha256_bytes(encoded)
+
+
+def pending_wake_request(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Generic wake request for any pending controller event. Trigger type is evidence, not policy."""
+    if not isinstance(state, dict) or state.get("pending_control_event") is not True:
+        return None
+    return {
+        "entry_point": WAKE_ENTRY_POINT,
+        "pending_control_event": True,
+        "triggers": list(state.get("triggers", [])),
+        "event_fingerprint": pending_event_fingerprint(state),
+        "session_id": str(state.get("session_id", "")),
+        "controller_host": state.get("controller_host"),
+    }
+
+
 def _non_rule_triggers(triggers: list[str] | set[str]) -> set[str]:
     return {
         str(item) for item in triggers
@@ -295,6 +350,11 @@ def evaluate_event(
     if snapshot is None:
         return {}, {}
     state = dict(prior_state or {})
+    prior_pending = bool((prior_state or {}).get("pending_control_event"))
+    prior_generation = int((prior_state or {}).get("wake_generation", 0) or 0)
+    if prior_pending and prior_generation <= 0:
+        prior_generation = 1
+    state["wake_generation"] = prior_generation
     state["snapshot"] = snapshot
     state["session_id"] = str(event.get("session_id", ""))
     event_host = str(event.get("controller_host", "")).strip()
@@ -320,6 +380,8 @@ def evaluate_event(
                 "stop_continuations": 0,
             }
         )
+        if triggers and not prior_pending:
+            state["wake_generation"] = prior_generation + 1
         if not triggers:
             return {
                 "hookSpecificOutput": {
@@ -344,7 +406,8 @@ def evaluate_event(
     if event_name == "SubagentStop":
         triggers = set(state.get("triggers", []))
         agent_id = str(event.get("agent_id", "unknown"))
-        triggers.add(f"subagent_stopped:{agent_id}")
+        trigger = f"subagent_stopped:{agent_id}"
+        triggers.add(trigger)
         state.update(
             {
                 "pending_control_event": True,
@@ -352,6 +415,8 @@ def evaluate_event(
                 "stop_continuations": 0,
             }
         )
+        if not prior_pending:
+            state["wake_generation"] = prior_generation + 1
         return {}, state
 
     if successful_control_receipt(event, snapshot) and not snapshot.get("runnable_ids", snapshot.get("ready_ids")):
@@ -363,6 +428,8 @@ def evaluate_event(
                 "stop_continuations": 0,
                 "rule_wake_policy": "after_event",
             })
+            if rule_triggers and not prior_pending:
+                state["wake_generation"] = prior_generation + 1
         else:
             state.update(
                 {
@@ -397,6 +464,8 @@ def evaluate_event(
     if wake_policy == "after_event" and prior_nonrule_pending:
         pending = True
     state.update({"pending_control_event": pending, "triggers": triggers})
+    if pending and not prior_pending:
+        state["wake_generation"] = prior_generation + 1
 
     if event_name == "PostToolUse":
         progress_labels = {
@@ -469,10 +538,56 @@ def registered_root(session_id: str) -> Path | None:
     return Path(value).expanduser().resolve()
 
 
-def register_controller(session_id: str, root: Path) -> None:
+def registered_controller_surface(session_id: str, expected_root: Path) -> Path | None:
     registry = load_json(REGISTRY_PATH)
-    registry[session_id] = str(root.resolve())
+    surfaces = registry.get(CONTROLLER_SURFACES_KEY)
+    if surfaces is None:
+        return expected_root.resolve()
+    if not isinstance(surfaces, dict):
+        return None
+    value = surfaces.get(session_id)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return Path(value).expanduser().resolve()
+
+
+def register_controller(session_id: str, root: Path) -> None:
+    canonical_root = canonical_main_root(root)
+    if canonical_root is None:
+        raise ValueError("controller registration requires a canonical main worktree")
+    registry = load_json(REGISTRY_PATH)
+    for registered_session, registered_path in registry.items():
+        if registered_session == session_id or not isinstance(registered_path, str):
+            continue
+        if Path(registered_path).expanduser().resolve() == canonical_root.resolve():
+            raise ValueError("canonical project already has a different controller session")
+    registry[session_id] = str(canonical_root)
+    surfaces = registry.get(CONTROLLER_SURFACES_KEY)
+    if surfaces is None:
+        surfaces = {}
+    elif not isinstance(surfaces, dict):
+        raise ValueError("controller surface registry is invalid")
+    surfaces[session_id] = str(root.resolve())
+    registry[CONTROLLER_SURFACES_KEY] = surfaces
     write_json(REGISTRY_PATH, registry)
+
+
+def controller_event_is_managed(
+    event: dict[str, Any], cwd: Path, expected_root: Path
+) -> bool:
+    session_id = str(event.get("session_id", "")).strip()
+    if not session_id or registered_root(session_id) != expected_root.resolve():
+        return False
+    try:
+        invocation_root = Path(run_git(cwd, "rev-parse", "--show-toplevel")).resolve()
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return False
+    if registered_controller_surface(session_id, expected_root) != invocation_root:
+        return False
+    snapshot = project_snapshot(cwd)
+    if snapshot is None or Path(snapshot["root"]).resolve() != expected_root.resolve():
+        return False
+    return snapshot.get("git_common_dir") == str(git_common_dir(expected_root))
 
 
 def state_path(session_id: str) -> Path:
@@ -493,7 +608,7 @@ def run_hook() -> int:
     if expected_root is None:
         return 0
     snapshot = project_snapshot(cwd)
-    if snapshot is None or Path(snapshot["root"]).resolve() != expected_root:
+    if snapshot is None or not controller_event_is_managed(event, cwd, expected_root):
         return 0
     path = state_path(session_id)
     output, next_state = evaluate_event(

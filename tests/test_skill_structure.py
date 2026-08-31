@@ -279,6 +279,30 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("--register-controller", readme)
         self.assertIn("/hooks", readme)
 
+    def test_controller_health_wake_contract_is_documented_without_second_identity(self):
+        entrypoint = read_entrypoint()
+        long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        combined = "\n".join((entrypoint, long_task, readme))
+
+        for phrase in (
+            "Controller Health",
+            "Wake Supervisor",
+            "DEAD",
+            "DEFERRED",
+            "Git common-dir",
+            "pending_control_event",
+            "same-controller continuation",
+            "wake success does not clear pending",
+        ):
+            self.assertIn(phrase, combined)
+        self.assertIn("Adaptive Agent Runtime", combined)
+        self.assertIn("technical Skill ID/path remain `adaptive-delivery`", combined)
+        self.assertIn("no second controller", combined)
+        self.assertIn("no mutable health ledger", combined)
+        self.assertIn("controller worktree events require binding proof", combined)
+        self.assertIn("explicit Resume/Replace handling", combined)
+
     def test_controller_scoring_machine_gate_is_packaged_and_documented(self):
         entrypoint = read_entrypoint()
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

@@ -11,7 +11,12 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
+
+try:
+    from controller_health import decide_controller_wake, derive_controller_health
+except ModuleNotFoundError:
+    from scripts.controller_health import decide_controller_wake, derive_controller_health
 
 
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
@@ -54,19 +59,24 @@ def canonical_root(path: str | Path) -> Path:
 
 
 def registered_controller_for_repo(repo: Path, registry_path: Path) -> str | None:
+    repo = repo.resolve()
     registry = load_json(registry_path)
-    matches = [
-        session_id
-        for session_id, value in registry.items()
-        if isinstance(value, str) and Path(value).expanduser().resolve() == repo
-    ]
+    matches: set[str] = set()
+    for session_id, value in registry.items():
+        if session_id == "__controller_surfaces__" or not isinstance(session_id, str):
+            continue
+        if isinstance(value, str) and Path(value).expanduser().resolve() == repo:
+            matches.add(session_id)
+    surfaces = registry.get("__controller_surfaces__")
+    if isinstance(surfaces, dict):
+        for session_id, value in surfaces.items():
+            if isinstance(session_id, str) and isinstance(value, str) and Path(value).expanduser().resolve() == repo:
+                matches.add(session_id)
     if not matches:
         return None
     if len(matches) != 1:
-        raise ValueError(
-            f"expected exactly one registered controller for {repo}, found {len(matches)}"
-        )
-    return matches[0]
+        raise ValueError(f"expected exactly one registered controller for {repo}, found {len(matches)}")
+    return next(iter(matches))
 
 
 def post_tool_event(
@@ -310,14 +320,31 @@ def _audit_receipt_status(cursor_path: Path, receipt: dict[str, Any]) -> str | N
     return receipts.get(_audit_receipt_key(receipt)) if isinstance(receipts, dict) else None
 
 
-def _set_audit_receipt_status(cursor_path: Path, receipt: dict[str, Any], status: str) -> None:
+def _audit_receipt_wake_fingerprint(cursor_path: Path, receipt: dict[str, Any]) -> str | None:
+    data = load_json(_audit_receipt_state_path(cursor_path))
+    fingerprints = data.get("wake_fingerprints", {}) if isinstance(data, dict) else {}
+    value = fingerprints.get(_audit_receipt_key(receipt)) if isinstance(fingerprints, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _set_audit_receipt_status(
+    cursor_path: Path, receipt: dict[str, Any], status: str, *, wake_fingerprint: str | None = None
+) -> None:
     path = _audit_receipt_state_path(cursor_path)
     data = load_json(path)
     receipts = data.get("receipts", {}) if isinstance(data.get("receipts"), dict) else {}
-    receipts[_audit_receipt_key(receipt)] = status
+    fingerprints = data.get("wake_fingerprints", {}) if isinstance(data.get("wake_fingerprints"), dict) else {}
+    key = _audit_receipt_key(receipt)
+    receipts[key] = status
+    if status == "wake_pending" and wake_fingerprint:
+        fingerprints[key] = wake_fingerprint
+    elif status != "wake_pending":
+        fingerprints.pop(key, None)
     if len(receipts) > 256:
-        receipts = dict(list(receipts.items())[-256:])
-    _write_json_atomic_file(path, {"receipts": receipts})
+        keep = set(list(receipts.keys())[-256:])
+        receipts = {key: value for key, value in receipts.items() if key in keep}
+        fingerprints = {key: value for key, value in fingerprints.items() if key in keep}
+    _write_json_atomic_file(path, {"receipts": receipts, "wake_fingerprints": fingerprints})
 
 
 def _advance_audit_cursor(cursor_path: Path, inode: int, offset: int) -> None:
@@ -422,17 +449,15 @@ def native_runtime_env(runtime_path: str | None = None) -> dict[str, str]:
 
 def codex_requires_node(codex: Path) -> bool:
     try:
-        first = codex.open("r", encoding="utf-8", errors="ignore").readline(512)
+        with codex.open("r", encoding="utf-8", errors="ignore") as handle:
+            first = handle.readline(512)
     except OSError:
         return False
     return "/usr/bin/env node" in first
 
 
 def write_auto_stop_state(state_path: Path, value: dict[str, Any]) -> None:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = state_path.with_suffix(state_path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(state_path)
+    _write_json_atomic_file(state_path, value)
 
 
 def preflight_native_resume(
@@ -442,9 +467,9 @@ def preflight_native_resume(
     if not repo.is_dir():
         return False, f"repository does not exist: {repo}", env
     try:
-        registered = registered_controller_for_repo(repo, registry)
-    except ValueError as exc:
-        return False, str(exc), env
+        registered = _registered_controller_for_common_dir(repo, registry)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"cannot resolve registered controller common-dir: {exc}", env
     if registered != session_id:
         return False, f"session {session_id} is not the registered controller for {repo}", env
     codex_path = Path(codex).expanduser()
@@ -486,6 +511,418 @@ def native_resume_command(*, codex: str, session_id: str, repo: Path) -> list[st
     )
     return [codex, "exec", "-C", str(repo.resolve()), "resume", session_id, prompt]
 
+
+def execute_native_resume(
+    *,
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    codex: str,
+    runtime_path: str | None = None,
+) -> dict[str, Any]:
+    """Run one bounded, preflighted same-thread native resume attempt."""
+    command = native_resume_command(codex=codex, session_id=session_id, repo=repo)
+    try:
+        ok, preflight_error, env = preflight_native_resume(
+            session_id=session_id,
+            repo=repo,
+            registry=registry,
+            codex=codex,
+            runtime_path=runtime_path,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        ok, preflight_error, env = (
+            False,
+            f"native resume preflight error: {exc}",
+            native_runtime_env(runtime_path),
+        )
+    if not ok:
+        return {
+            "operation": "native_resume",
+            "command": command,
+            "result": "FAILED",
+            "state": "RESUME_FAILED",
+            "pending_control_event": True,
+            "returncode": 78,
+            "stderr_tail": bounded_tail(preflight_error),
+            "error_code": "WEB_LIFECYCLE_RESUME_FAILED",
+        }
+
+    try:
+        completed = subprocess.run(
+            command, check=False, capture_output=True, text=True, env=env
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "operation": "native_resume",
+            "command": command,
+            "result": "FAILED",
+            "state": "RESUME_FAILED",
+            "pending_control_event": True,
+            "returncode": 78,
+            "stderr_tail": bounded_tail(f"native resume execution error: {exc}"),
+            "error_code": "WEB_LIFECYCLE_RESUME_FAILED",
+        }
+
+    attempt: dict[str, Any] = {
+        "operation": "native_resume",
+        "command": command,
+        "pending_control_event": True,
+        "returncode": completed.returncode,
+        "stdout_tail": bounded_tail(completed.stdout),
+        "stderr_tail": bounded_tail(completed.stderr),
+    }
+    if completed.returncode == 0:
+        attempt.update({"result": "CONFIRMED", "state": "RESUME_SUCCEEDED"})
+        return attempt
+    attempt.update(classify_native_resume_failure(
+        completed.returncode, completed.stdout, completed.stderr
+    ))
+    attempt["result"] = "DEFERRED" if attempt["state"] == "RESUME_DEFERRED_ACTIVE_WRITER" else "FAILED"
+    return attempt
+
+
+def controller_wake_lock_path(repo: Path) -> Path:
+    return _git_common_dir(repo) / "adaptive-delivery" / "controller-wake.lock"
+
+
+def _registered_controller_for_common_dir(repo: Path, registry_path: Path) -> str | None:
+    common_dir = _git_common_dir(repo)
+    registry = load_json(registry_path)
+    matches: list[str] = []
+    for session_id, registered_repo in registry.items():
+        if not isinstance(session_id, str) or not isinstance(registered_repo, str):
+            continue
+        try:
+            if _git_common_dir(Path(registered_repo).expanduser().resolve()) == common_dir:
+                matches.append(session_id)
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _wake_event_fingerprint(lifecycle_state: dict[str, Any]) -> str:
+    snapshot = lifecycle_state.get("snapshot")
+    generation: dict[str, Any] = {}
+    if isinstance(snapshot, dict):
+        generation = {
+            "head": snapshot.get("head"),
+            "ledger_sha256": snapshot.get("ledger_sha256"),
+            "worktree_status_sha256": snapshot.get("worktree_status_sha256"),
+            "ready_ids": snapshot.get("ready_ids", []),
+            "runnable_ids": snapshot.get("runnable_ids", []),
+            "candidate_revisions": snapshot.get("candidate_revisions", []),
+            "rule_handshake": snapshot.get("rule_handshake", {}),
+        }
+    value = {
+        "pending_control_event": lifecycle_state.get("pending_control_event") is True,
+        "triggers": lifecycle_state.get("triggers", []),
+        "wake_generation": int(lifecycle_state.get("wake_generation", 0) or 0),
+        "event_generation": generation,
+    }
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return __import__("hashlib").sha256(encoded).hexdigest()
+
+
+def _bounded_adapter_operation(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return f"<non-text adapter operation: {type(value).__name__}>"
+    return _bounded_text(value, 512)[0]
+
+
+def _bounded_adapter_command(value: Any) -> list[str] | None:
+    if not isinstance(value, (list, tuple)):
+        return None
+    remaining = STDERR_TAIL_LIMIT
+    command: list[str] = []
+    for argument in value[:64]:
+        if not isinstance(argument, str):
+            return None
+        if remaining <= 0:
+            break
+        normalized, _ = _bounded_text(argument, min(1024, remaining))
+        command.append(normalized)
+        remaining -= len(normalized.encode("utf-8"))
+    return command
+
+
+def _bounded_adapter_diagnostics(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return f"<non-text adapter diagnostics: {type(value).__name__}>"
+    return bounded_tail(value)
+
+
+def _wake_receipt(
+    *,
+    common_dir: Path,
+    session_id: str,
+    event_fingerprint: str,
+    health: dict[str, Any],
+    decision: str,
+    selected_host: str | None,
+    reason: str,
+    operation: Any,
+    result: str,
+    command: Any = None,
+    diagnostics: Any = None,
+) -> dict[str, Any]:
+    now = int(time.time() * 1000)
+    receipt: dict[str, Any] = {
+        "schema_version": 1,
+        "canonical_common_dir": str(common_dir),
+        "controller_session_id": session_id,
+        "event_fingerprint": event_fingerprint,
+        "health": health.get("state"),
+        "preferred_host": health.get("controller_host"),
+        "selected_host": selected_host,
+        "decision": decision,
+        "reason": bounded_tail(reason, 512),
+        "started_at_unix_ms": now,
+        "completed_at_unix_ms": now,
+        "operation": _bounded_adapter_operation(operation),
+        "result": result,
+        # A host confirmation proves only the same-thread launch.  Lifecycle closure
+        # remains the control-event guard's responsibility.
+        "pending_control_event": True,
+    }
+    normalized_command = _bounded_adapter_command(command)
+    if normalized_command is not None:
+        receipt["command"] = normalized_command
+    normalized_diagnostics = _bounded_adapter_diagnostics(diagnostics)
+    if normalized_diagnostics:
+        receipt["diagnostics"] = normalized_diagnostics
+    return receipt
+
+
+def wake_existing_controller(
+    *,
+    lifecycle_state: dict[str, Any],
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    codex: str,
+    receipt_path: Path,
+    host_facts: dict[str, Any],
+    resume_adapters: dict[str, Callable[..., dict[str, Any]]] | None = None,
+    runtime_path: str | None = None,
+) -> dict[str, Any]:
+    """Wake only the registered controller, using Task 1's pure decision policy."""
+    repo = repo.resolve()
+    try:
+        common_dir = _git_common_dir(repo)
+    except (OSError, subprocess.SubprocessError) as exc:
+        health = derive_controller_health({})
+        receipt = _wake_receipt(
+            common_dir=repo,
+            session_id=session_id,
+            event_fingerprint=_wake_event_fingerprint(lifecycle_state),
+            health=health,
+            decision="DEAD_BLOCK",
+            selected_host=None,
+            reason=f"cannot resolve Git common-dir: {exc}",
+            operation=None,
+            result="BLOCKED",
+        )
+        _write_json_atomic_file(receipt_path, receipt)
+        return receipt
+
+    facts = dict(host_facts) if isinstance(host_facts, dict) else {}
+    facts.update({
+        "registered_controller": session_id,
+        "canonical_common_dir": str(common_dir),
+        "pending_control_event": lifecycle_state.get("pending_control_event") is True,
+    })
+    if _registered_controller_for_common_dir(repo, registry) != session_id:
+        facts.pop("registered_controller", None)
+    health = derive_controller_health(facts)
+    wake = decide_controller_wake(health)
+    decision = str(wake["decision"])
+    selected_host = wake["selected_host"]
+    fingerprint = _wake_event_fingerprint(lifecycle_state)
+    reason = str(facts.get("failure_class") or health["state"])
+
+    lock_path = common_dir / "adaptive-delivery" / "controller-wake.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            receipt = _wake_receipt(
+                common_dir=common_dir,
+                session_id=session_id,
+                event_fingerprint=fingerprint,
+                health=health,
+                decision="DEFER",
+                selected_host=None,
+                reason="common_dir_wake_locked",
+                operation=None,
+                result="DEFERRED",
+            )
+            return receipt
+
+        if decision == "NOOP_ACTIVE":
+            receipt = _wake_receipt(
+                common_dir=common_dir, session_id=session_id, event_fingerprint=fingerprint,
+                health=health, decision=decision, selected_host=None, reason=reason,
+                operation=None, result="CONFIRMED",
+            )
+        elif decision == "DEFER":
+            receipt = _wake_receipt(
+                common_dir=common_dir, session_id=session_id, event_fingerprint=fingerprint,
+                health=health, decision=decision, selected_host=None, reason=reason,
+                operation=None, result="DEFERRED",
+            )
+        elif decision == "DEAD_BLOCK":
+            receipt = _wake_receipt(
+                common_dir=common_dir, session_id=session_id, event_fingerprint=fingerprint,
+                health=health, decision=decision, selected_host=None, reason=reason,
+                operation=None, result="BLOCKED",
+            )
+        else:
+            if selected_host == health.get("controller_host"):
+                attempt = execute_native_resume(
+                    session_id=session_id, repo=repo, registry=registry, codex=codex,
+                    runtime_path=runtime_path,
+                )
+            else:
+                adapter = (resume_adapters or {}).get(str(selected_host))
+                if adapter is None:
+                    attempt = {
+                        "operation": None,
+                        "result": "DEFERRED",
+                        "state": "RESUME_DEFERRED",
+                        "stderr_tail": f"no authorized adapter for peer host {selected_host}",
+                    }
+                else:
+                    try:
+                        attempt = adapter(
+                            session_id=session_id,
+                            repo=repo,
+                            registry=registry,
+                            codex=codex,
+                            runtime_path=runtime_path,
+                        )
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        attempt = {
+                            "operation": f"{selected_host}_resume",
+                            "result": "FAILED",
+                            "state": "RESUME_FAILED",
+                            "stderr_tail": f"host adapter error: {exc}",
+                        }
+            result = str(attempt.get("result", "FAILED"))
+            receipt = _wake_receipt(
+                common_dir=common_dir, session_id=session_id, event_fingerprint=fingerprint,
+                health=health, decision=decision, selected_host=str(selected_host), reason=reason,
+                operation=attempt.get("operation"), result=result,
+                command=attempt.get("command"), diagnostics=attempt.get("stderr_tail"),
+            )
+        _write_json_atomic_file(receipt_path, receipt)
+        return receipt
+    finally:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock.close()
+
+
+def default_wake_receipt_path(repo: Path) -> Path:
+    return _git_common_dir(repo) / "adaptive-delivery" / "controller-wake-receipt.json"
+
+
+def _lifecycle_module() -> Any:
+    try:
+        import lifecycle_hook as lifecycle
+    except ModuleNotFoundError:
+        from scripts import lifecycle_hook as lifecycle
+    return lifecycle
+
+
+def _load_lifecycle_state(session_id: str) -> dict[str, Any]:
+    try:
+        lifecycle = _lifecycle_module()
+        loaded = lifecycle.load_json(lifecycle.state_path(session_id))
+    except (OSError, ValueError, ModuleNotFoundError, ImportError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def dispatch_pending_lifecycle_wake(
+    *,
+    lifecycle_state: dict[str, Any],
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    codex: str,
+    receipt_path: Path | None = None,
+    host_facts: dict[str, Any] | None = None,
+    resume_adapters: dict[str, Callable[..., dict[str, Any]]] | None = None,
+    runtime_path: str | None = None,
+) -> dict[str, Any] | None:
+    """Route any pending lifecycle event through the one Wake Supervisor path."""
+    if not isinstance(lifecycle_state, dict) or lifecycle_state.get("pending_control_event") is not True:
+        return None
+    repo = repo.resolve()
+    try:
+        target_receipt = receipt_path or default_wake_receipt_path(repo)
+    except (OSError, subprocess.SubprocessError):
+        if receipt_path is None:
+            return None
+        target_receipt = receipt_path
+    fingerprint = _wake_event_fingerprint(lifecycle_state)
+    prior = load_json(target_receipt)
+    try:
+        current_common_dir = str(_git_common_dir(repo))
+        current_registered = _registered_controller_for_common_dir(repo, registry)
+    except (OSError, subprocess.SubprocessError):
+        current_common_dir = None
+        current_registered = None
+    if (
+        prior.get("event_fingerprint") == fingerprint
+        and prior.get("result") == "CONFIRMED"
+        and prior.get("controller_session_id") == session_id
+        and current_registered == session_id
+        and current_common_dir is not None
+        and prior.get("canonical_common_dir") == current_common_dir
+    ):
+        debounced = dict(prior)
+        debounced["debounced"] = True
+        return debounced
+
+    facts = dict(host_facts) if isinstance(host_facts, dict) else {}
+    controller_host = str(lifecycle_state.get("controller_host") or facts.get("controller_host") or "web").strip()
+    if controller_host not in {"web", "desktop_codex"}:
+        controller_host = "web"
+    facts.setdefault("controller_host", controller_host)
+    if (
+        "resume_actionable" not in facts
+        and "resume_state" not in facts
+        and facts.get("controller_execution_active") is not True
+        and facts.get("active_writer") is not True
+    ):
+        facts["resume_actionable"] = True
+    return wake_existing_controller(
+        lifecycle_state=lifecycle_state,
+        session_id=session_id,
+        repo=repo,
+        registry=registry,
+        codex=codex,
+        receipt_path=target_receipt,
+        host_facts=facts,
+        resume_adapters=resume_adapters,
+        runtime_path=runtime_path,
+    )
+
+
+
+def wake_receipt_confirmed(receipt: dict[str, Any] | None) -> bool:
+    return isinstance(receipt, dict) and receipt.get("result") == "CONFIRMED"
 
 def successful_guard_event_from_receipt(
     receipt: dict[str, Any], *, session_id: str, repo: Path
@@ -705,59 +1142,41 @@ def run_auto_native_stop(
         "runtime_path": runtime_path or DEFAULT_RUNTIME_PATH,
     })
     write_auto_stop_state(state_path, latest)
-
-    try:
-        ok, preflight_error, env = preflight_native_resume(
-            session_id=session_id, repo=repo, registry=registry, codex=codex, runtime_path=runtime_path
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        ok, preflight_error, env = False, f"native resume preflight error: {exc}", native_runtime_env(runtime_path)
-    if not ok:
-        latest = load_json(state_path)
-        if latest.get("receipt_id") == receipt_id:
-            latest.update({
-                "state": "RESUME_FAILED",
-                "pending_control_event": True,
-                "completed_at_unix_ms": int(time.time() * 1000),
-                "returncode": 78,
-                "stderr_tail": bounded_tail(preflight_error),
-                "error_code": "WEB_LIFECYCLE_RESUME_FAILED",
-            })
-            write_auto_stop_state(state_path, latest)
-        print(preflight_error, file=sys.stderr)
-        return 78
-
-    completed = subprocess.run(
-        command, check=False, capture_output=True, text=True, env=env
+    attempt = execute_native_resume(
+        session_id=session_id, repo=repo, registry=registry, codex=codex,
+        runtime_path=runtime_path,
     )
     latest = load_json(state_path)
     if latest.get("receipt_id") == receipt_id:
-        confirmed = completed.returncode == 0
-        if confirmed:
+        if attempt["result"] == "CONFIRMED":
             latest.update({
                 "state": "RESUME_CONFIRMED",
-                "pending_control_event": False,
+                "pending_control_event": True,
                 "completed_at_unix_ms": int(time.time() * 1000),
-                "returncode": completed.returncode,
-                "stdout_tail": bounded_tail(completed.stdout),
-                "stderr_tail": bounded_tail(completed.stderr),
+                "returncode": attempt["returncode"],
+                "stdout_tail": attempt.get("stdout_tail", ""),
+                "stderr_tail": attempt.get("stderr_tail", ""),
             })
             latest.pop("error_code", None)
             latest.pop("failure_class", None)
             latest.pop("fallback_eligible", None)
         else:
-            classification = classify_native_resume_failure(completed.returncode, completed.stdout, completed.stderr)
-            latest.update(classification)
             latest.update({
+                "state": attempt["state"],
+                "pending_control_event": True,
                 "completed_at_unix_ms": int(time.time() * 1000),
-                "returncode": completed.returncode,
-                "stdout_tail": bounded_tail(completed.stdout),
-                "stderr_tail": bounded_tail(completed.stderr),
+                "returncode": attempt["returncode"],
+                "stdout_tail": attempt.get("stdout_tail", ""),
+                "stderr_tail": attempt.get("stderr_tail", ""),
             })
+            for key in ("error_code", "failure_class", "fallback_eligible"):
+                if key in attempt:
+                    latest[key] = attempt[key]
         write_auto_stop_state(state_path, latest)
-    if completed.stderr:
-        print(bounded_tail(completed.stderr), file=sys.stderr, end="" if completed.stderr.endswith("\n") else "\n")
-    return completed.returncode
+    stderr_tail = str(attempt.get("stderr_tail", ""))
+    if stderr_tail:
+        print(stderr_tail, file=sys.stderr, end="" if stderr_tail.endswith("\n") else "\n")
+    return int(attempt["returncode"])
 
 
 def zshenv_block() -> str:
@@ -773,11 +1192,12 @@ if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* ]]; then
   _ad_web_lifecycle_exit() {{
     local _ad_web_exit_code=$?
     trap - EXIT
-    "$_ad_web_bridge_python" "$_ad_web_bridge_script" post-shell \\
-      --cwd "$_ad_web_cwd" \\
-      --command "$_ad_web_command" \\
-      --exit-code "$_ad_web_exit_code" || true
-    exit "$_ad_web_exit_code"
+    "$_ad_web_bridge_python" "$_ad_web_bridge_script" post-shell --cwd "$_ad_web_cwd" --command "$_ad_web_command" --exit-code "$_ad_web_exit_code"
+    local _ad_web_bridge_exit_code=$?
+    if [[ "$_ad_web_exit_code" -ne 0 ]]; then
+      exit "$_ad_web_exit_code"
+    fi
+    exit "$_ad_web_bridge_exit_code"
   }}
   trap _ad_web_lifecycle_exit EXIT
 fi
@@ -900,7 +1320,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 encoding="utf-8",
             )
             return 0
-        return dispatch_event(event)
+        dispatch_code = dispatch_event(event)
+        if dispatch_code != 0:
+            return dispatch_code
+        lifecycle_state = _load_lifecycle_state(session_id)
+        wake_receipt = dispatch_pending_lifecycle_wake(
+            lifecycle_state=lifecycle_state,
+            session_id=session_id,
+            repo=repo,
+            registry=Path(args.registry).expanduser(),
+            codex="/opt/homebrew/bin/codex",
+        )
+        if lifecycle_state.get("pending_control_event") is True and not wake_receipt_confirmed(wake_receipt):
+            return 78
+        return 0
 
     if args.command_name == "audit-once":
         repo = Path(args.repo).expanduser().resolve()
@@ -920,6 +1353,55 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else default_computer_lease_path(args.session_id)
             )
             for receipt, next_offset in records:
+                status = _audit_receipt_status(cursor_path, receipt)
+                if status == "handled":
+                    _advance_audit_cursor(cursor_path, audit_inode, next_offset)
+                    continue
+                if status == "pending":
+                    print(
+                        f"web lifecycle receipt outcome unknown; reconcile before replay: {_audit_receipt_key(receipt)}",
+                        file=sys.stderr,
+                    )
+                    return 3
+                if status == "wake_pending":
+                    expected_wake_fingerprint = _audit_receipt_wake_fingerprint(cursor_path, receipt)
+                    try:
+                        lifecycle_state = _load_lifecycle_state(args.session_id)
+                        if lifecycle_state.get("pending_control_event") is not True:
+                            print(
+                                f"web lifecycle wake retry state missing or no longer pending for {_audit_receipt_key(receipt)}",
+                                file=sys.stderr,
+                            )
+                            return 78
+                        current_fingerprint = _wake_event_fingerprint(lifecycle_state)
+                        if not expected_wake_fingerprint or current_fingerprint != expected_wake_fingerprint:
+                            print(
+                                f"web lifecycle wake retry generation mismatch for {_audit_receipt_key(receipt)}",
+                                file=sys.stderr,
+                            )
+                            return 78
+                        wake_receipt = dispatch_pending_lifecycle_wake(
+                            lifecycle_state=lifecycle_state,
+                            session_id=args.session_id,
+                            repo=repo,
+                            registry=Path(args.registry).expanduser(),
+                            codex=args.codex,
+                            runtime_path=args.runtime_path,
+                        )
+                        if not wake_receipt_confirmed(wake_receipt):
+                            result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
+                            print(
+                                f"web lifecycle wake not confirmed for {_audit_receipt_key(receipt)}: {result}",
+                                file=sys.stderr,
+                            )
+                            return 78
+                    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                        print(f"web lifecycle handling failed for {_audit_receipt_key(receipt)}: {exc}", file=sys.stderr)
+                        return 3
+                    _set_audit_receipt_status(cursor_path, receipt, "handled")
+                    _advance_audit_cursor(cursor_path, audit_inode, next_offset)
+                    continue
+
                 guard_event = successful_guard_event_from_receipt(
                     receipt, session_id=args.session_id, repo=repo
                 )
@@ -931,13 +1413,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if event is None:
                     _advance_audit_cursor(cursor_path, audit_inode, next_offset)
                     continue
-                status = _audit_receipt_status(cursor_path, receipt)
-                if status == "handled":
-                    _advance_audit_cursor(cursor_path, audit_inode, next_offset)
-                    continue
-                if status == "pending":
-                    print(f"web lifecycle receipt outcome unknown; reconcile before replay: {_audit_receipt_key(receipt)}", file=sys.stderr)
-                    return 3
                 _set_audit_receipt_status(cursor_path, receipt, "pending")
                 try:
                     if args.capture_events:
@@ -945,8 +1420,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else:
                         dispatch_code = dispatch_event(event)
                         if dispatch_code != 0:
-                            print(f"web lifecycle dispatch failed for {_audit_receipt_key(receipt)}: exit {dispatch_code}", file=sys.stderr)
+                            print(
+                                f"web lifecycle dispatch failed for {_audit_receipt_key(receipt)}: exit {dispatch_code}",
+                                file=sys.stderr,
+                            )
                             return dispatch_code
+                        lifecycle_state = _load_lifecycle_state(args.session_id)
+                        if lifecycle_state.get("pending_control_event") is True:
+                            _set_audit_receipt_status(
+                                cursor_path,
+                                receipt,
+                                "wake_pending",
+                                wake_fingerprint=_wake_event_fingerprint(lifecycle_state),
+                            )
+                            wake_receipt = dispatch_pending_lifecycle_wake(
+                                lifecycle_state=lifecycle_state,
+                                session_id=args.session_id,
+                                repo=repo,
+                                registry=Path(args.registry).expanduser(),
+                                codex=args.codex,
+                                runtime_path=args.runtime_path,
+                            )
+                            if not wake_receipt_confirmed(wake_receipt):
+                                result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
+                                print(
+                                    f"web lifecycle wake not confirmed for {_audit_receipt_key(receipt)}: {result}",
+                                    file=sys.stderr,
+                                )
+                                return 78
                     if args.auto_native_stop and guard_event is not None:
                         receipt_id = str(receipt.get("receiptId") or "web-guard")
                         state_path = (
@@ -1047,14 +1548,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             print(json.dumps(command, ensure_ascii=False))
             return 0
-        ok, error, env = preflight_native_resume(
-            session_id=args.session_id, repo=repo, registry=Path(args.registry).expanduser(), codex=args.codex, runtime_path=args.runtime_path
+        lifecycle_state = _load_lifecycle_state(args.session_id)
+        wake_receipt = dispatch_pending_lifecycle_wake(
+            lifecycle_state=lifecycle_state,
+            session_id=args.session_id,
+            repo=repo,
+            registry=Path(args.registry).expanduser(),
+            codex=args.codex,
+            runtime_path=args.runtime_path,
         )
-        if not ok:
-            print(error, file=sys.stderr)
+        if wake_receipt is None:
+            print("web lifecycle wake supervisor produced no receipt", file=sys.stderr)
             return 78
-        completed = subprocess.run(command, check=False, env=env)
-        return completed.returncode
+        return 0 if wake_receipt_confirmed(wake_receipt) else 78
 
     if args.command_name == "auto-native-stop":
         repo = canonical_root(args.repo)
