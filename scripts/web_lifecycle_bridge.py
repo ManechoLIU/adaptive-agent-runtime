@@ -320,14 +320,31 @@ def _audit_receipt_status(cursor_path: Path, receipt: dict[str, Any]) -> str | N
     return receipts.get(_audit_receipt_key(receipt)) if isinstance(receipts, dict) else None
 
 
-def _set_audit_receipt_status(cursor_path: Path, receipt: dict[str, Any], status: str) -> None:
+def _audit_receipt_wake_fingerprint(cursor_path: Path, receipt: dict[str, Any]) -> str | None:
+    data = load_json(_audit_receipt_state_path(cursor_path))
+    fingerprints = data.get("wake_fingerprints", {}) if isinstance(data, dict) else {}
+    value = fingerprints.get(_audit_receipt_key(receipt)) if isinstance(fingerprints, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _set_audit_receipt_status(
+    cursor_path: Path, receipt: dict[str, Any], status: str, *, wake_fingerprint: str | None = None
+) -> None:
     path = _audit_receipt_state_path(cursor_path)
     data = load_json(path)
     receipts = data.get("receipts", {}) if isinstance(data.get("receipts"), dict) else {}
-    receipts[_audit_receipt_key(receipt)] = status
+    fingerprints = data.get("wake_fingerprints", {}) if isinstance(data.get("wake_fingerprints"), dict) else {}
+    key = _audit_receipt_key(receipt)
+    receipts[key] = status
+    if status == "wake_pending" and wake_fingerprint:
+        fingerprints[key] = wake_fingerprint
+    elif status != "wake_pending":
+        fingerprints.pop(key, None)
     if len(receipts) > 256:
-        receipts = dict(list(receipts.items())[-256:])
-    _write_json_atomic_file(path, {"receipts": receipts})
+        keep = set(list(receipts.keys())[-256:])
+        receipts = {key: value for key, value in receipts.items() if key in keep}
+        fingerprints = {key: value for key, value in fingerprints.items() if key in keep}
+    _write_json_atomic_file(path, {"receipts": receipts, "wake_fingerprints": fingerprints})
 
 
 def _advance_audit_cursor(cursor_path: Path, inode: int, offset: int) -> None:
@@ -1330,6 +1347,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"web lifecycle receipt outcome unknown; reconcile before replay: {_audit_receipt_key(receipt)}", file=sys.stderr)
                     return 3
                 retry_wake_only = status == "wake_pending"
+                expected_wake_fingerprint = (
+                    _audit_receipt_wake_fingerprint(cursor_path, receipt) if retry_wake_only else None
+                )
                 guard_event = successful_guard_event_from_receipt(
                     receipt, session_id=args.session_id, repo=repo
                 )
@@ -1352,8 +1372,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                             if dispatch_code != 0:
                                 print(f"web lifecycle dispatch failed for {_audit_receipt_key(receipt)}: exit {dispatch_code}", file=sys.stderr)
                                 return dispatch_code
-                            _set_audit_receipt_status(cursor_path, receipt, "wake_pending")
                         lifecycle_state = _load_lifecycle_state(args.session_id)
+                        if retry_wake_only:
+                            if lifecycle_state.get("pending_control_event") is not True:
+                                print(
+                                    f"web lifecycle wake retry state missing or no longer pending for {_audit_receipt_key(receipt)}",
+                                    file=sys.stderr,
+                                )
+                                return 78
+                            current_fingerprint = _wake_event_fingerprint(lifecycle_state)
+                            if not expected_wake_fingerprint or current_fingerprint != expected_wake_fingerprint:
+                                print(
+                                    f"web lifecycle wake retry generation mismatch for {_audit_receipt_key(receipt)}",
+                                    file=sys.stderr,
+                                )
+                                return 78
+                        elif lifecycle_state.get("pending_control_event") is True:
+                            _set_audit_receipt_status(
+                                cursor_path,
+                                receipt,
+                                "wake_pending",
+                                wake_fingerprint=_wake_event_fingerprint(lifecycle_state),
+                            )
                         wake_receipt = dispatch_pending_lifecycle_wake(
                             lifecycle_state=lifecycle_state,
                             session_id=args.session_id,
@@ -1362,7 +1402,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             codex=args.codex,
                             runtime_path=args.runtime_path,
                         )
-                        if lifecycle_state.get("pending_control_event") is True and not wake_receipt_confirmed(wake_receipt):
+                        if (retry_wake_only or lifecycle_state.get("pending_control_event") is True) and not wake_receipt_confirmed(wake_receipt):
                             result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
                             print(
                                 f"web lifecycle wake not confirmed for {_audit_receipt_key(receipt)}: {result}",

@@ -1400,6 +1400,57 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertNotEqual(native, 0)
             self.assertFalse(marker.exists())
 
+    def test_audit_wake_pending_requires_same_generation_and_present_state(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            audit = root / "audit.jsonl"
+            receipt = {
+                "receiptId": "wake-generation-1", "childTool": "shell_command", "state": "succeeded",
+                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
+                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            cursor = root / "cursor.json"
+            first_state = {
+                "pending_control_event": True, "triggers": ["READY:F1"],
+                "snapshot": {"head": "h1", "ledger_sha256": "l1", "worktree_status_sha256": "s1"},
+            }
+            changed_state = {
+                "pending_control_event": True, "triggers": ["READY:F1"],
+                "snapshot": {"head": "h2", "ledger_sha256": "l1", "worktree_status_sha256": "s1"},
+            }
+            args = [
+                "audit-once", "--repo", str(repo), "--session-id", "controller-1",
+                "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry),
+                "--codex", str(codex),
+            ]
+            with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch, patch.object(
+                web_bridge, "_load_lifecycle_state", side_effect=[first_state, changed_state, {}]
+            ), patch.object(
+                web_bridge, "dispatch_pending_lifecycle_wake", return_value={
+                    "result": "DEFERRED", "decision": "DEFER", "pending_control_event": True
+                }
+            ) as wake:
+                first = web_bridge.main(args)
+                changed = web_bridge.main(args)
+                missing = web_bridge.main(args)
+            self.assertNotEqual(first, 0)
+            self.assertNotEqual(changed, 0)
+            self.assertNotEqual(missing, 0)
+            self.assertEqual(dispatch.call_count, 1)
+            self.assertEqual(wake.call_count, 1)
+            self.assertFalse(cursor.exists())
+            state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
+            stored = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(stored["receipts"]["wake-generation-1"], "wake_pending")
+            self.assertEqual(
+                stored["wake_fingerprints"]["wake-generation-1"],
+                web_bridge._wake_event_fingerprint(first_state),
+            )
+
     def test_audit_once_retries_wake_without_reconsuming_one_use_computer_lease(self) -> None:
         from unittest.mock import patch
 
