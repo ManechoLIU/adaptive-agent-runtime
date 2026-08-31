@@ -206,7 +206,7 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             # A side-effecting attempt is unknown while it is in flight. Only a durable
             # terminal receipt may prove and clear the outcome. This keeps abrupt death
             # or terminal-receipt persistence failure from becoming an unsafe retry.
-            "result_unknown": bool(side_effect) if contract_version >= 2 else False,
+            "result_unknown": bool(side_effect) if contract_version >= 2 else True,
             "terminal_state": None,
             "terminal_at": None,
             "lease_expires_at": _iso(issued + timedelta(minutes=policy.heartbeat_ttl_minutes)),

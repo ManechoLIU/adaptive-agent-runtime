@@ -532,6 +532,24 @@ class ReviewerSupervisorRunTests(unittest.TestCase):
             "critical": [], "important": [], "minor": [],
         }))
 
+    def test_second_supervisor_for_same_repo_is_rejected_while_first_lock_is_held(self):
+        import fcntl
+        root = git_common_state_root(self.repo)
+        root.mkdir(parents=True, exist_ok=True)
+        lock_path = root / "active-review.lock"
+        calls = []
+        with lock_path.open("a+") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            def attempt(contract, number):
+                calls.append(number)
+                self._write_final(contract)
+                return AttemptResult("RUNNING", 1, 0, True, "s")
+            result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertEqual(calls, [])
+        state = json.loads(result.state_path.read_text())
+        self.assertIn("active reviewer", state["diagnostic"].lower())
+
     def test_findings_are_terminal_and_not_retried(self):
         calls = []
         def attempt(contract, number):

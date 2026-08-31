@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import json
+import fcntl
 import os
 import subprocess
 import tempfile
@@ -459,7 +460,7 @@ def _sha256(path: Path) -> Optional[str]:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def run_review(
+def _run_review_locked(
     repo: Path,
     base: str,
     instructions: str,
@@ -576,6 +577,58 @@ def run_review(
     })
     atomic_write_json(state_path, terminal)
     return ReviewRunResult(run_id, "REVIEW_INFRA_FAILED", head, None, max_infra_retries + 1, state_path)
+
+
+
+def run_review(
+    repo: Path,
+    base: str,
+    instructions: str,
+    *,
+    max_infra_retries: int = 1,
+    attempt_runner=None,
+    codex_executable: Optional[str] = None,
+    timeout_seconds: float = 600.0,
+) -> ReviewRunResult:
+    repo = Path(repo).resolve()
+    root = git_common_state_root(repo)
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / "active-review.lock"
+    lock_handle = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            head = _git_head(repo)
+            base_revision = _git_revision(repo, base)
+            run_id = uuid.uuid4().hex
+            state_path = root / f"{run_id}.json"
+            blocked = {
+                "run_id": run_id,
+                "repo": str(repo),
+                "base_ref": base,
+                "base_revision": base_revision,
+                "candidate_head": head,
+                "state": "REVIEW_INFRA_FAILED",
+                "diagnostic": "active reviewer already holds the repository review lock",
+                "started_at": time.time(),
+                "completed_at": time.time(),
+                "retry_count": 0,
+            }
+            atomic_write_json(state_path, blocked)
+            return ReviewRunResult(run_id, "REVIEW_INFRA_FAILED", head, None, 0, state_path)
+        return _run_review_locked(
+            repo, base, instructions,
+            max_infra_retries=max_infra_retries,
+            attempt_runner=attempt_runner,
+            codex_executable=codex_executable,
+            timeout_seconds=timeout_seconds,
+        )
+    finally:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_handle.close()
 
 
 def main(argv=None) -> int:

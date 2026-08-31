@@ -160,6 +160,18 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
         self.assertEqual(lease["side_effect_contract_version"], 1)
         self.assertIsNone(lease["side_effect"])
 
+    def test_legacy_v1_inflight_without_terminal_receipt_blocks_recovery(self):
+        legacy = receipt("assignment_started", attempt=1, lease_id="legacy-1", event_seq=1)
+        legacy.pop("assignment_contract_version")
+        legacy.pop("side_effect")
+        state = apply_receipt({}, legacy, now=T0)
+        self.assertTrue(state["leases"]["a1"]["result_unknown"])
+        retry = receipt("assignment_started", T0 + timedelta(minutes=40), attempt=2, lease_id="legacy-2", event_seq=1)
+        retry.pop("assignment_contract_version")
+        retry.pop("side_effect")
+        with self.assertRaisesRegex(ValueError, "legacy unknown side-effect result requires a new Assignment"):
+            apply_receipt(state, retry, now=T0 + timedelta(minutes=40))
+
     def test_v2_initial_start_requires_explicit_side_effect_contract(self):
         start = receipt("assignment_started", assignment_contract_version=2)
         start.pop("side_effect")
