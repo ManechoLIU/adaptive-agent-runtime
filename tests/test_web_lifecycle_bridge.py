@@ -1400,6 +1400,47 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertNotEqual(native, 0)
             self.assertFalse(marker.exists())
 
+    def test_audit_once_retries_wake_without_reconsuming_one_use_computer_lease(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            audit = root / "audit.jsonl"
+            receipt = {
+                "receiptId": "computer-wake-retry-1", "childTool": "computer", "state": "succeeded",
+                "targetLabel": "Google Chrome", "detail": "电脑操作：get_app_state · 应用 Google Chrome",
+                "occurredAtUnixMs": 2000,
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            cursor = root / "cursor.json"
+            lease = root / "lease.json"
+            lease.write_text(json.dumps({
+                "session_id": "controller-1", "repo": str(repo.resolve()),
+                "issued_at_unix_ms": 1000, "expires_at_unix_ms": 9999999999999, "remaining_uses": 1,
+            }), encoding="utf-8")
+            state = {"pending_control_event": True, "triggers": ["main_worktree_changed"]}
+            wake_results = [
+                {"result": "DEFERRED", "decision": "DEFER", "pending_control_event": True},
+                {"result": "CONFIRMED", "decision": "RESUME_CURRENT_HOST", "pending_control_event": True},
+            ]
+            args = [
+                "audit-once", "--repo", str(repo), "--session-id", "controller-1",
+                "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry),
+                "--codex", str(codex), "--computer-lease", str(lease),
+            ]
+            with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch, patch.object(
+                web_bridge, "_load_lifecycle_state", return_value=state
+            ), patch.object(web_bridge, "dispatch_pending_lifecycle_wake", side_effect=wake_results) as wake:
+                first = web_bridge.main(args)
+                self.assertFalse(lease.exists())
+                second = web_bridge.main(args)
+            self.assertNotEqual(first, 0)
+            self.assertEqual(second, 0)
+            self.assertEqual(dispatch.call_count, 1)
+            self.assertEqual(wake.call_count, 2)
+            self.assertEqual(json.loads(cursor.read_text(encoding="utf-8"))["offset"], audit.stat().st_size)
+
     def test_audit_once_retries_wake_after_dispatch_succeeded_but_wake_deferred(self) -> None:
         from unittest.mock import patch
 

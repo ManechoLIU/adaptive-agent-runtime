@@ -1322,17 +1322,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else default_computer_lease_path(args.session_id)
             )
             for receipt, next_offset in records:
-                guard_event = successful_guard_event_from_receipt(
-                    receipt, session_id=args.session_id, repo=repo
-                )
-                event = guard_event
-                if event is None:
-                    event = computer_event_from_receipt(
-                        receipt, session_id=args.session_id, repo=repo, lease_path=lease_path
-                    )
-                if event is None:
-                    _advance_audit_cursor(cursor_path, audit_inode, next_offset)
-                    continue
                 status = _audit_receipt_status(cursor_path, receipt)
                 if status == "handled":
                     _advance_audit_cursor(cursor_path, audit_inode, next_offset)
@@ -1341,6 +1330,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"web lifecycle receipt outcome unknown; reconcile before replay: {_audit_receipt_key(receipt)}", file=sys.stderr)
                     return 3
                 retry_wake_only = status == "wake_pending"
+                guard_event = successful_guard_event_from_receipt(
+                    receipt, session_id=args.session_id, repo=repo
+                )
+                event = guard_event
+                if not retry_wake_only and event is None:
+                    event = computer_event_from_receipt(
+                        receipt, session_id=args.session_id, repo=repo, lease_path=lease_path
+                    )
+                if not retry_wake_only and event is None:
+                    _advance_audit_cursor(cursor_path, audit_inode, next_offset)
+                    continue
                 if not retry_wake_only:
                     _set_audit_receipt_status(cursor_path, receipt, "pending")
                 try:
