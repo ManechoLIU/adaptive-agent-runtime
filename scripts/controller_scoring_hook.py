@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from controller_scoring_guard import consume_score_guard, read_and_record_model, receipt_path
+    from controller_scoring_guard import consume_score_guard, finalize_score, latest_score_history, read_and_record_model, receipt_path
 except ModuleNotFoundError:
-    from scripts.controller_scoring_guard import consume_score_guard, read_and_record_model, receipt_path
+    from scripts.controller_scoring_guard import consume_score_guard, finalize_score, latest_score_history, read_and_record_model, receipt_path
 
 MODEL_RELATIVE_PATH = Path("references/controller-performance-scoring.md")
 STATE_ROOT = Path(
@@ -60,6 +60,26 @@ def is_controller_scoring_request(prompt: str) -> bool:
 
 def looks_like_controller_score_output(message: str) -> bool:
     return bool(_OUTPUT_SCORE.search(str(message or "")))
+
+
+def _extract_score_value(message: str) -> float | None:
+    match = _OUTPUT_SCORE.search(str(message or ""))
+    if not match:
+        return None
+    value = re.search(r"(?:100|[1-9]?\d)(?:\.\d+)?", match.group(0))
+    return float(value.group(0)) if value else None
+
+
+def _extract_window_summary(message: str) -> str | None:
+    for raw_line in str(message or "").splitlines():
+        line = raw_line.strip()
+        if re.search(r"(?:评估窗口|评分窗口|evaluation\s+window)", line, re.IGNORECASE):
+            if "：" in line:
+                line = line.split("：", 1)[1].strip()
+            elif ":" in line:
+                line = line.split(":", 1)[1].strip()
+            return line[:500] or None
+    return None
 
 
 def _repo_root(cwd: str | Path) -> Path:
@@ -191,17 +211,33 @@ def evaluate_event(
                     "当前评分正文不再有效。本回合只能说明阻塞，不能输出分数；请用户重新提交总控评分/审计请求，让新的 UserPromptSubmit 完整注入当前安装评分模型。"
                 ),
             }, state
+        score = _extract_score_value(message)
         try:
-            errors = consume_score_guard(Path(repo_text), skill_root=skill_root)
-        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            if score is None:
+                errors = consume_score_guard(Path(repo_text), skill_root=skill_root)
+                if errors:
+                    return {
+                        "decision": "block",
+                        "reason": "controller scoring blocked: score-guard failed: " + "; ".join(errors),
+                    }, state
+            else:
+                finalize_score(
+                    Path(repo_text), skill_root=skill_root,
+                    controller_session_id=str(event.get("session_id", "")).strip(),
+                    turn_id=current_turn, score=score, window_summary=_extract_window_summary(message),
+                    message_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                )
+        except ValueError as error:
             return {
                 "decision": "block",
                 "reason": f"controller scoring blocked: score-guard validation failed safely: {error}",
             }, state
-        if errors:
+        except (OSError, subprocess.CalledProcessError) as error:
+            state["pending_scoring"] = False
+            state["reinject_required"] = True
             return {
                 "decision": "block",
-                "reason": "controller scoring blocked: score-guard failed: " + "; ".join(errors),
+                "reason": f"controller scoring blocked: score finalization could not persist a valid history record; resubmit the scoring request. {error}",
             }, state
         state["pending_scoring"] = False
         return {}, state
