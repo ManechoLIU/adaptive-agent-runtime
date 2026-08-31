@@ -6,7 +6,7 @@
 
 ## 产品身份与兼容性
 
-**Adaptive Agent Runtime** 是新的对外产品名与首选 Skill ID：`adaptive-agent-runtime`。旧 `adaptive-delivery` 保留为 **legacy alias**，用于兼容已有安装、Hook、handshake、receipt 与项目续接。迁移期间机器运行事实仍只使用既有 `.git/adaptive-delivery/` canonical state，不创建第二套 runtime。
+**Adaptive Agent Runtime** 是新的对外产品名；`adaptive-agent-runtime` 是产品 slug。为保证已有项目、显式调用、Hook、handshake、receipt 与安装路径零中断，底层 Skill ID 暂继续使用稳定兼容标识 `adaptive-delivery`（legacy machine identifier）。这不是第二个产品或第二套规则：机器运行事实仍只使用既有 `.git/adaptive-delivery/` canonical state，不创建双 Skill/runtime。未来只有宿主标准提供可靠 alias/迁移语义时才考虑切换技术 ID。
 
 ## 先用一句话理解
 

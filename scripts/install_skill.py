@@ -15,7 +15,8 @@ from typing import Any, Sequence
 
 UTC = timezone.utc
 PRODUCT_NAME = "Adaptive Agent Runtime"
-SKILL_ID = "adaptive-agent-runtime"
+SKILL_ID = "adaptive-delivery"
+PRODUCT_SLUG = "adaptive-agent-runtime"
 LEGACY_SKILL_IDS = ("adaptive-delivery",)
 DEFAULT_AI_BRIDGE_EXECUTABLE = Path("/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge")
 DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
@@ -181,6 +182,7 @@ def install_skill(
         "schema_version": 1,
         "product_name": PRODUCT_NAME,
         "skill_id": SKILL_ID,
+        "product_slug": PRODUCT_SLUG,
         "legacy_skill_ids": list(LEGACY_SKILL_IDS),
         "revision": revision,
         "previous_revision": prior_revision,

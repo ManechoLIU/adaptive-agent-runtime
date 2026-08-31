@@ -62,7 +62,7 @@ class SkillStructureTests(unittest.TestCase):
         frontmatter, _ = split_frontmatter(read_entrypoint())
         fields = dict(re.findall(r"(?m)^([A-Za-z][\w-]*):\s*(.+?)\s*$", frontmatter))
 
-        self.assertEqual("adaptive-agent-runtime", fields.get("name"))
+        self.assertEqual("adaptive-delivery", fields.get("name"))
         description = fields.get("description", "").strip().strip('"')
         self.assertRegex(description, r"^Use when\b")
         self.assertLessEqual(len(frontmatter), 1024)

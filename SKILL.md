@@ -1,5 +1,5 @@
 ---
-name: adaptive-agent-runtime
+name: adaptive-delivery
 description: Use when initializing or governing a long-running project, choosing task-ledger granularity, managing AI context, Wiki, memory, Compact, agents, branches, worktrees, Harness or release gates, recovering stalled work, governing visual references, or extracting reusable engineering experience.
 ---
 
