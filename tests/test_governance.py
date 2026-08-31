@@ -103,6 +103,8 @@ class GovernanceTests(unittest.TestCase):
             (root/".git"/"adaptive-delivery"/"runtime-assignments.json").write_text(json.dumps({"schema_version":1,"leases":{"a1":lease}}))
             def fake_git(_root,*args):
                 if args==("rev-parse","--show-toplevel"): return str(root)
+                if args==("rev-parse","--git-common-dir"): return str(root / ".git")
+                if args==("worktree","list","--porcelain"): return f"worktree {root}\nHEAD abc\nbranch refs/heads/main\n"
                 if args==("branch","--show-current"): return "main"
                 if args==("status","--porcelain=v1","--untracked-files=no"): return ""
                 if args==("rev-parse","HEAD"): return "abc"
@@ -111,6 +113,54 @@ class GovernanceTests(unittest.TestCase):
                 snap=lifecycle_hook.project_snapshot(root)
             self.assertEqual(snap["assignment_liveness"]["T1"]["state"],"unhealthy")
             self.assertEqual(snap["assignment_liveness"]["T1"]["reason"],"lease_expired")
+
+    def test_lifecycle_binds_registered_controller_worktree_by_git_common_dir(self) -> None:
+        import subprocess
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            main = Path(directory) / "main"
+            controller_worktree = Path(directory) / "controller-worktree"
+            registry = Path(directory) / "controllers.json"
+            main.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=main, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=main, check=True)
+            subprocess.run(["git", "config", "user.name", "Tests"], cwd=main, check=True)
+            (main / "TASK_LEDGER.md").write_text(
+                "| ID | 状态 | 负责人 | 下一步 |\n|---|---|---|---|\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=main, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=main, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "worktree", "add", "-b", "controller-surface", str(controller_worktree)],
+                cwd=main,
+                check=True,
+                capture_output=True,
+            )
+
+            with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+                lifecycle_hook.register_controller("controller-1", main)
+                main_snapshot = lifecycle_hook.project_snapshot(main)
+                feature_snapshot = lifecycle_hook.project_snapshot(controller_worktree)
+
+                self.assertIsNotNone(main_snapshot)
+                self.assertIsNotNone(feature_snapshot)
+                self.assertEqual(main_snapshot["git_common_dir"], feature_snapshot["git_common_dir"])
+                self.assertTrue(
+                    lifecycle_hook.controller_event_is_managed(
+                        {"session_id": "controller-1", "controller_host": "web"},
+                        controller_worktree,
+                        main,
+                    )
+                )
+                self.assertFalse(
+                    lifecycle_hook.controller_event_is_managed(
+                        {"session_id": "writer-1", "controller_host": "web"},
+                        controller_worktree,
+                        main,
+                    )
+                )
 
     def test_project_snapshot_exposes_five_state_task_projection(self) -> None:
         import subprocess
@@ -142,6 +192,8 @@ class GovernanceTests(unittest.TestCase):
             )
             def fake_git(_root, *args):
                 if args == ("rev-parse", "--show-toplevel"): return str(root)
+                if args == ("rev-parse", "--git-common-dir"): return str(root / ".git")
+                if args == ("worktree", "list", "--porcelain"): return f"worktree {root}\nHEAD abc\nbranch refs/heads/main\n"
                 if args == ("branch", "--show-current"): return "main"
                 if args == ("status", "--porcelain=v1", "--untracked-files=no"): return ""
                 if args == ("rev-parse", "HEAD"): return "abc"

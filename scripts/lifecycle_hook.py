@@ -64,13 +64,39 @@ def run_git(root: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def project_snapshot(cwd: Path) -> dict[str, Any] | None:
+def git_common_dir(cwd: Path) -> Path | None:
     try:
-        root = Path(run_git(cwd, "rev-parse", "--show-toplevel")).resolve()
-        branch = run_git(root, "branch", "--show-current")
+        value = run_git(cwd, "rev-parse", "--git-common-dir")
     except (OSError, subprocess.CalledProcessError, ValueError):
         return None
-    if branch != "main":
+    if not value:
+        return None
+    path = Path(value)
+    return (path if path.is_absolute() else cwd / path).resolve()
+
+
+def canonical_main_root(cwd: Path) -> Path | None:
+    try:
+        worktrees = run_git(cwd, "worktree", "list", "--porcelain")
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return None
+    worktree: Path | None = None
+    for line in worktrees.splitlines():
+        if line.startswith("worktree "):
+            worktree = Path(line.removeprefix("worktree ")).resolve()
+        elif line == "branch refs/heads/main" and worktree is not None:
+            return worktree
+    return None
+
+
+def project_snapshot(cwd: Path) -> dict[str, Any] | None:
+    try:
+        invocation_root = Path(run_git(cwd, "rev-parse", "--show-toplevel")).resolve()
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return None
+    common_dir = git_common_dir(invocation_root)
+    root = canonical_main_root(invocation_root)
+    if common_dir is None or root is None or git_common_dir(root) != common_dir:
         return None
     ledger = next((root / name for name in LEDGER_NAMES if (root / name).is_file()), None)
     if ledger is None:
@@ -125,6 +151,7 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         rule_handshake = {"state": "integrity_error", "blocking": True, "installed_revision": None, "errors": [str(error)]}
     return {
         "root": str(root),
+        "git_common_dir": str(common_dir),
         "ledger": str(ledger),
         "head": run_git(root, "rev-parse", "HEAD"),
         "ledger_sha256": sha256_bytes(ledger.read_bytes()),
@@ -470,9 +497,24 @@ def registered_root(session_id: str) -> Path | None:
 
 
 def register_controller(session_id: str, root: Path) -> None:
+    canonical_root = canonical_main_root(root)
+    if canonical_root is None:
+        raise ValueError("controller registration requires a canonical main worktree")
     registry = load_json(REGISTRY_PATH)
-    registry[session_id] = str(root.resolve())
+    registry[session_id] = str(canonical_root)
     write_json(REGISTRY_PATH, registry)
+
+
+def controller_event_is_managed(
+    event: dict[str, Any], cwd: Path, expected_root: Path
+) -> bool:
+    session_id = str(event.get("session_id", "")).strip()
+    if not session_id or registered_root(session_id) != expected_root.resolve():
+        return False
+    snapshot = project_snapshot(cwd)
+    if snapshot is None or Path(snapshot["root"]).resolve() != expected_root.resolve():
+        return False
+    return snapshot.get("git_common_dir") == str(git_common_dir(expected_root))
 
 
 def state_path(session_id: str) -> Path:
@@ -493,7 +535,7 @@ def run_hook() -> int:
     if expected_root is None:
         return 0
     snapshot = project_snapshot(cwd)
-    if snapshot is None or Path(snapshot["root"]).resolve() != expected_root:
+    if snapshot is None or not controller_event_is_managed(event, cwd, expected_root):
         return 0
     path = state_path(session_id)
     output, next_state = evaluate_event(
