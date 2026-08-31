@@ -394,6 +394,33 @@ class HostAdapterInstallationTests(unittest.TestCase):
             self.assertEqual(zshenv.read_text(encoding="utf-8"), "export KEEP=1\n")
             self.assertIn("rolled back", output.getvalue().lower())
 
+    def test_install_cli_rejects_concurrent_installer_without_mutating_target(self):
+        import subprocess, sys, time
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = InstallMigrationContractTests().make_source(root)
+            target = root / "installed" / "adaptive-delivery"
+            target.mkdir(parents=True)
+            (target / "old.txt").write_text("old", encoding="utf-8")
+            lock = target.parent / f".{target.name}.install.lock"
+            ready = root / "ready"
+            holder = subprocess.Popen([sys.executable, "-c",
+                "import fcntl,time,sys,pathlib; f=open(sys.argv[1],'a+'); fcntl.flock(f.fileno(),fcntl.LOCK_EX); pathlib.Path(sys.argv[2]).write_text('1'); time.sleep(2.0)",
+                str(lock), str(ready)])
+            for _ in range(50):
+                if ready.exists(): break
+                time.sleep(0.01)
+            installer = Path(__file__).resolve().parents[1] / "scripts" / "install_skill.py"
+            result = subprocess.run([sys.executable, str(installer),
+                "--source", str(source), "--target", str(target), "--summary", "concurrent",
+                "--impact", "none", "--stop-condition", "blocked", "--no-configure-host-adapters"],
+                text=True, capture_output=True)
+            holder.wait(timeout=3)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("another installer", result.stdout.lower())
+            self.assertEqual((target / "old.txt").read_text(encoding="utf-8"), "old")
+            self.assertFalse((target / "SKILL.md").exists())
+
     def test_install_cli_configures_available_host_adapters_in_one_entrypoint(self):
         import contextlib
         import io

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -585,21 +586,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--zshenv-file", default=str(DEFAULT_ZSHENV))
     args = parser.parse_args(argv)
 
-    if args.no_configure_host_adapters:
-        try:
-            manifest = install_skill(
-                args.source, args.target, summary=args.summary, impact=args.impact,
-                stop_condition=args.stop_condition, previous_revision=args.previous_revision,
-            )
-        except (OSError, ValueError, subprocess.CalledProcessError) as error:
-            print(f"adaptive-agent-runtime-install: blocked: {error}")
-            return 1
-        print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
-        return 0
-
     target_path = Path(args.target).expanduser().resolve(strict=False)
     hooks_path = Path(args.hooks_file).expanduser().resolve(strict=False)
     zshenv_path = Path(args.zshenv_file).expanduser().resolve(strict=False)
+    install_lock_path = target_path.parent / f".{target_path.name}.install.lock"
+    install_lock_path.parent.mkdir(parents=True, exist_ok=True)
+    install_lock = install_lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(install_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"adaptive-agent-runtime-install: blocked: another installer is active for {target_path}")
+            return 1
+        if args.no_configure_host_adapters:
+            try:
+                manifest = install_skill(
+                    args.source, target_path, summary=args.summary, impact=args.impact,
+                    stop_condition=args.stop_condition, previous_revision=args.previous_revision,
+                )
+            except (OSError, ValueError, subprocess.CalledProcessError) as error:
+                print(f"adaptive-agent-runtime-install: blocked: {error}")
+                return 1
+            print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+            return 0
+        return _run_install_transaction(args, target_path, hooks_path, zshenv_path)
+    finally:
+        install_lock.close()
+
+
+def _run_install_transaction(args, target_path: Path, hooks_path: Path, zshenv_path: Path) -> int:
     with tempfile.TemporaryDirectory(prefix="adaptive-agent-runtime-install-rollback-") as backup_dir:
         backup_root = Path(backup_dir)
         snapshots = [

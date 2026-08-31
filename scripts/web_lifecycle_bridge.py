@@ -245,33 +245,77 @@ def classify_native_resume_failure(returncode: int, stdout: str, stderr: str) ->
         "returncode": returncode,
     }
 
-def audit_receipts_from_cursor(audit_log: Path, cursor_path: Path) -> list[dict[str, Any]]:
+def _write_json_atomic_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def audit_records_from_cursor(audit_log: Path, cursor_path: Path) -> tuple[list[tuple[dict[str, Any], int]], int]:
     state = load_json(cursor_path)
     try:
         stat = audit_log.stat()
     except OSError:
-        return []
+        return [], 0
     inode = int(state.get("inode", 0) or 0)
     offset = int(state.get("offset", 0) or 0)
     if inode != stat.st_ino or offset < 0 or offset > stat.st_size:
         offset = 0
-    receipts: list[dict[str, Any]] = []
+    records: list[tuple[dict[str, Any], int]] = []
     with audit_log.open("rb") as handle:
         handle.seek(offset)
         for raw_line in handle:
+            next_offset = handle.tell()
             try:
                 value = json.loads(raw_line.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if isinstance(value, dict):
-                receipts.append(value)
-        next_offset = handle.tell()
-    cursor_path.parent.mkdir(parents=True, exist_ok=True)
-    cursor_path.write_text(
-        json.dumps({"inode": stat.st_ino, "offset": next_offset}, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    return receipts
+                records.append((value, next_offset))
+    return records, stat.st_ino
+
+
+def audit_receipts_from_cursor(audit_log: Path, cursor_path: Path) -> list[dict[str, Any]]:
+    records, _ = audit_records_from_cursor(audit_log, cursor_path)
+    return [receipt for receipt, _ in records]
+
+
+def _audit_receipt_state_path(cursor_path: Path) -> Path:
+    return cursor_path.with_suffix(cursor_path.suffix + ".receipts.json")
+
+
+def _audit_receipt_key(receipt: dict[str, Any]) -> str:
+    receipt_id = str(receipt.get("receiptId") or "").strip()
+    if receipt_id:
+        return receipt_id
+    import hashlib
+    canonical = json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _audit_receipt_status(cursor_path: Path, receipt: dict[str, Any]) -> str | None:
+    data = load_json(_audit_receipt_state_path(cursor_path))
+    receipts = data.get("receipts", {}) if isinstance(data, dict) else {}
+    return receipts.get(_audit_receipt_key(receipt)) if isinstance(receipts, dict) else None
+
+
+def _set_audit_receipt_status(cursor_path: Path, receipt: dict[str, Any], status: str) -> None:
+    path = _audit_receipt_state_path(cursor_path)
+    data = load_json(path)
+    receipts = data.get("receipts", {}) if isinstance(data.get("receipts"), dict) else {}
+    receipts[_audit_receipt_key(receipt)] = status
+    if len(receipts) > 256:
+        receipts = dict(list(receipts.items())[-256:])
+    _write_json_atomic_file(path, {"receipts": receipts})
+
+
+def _advance_audit_cursor(cursor_path: Path, inode: int, offset: int) -> None:
+    _write_json_atomic_file(cursor_path, {"inode": inode, "offset": offset})
 
 
 def computer_event_from_receipt(
@@ -456,6 +500,8 @@ def append_captured_event(path: Path, event: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def dispatch_event(event: dict[str, Any]) -> int:
@@ -852,48 +898,67 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command_name == "audit-once":
         repo = Path(args.repo).expanduser().resolve()
-        receipts = audit_receipts_from_cursor(
-            Path(args.audit_log).expanduser(), Path(args.cursor).expanduser()
+        cursor_path = Path(args.cursor).expanduser()
+        records, audit_inode = audit_records_from_cursor(
+            Path(args.audit_log).expanduser(), cursor_path
         )
+        receipts = [receipt for receipt, _ in records]
         lease_path = (
             Path(args.computer_lease).expanduser()
             if args.computer_lease
             else default_computer_lease_path(args.session_id)
         )
-        for receipt in receipts:
-            event = successful_guard_event_from_receipt(
+        for receipt, next_offset in records:
+            guard_event = successful_guard_event_from_receipt(
                 receipt, session_id=args.session_id, repo=repo
             )
+            event = guard_event
             if event is None:
                 event = computer_event_from_receipt(
                     receipt, session_id=args.session_id, repo=repo, lease_path=lease_path
                 )
             if event is None:
+                _advance_audit_cursor(cursor_path, audit_inode, next_offset)
                 continue
-            if args.capture_events:
-                append_captured_event(Path(args.capture_events), event)
-            else:
-                dispatch_event(event)
-            if args.auto_native_stop and successful_guard_event_from_receipt(
-                receipt, session_id=args.session_id, repo=repo
-            ) is not None:
-                receipt_id = str(receipt.get("receiptId") or "web-guard")
-                state_path = (
-                    Path(args.auto_stop_state).expanduser()
-                    if args.auto_stop_state
-                    else default_auto_stop_state_path(args.session_id)
-                )
-                schedule_auto_native_stop(
-                    session_id=args.session_id,
-                    repo=repo,
-                    receipt_id=receipt_id,
-                    registry=Path(args.registry).expanduser(),
-                    codex=args.codex,
-                    delay_seconds=max(0.0, args.auto_stop_delay_seconds),
-                    state_path=state_path,
-                    capture_path=Path(args.capture_auto_stop).expanduser() if args.capture_auto_stop else None,
-                    runtime_path=args.runtime_path,
-                )
+            status = _audit_receipt_status(cursor_path, receipt)
+            if status == "handled":
+                _advance_audit_cursor(cursor_path, audit_inode, next_offset)
+                continue
+            if status == "pending":
+                print(f"web lifecycle receipt outcome unknown; reconcile before replay: {_audit_receipt_key(receipt)}", file=sys.stderr)
+                return 3
+            _set_audit_receipt_status(cursor_path, receipt, "pending")
+            try:
+                if args.capture_events:
+                    append_captured_event(Path(args.capture_events), event)
+                else:
+                    dispatch_code = dispatch_event(event)
+                    if dispatch_code != 0:
+                        print(f"web lifecycle dispatch failed for {_audit_receipt_key(receipt)}: exit {dispatch_code}", file=sys.stderr)
+                        return dispatch_code
+                if args.auto_native_stop and guard_event is not None:
+                    receipt_id = str(receipt.get("receiptId") or "web-guard")
+                    state_path = (
+                        Path(args.auto_stop_state).expanduser()
+                        if args.auto_stop_state
+                        else default_auto_stop_state_path(args.session_id)
+                    )
+                    schedule_auto_native_stop(
+                        session_id=args.session_id,
+                        repo=repo,
+                        receipt_id=receipt_id,
+                        registry=Path(args.registry).expanduser(),
+                        codex=args.codex,
+                        delay_seconds=max(0.0, args.auto_stop_delay_seconds),
+                        state_path=state_path,
+                        capture_path=Path(args.capture_auto_stop).expanduser() if args.capture_auto_stop else None,
+                        runtime_path=args.runtime_path,
+                    )
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                print(f"web lifecycle handling failed for {_audit_receipt_key(receipt)}: {exc}", file=sys.stderr)
+                return 3
+            _set_audit_receipt_status(cursor_path, receipt, "handled")
+            _advance_audit_cursor(cursor_path, audit_inode, next_offset)
         if receipts and args.auto_native_stop:
             lifecycle_state = refresh_rule_wake_state(session_id=args.session_id, repo=repo)
             state_path = (

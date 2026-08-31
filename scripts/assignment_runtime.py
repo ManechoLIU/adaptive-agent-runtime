@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -361,9 +362,13 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict):
             raise ValueError("runtime receipt must be a JSON object")
-        state = load_runtime_state(args.repo)
-        updated = apply_receipt(state, payload)
-        save_runtime_state(args.repo, updated)
+        lock_path = adaptive_delivery_state_dir(args.repo) / "runtime-assignments.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            state = load_runtime_state(args.repo)
+            updated = apply_receipt(state, payload)
+            save_runtime_state(args.repo, updated)
         print(json.dumps({"allowed": True, "assignment_id": payload.get("assignment_id"), "attempt": payload.get("attempt", 1)}, sort_keys=True))
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as error:

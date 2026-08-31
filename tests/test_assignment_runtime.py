@@ -506,6 +506,36 @@ class RuntimeAttemptSequenceTests(unittest.TestCase):
                 now=T0 + timedelta(minutes=1),
             )
 
+class RuntimeTransactionLockTests(unittest.TestCase):
+    def test_cli_waits_for_cross_process_runtime_transaction_lock(self):
+        import subprocess, sys, time
+        from scripts.project_state import adaptive_delivery_state_dir
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"; repo.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init", "-b", "main"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "x").write_text("x")
+            subprocess.run(["git", "-C", str(repo), "add", "x"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+            lock = adaptive_delivery_state_dir(repo) / "runtime-assignments.lock"
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            ready = Path(d) / "ready"
+            holder = subprocess.Popen([sys.executable, "-c",
+                "import fcntl,time,sys,pathlib; f=open(sys.argv[1],'a+'); fcntl.flock(f.fileno(),fcntl.LOCK_EX); pathlib.Path(sys.argv[2]).write_text('1'); time.sleep(0.6)",
+                str(lock), str(ready)])
+            for _ in range(50):
+                if ready.exists(): break
+                time.sleep(0.01)
+            script = Path(__file__).resolve().parents[1] / "scripts" / "assignment_runtime.py"
+            payload = receipt("assignment_started", worktree=str(repo), side_effect=False)
+            started = time.monotonic()
+            result = subprocess.run([sys.executable, str(script), "apply", "--repo", str(repo)], input=json.dumps(payload), text=True, capture_output=True)
+            elapsed = time.monotonic() - started
+            holder.wait(timeout=2)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertGreater(elapsed, 0.35)
+
 class RuntimeCliCommonStateTests(unittest.TestCase):
     def test_apply_cli_shares_lineage_and_rejects_attempt_four_across_worktrees(self):
         import json

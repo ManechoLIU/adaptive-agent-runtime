@@ -236,6 +236,30 @@ class WebLifecycleAuditTests(unittest.TestCase):
             self.assertIn("control-event: allowed", events[0]["tool_response"]["output"])
             self.assertEqual(json.loads(cursor.read_text())["offset"], audit.stat().st_size)
 
+    def test_audit_dispatch_failure_does_not_advance_cursor_and_replay_is_fail_closed(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            audit = root / "audit.jsonl"; cursor = root / "cursor.json"
+            receipt = {
+                "receiptId":"guard-fail-1", "childTool":"shell_command", "state":"succeeded",
+                "rootLabel":str(repo), "targetLabel":"python3 scripts/control_event_guard.py event.json",
+                "detail":f"命令：python3 scripts/control_event_guard.py event.json · 工作目录：{repo}\n\n命令输出：\ncontrol-event: allowed; done\n",
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            args = ["audit-once", "--session-id", "controller-1", "--repo", str(repo),
+                    "--audit-log", str(audit), "--cursor", str(cursor)]
+            with patch.object(web_bridge, "dispatch_event", return_value=9) as first:
+                code1 = web_bridge.main(args)
+            offset1 = json.loads(cursor.read_text()).get("offset", 0) if cursor.exists() else 0
+            with patch.object(web_bridge, "dispatch_event", return_value=0) as second:
+                code2 = web_bridge.main(args)
+        self.assertNotEqual(code1, 0)
+        self.assertEqual(offset1, 0)
+        self.assertEqual(first.call_count, 1)
+        self.assertNotEqual(code2, 0)
+        self.assertEqual(second.call_count, 0)
+
     def test_rule_wake_schedule_immediate_is_ready_now(self) -> None:
         decision = web_bridge.rule_wake_schedule_decision({
             "rule_wake_policy": "immediate",
