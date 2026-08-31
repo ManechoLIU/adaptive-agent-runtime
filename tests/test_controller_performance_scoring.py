@@ -53,6 +53,12 @@ class ControllerPerformanceScoringContractTests(unittest.TestCase):
         self.assertIn("调度与执行效率", self.text)
         self.assertIn("控制面一致性与可审计性", self.text)
 
+    def test_historical_score_comparison_fails_closed_without_verifiable_previous_score(self) -> None:
+        self.assertIn("最近一次有效评分", self.text)
+        self.assertIn("不得根据模型记忆", self.text)
+        self.assertIn("UNKNOWN", self.text)
+        self.assertIn("上升 / 下降", self.text)
+
     def test_standard_output_requires_attribution_conclusion(self) -> None:
         self.assertIn("责任归因结论", self.text)
 
