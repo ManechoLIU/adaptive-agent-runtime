@@ -449,11 +449,11 @@ def _promote_staged_install(stage: Path, target: Path) -> None:
     try:
         os.replace(stage, target)
     except Exception:
-        if had_target and backup.exists():
+        if had_target and (backup.exists() or backup.is_symlink()):
             os.replace(backup, target)
         raise
-    if had_target and backup.exists():
-        shutil.rmtree(backup)
+    if had_target and (backup.exists() or backup.is_symlink()):
+        _remove_path(backup)
 
 
 def install_skill(

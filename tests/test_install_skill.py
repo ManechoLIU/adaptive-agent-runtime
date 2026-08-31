@@ -198,6 +198,30 @@ class InstallMigrationContractTests(unittest.TestCase):
         self.assertEqual(installed, committed)
         self.assertNotIn("concurrent mutation", installed)
 
+class InstallPromotionSafetyTests(unittest.TestCase):
+    def test_promote_staged_install_cleans_symlink_backup_without_error(self):
+        from scripts.install_skill import _promote_staged_install
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            legacy_real = root / "legacy-real"
+            legacy_real.mkdir()
+            (legacy_real / "old.txt").write_text("old", encoding="utf-8")
+            target = root / "adaptive-delivery"
+            target.symlink_to(legacy_real, target_is_directory=True)
+            stage = root / "stage"
+            stage.mkdir()
+            (stage / "new.txt").write_text("new", encoding="utf-8")
+
+            _promote_staged_install(stage, target)
+
+            backups = list(root.glob(".adaptive-delivery.backup-*"))
+            self.assertTrue(target.is_dir())
+            self.assertFalse(target.is_symlink())
+            self.assertEqual((target / "new.txt").read_text(encoding="utf-8"), "new")
+            self.assertEqual(backups, [])
+            self.assertEqual((legacy_real / "old.txt").read_text(encoding="utf-8"), "old")
+
+
 class HostAdapterInstallationTests(unittest.TestCase):
     def test_codex_hook_install_preserves_existing_hooks_and_is_idempotent(self):
         import json

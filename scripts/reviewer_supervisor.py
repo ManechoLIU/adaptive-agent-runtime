@@ -409,6 +409,10 @@ def run_attempt(
         return post_wait_infra_failure(
             f"review process exit={exit_code} running_observed={running_observed}"
         )
+    if not _wait_for_group_exit(process_group_id, process_group_exists, 0.0):
+        return post_wait_infra_failure(
+            "reviewer leader exited successfully but process group still has live descendants"
+        )
     return AttemptResult(
         state="RUNNING",
         pid=process.pid,
