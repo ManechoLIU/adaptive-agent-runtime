@@ -43,3 +43,100 @@ def atomic_write_json(path: Path, payload: dict) -> None:
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
+
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+
+@dataclass(frozen=True)
+class ReviewContract:
+    repo: Path
+    base: str
+    head: str
+    instructions: str
+    event_path: Path
+    final_path: Path
+
+
+@dataclass(frozen=True)
+class AttemptResult:
+    state: str
+    pid: int
+    exit_code: int
+    running_observed: bool
+    session_id: Optional[str] = None
+    diagnostic: str = ""
+
+
+def _session_id_from_event(event: dict) -> Optional[str]:
+    for key in ("thread_id", "session_id", "threadId", "sessionId"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        return _session_id_from_event(payload)
+    return None
+
+
+def run_attempt(
+    contract: ReviewContract,
+    attempt: int,
+    *,
+    popen_factory: Callable = subprocess.Popen,
+    codex_executable: str = "codex",
+) -> AttemptResult:
+    contract.event_path.parent.mkdir(parents=True, exist_ok=True)
+    contract.final_path.parent.mkdir(parents=True, exist_ok=True)
+    argv = [
+        codex_executable,
+        "exec",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--ephemeral",
+        "--json",
+        "-o",
+        str(contract.final_path),
+        "review",
+        "--base",
+        contract.base,
+        contract.instructions,
+    ]
+    process = popen_factory(
+        argv,
+        cwd=str(contract.repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+    )
+    running_observed = False
+    session_id = None
+    diagnostics = []
+    with contract.event_path.open("w", encoding="utf-8") as event_log:
+        if process.stdout is not None:
+            for line in process.stdout:
+                event_log.write(line)
+                event_log.flush()
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    diagnostics.append(line.strip())
+                    continue
+                if isinstance(event, dict):
+                    running_observed = True
+                    session_id = session_id or _session_id_from_event(event)
+    exit_code = process.wait()
+    if not running_observed:
+        state = "REVIEW_INFRA_FAILED"
+    else:
+        state = "RUNNING" if exit_code == 0 else "REVIEW_INFRA_FAILED"
+    return AttemptResult(
+        state=state,
+        pid=process.pid,
+        exit_code=exit_code,
+        running_observed=running_observed,
+        session_id=session_id,
+        diagnostic="\n".join(diagnostics)[-4000:],
+    )
