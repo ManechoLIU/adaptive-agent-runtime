@@ -40,6 +40,7 @@ REGISTRY_PATH = Path(
     )
 ).expanduser()
 LEDGER_NAMES = ("TASK_LEDGER.md", "PROJECT_STATUS.md")
+CONTROLLER_SURFACES_KEY = "__controller_surfaces__"
 
 
 
@@ -496,12 +497,37 @@ def registered_root(session_id: str) -> Path | None:
     return Path(value).expanduser().resolve()
 
 
+def registered_controller_surface(session_id: str, expected_root: Path) -> Path | None:
+    registry = load_json(REGISTRY_PATH)
+    surfaces = registry.get(CONTROLLER_SURFACES_KEY)
+    if surfaces is None:
+        return expected_root.resolve()
+    if not isinstance(surfaces, dict):
+        return None
+    value = surfaces.get(session_id)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return Path(value).expanduser().resolve()
+
+
 def register_controller(session_id: str, root: Path) -> None:
     canonical_root = canonical_main_root(root)
     if canonical_root is None:
         raise ValueError("controller registration requires a canonical main worktree")
     registry = load_json(REGISTRY_PATH)
+    for registered_session, registered_path in registry.items():
+        if registered_session == session_id or not isinstance(registered_path, str):
+            continue
+        if Path(registered_path).expanduser().resolve() == canonical_root.resolve():
+            raise ValueError("canonical project already has a different controller session")
     registry[session_id] = str(canonical_root)
+    surfaces = registry.get(CONTROLLER_SURFACES_KEY)
+    if surfaces is None:
+        surfaces = {}
+    elif not isinstance(surfaces, dict):
+        raise ValueError("controller surface registry is invalid")
+    surfaces[session_id] = str(root.resolve())
+    registry[CONTROLLER_SURFACES_KEY] = surfaces
     write_json(REGISTRY_PATH, registry)
 
 
@@ -510,6 +536,12 @@ def controller_event_is_managed(
 ) -> bool:
     session_id = str(event.get("session_id", "")).strip()
     if not session_id or registered_root(session_id) != expected_root.resolve():
+        return False
+    try:
+        invocation_root = Path(run_git(cwd, "rev-parse", "--show-toplevel")).resolve()
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return False
+    if registered_controller_surface(session_id, expected_root) != invocation_root:
         return False
     snapshot = project_snapshot(cwd)
     if snapshot is None or Path(snapshot["root"]).resolve() != expected_root.resolve():

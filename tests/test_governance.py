@@ -114,53 +114,100 @@ class GovernanceTests(unittest.TestCase):
             self.assertEqual(snap["assignment_liveness"]["T1"]["state"],"unhealthy")
             self.assertEqual(snap["assignment_liveness"]["T1"]["reason"],"lease_expired")
 
-    def test_lifecycle_binds_registered_controller_worktree_by_git_common_dir(self) -> None:
+    def lifecycle_worktree_fixture(self) -> tuple[Path, Path, Path, Path]:
         import subprocess
-        from unittest.mock import patch
 
-        with tempfile.TemporaryDirectory() as directory:
-            main = Path(directory) / "main"
-            controller_worktree = Path(directory) / "controller-worktree"
-            registry = Path(directory) / "controllers.json"
-            main.mkdir()
-            subprocess.run(["git", "init", "-b", "main"], cwd=main, check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=main, check=True)
-            subprocess.run(["git", "config", "user.name", "Tests"], cwd=main, check=True)
-            (main / "TASK_LEDGER.md").write_text(
-                "| ID | 状态 | 负责人 | 下一步 |\n|---|---|---|---|\n",
-                encoding="utf-8",
-            )
-            subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=main, check=True)
-            subprocess.run(["git", "commit", "-m", "base"], cwd=main, check=True, capture_output=True)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        main = Path(directory.name) / "main"
+        controller_worktree = Path(directory.name) / "controller-worktree"
+        writer_worktree = Path(directory.name) / "writer-worktree"
+        registry = Path(directory.name) / "controllers.json"
+        main.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=main, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=main, check=True)
+        subprocess.run(["git", "config", "user.name", "Tests"], cwd=main, check=True)
+        (main / "TASK_LEDGER.md").write_text(
+            "| ID | 状态 | 负责人 | 下一步 |\n|---|---|---|---|\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=main, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=main, check=True, capture_output=True)
+        for branch, worktree in (
+            ("controller-surface", controller_worktree),
+            ("writer-surface", writer_worktree),
+        ):
             subprocess.run(
-                ["git", "worktree", "add", "-b", "controller-surface", str(controller_worktree)],
+                ["git", "worktree", "add", "-b", branch, str(worktree)],
                 cwd=main,
                 check=True,
                 capture_output=True,
             )
+        return main, controller_worktree, writer_worktree, registry
 
-            with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
-                lifecycle_hook.register_controller("controller-1", main)
-                main_snapshot = lifecycle_hook.project_snapshot(main)
-                feature_snapshot = lifecycle_hook.project_snapshot(controller_worktree)
+    def test_lifecycle_unbound_writer_worktree_rejects_registered_session(self) -> None:
+        from unittest.mock import patch
 
-                self.assertIsNotNone(main_snapshot)
-                self.assertIsNotNone(feature_snapshot)
-                self.assertEqual(main_snapshot["git_common_dir"], feature_snapshot["git_common_dir"])
-                self.assertTrue(
-                    lifecycle_hook.controller_event_is_managed(
-                        {"session_id": "controller-1", "controller_host": "web"},
-                        controller_worktree,
-                        main,
-                    )
+        main, _controller_worktree, writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+            self.assertFalse(
+                lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "controller-1", "controller_host": "web"},
+                    writer_worktree,
+                    main,
                 )
-                self.assertFalse(
-                    lifecycle_hook.controller_event_is_managed(
-                        {"session_id": "writer-1", "controller_host": "web"},
-                        controller_worktree,
-                        main,
-                    )
+            )
+
+    def test_lifecycle_registering_linked_worktree_binds_only_that_surface(self) -> None:
+        from unittest.mock import patch
+
+        main, controller_worktree, writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", controller_worktree)
+            main_snapshot = lifecycle_hook.project_snapshot(main)
+            controller_snapshot = lifecycle_hook.project_snapshot(controller_worktree)
+
+            self.assertIsNotNone(main_snapshot)
+            self.assertIsNotNone(controller_snapshot)
+            self.assertEqual(main_snapshot["git_common_dir"], controller_snapshot["git_common_dir"])
+            self.assertEqual(lifecycle_hook.registered_root("controller-1"), main.resolve())
+            self.assertTrue(
+                lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "controller-1", "controller_host": "web"},
+                    controller_worktree,
+                    main,
                 )
+            )
+            self.assertFalse(
+                lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "controller-1", "controller_host": "web"},
+                    writer_worktree,
+                    main,
+                )
+            )
+            self.assertFalse(
+                lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "controller-1", "controller_host": "web"},
+                    main,
+                    main,
+                )
+            )
+
+    def test_lifecycle_rejects_second_controller_session_for_canonical_project(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+            original_registry = lifecycle_hook.load_json(registry)
+
+            with self.assertRaises(ValueError):
+                lifecycle_hook.register_controller("controller-2", main)
+
+            self.assertEqual(lifecycle_hook.load_json(registry), original_registry)
+            self.assertEqual(lifecycle_hook.registered_root("controller-1"), main.resolve())
+            self.assertIsNone(lifecycle_hook.registered_root("controller-2"))
 
     def test_project_snapshot_exposes_five_state_task_projection(self) -> None:
         import subprocess
