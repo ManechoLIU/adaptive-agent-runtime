@@ -366,6 +366,7 @@ function validateAssignmentLaunch(options) {
     throw new Error("legacy assignment-ack cannot declare idempotency_key without v2 side-effect contract");
   }
   assignment.assignment_contract_version = contractVersion;
+  assignment.progress_deadline_minutes = assignmentProgressDeadlineMinutes(assignment);
   const repositoryRoot = gitFact(options.cwd, ["rev-parse", "--show-toplevel"], "launch repository");
   const branch = gitFact(options.cwd, ["branch", "--show-current"], "launch branch");
   const head = gitFact(options.cwd, ["rev-parse", "HEAD"], "launch revision");
@@ -431,6 +432,17 @@ function deriveExecutionLineage(options, assignment) {
 
 const PASS_EVIDENCE_SCHEMES = new Set(["test-log", "green-test", "receipt", "git", "file", "artifact"]);
 const PASS_ARTIFACT_SCHEMES = new Set(["git", "file", "artifact"]);
+const IMPLEMENTATION_PROGRESS_DEADLINE_MINUTES = 10;
+const MAX_ASSIGNMENT_PROGRESS_DEADLINE_MINUTES = 30;
+
+function assignmentProgressDeadlineMinutes(assignment) {
+  const raw = assignment.progress_deadline_minutes;
+  if (raw === undefined || raw === null) return IMPLEMENTATION_PROGRESS_DEADLINE_MINUTES;
+  if (!Number.isInteger(raw) || raw < 1 || raw > MAX_ASSIGNMENT_PROGRESS_DEADLINE_MINUTES) {
+    throw new Error("assignment-ack progress_deadline_minutes must be a positive integer within 1..30");
+  }
+  return raw;
+}
 
 function isTraceableLocator(value, schemes) {
   if (typeof value !== "string") return false;
@@ -524,6 +536,16 @@ function runtimeGitSnapshot(cwd) {
     head,
     statusSha256: createHash("sha256").update(status).digest("hex"),
   };
+}
+
+function boundedProgressEvidence(previous, snapshot) {
+  const changedFields = [];
+  if (snapshot.head !== previous.head) changedFields.push("last_observed_head");
+  if (snapshot.statusSha256 !== previous.statusSha256) changedFields.push("last_observed_status_sha256");
+  const evidence = { changed_fields: changedFields };
+  if (changedFields.includes("last_observed_head")) evidence.last_observed_head = snapshot.head;
+  if (changedFields.includes("last_observed_status_sha256")) evidence.last_observed_status_sha256 = snapshot.statusSha256;
+  return evidence;
 }
 
 function runtimeHeartbeatIntervalMs() {
@@ -780,6 +802,7 @@ async function main() {
       options.assignmentContractVersion = assignment.assignment_contract_version || 1;
       options.sideEffect = typeof assignment.side_effect === "boolean" ? assignment.side_effect : null;
       options.idempotencyKey = typeof assignment.idempotency_key === "string" ? assignment.idempotency_key.trim() : null;
+      options.progressDeadlineMinutes = assignment.progress_deadline_minutes;
       options.executionLineage = deriveExecutionLineage(options, assignment);
     }
     validateRuleHandshake(options);
@@ -789,6 +812,7 @@ async function main() {
       baseline_head: previousSnapshot.head,
       last_observed_head: previousSnapshot.head,
       last_observed_status_sha256: previousSnapshot.statusSha256,
+      ...(options.progressDeadlineMinutes ? { progress_deadline_minutes: options.progressDeadlineMinutes } : {}),
     });
     const heartbeat = options.assignmentId ? setInterval(() => {
       try {
@@ -798,6 +822,7 @@ async function main() {
           recordRuntimeReceipt(options, "assignment_progress", eventSeq, {
             last_observed_head: snapshot.head,
             last_observed_status_sha256: snapshot.statusSha256,
+            progress_evidence: boundedProgressEvidence(previousSnapshot, snapshot),
           });
           previousSnapshot = snapshot;
         } else {

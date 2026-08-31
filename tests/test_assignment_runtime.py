@@ -736,3 +736,160 @@ class WorktreeRuntimePathTests(unittest.TestCase):
             state = apply_receipt({}, receipt("assignment_started"), now=T0)
             save_runtime_state(wt, state)
             self.assertEqual(load_runtime_state(root)["leases"]["a1"]["session_id"], "s1")
+
+class VerifiableProgressObservabilityTests(unittest.TestCase):
+    def test_start_projects_started_phase_and_bounded_progress_evidence(self):
+        state = apply_receipt(
+            {},
+            receipt(
+                "assignment_started",
+                baseline_head="abc",
+                last_observed_status_sha256="status-1",
+            ),
+            now=T0,
+        )
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["last_progress_phase"], "STARTED")
+        evidence = lease["last_progress_evidence"]
+        self.assertIsInstance(evidence, dict)
+        json.dumps(evidence)
+        self.assertIn("changed_fields", evidence)
+        self.assertIn("last_observed_head", evidence["changed_fields"])
+        self.assertEqual(evidence["last_observed_head"], "abc")
+
+    def test_phase_label_without_changed_fingerprint_cannot_fake_progress(self):
+        state = apply_receipt(
+            {},
+            receipt(
+                "assignment_started",
+                baseline_head="abc",
+                last_observed_status_sha256="status-1",
+            ),
+            now=T0,
+        )
+        t = T0 + timedelta(minutes=10)
+        state = apply_receipt(
+            state,
+            receipt(
+                "assignment_progress",
+                t,
+                event_seq=2,
+                last_progress_phase="GREEN",
+                phase="RED",
+                last_observed_head="abc",
+                last_observed_status_sha256="status-1",
+            ),
+            now=t,
+        )
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["last_progress_at"], T0.isoformat())
+        self.assertEqual(lease["progress_deadline_at"], (T0 + timedelta(minutes=30)).isoformat())
+        self.assertEqual(lease["last_progress_phase"], "STARTED")
+        self.assertNotIn(lease["last_progress_phase"], {"RED", "GREEN", "REGRESSION"})
+
+    def test_git_snapshot_change_projects_worktree_changed_not_agent_green(self):
+        state = apply_receipt(
+            {},
+            receipt(
+                "assignment_started",
+                baseline_head="abc",
+                last_observed_status_sha256="status-1",
+            ),
+            now=T0,
+        )
+        t = T0 + timedelta(minutes=5)
+        state = apply_receipt(
+            state,
+            receipt(
+                "assignment_progress",
+                t,
+                event_seq=2,
+                last_observed_head="abc",
+                last_observed_status_sha256="status-2",
+                last_progress_phase="GREEN",
+            ),
+            now=t,
+        )
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["last_progress_at"], t.isoformat())
+        self.assertEqual(lease["last_progress_phase"], "WORKTREE_CHANGED")
+        self.assertNotEqual(lease["last_progress_phase"], "GREEN")
+        evidence = lease["last_progress_evidence"]
+        self.assertIn("last_observed_status_sha256", evidence["changed_fields"])
+        self.assertEqual(evidence["last_observed_status_sha256"], "status-2")
+        json.dumps(evidence)
+
+    def test_terminal_projects_delivery_phase_without_claiming_green(self):
+        state = apply_receipt({}, receipt("assignment_started", baseline_head="abc"), now=T0)
+        t = T0 + timedelta(minutes=1)
+        state = apply_receipt(
+            state,
+            receipt(
+                "assignment_terminal",
+                t,
+                event_seq=2,
+                terminal_state="completed",
+                transport_outcome="completed",
+                delivery_outcome="unresolved",
+                summary="external agent process completed",
+                evidence=[],
+                artifacts=[],
+                next_action="inspect delivery",
+                retry_class="none",
+                last_progress_phase="GREEN",
+            ),
+            now=t,
+        )
+        self.assertEqual(state["leases"]["a1"]["last_progress_phase"], "DELIVERY")
+
+    def test_implementation_assignment_budget_is_ten_minutes_without_changing_policy_defaults(self):
+        policy = RuntimePolicy()
+        self.assertEqual(
+            (policy.heartbeat_ttl_minutes, policy.progress_deadline_minutes, policy.progress_grace_minutes),
+            (20, 30, 15),
+        )
+        state = apply_receipt(
+            {},
+            receipt(
+                "assignment_started",
+                progress_deadline_minutes=10,
+                baseline_head="abc",
+                last_observed_status_sha256="status-1",
+            ),
+            now=T0,
+            policy=policy,
+        )
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["progress_deadline_minutes"], 10)
+        self.assertEqual(lease["progress_deadline_at"], (T0 + timedelta(minutes=10)).isoformat())
+        t = T0 + timedelta(minutes=9)
+        state = apply_receipt(state, receipt("assignment_heartbeat", t, event_seq=2), now=t, policy=policy)
+        self.assertEqual(evaluate_lease(state["leases"]["a1"], now=t, policy=policy)["state"], "healthy")
+        self.assertEqual(
+            evaluate_lease(state["leases"]["a1"], now=T0 + timedelta(minutes=11), policy=policy),
+            {"state": "progress_stale", "reason": "progress_deadline_exceeded"},
+        )
+
+    def test_progress_refresh_keeps_assignment_specific_budget(self):
+        state = apply_receipt(
+            {},
+            receipt("assignment_started", progress_deadline_minutes=10, baseline_head="abc"),
+            now=T0,
+        )
+        t = T0 + timedelta(minutes=4)
+        state = apply_receipt(
+            state,
+            receipt("assignment_progress", t, event_seq=2, last_observed_head="def"),
+            now=t,
+        )
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["progress_deadline_at"], (t + timedelta(minutes=10)).isoformat())
+        self.assertEqual(lease["last_progress_phase"], "WORKTREE_CHANGED")
+
+    def test_invalid_assignment_progress_budget_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "progress_deadline_minutes"):
+            apply_receipt({}, receipt("assignment_started", progress_deadline_minutes=31), now=T0)
+        with self.assertRaisesRegex(ValueError, "progress_deadline_minutes"):
+            apply_receipt({}, receipt("assignment_started", progress_deadline_minutes=True), now=T0)
+        with self.assertRaisesRegex(ValueError, "progress_deadline_minutes"):
+            apply_receipt({}, receipt("assignment_started", progress_deadline_minutes=0), now=T0)

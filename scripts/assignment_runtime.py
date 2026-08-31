@@ -36,6 +36,8 @@ EVIDENCE_FINGERPRINT_FIELDS = (
     "artifact_fingerprint",
     "blocker_evidence_fingerprint",
 )
+GIT_EVIDENCE_FIELDS = ("last_observed_head", "last_observed_status_sha256")
+MAX_PROGRESS_EVIDENCE_CHARS = 128
 LINEAGE_CONTRACT_FIELDS = ("primary_goal", "success_criteria", "owned_scope", "strategy")
 LINEAGE_WHITESPACE_RE = re.compile(r"[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
 PASS_EVIDENCE_SCHEMES = {"test-log", "green-test", "receipt", "git", "file", "artifact"}
@@ -72,6 +74,41 @@ def _traceable_locator(value: Any, schemes: set[str]) -> bool:
         return False
     scheme, locator = token.split(":", 1)
     return scheme in schemes and bool(locator.strip())
+
+def _assignment_progress_deadline_minutes(receipt: dict[str, Any], policy: RuntimePolicy) -> int:
+    raw = receipt.get("progress_deadline_minutes")
+    if raw is None:
+        return policy.progress_deadline_minutes
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < 1 or raw > policy.progress_deadline_minutes:
+        raise ValueError("progress_deadline_minutes must be a positive integer within the runtime policy bound")
+    return raw
+
+def _bounded_progress_scalar(value: Any) -> str | int | bool | None:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return value[:MAX_PROGRESS_EVIDENCE_CHARS]
+    return None
+
+def _bounded_progress_evidence(changed_fields: list[str], source: dict[str, Any]) -> dict[str, Any]:
+    bounded_fields = [field for field in changed_fields if field in EVIDENCE_FINGERPRINT_FIELDS][:len(EVIDENCE_FINGERPRINT_FIELDS)]
+    evidence: dict[str, Any] = {"changed_fields": bounded_fields}
+    for field in bounded_fields:
+        value = _bounded_progress_scalar(source.get(field))
+        if value not in (None, ""):
+            evidence[field] = value
+    return evidence
+
+def _project_progress_phase(*, event: str, changed_fields: list[str], current: str | None) -> str:
+    if event == "assignment_started":
+        return "STARTED"
+    if event == "assignment_terminal":
+        return "DELIVERY"
+    if event == "assignment_progress" and any(field in GIT_EVIDENCE_FIELDS for field in changed_fields):
+        return "WORKTREE_CHANGED"
+    return current if current in {"STARTED", "WORKTREE_CHANGED", "DELIVERY"} else "STARTED"
 
 def execution_lineage_id(*, task_id: str, primary_goal: str, success_criteria: list[str], owned_scope: list[str], strategy: str) -> str:
     canonical = json.dumps({
@@ -192,6 +229,7 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "execution_count": int(lineage.get("execution_count", previous_recovery_count + 1)) + 1 if lineage else 1,
             "recovery_count": recovery_count,
         }
+        deadline_minutes = _assignment_progress_deadline_minutes(receipt, policy)
         lease = {f: receipt[f] for f in IDENTITY_FIELDS}
         lease.update({
             "schema_version": 1,
@@ -220,9 +258,13 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "terminal_state": None,
             "terminal_at": None,
             "lease_expires_at": _iso(issued + timedelta(minutes=policy.heartbeat_ttl_minutes)),
-            "progress_deadline_at": _iso(issued + timedelta(minutes=policy.progress_deadline_minutes)),
+            "progress_deadline_minutes": deadline_minutes,
+            "progress_deadline_at": _iso(issued + timedelta(minutes=deadline_minutes)),
+            "last_progress_phase": "STARTED",
             "runtime_receipt_id": receipt.get("receipt_id"),
         })
+        start_changed = [field for field in EVIDENCE_FINGERPRINT_FIELDS if lease.get(field) not in (None, "")]
+        lease["last_progress_evidence"] = _bounded_progress_evidence(start_changed, lease)
         leases[aid] = lease; return out
     if not existing: raise ValueError("runtime receipt has no started lease")
     lease = existing
@@ -230,7 +272,7 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
     if event in {"assignment_heartbeat", "assignment_progress"}:
         lease["last_heartbeat_at"] = _iso(issued); lease["lease_expires_at"] = _iso(issued + timedelta(minutes=policy.heartbeat_ttl_minutes))
     if event == "assignment_progress":
-        changed = False
+        changed_fields: list[str] = []
         for field in EVIDENCE_FINGERPRINT_FIELDS:
             if field not in receipt:
                 continue
@@ -238,11 +280,18 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             if value in (None, ""):
                 continue
             if lease.get(field) != value:
-                changed = True
+                changed_fields.append(field)
                 lease[field] = value
-        if changed:
+        if changed_fields:
+            deadline_minutes = int(lease.get("progress_deadline_minutes") or policy.progress_deadline_minutes)
             lease["last_progress_at"] = _iso(issued)
-            lease["progress_deadline_at"] = _iso(issued + timedelta(minutes=policy.progress_deadline_minutes))
+            lease["progress_deadline_at"] = _iso(issued + timedelta(minutes=deadline_minutes))
+            lease["last_progress_phase"] = _project_progress_phase(
+                event="assignment_progress",
+                changed_fields=changed_fields,
+                current=lease.get("last_progress_phase"),
+            )
+            lease["last_progress_evidence"] = _bounded_progress_evidence(changed_fields, lease)
     if event == "assignment_terminal":
         existing_contract_version = int(existing.get("side_effect_contract_version", 1))
         if existing_contract_version >= 2:
@@ -335,6 +384,7 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             lease["transport_outcome"] = transport_outcome
             lease["delivery_outcome"] = delivery_outcome
         lease["evidence"] = receipt["evidence"]; lease["artifacts"] = receipt["artifacts"]; lease["next_action"] = receipt["next_action"]; lease["retry_class"] = receipt["retry_class"]
+        lease["last_progress_phase"] = "DELIVERY"
     lease["runtime_receipt_id"] = receipt.get("receipt_id") or lease.get("runtime_receipt_id")
     return out
 
