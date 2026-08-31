@@ -346,6 +346,15 @@ function validateAssignmentLaunch(options) {
   if (!new Set(["ACKED", "ACTIVE"]).has(state)) {
     throw new Error("assignment-ack launch state must be ACKED or ACTIVE");
   }
+  if (typeof assignment.side_effect !== "boolean") {
+    throw new Error("assignment-ack requires explicit side_effect contract");
+  }
+  if (assignment.idempotency_key !== null && assignment.idempotency_key !== undefined && typeof assignment.idempotency_key !== "string") {
+    throw new Error("assignment-ack idempotency_key must be a string or null");
+  }
+  if (typeof assignment.idempotency_key === "string" && assignment.idempotency_key.trim().length === 0) {
+    throw new Error("assignment-ack idempotency_key cannot be blank");
+  }
   const repositoryRoot = gitFact(options.cwd, ["rev-parse", "--show-toplevel"], "launch repository");
   const branch = gitFact(options.cwd, ["branch", "--show-current"], "launch branch");
   const head = gitFact(options.cwd, ["rev-parse", "HEAD"], "launch revision");
@@ -473,6 +482,8 @@ function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
     worktree: options.cwd, issued_at: new Date().toISOString(), attempt: options.attempt,
     lease_id: options.leaseId || `${options.assignmentId}:attempt:${options.attempt}`, event_seq: eventSeq,
     receipt_id: `${options.assignmentId}:${options.attempt}:${eventSeq}`,
+    side_effect: Boolean(options.sideEffect),
+    idempotency_key: options.idempotencyKey || null,
     ...(eventType === "assignment_started" ? options.executionLineage : {}), ...extra,
   };
 }
@@ -741,7 +752,11 @@ async function main() {
       return;
     }
     const assignment = validateAssignmentLaunch(options);
-    if (assignment) options.executionLineage = deriveExecutionLineage(options, assignment);
+    if (assignment) {
+      options.sideEffect = assignment.side_effect;
+      options.idempotencyKey = typeof assignment.idempotency_key === "string" ? assignment.idempotency_key.trim() : null;
+      options.executionLineage = deriveExecutionLineage(options, assignment);
+    }
     validateRuleHandshake(options);
     let eventSeq = 1;
     let previousSnapshot = runtimeGitSnapshot(options.cwd);
@@ -774,7 +789,7 @@ async function main() {
     } catch (error) {
       if (heartbeat) clearInterval(heartbeat);
       eventSeq += 1;
-      recordRuntimeReceipt(options, "assignment_terminal", eventSeq, { terminal_state: "failed", transport_outcome: "failed", delivery_outcome: "unresolved", summary: error.message, evidence: [], artifacts: [], next_action: "inspect external agent failure", retry_class: "transport_error" });
+      recordRuntimeReceipt(options, "assignment_terminal", eventSeq, { terminal_state: "failed", transport_outcome: "failed", delivery_outcome: "unresolved", summary: error.message, evidence: [], artifacts: [], next_action: "inspect external agent failure", retry_class: "transport_error", result_unknown: Boolean(options.sideEffect) });
       throw error;
     }
     if (heartbeat) clearInterval(heartbeat);
@@ -796,6 +811,7 @@ async function main() {
       evidence: delivery?.evidence || [], artifacts: delivery?.artifacts || [],
       next_action: delivery?.next_action || (deliveryError ? "repair delivery receipt" : code === 0 ? "inspect delivery" : "inspect external agent output"),
       retry_class: delivery?.retry_class || (deliveryError ? "none" : code === 0 ? "none" : "provider_exit"),
+      result_unknown: Boolean(options.sideEffect) && (code !== 0 || deliveryError !== null || delivery?.delivery_outcome === "unresolved" || delivery === null),
     });
     if (deliveryError) throw deliveryError;
     process.exitCode = code;

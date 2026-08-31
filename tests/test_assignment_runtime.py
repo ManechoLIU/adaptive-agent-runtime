@@ -12,7 +12,7 @@ UTC=timezone.utc
 T0=datetime(2026,8,29,10,0,tzinfo=UTC)
 
 def receipt(event, at=T0, **extra):
-    base={"event_type":event,"assignment_id":"a1","task_id":"T1","agent_id":"grok-writer","provider":"grok","session_id":"s1","worktree":"/tmp/wt","issued_at":at.isoformat(),"primary_goal":"finish bounded task","success_criteria":["green"],"owned_scope":["scripts/assignment_runtime.py"],"strategy":"grok-build:grok-4.6:oauth:low"}
+    base={"event_type":event,"assignment_id":"a1","task_id":"T1","agent_id":"grok-writer","provider":"grok","session_id":"s1","worktree":"/tmp/wt","issued_at":at.isoformat(),"primary_goal":"finish bounded task","success_criteria":["green"],"owned_scope":["scripts/assignment_runtime.py"],"strategy":"grok-build:grok-4.6:oauth:low","side_effect":False}
     base.update(extra); return base
 
 class RuntimeTests(unittest.TestCase):
@@ -155,6 +155,62 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
         self.assertEqual(allowed["idempotency_key"], "publish:release-42")
         self.assertFalse(exhausted["retry"])
         self.assertEqual(exhausted["reason"], "attempt_budget_exhausted")
+
+    def test_new_assignment_start_requires_explicit_side_effect_contract(self):
+        start = receipt("assignment_started")
+        start.pop("side_effect")
+        with self.assertRaisesRegex(ValueError, "side_effect contract"):
+            apply_receipt({}, start, now=T0)
+
+    def test_unknown_non_idempotent_side_effect_blocks_next_attempt_at_runtime_gate(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1, side_effect=True
+        ), now=T0)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+            terminal_state="failed", transport_outcome="failed", delivery_outcome="unresolved",
+            summary="connection lost after write may have occurred", evidence=[], artifacts=[],
+            next_action="reconcile external state", retry_class="transport_error", side_effect=True, result_unknown=True,
+        ), now=T0 + timedelta(minutes=1))
+        with self.assertRaisesRegex(ValueError, "non-idempotent unknown side effect"):
+            apply_receipt(state, receipt(
+                "assignment_started", T0 + timedelta(minutes=2), attempt=2, lease_id="lease-2", event_seq=1, side_effect=True
+            ), now=T0 + timedelta(minutes=2))
+
+    def test_unknown_side_effect_with_original_stable_key_allows_next_attempt(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1,
+            side_effect=True, idempotency_key="publish:release-42"
+        ), now=T0)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+            terminal_state="failed", transport_outcome="failed", delivery_outcome="unresolved",
+            summary="connection lost", evidence=[], artifacts=[], next_action="retry with same key",
+            retry_class="transport_error", side_effect=True, idempotency_key="publish:release-42", result_unknown=True,
+        ), now=T0 + timedelta(minutes=1))
+        recovered = apply_receipt(state, receipt(
+            "assignment_started", T0 + timedelta(minutes=2), attempt=2, lease_id="lease-2", event_seq=1,
+            side_effect=True, idempotency_key="publish:release-42"
+        ), now=T0 + timedelta(minutes=2))
+        self.assertEqual(recovered["leases"]["a1"]["attempt"], 2)
+        self.assertEqual(recovered["leases"]["a1"]["idempotency_key"], "publish:release-42")
+
+    def test_side_effect_or_idempotency_contract_cannot_drift_during_recovery(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1,
+            side_effect=True, idempotency_key="resource:create-1"
+        ), now=T0)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+            terminal_state="failed", transport_outcome="failed", delivery_outcome="fail",
+            summary="known failure", evidence=[], artifacts=[], next_action="retry", retry_class="transport_error",
+            side_effect=True, idempotency_key="resource:create-1", result_unknown=False,
+        ), now=T0 + timedelta(minutes=1))
+        with self.assertRaisesRegex(ValueError, "side-effect contract drift"):
+            apply_receipt(state, receipt(
+                "assignment_started", T0 + timedelta(minutes=2), attempt=2, lease_id="lease-2", event_seq=1,
+                side_effect=False
+            ), now=T0 + timedelta(minutes=2))
 
 class EvidenceDeltaAndRecoveryBudgetTests(unittest.TestCase):
     def test_no_delta_progress_refreshes_heartbeat_but_not_progress_deadline(self):

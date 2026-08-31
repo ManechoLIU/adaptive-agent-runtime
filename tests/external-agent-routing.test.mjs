@@ -18,6 +18,7 @@ async function assignmentAckFile(directory, overrides = {}, repositoryRoot = ski
   const assignment = {
     assignment_id: "a1", task_id: "T1", agent_id: "writer", state: "ACKED",
     primary_goal: "finish bounded task", success_criteria: ["green"], owned_scope: ["scripts/run_external_agent.mjs"],
+    side_effect: false, idempotency_key: null,
     forbidden_scope: [], parallelizable: true, observed_modified_files: [],
     ack: { repository_root: repositoryRoot, branch, head, status: "clean", owned_files: ["scripts/run_external_agent.mjs"], first_red: "red", stop_condition: "candidate" },
     ...overrides,
@@ -477,6 +478,26 @@ test("assignment-bound execute rejects stale or mismatched ACK before spawn", as
     ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
     assert.equal(result.status, 1);
   }
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
+test("assignment-bound execute rejects missing side-effect contract before spawn", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-side-effect-missing-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, { side_effect: undefined }, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack,
+  ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /side_effect contract/i);
   await assert.rejects(readFile(marker, "utf8"));
 });
 
