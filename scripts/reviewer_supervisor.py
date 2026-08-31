@@ -100,7 +100,6 @@ def run_attempt(
         "review",
         "--base",
         contract.base,
-        contract.instructions,
     ]
     process = popen_factory(
         argv,
@@ -110,6 +109,7 @@ def run_attempt(
         text=True,
         bufsize=1,
         start_new_session=True,
+        input=contract.instructions,
     )
     running_observed = False
     session_id = None

@@ -76,6 +76,9 @@ class ReviewerSupervisorLaunchTests(unittest.TestCase):
         result = run_attempt(contract, 0, popen_factory=factory, codex_executable="/usr/bin/codex")
         argv, kwargs = calls[0]
         self.assertEqual(argv[0:2], ["/usr/bin/codex", "exec"])
+        self.assertEqual(argv[-3:], ["review", "--base", "main"])
+        self.assertNotIn(contract.instructions, argv)
+        self.assertEqual(kwargs["input"], contract.instructions)
         self.assertNotIn("nohup", argv)
         self.assertNotIn("sh", argv)
         self.assertTrue(kwargs["start_new_session"])
