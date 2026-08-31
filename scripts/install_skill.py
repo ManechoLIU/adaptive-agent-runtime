@@ -434,6 +434,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 codex_executable=args.codex, ai_bridge_executable=args.ai_bridge,
                 hooks_file=args.hooks_file, zshenv_file=args.zshenv_file,
             )
+            _write_json_atomic(Path(args.target).expanduser().resolve() / MANIFEST_NAME, manifest)
     print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
     return 0
 

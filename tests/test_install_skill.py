@@ -172,6 +172,36 @@ class HostAdapterInstallationTests(unittest.TestCase):
             self.assertEqual(report["web_local_adapter"]["status"], "enabled")
             self.assertTrue(hooks.is_file())
             self.assertTrue(zshenv.is_file())
+    def test_install_cli_persists_degraded_capabilities_when_adapter_configuration_partially_fails(self):
+        import contextlib
+        import io
+        import json
+        from unittest.mock import patch
+        from scripts.install_skill import MANIFEST_NAME, main
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = InstallMigrationContractTests().make_source(root)
+            target = root / "installed" / "adaptive-delivery"
+            codex = root / "codex"; codex.write_text("#!/bin/sh\n", encoding="utf-8"); codex.chmod(0o755)
+            bridge = root / "ai-bridge"; bridge.write_text("#!/bin/sh\n", encoding="utf-8"); bridge.chmod(0o755)
+            hooks = root / "hooks.json"
+            zshenv = root / ".zshenv"
+            output = io.StringIO()
+            with patch("scripts.install_skill.configure_host_adapters", side_effect=OSError("zshenv write failed")):
+                with contextlib.redirect_stdout(output):
+                    code = main([
+                        "--source", str(source), "--target", str(target),
+                        "--summary", "partial adapter failure", "--impact", "none",
+                        "--stop-condition", "ready", "--codex", str(codex),
+                        "--ai-bridge", str(bridge), "--hooks-file", str(hooks),
+                        "--zshenv-file", str(zshenv),
+                    ])
+            payload = json.loads(output.getvalue().splitlines()[-1])
+            persisted = json.loads((target / MANIFEST_NAME).read_text(encoding="utf-8"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(persisted["capabilities"], payload["capabilities"])
+
     def test_install_cli_configures_available_host_adapters_in_one_entrypoint(self):
         import contextlib
         import io
