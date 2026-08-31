@@ -40,7 +40,7 @@ LINEAGE_CONTRACT_FIELDS = ("primary_goal", "success_criteria", "owned_scope", "s
 LINEAGE_WHITESPACE_RE = re.compile(r"[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
 PASS_EVIDENCE_SCHEMES = {"test-log", "green-test", "receipt", "git", "file", "artifact"}
 PASS_ARTIFACT_SCHEMES = {"git", "file", "artifact"}
-RECONCILIATION_EVIDENCE_SCHEMES = {"receipt", "file", "artifact"}
+RECONCILIATION_EVIDENCE_SCHEMES = {"receipt", "artifact"}
 
 @dataclass(frozen=True)
 class RuntimePolicy:
@@ -116,6 +116,8 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
         if mismatches: raise ValueError("runtime receipt identity mismatch: " + ", ".join(mismatches))
         current_attempt = int(existing.get("attempt", 1))
         if attempt < current_attempt: raise ValueError("stale runtime attempt")
+        if attempt == current_attempt and existing.get("terminal_state"):
+            raise ValueError("terminal attempt is immutable; create a new recovery attempt only when policy allows")
         if attempt == current_attempt and lease_id != existing.get("lease_id"): raise ValueError("runtime lease_id mismatch")
         if attempt == current_attempt and event_seq <= int(existing.get("last_event_seq", 0)): raise ValueError("runtime event_seq must increase")
     if event == "assignment_started":
@@ -290,12 +292,18 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             result_unknown = receipt.get("result_unknown", False)
             reconciliation_evidence = receipt.get("reconciliation_evidence", [])
             if lease.get("side_effect") and not result_unknown:
-                successful_delivery = terminal == "completed" and delivery_outcome == "pass"
-                if not successful_delivery:
-                    if not isinstance(reconciliation_evidence, list) or not reconciliation_evidence:
-                        raise ValueError("clearing side-effect result_unknown requires reconciliation evidence")
-                    if not all(_traceable_locator(item, RECONCILIATION_EVIDENCE_SCHEMES) for item in reconciliation_evidence):
-                        raise ValueError("reconciliation evidence must be traceable receipt/file/artifact locators")
+                if not isinstance(reconciliation_evidence, list) or not reconciliation_evidence:
+                    raise ValueError("clearing side-effect result_unknown requires provider reconciliation evidence")
+                stable_key = str(existing.get("idempotency_key") or "").strip() or None
+                for item in reconciliation_evidence:
+                    if not _traceable_locator(item, RECONCILIATION_EVIDENCE_SCHEMES):
+                        raise ValueError("provider reconciliation evidence must use receipt/artifact locators")
+                    token = str(item).strip()
+                    scheme, locator = token.split(":", 1)
+                    if not locator.startswith("provider/"):
+                        raise ValueError("provider reconciliation evidence must identify the provider/resource")
+                    if stable_key is not None and stable_key not in locator:
+                        raise ValueError("provider reconciliation evidence must bind the exact idempotency key")
             elif reconciliation_evidence and not isinstance(reconciliation_evidence, list):
                 raise ValueError("reconciliation_evidence must be a list")
         else:

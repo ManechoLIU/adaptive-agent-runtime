@@ -519,6 +519,35 @@ test("v2 side-effect execution propagates stable idempotency key to provider con
   assert.match(payload.args.join(" "), /publish:release-42/);
 });
 
+test("side-effect PASS propagates provider reconciliation evidence into terminal runtime receipt", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-side-effect-reconciliation-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const receipts = path.join(bin, "receipts.jsonl");
+  const deliveryPath = path.join(bin, "delivery.json");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const key = "publish:release-42";
+  const ack = await assignmentAckFile(bin, { side_effect: true, idempotency_key: key }, repo);
+  await writeFile(deliveryPath, JSON.stringify({
+    delivery_outcome: "pass", summary: "provider confirmed publish",
+    evidence: [`receipt:provider/${key}`], artifacts: ["artifact:publish-1"],
+    next_action: "done", retry_class: "none",
+    reconciliation_evidence: [`receipt:provider/${key}`],
+  }));
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack, "--runtime-receipts", receipts, "--delivery-receipt", deliveryPath,
+  ], { encoding: "utf8", input: "publish once", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
+  assert.equal(result.status, 0, result.stderr);
+  const events = (await readFile(receipts, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.deepEqual(events.at(-1).reconciliation_evidence, [`receipt:provider/${key}`]);
+  assert.equal(events.at(-1).result_unknown, false);
+});
+
 test("assignment-bound execute rejects missing side-effect contract before spawn", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-side-effect-missing-"));
   const repo = await makeAssignmentRepo(bin);

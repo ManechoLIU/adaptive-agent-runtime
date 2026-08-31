@@ -468,9 +468,13 @@ function readDeliveryReceipt(pathname) {
   if (deliveryOutcome === "pass" && (!receipt.evidence.every((item) => isTraceableLocator(item, PASS_EVIDENCE_SCHEMES)) || !receipt.artifacts.every((item) => isTraceableLocator(item, PASS_ARTIFACT_SCHEMES)))) {
     throw new Error("delivery PASS requires traceable evidence and artifact");
   }
+  if (receipt.reconciliation_evidence !== undefined && !Array.isArray(receipt.reconciliation_evidence)) {
+    throw new Error("delivery-receipt reconciliation_evidence must be an array when provided");
+  }
   return {
     delivery_outcome: deliveryOutcome, summary, evidence: receipt.evidence, artifacts: receipt.artifacts,
     next_action: receipt.next_action, retry_class: receipt.retry_class,
+    reconciliation_evidence: receipt.reconciliation_evidence || [],
   };
 }
 
@@ -832,6 +836,7 @@ async function main() {
       evidence: delivery?.evidence || [], artifacts: delivery?.artifacts || [],
       next_action: delivery?.next_action || (deliveryError ? "repair delivery receipt" : code === 0 ? "inspect delivery" : "inspect external agent output"),
       retry_class: delivery?.retry_class || (deliveryError ? "none" : code === 0 ? "none" : "provider_exit"),
+      reconciliation_evidence: delivery?.reconciliation_evidence || [],
       result_unknown: Boolean(options.sideEffect) && (code !== 0 || deliveryError !== null || delivery?.delivery_outcome === "unresolved" || delivery === null),
     });
     if (deliveryError) throw deliveryError;

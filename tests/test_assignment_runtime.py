@@ -204,7 +204,7 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
             terminal_state="failed", transport_outcome="failed", delivery_outcome="fail",
             summary="provider proved no mutation committed", evidence=[], artifacts=[], next_action="retry",
             retry_class="transport_error", side_effect=True, result_unknown=False,
-            reconciliation_evidence=["receipt:provider-no-write-1"],
+            reconciliation_evidence=["receipt:provider/no-write-1"],
         ), now=T0 + timedelta(minutes=1))
         self.assertFalse(state["leases"]["a1"]["result_unknown"])
         recovered = apply_receipt(state, receipt(
@@ -224,6 +224,63 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
                 retry_class="transport_error", side_effect=True, result_unknown=False,
             ), now=T0 + timedelta(minutes=1))
 
+    def test_terminal_receipt_is_immutable_for_same_attempt(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1, side_effect=False
+        ), now=T0)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+            terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
+            summary="done", evidence=["receipt:done-1"], artifacts=["artifact:done-1"],
+            next_action="done", retry_class="none", side_effect=False, result_unknown=False,
+        ), now=T0 + timedelta(minutes=1))
+        with self.assertRaisesRegex(ValueError, "terminal attempt is immutable"):
+            apply_receipt(state, receipt(
+                "assignment_terminal", T0 + timedelta(minutes=2), attempt=1, lease_id="lease-1", event_seq=3,
+                terminal_state="failed", transport_outcome="failed", delivery_outcome="unresolved",
+                summary="late overwrite", evidence=[], artifacts=[], next_action="inspect", retry_class="transport_error",
+                side_effect=False, result_unknown=False,
+            ), now=T0 + timedelta(minutes=2))
+
+    def test_post_terminal_heartbeat_is_rejected_for_same_attempt(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1, side_effect=False
+        ), now=T0)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+            terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
+            summary="done", evidence=["receipt:done-1"], artifacts=["artifact:done-1"],
+            next_action="done", retry_class="none", side_effect=False, result_unknown=False,
+        ), now=T0 + timedelta(minutes=1))
+        with self.assertRaisesRegex(ValueError, "terminal attempt is immutable"):
+            apply_receipt(state, receipt(
+                "assignment_heartbeat", T0 + timedelta(minutes=2), attempt=1, lease_id="lease-1", event_seq=3
+            ), now=T0 + timedelta(minutes=2))
+
+    def test_side_effect_pass_requires_provider_reconciliation_bound_to_idempotency_key(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1,
+            side_effect=True, idempotency_key="publish:release-42"
+        ), now=T0)
+        with self.assertRaisesRegex(ValueError, "provider reconciliation evidence"):
+            apply_receipt(state, receipt(
+                "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+                terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
+                summary="published", evidence=["file:local-proof.json"], artifacts=["artifact:publish-1"],
+                next_action="done", retry_class="none", side_effect=True,
+                idempotency_key="publish:release-42", result_unknown=False,
+                reconciliation_evidence=["file:local-proof.json"],
+            ), now=T0 + timedelta(minutes=1))
+        confirmed = apply_receipt(state, receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+            terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
+            summary="published", evidence=["receipt:provider/publish:release-42"], artifacts=["artifact:publish-1"],
+            next_action="done", retry_class="none", side_effect=True,
+            idempotency_key="publish:release-42", result_unknown=False,
+            reconciliation_evidence=["receipt:provider/publish:release-42"],
+        ), now=T0 + timedelta(minutes=1))
+        self.assertFalse(confirmed["leases"]["a1"]["result_unknown"])
+
     def test_successfully_completed_assignment_cannot_be_recovered(self):
         state = apply_receipt({}, receipt(
             "assignment_started", attempt=1, lease_id="lease-1", event_seq=1, side_effect=True
@@ -231,8 +288,9 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
         state = apply_receipt(state, receipt(
             "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
             terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
-            summary="published once", evidence=["receipt:publish-1"], artifacts=["artifact:publish-1"],
+            summary="published once", evidence=["receipt:provider/publish-1"], artifacts=["artifact:publish-1"],
             next_action="done", retry_class="none", side_effect=True, result_unknown=False,
+            reconciliation_evidence=["receipt:provider/publish-1"],
         ), now=T0 + timedelta(minutes=1))
         with self.assertRaisesRegex(ValueError, "completed assignment cannot be recovered"):
             apply_receipt(state, receipt(
@@ -306,7 +364,7 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
             terminal_state="failed", transport_outcome="failed", delivery_outcome="fail",
             summary="known failure", evidence=[], artifacts=[], next_action="retry", retry_class="transport_error",
             side_effect=True, idempotency_key="resource:create-1", result_unknown=False,
-            reconciliation_evidence=["receipt:provider-no-write-drift-test"],
+            reconciliation_evidence=["receipt:provider/no-write-drift-test/resource:create-1"],
         ), now=T0 + timedelta(minutes=1))
         with self.assertRaisesRegex(ValueError, "side-effect contract drift"):
             apply_receipt(state, receipt(
