@@ -201,6 +201,7 @@ export function parseArgs(argv) {
     authMode: null,
     region: null,
     cwd: null,
+    runtimeRepo: null,
     workPackage: null, category: null, status: null, detail: null,
     assignmentId: null, taskId: null, agentId: null, sessionId: null,
     attempt: 1, leaseId: null, runtimeReceipts: null, assignmentAck: null, deliveryReceipt: null,
@@ -224,7 +225,7 @@ export function parseArgs(argv) {
     else if (argument === "--billing-boundary") options.billingBoundary = true;
     else if (argument === "--authorization-boundary") options.authorizationBoundary = true;
     else if (argument === "--peer-host-available") options.peerHostAvailable = true;
-    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--work-package", "--category", "--status", "--detail", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts", "--assignment-ack", "--delivery-receipt", "--work-type", "--complexity", "--failure-class", "--controller-host", "--current-host-failure-class"].includes(argument)) {
+    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--runtime-repo", "--work-package", "--category", "--status", "--detail", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts", "--assignment-ack", "--delivery-receipt", "--work-type", "--complexity", "--failure-class", "--controller-host", "--current-host-failure-class"].includes(argument)) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`Missing value for ${argument}`);
       if (argument === "--auth-mode") options.authMode = value;
@@ -236,6 +237,7 @@ export function parseArgs(argv) {
       else if (argument === "--attempt") options.attempt = Number.parseInt(value, 10);
       else if (argument === "--lease-id") options.leaseId = value;
       else if (argument === "--runtime-receipts") options.runtimeReceipts = value;
+      else if (argument === "--runtime-repo") options.runtimeRepo = value;
       else if (argument === "--work-package") options.workPackage = value;
       else if (argument === "--assignment-ack") options.assignmentAck = value;
       else if (argument === "--delivery-receipt") options.deliveryReceipt = value;
@@ -329,6 +331,22 @@ function gitFact(cwd, args, label) {
   const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
   if (result.status !== 0) throw new Error(`cannot resolve ${label}: ${(result.stderr || result.stdout).trim()}`);
   return result.stdout.trim();
+}
+
+function runtimeRepository(options) {
+  return options.runtimeRepo || options.cwd;
+}
+
+function validateRuntimeBinding(options) {
+  if (!options.assignmentId) return;
+  const executionCommon = gitFact(options.cwd, ["rev-parse", "--git-common-dir"], "execution git common-dir");
+  const executionCommonBase = path.basename(path.resolve(options.cwd, executionCommon));
+  if (!options.runtimeRepo && executionCommonBase !== ".git") {
+    throw new Error("canonical runtime repo is required for assignment-bound execution from a nonstandard Git common-dir; pass --runtime-repo");
+  }
+  const runtimeRepo = runtimeRepository(options);
+  const runtimeRoot = gitFact(runtimeRepo, ["rev-parse", "--show-toplevel"], "runtime repository");
+  options.runtimeRepo = runtimeRoot;
 }
 
 function validateAssignmentLaunch(options) {
@@ -494,7 +512,7 @@ function validateRuleHandshake(options) {
   if (!options.assignmentId) return;
   const guard = fileURLToPath(new URL("./rule_handshake.py", import.meta.url));
   const python = process.env.AD_PYTHON || "python3";
-  const result = spawnSync(python, [guard, "launch-guard", "--repo", options.cwd], { encoding: "utf8" });
+  const result = spawnSync(python, [guard, "launch-guard", "--repo", runtimeRepository(options)], { encoding: "utf8" });
   if (result.error) throw new Error(`rule handshake validation failed: ${result.error.message}`);
   if (result.status !== 0) throw new Error(`rule handshake validation failed: ${(result.stdout || result.stderr).trim()}`);
 }
@@ -523,7 +541,7 @@ function recordRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
   if (!receipt) return;
   const runtime = fileURLToPath(new URL("./assignment_runtime.py", import.meta.url));
   const python = process.env.AD_PYTHON || "python3";
-  const result = spawnSync(python, [runtime, "apply", "--repo", options.cwd], { encoding: "utf8", input: JSON.stringify(receipt) });
+  const result = spawnSync(python, [runtime, "apply", "--repo", runtimeRepository(options)], { encoding: "utf8", input: JSON.stringify(receipt) });
   if (result.error) throw new Error(`runtime receipt apply failed: ${result.error.message}`);
   if (result.status !== 0) throw new Error(`runtime receipt apply failed: ${(result.stdout || result.stderr).trim()}`);
   if (options.runtimeReceipts) appendFileSync(options.runtimeReceipts, `${JSON.stringify(receipt)}\n`, "utf8");
@@ -798,6 +816,7 @@ async function main() {
       return;
     }
     const assignment = validateAssignmentLaunch(options);
+    validateRuntimeBinding(options);
     if (assignment) {
       options.assignmentContractVersion = assignment.assignment_contract_version || 1;
       options.sideEffect = typeof assignment.side_effect === "boolean" ? assignment.side_effect : null;
