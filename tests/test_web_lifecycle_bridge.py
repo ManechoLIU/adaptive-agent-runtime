@@ -1109,6 +1109,49 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertTrue(second.get("debounced") is True)
             self.assertEqual(marker.read_text(encoding="utf-8").count("resume controller-1"), 1)
 
+    def test_same_trigger_labels_with_new_snapshot_are_not_debounced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, marker = self.make_controller(root)
+            first_state = {
+                "pending_control_event": True,
+                "triggers": ["main_worktree_changed"],
+                "controller_host": "web",
+                "snapshot": {
+                    "head": "head-1",
+                    "ledger_sha256": "ledger-1",
+                    "worktree_status_sha256": "status-1",
+                    "ready_ids": ["F1"],
+                    "runnable_ids": ["F1"],
+                    "candidate_revisions": [],
+                    "rule_handshake": {"state": "current", "installed_revision": "rev-1"},
+                },
+            }
+            second_state = {
+                **first_state,
+                "snapshot": {**first_state["snapshot"], "worktree_status_sha256": "status-2"},
+            }
+            from unittest.mock import patch
+            with patch.object(
+                web_bridge, "execute_native_resume", wraps=web_bridge.execute_native_resume
+            ) as native_resume:
+                first = web_bridge.dispatch_pending_lifecycle_wake(
+                    lifecycle_state=first_state, session_id="controller-1", repo=repo, registry=registry,
+                    codex=str(codex), receipt_path=receipt_path,
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                )
+                second = web_bridge.dispatch_pending_lifecycle_wake(
+                    lifecycle_state=second_state, session_id="controller-1", repo=repo, registry=registry,
+                    codex=str(codex), receipt_path=receipt_path,
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                )
+            self.assertEqual(first["result"], "CONFIRMED")
+            self.assertEqual(second["result"], "CONFIRMED")
+            self.assertNotEqual(second["event_fingerprint"], first["event_fingerprint"])
+            self.assertFalse(second.get("debounced", False))
+            self.assertEqual(native_resume.call_count, 2)
+            self.assertIn("resume controller-1", marker.read_text(encoding="utf-8"))
+
     def test_deferred_wake_is_retryable_for_same_pending_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

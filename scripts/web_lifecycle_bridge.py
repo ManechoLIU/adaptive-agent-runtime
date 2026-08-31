@@ -582,9 +582,22 @@ def _registered_controller_for_common_dir(repo: Path, registry_path: Path) -> st
 
 
 def _wake_event_fingerprint(lifecycle_state: dict[str, Any]) -> str:
+    snapshot = lifecycle_state.get("snapshot")
+    generation: dict[str, Any] = {}
+    if isinstance(snapshot, dict):
+        generation = {
+            "head": snapshot.get("head"),
+            "ledger_sha256": snapshot.get("ledger_sha256"),
+            "worktree_status_sha256": snapshot.get("worktree_status_sha256"),
+            "ready_ids": snapshot.get("ready_ids", []),
+            "runnable_ids": snapshot.get("runnable_ids", []),
+            "candidate_revisions": snapshot.get("candidate_revisions", []),
+            "rule_handshake": snapshot.get("rule_handshake", {}),
+        }
     value = {
         "pending_control_event": lifecycle_state.get("pending_control_event") is True,
         "triggers": lifecycle_state.get("triggers", []),
+        "event_generation": generation,
     }
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return __import__("hashlib").sha256(encoded).hexdigest()
