@@ -14,9 +14,60 @@ from pathlib import Path
 from typing import Any, Sequence
 
 UTC = timezone.utc
+PRODUCT_NAME = "Adaptive Agent Runtime"
+SKILL_ID = "adaptive-agent-runtime"
+LEGACY_SKILL_IDS = ("adaptive-delivery",)
+DEFAULT_AI_BRIDGE_EXECUTABLE = Path("/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge")
+DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
 MANIFEST_NAME = ".adaptive-delivery-install.json"
 IMPACTS = {"none", "live_assignments"}
 
+
+
+def detect_host_capabilities(
+    *,
+    codex_executable: str | Path | None = None,
+    ai_bridge_executable: str | Path = DEFAULT_AI_BRIDGE_EXECUTABLE,
+    hooks_file: str | Path = DEFAULT_CODEX_HOOKS,
+) -> dict[str, dict[str, str]]:
+    codex_path = Path(codex_executable).expanduser() if codex_executable else None
+    if codex_path is None:
+        discovered = shutil.which("codex")
+        codex_path = Path(discovered) if discovered else None
+    bridge_path = Path(ai_bridge_executable).expanduser()
+    hooks_path = Path(hooks_file).expanduser()
+
+    desktop = (
+        {
+            "status": "degraded",
+            "adapter": "codex-native",
+            "reason": "hook trust/activation must be verified by the host",
+        }
+        if codex_path is not None and codex_path.is_file()
+        else {
+            "status": "blocked",
+            "adapter": "codex-native",
+            "reason": "codex executable not detected",
+        }
+    )
+    if desktop["status"] == "degraded" and hooks_path.is_file():
+        desktop["reason"] = "hooks file detected; host trust/activation still requires verification"
+
+    web = (
+        {"status": "enabled", "adapter": "ai-bridge", "mode": "local_bridge", "reason": "AI-Bridge executable detected"}
+        if bridge_path.is_file()
+        else {
+            "status": "degraded",
+            "adapter": "none",
+            "mode": "pure_web_file",
+            "reason": "AI-Bridge not detected; local repo/runtime access is unavailable",
+        }
+    )
+    return {
+        "core": {"status": "enabled", "adapter": "adaptive-agent-runtime", "reason": "core governance is host-neutral"},
+        "desktop_adapter": desktop,
+        "web_local_adapter": web,
+    }
 
 def _git(source: Path, *args: str) -> str:
     result = subprocess.run(
@@ -128,6 +179,9 @@ def install_skill(
     installed_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
     manifest: dict[str, Any] = {
         "schema_version": 1,
+        "product_name": PRODUCT_NAME,
+        "skill_id": SKILL_ID,
+        "legacy_skill_ids": list(LEGACY_SKILL_IDS),
         "revision": revision,
         "previous_revision": prior_revision,
         "installed_at": installed_at,

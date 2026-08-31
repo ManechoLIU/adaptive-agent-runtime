@@ -1,8 +1,12 @@
-# Adaptive Delivery
+# Adaptive Agent Runtime
 
 让 AI 编程代理把长期项目真正推进到可验证结果，而不是只会写计划、堆测试、维护台账，或在遇到阻塞后停止。
 
 它会根据任务风险选择最小够用的流程，并把需求、设计、开发、测试、真实验收、主线集成、发布门禁和跨会话恢复连接起来。
+
+## 产品身份与兼容性
+
+**Adaptive Agent Runtime** 是新的对外产品名与首选 Skill ID：`adaptive-agent-runtime`。旧 `adaptive-delivery` 保留为 **legacy alias**，用于兼容已有安装、Hook、handshake、receipt 与项目续接。迁移期间机器运行事实仍只使用既有 `.git/adaptive-delivery/` canonical state，不创建第二套 runtime。
 
 ## 先用一句话理解
 

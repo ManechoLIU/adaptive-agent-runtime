@@ -62,11 +62,23 @@ class SkillStructureTests(unittest.TestCase):
         frontmatter, _ = split_frontmatter(read_entrypoint())
         fields = dict(re.findall(r"(?m)^([A-Za-z][\w-]*):\s*(.+?)\s*$", frontmatter))
 
-        self.assertEqual("adaptive-delivery", fields.get("name"))
+        self.assertEqual("adaptive-agent-runtime", fields.get("name"))
         description = fields.get("description", "").strip().strip('"')
         self.assertRegex(description, r"^Use when\b")
         self.assertLessEqual(len(frontmatter), 1024)
         self.assertLessEqual(len(description), 500)
+
+
+    def test_product_identity_documents_legacy_alias_without_second_state_root(self):
+        entrypoint = read_entrypoint()
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        project_state = (ROOT / "scripts" / "project_state.py").read_text(encoding="utf-8")
+
+        self.assertIn("# Adaptive Agent Runtime", entrypoint)
+        self.assertIn("adaptive-delivery", readme)
+        self.assertIn("legacy alias", readme.casefold())
+        self.assertIn(' / "adaptive-delivery"', project_state)
+        self.assertNotIn(' / "adaptive-agent-runtime"', project_state)
 
     def test_entrypoint_is_short(self):
         _, body = split_frontmatter(read_entrypoint())
