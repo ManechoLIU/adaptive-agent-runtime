@@ -21,6 +21,11 @@ try:
 except ModuleNotFoundError:
     from scripts.rule_handshake import derive_rule_wake_policy, evaluate_rule_handshake
 
+try:
+    from controller_self_check import render_controller_self_check
+except ModuleNotFoundError:
+    from scripts.controller_self_check import render_controller_self_check
+
 
 STATE_ROOT = Path(
     os.environ.get(
@@ -36,6 +41,14 @@ REGISTRY_PATH = Path(
 ).expanduser()
 LEDGER_NAMES = ("TASK_LEDGER.md", "PROJECT_STATUS.md")
 
+
+
+def controller_self_check_context() -> str:
+    skill_root = Path(__file__).resolve().parents[1]
+    try:
+        return render_controller_self_check(skill_root)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        return f"Controller Self-Check unavailable from installed scoring model: {error}; do not infer or calculate a score."
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
@@ -264,12 +277,13 @@ def continuation_reason(
     if runnable_ids:
         actions.append("处理可执行工作派发与 ACK；若客观上无法派发，必须把对应任务明确转为 BLOCKED 并记录可验证原因")
     actions.append("随后用 control_event_guard.py 生成通过收据")
-    return (
-        "Adaptive Delivery 生命周期门检测到尚未闭合的控制事件。"
+    lifecycle = (
+        "Adaptive Agent Runtime 生命周期门检测到尚未闭合的控制事件。"
         f"触发：{trigger_text}；当前可执行：{ready}；候选：{candidates}。"
         + "；".join(actions) + "。"
         "不得仅把动作写成下一事件后停止。" + rule_text
     )
+    return lifecycle + "\n\n" + controller_self_check_context()
 
 
 def evaluate_event(
@@ -307,7 +321,12 @@ def evaluate_event(
             }
         )
         if not triggers:
-            return {}, state
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": controller_self_check_context(),
+                }
+            }, state
         context = continuation_reason(
             triggers,
             list(snapshot.get("ready_ids", [])),

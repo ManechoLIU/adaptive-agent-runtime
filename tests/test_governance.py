@@ -2389,6 +2389,20 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ControllerSelfCheckLifecycleTests(unittest.TestCase):
+    def test_quiescent_session_start_still_injects_non_numeric_controller_self_check(self) -> None:
+        snapshot = {"head":"h","ledger_sha256":"l","worktree_status_sha256":"s","ready_ids":[],"runnable_ids":[],"candidate_revisions":[],"rule_handshake":{}}
+        output, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name":"SessionStart","session_id":"controller-1"}, snapshot=snapshot, prior_state=None
+        )
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Controller Self-Check", context)
+        self.assertIn("关键路径与优先级", context)
+        self.assertNotIn("25%", context)
+        self.assertNotIn("当前得分", context)
+        self.assertFalse(state["pending_control_event"])
+
+
 class ControllerHostLifecycleTests(unittest.TestCase):
     def test_native_lifecycle_defaults_current_host_to_desktop_codex(self) -> None:
         snapshot = {"head":"h","ledger_sha256":"l","worktree_status_sha256":"s","ready_ids":[],"runnable_ids":[],"candidate_revisions":[],"rule_handshake":{}}
