@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.reviewer_supervisor import ReviewContract, run_attempt, git_common_state_root, validate_verdict
+from scripts.reviewer_supervisor import ReviewContract, AttemptResult, run_attempt, run_review, git_common_state_root, validate_verdict
 
 
 class ReviewerSupervisorCoreTests(unittest.TestCase):
@@ -95,6 +95,53 @@ class ReviewerSupervisorLaunchTests(unittest.TestCase):
         self.assertTrue(result.running_observed)
         self.assertEqual(result.session_id, "thread-1")
         self.assertEqual(result.pid, 4242)
+
+
+class ReviewerSupervisorRunTests(unittest.TestCase):
+    def _write_final(self, contract, verdict="PASS", head=None):
+        contract.final_path.write_text(json.dumps({
+            "reviewed_head": head or contract.head,
+            "verdict": verdict,
+            "critical": [], "important": [], "minor": [],
+        }))
+
+    def test_findings_are_terminal_and_not_retried(self):
+        calls = []
+        def attempt(contract, number):
+            calls.append(number); self._write_final(contract, "FINDINGS")
+            return AttemptResult("RUNNING", 1, 0, True, "s")
+        result = run_review(Path.cwd(), "main", "review", attempt_runner=attempt)
+        self.assertEqual(result.state, "FINDINGS")
+        self.assertEqual(calls, [0])
+
+    def test_infra_failure_retries_once_with_same_contract(self):
+        seen = []
+        def attempt(contract, number):
+            seen.append((contract.repo, contract.base, contract.head, contract.instructions))
+            if number == 0:
+                return AttemptResult("REVIEW_INFRA_FAILED", 1, 1, False, None, "start failed")
+            self._write_final(contract)
+            return AttemptResult("RUNNING", 2, 0, True, "s")
+        result = run_review(Path.cwd(), "main", "review", attempt_runner=attempt)
+        self.assertEqual(result.state, "PASS")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0], seen[1])
+
+    def test_exit_zero_without_output_fails_closed_twice(self):
+        calls = []
+        def attempt(contract, number):
+            calls.append(number)
+            return AttemptResult("RUNNING", number + 1, 0, True, "s")
+        result = run_review(Path.cwd(), "main", "review", attempt_runner=attempt)
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertEqual(calls, [0, 1])
+
+    def test_revision_mismatch_is_infrastructure_failure(self):
+        def attempt(contract, number):
+            self._write_final(contract, head="f" * 40)
+            return AttemptResult("RUNNING", 1, 0, True, "s")
+        result = run_review(Path.cwd(), "main", "review", attempt_runner=attempt, max_infra_retries=0)
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
 
 
 if __name__ == "__main__":
