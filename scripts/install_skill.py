@@ -31,12 +31,38 @@ IMPACTS = {"none", "live_assignments"}
 
 
 
-def _hooks_contain(path: Path, needle: str) -> bool:
+def _hooks_contain(path: Path, needle: str, *, skill_root: Path | None = None) -> bool:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return needle in json.dumps(data, ensure_ascii=False)
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return False
+    expected = (skill_root / "scripts" / needle).resolve() if skill_root is not None else None
+    if expected is not None and not expected.is_file():
+        return False
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                continue
+            for handler in entry["hooks"]:
+                if not isinstance(handler, dict):
+                    continue
+                command = handler.get("command")
+                if not isinstance(command, str) or needle not in command:
+                    continue
+                if expected is None:
+                    return True
+                try:
+                    tokens = shlex.split(command)
+                except ValueError:
+                    continue
+                if len(tokens) >= 2 and Path(tokens[1]).expanduser().resolve() == expected:
+                    return True
+    return False
 
 
 def _zshenv_has_web_bridge(
@@ -51,11 +77,18 @@ def _zshenv_has_web_bridge(
     if start < 0 or end < 0:
         return False
     block = text[start:end + len(WEB_BLOCK_END)]
-    match = re.search(r'^\s*"([^"]+)"\s+"([^"]+)"\s+post-shell\b', block, re.MULTILINE)
-    if match is None:
+    command_line = next((line.strip() for line in block.splitlines() if " post-shell " in line and "web_lifecycle_bridge.py" in line), None)
+    if command_line is None:
         return False
-    python_path = Path(match.group(1)).expanduser()
-    script_path = Path(match.group(2)).expanduser()
+    command_text = command_line[:-7].rstrip() if command_line.endswith("|| true") else command_line
+    try:
+        tokens = shlex.split(command_text)
+    except ValueError:
+        return False
+    if len(tokens) < 3 or tokens[2] != "post-shell":
+        return False
+    python_path = Path(tokens[0]).expanduser()
+    script_path = Path(tokens[1]).expanduser()
     if not python_path.is_file() or not os.access(python_path, os.X_OK) or not script_path.is_file():
         return False
     if skill_root is not None:
@@ -63,8 +96,8 @@ def _zshenv_has_web_bridge(
         if script_path.resolve() != expected_script:
             return False
     if ai_bridge_executable is not None:
-        expected_bridge = str(ai_bridge_executable.expanduser().resolve())
-        if expected_bridge not in block:
+        expected_assignment = f"_ad_web_bridge_executable={shlex.quote(str(ai_bridge_executable.expanduser().resolve()))}"
+        if expected_assignment not in block:
             return False
     return True
 
@@ -87,8 +120,8 @@ def detect_host_capabilities(
     skill_root_path = Path(skill_root).expanduser().resolve() if skill_root is not None else None
 
     codex_available = bool(codex_path and codex_path.is_file() and os.access(codex_path, os.X_OK))
-    lifecycle_configured = _hooks_contain(hooks_path, "lifecycle_hook.py")
-    scoring_configured = _hooks_contain(hooks_path, "controller_scoring_hook.py")
+    lifecycle_configured = _hooks_contain(hooks_path, "lifecycle_hook.py", skill_root=skill_root_path)
+    scoring_configured = _hooks_contain(hooks_path, "controller_scoring_hook.py", skill_root=skill_root_path)
     if not codex_available:
         desktop = {
             "status": "blocked", "adapter": "codex-native", "configured": False,
@@ -160,6 +193,21 @@ def _write_text_atomic(path: Path, text: str) -> None:
             os.unlink(temporary)
 
 
+def _remove_matching_handlers(entries: list[Any], needle: str) -> list[Any]:
+    kept: list[Any] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            if needle not in str(entry):
+                kept.append(entry)
+            continue
+        remaining = [handler for handler in entry["hooks"] if needle not in str(handler)]
+        if remaining:
+            preserved = dict(entry)
+            preserved["hooks"] = remaining
+            kept.append(preserved)
+    return kept
+
+
 def install_codex_hooks(
     hooks_file: str | Path,
     target: str | Path,
@@ -184,7 +232,7 @@ def install_codex_hooks(
         entries = hooks.setdefault(event_name, [])
         if not isinstance(entries, list):
             raise ValueError(f"{event_name} hooks must be a list")
-        entries[:] = [entry for entry in entries if "lifecycle_hook.py" not in str(entry)]
+        entries[:] = _remove_matching_handlers(entries, "lifecycle_hook.py")
         handler: dict[str, Any] = {
             "type": "command", "command": lifecycle_command, "timeout": 5, "statusMessage": status,
         }
@@ -199,7 +247,7 @@ def install_codex_hooks(
         entries = hooks.setdefault(event_name, [])
         if not isinstance(entries, list):
             raise ValueError(f"{event_name} hooks must be a list")
-        entries[:] = [entry for entry in entries if "controller_scoring_hook.py" not in str(entry)]
+        entries[:] = _remove_matching_handlers(entries, "controller_scoring_hook.py")
         handler = {
             "type": "command", "command": scoring_command, "timeout": 5,
             "statusMessage": "Enforcing Adaptive Agent Runtime controller scoring model",
@@ -214,22 +262,25 @@ def install_codex_hooks(
 
 def _web_zshenv_block(target: Path, bridge: Path, python_executable: str) -> str:
     script = target / "scripts" / "web_lifecycle_bridge.py"
-    return f'''{WEB_BLOCK_START}
-_ad_web_parent=$(/bin/ps -p "$PPID" -o command= 2>/dev/null)
-if [[ "$_ad_web_parent" == *"{bridge}"* ]]; then
-  _ad_web_cwd="$PWD"
-  _ad_web_command="$ZSH_EXECUTION_STRING"
+    bridge_literal = shlex.quote(str(bridge))
+    python_literal = shlex.quote(str(python_executable))
+    script_literal = shlex.quote(str(script))
+    return f"""{WEB_BLOCK_START}
+_ad_web_bridge_executable={bridge_literal}
+_ad_web_parent=$(/bin/ps -p \"$PPID\" -o command= 2>/dev/null)
+if [[ \"$_ad_web_parent\" == *\"$_ad_web_bridge_executable\"* ]]; then
+  _ad_web_cwd=\"$PWD\"
+  _ad_web_command=\"$ZSH_EXECUTION_STRING\"
   _ad_web_lifecycle_exit() {{
     local _ad_web_exit_code=$?
     trap - EXIT
-    "{python_executable}" "{script}" post-shell --cwd "$_ad_web_cwd" --command "$_ad_web_command" --exit-code "$_ad_web_exit_code" || true
-    exit "$_ad_web_exit_code"
+    {python_literal} {script_literal} post-shell --cwd \"$_ad_web_cwd\" --command \"$_ad_web_command\" --exit-code \"$_ad_web_exit_code\" || true
+    exit \"$_ad_web_exit_code\"
   }}
   trap _ad_web_lifecycle_exit EXIT
 fi
-unset _ad_web_parent
-{WEB_BLOCK_END}'''
-
+unset _ad_web_parent _ad_web_bridge_executable
+{WEB_BLOCK_END}"""
 
 def install_ai_bridge_zshenv(
     zshenv_file: str | Path,

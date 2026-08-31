@@ -482,6 +482,7 @@ function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
     worktree: options.cwd, issued_at: new Date().toISOString(), attempt: options.attempt,
     lease_id: options.leaseId || `${options.assignmentId}:attempt:${options.attempt}`, event_seq: eventSeq,
     receipt_id: `${options.assignmentId}:${options.attempt}:${eventSeq}`,
+    assignment_contract_version: 2,
     side_effect: Boolean(options.sideEffect),
     idempotency_key: options.idempotencyKey || null,
     ...(eventType === "assignment_started" ? options.executionLineage : {}), ...extra,

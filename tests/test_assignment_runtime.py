@@ -12,7 +12,7 @@ UTC=timezone.utc
 T0=datetime(2026,8,29,10,0,tzinfo=UTC)
 
 def receipt(event, at=T0, **extra):
-    base={"event_type":event,"assignment_id":"a1","task_id":"T1","agent_id":"grok-writer","provider":"grok","session_id":"s1","worktree":"/tmp/wt","issued_at":at.isoformat(),"primary_goal":"finish bounded task","success_criteria":["green"],"owned_scope":["scripts/assignment_runtime.py"],"strategy":"grok-build:grok-4.6:oauth:low","side_effect":False}
+    base={"event_type":event,"assignment_id":"a1","task_id":"T1","agent_id":"grok-writer","provider":"grok","session_id":"s1","worktree":"/tmp/wt","issued_at":at.isoformat(),"primary_goal":"finish bounded task","success_criteria":["green"],"owned_scope":["scripts/assignment_runtime.py"],"strategy":"grok-build:grok-4.6:oauth:low","assignment_contract_version":2,"side_effect":False}
     base.update(extra); return base
 
 class RuntimeTests(unittest.TestCase):
@@ -156,8 +156,23 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
         self.assertFalse(exhausted["retry"])
         self.assertEqual(exhausted["reason"], "attempt_budget_exhausted")
 
+    def test_legacy_v1_initial_start_without_side_effect_contract_remains_readable(self):
+        legacy = receipt("assignment_started", attempt=1, lease_id="legacy-1", event_seq=1)
+        legacy.pop("assignment_contract_version")
+        legacy.pop("side_effect")
+        state = apply_receipt({}, legacy, now=T0)
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["side_effect_contract_version"], 1)
+        self.assertIsNone(lease["side_effect"])
+
+    def test_v2_initial_start_requires_explicit_side_effect_contract(self):
+        start = receipt("assignment_started", assignment_contract_version=2)
+        start.pop("side_effect")
+        with self.assertRaisesRegex(ValueError, "side_effect contract"):
+            apply_receipt({}, start, now=T0)
+
     def test_new_assignment_start_requires_explicit_side_effect_contract(self):
-        start = receipt("assignment_started")
+        start = receipt("assignment_started", assignment_contract_version=2)
         start.pop("side_effect")
         with self.assertRaisesRegex(ValueError, "side_effect contract"):
             apply_receipt({}, start, now=T0)

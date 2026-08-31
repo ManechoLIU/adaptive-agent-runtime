@@ -117,13 +117,24 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
         if attempt == current_attempt and lease_id != existing.get("lease_id"): raise ValueError("runtime lease_id mismatch")
         if attempt == current_attempt and event_seq <= int(existing.get("last_event_seq", 0)): raise ValueError("runtime event_seq must increase")
     if event == "assignment_started":
-        if "side_effect" not in receipt or not isinstance(receipt.get("side_effect"), bool):
-            raise ValueError("runtime start receipt requires explicit side_effect contract")
-        side_effect = receipt["side_effect"]
-        idempotency_key_raw = receipt.get("idempotency_key")
-        if idempotency_key_raw is not None and not isinstance(idempotency_key_raw, str):
-            raise ValueError("idempotency_key must be a string when provided")
-        idempotency_key = str(idempotency_key_raw or "").strip() or None
+        contract_version_raw = receipt.get("assignment_contract_version", 1)
+        if not isinstance(contract_version_raw, int) or isinstance(contract_version_raw, bool) or contract_version_raw < 1:
+            raise ValueError("assignment_contract_version must be a positive integer")
+        contract_version = int(contract_version_raw)
+        if contract_version >= 2:
+            if "side_effect" not in receipt or not isinstance(receipt.get("side_effect"), bool):
+                raise ValueError("runtime start receipt requires explicit side_effect contract")
+            side_effect = receipt["side_effect"]
+            idempotency_key_raw = receipt.get("idempotency_key")
+            if idempotency_key_raw is not None and not isinstance(idempotency_key_raw, str):
+                raise ValueError("idempotency_key must be a string when provided")
+            idempotency_key = str(idempotency_key_raw or "").strip() or None
+        else:
+            # Legacy v1 receipts predate the side-effect contract. Keep an already-issued
+            # initial receipt readable, but record the contract as unknown rather than
+            # silently asserting that it has no external side effects.
+            side_effect = receipt.get("side_effect") if isinstance(receipt.get("side_effect"), bool) else None
+            idempotency_key = None
         missing_contract = [field for field in LINEAGE_CONTRACT_FIELDS if field not in receipt]
         if missing_contract:
             raise ValueError("runtime start receipt missing lineage contract: " + ", ".join(missing_contract))
@@ -141,12 +152,19 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             current_attempt = int(existing.get("attempt", 1))
             if attempt != current_attempt + 1:
                 raise ValueError("recovery attempt must increment by exactly one")
-            if "side_effect" in existing:
+            if int(existing.get("recovery_count", 0)) >= policy.max_recoveries:
+                raise ValueError("recovery budget exhausted; strategy change requires a new execution lineage")
+            existing_contract_version = int(existing.get("side_effect_contract_version", 1))
+            if existing_contract_version != contract_version:
+                raise ValueError("side-effect contract version drift requires a new Assignment")
+            if existing_contract_version >= 2:
                 existing_key = str(existing.get("idempotency_key") or "").strip() or None
-                if bool(existing.get("side_effect")) != side_effect or existing_key != idempotency_key:
+                if existing.get("side_effect") != side_effect or existing_key != idempotency_key:
                     raise ValueError("side-effect contract drift requires a new Assignment")
                 if bool(existing.get("side_effect")) and bool(existing.get("result_unknown")) and existing_key is None:
                     raise ValueError("non-idempotent unknown side effect blocks automatic recovery")
+            elif bool(existing.get("result_unknown")):
+                raise ValueError("legacy unknown side-effect result requires a new Assignment before recovery")
         lineage = lineages.get(lineage_id)
         if lineage is None and existing:
             legacy_recoveries = int(existing.get("recovery_count", 0))
@@ -182,6 +200,7 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "artifact_fingerprint": receipt.get("artifact_fingerprint"),
             "blocker_evidence_fingerprint": receipt.get("blocker_evidence_fingerprint"),
             "recovery_count": recovery_count,
+            "side_effect_contract_version": contract_version,
             "side_effect": side_effect,
             "idempotency_key": idempotency_key,
             "result_unknown": False,
@@ -212,7 +231,8 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             lease["last_progress_at"] = _iso(issued)
             lease["progress_deadline_at"] = _iso(issued + timedelta(minutes=policy.progress_deadline_minutes))
     if event == "assignment_terminal":
-        if "side_effect" in existing:
+        existing_contract_version = int(existing.get("side_effect_contract_version", 1))
+        if existing_contract_version >= 2:
             if "side_effect" not in receipt or not isinstance(receipt.get("side_effect"), bool):
                 raise ValueError("terminal receipt requires side_effect contract")
             terminal_key = str(receipt.get("idempotency_key") or "").strip() or None
@@ -245,14 +265,24 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
                     raise ValueError("delivery PASS requires evidence and artifact")
                 if not all(_traceable_locator(item, PASS_EVIDENCE_SCHEMES) for item in receipt["evidence"]) or not all(_traceable_locator(item, PASS_ARTIFACT_SCHEMES) for item in receipt["artifacts"]):
                     raise ValueError("delivery PASS requires traceable evidence and artifact")
-        if lease.get("side_effect"):
-            if "result_unknown" not in receipt:
-                raise ValueError("side-effect terminal receipt requires explicit result_unknown")
-            if not isinstance(receipt.get("result_unknown"), bool):
+        if existing_contract_version >= 2:
+            if lease.get("side_effect"):
+                if "result_unknown" not in receipt:
+                    raise ValueError("side-effect terminal receipt requires explicit result_unknown")
+                if not isinstance(receipt.get("result_unknown"), bool):
+                    raise ValueError("result_unknown must be a boolean")
+            elif "result_unknown" in receipt and not isinstance(receipt.get("result_unknown"), bool):
                 raise ValueError("result_unknown must be a boolean")
-        elif "result_unknown" in receipt and not isinstance(receipt.get("result_unknown"), bool):
-            raise ValueError("result_unknown must be a boolean")
-        result_unknown = receipt.get("result_unknown", False)
+            result_unknown = receipt.get("result_unknown", False)
+        else:
+            if "result_unknown" in receipt and not isinstance(receipt.get("result_unknown"), bool):
+                raise ValueError("result_unknown must be a boolean")
+            if "result_unknown" in receipt:
+                result_unknown = receipt["result_unknown"]
+            elif transport_outcome is not None:
+                result_unknown = transport_outcome != "completed" or delivery_outcome == "unresolved"
+            else:
+                result_unknown = legacy_outcome != "success"
         lease["result_unknown"] = result_unknown
         lease["terminal_state"] = terminal; lease["terminal_at"] = _iso(issued); lease["summary"] = summary
         if transport_outcome is None and delivery_outcome is None:

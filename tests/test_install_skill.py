@@ -26,6 +26,29 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertEqual(report["web_local_adapter"]["status"], "degraded")
         self.assertEqual(report["web_local_adapter"]["mode"], "pure_web_file")
 
+    def test_capability_report_rejects_stale_codex_hooks_from_another_install(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            codex = root / "codex"; codex.write_text("#!/bin/sh\n", encoding="utf-8"); codex.chmod(0o755)
+            skill_root = root / "adaptive-delivery"
+            (skill_root / "scripts").mkdir(parents=True)
+            for name in ("lifecycle_hook.py", "controller_scoring_hook.py"):
+                path = skill_root / "scripts" / name
+                path.write_text("#!/usr/bin/env python3\n", encoding="utf-8"); path.chmod(0o755)
+            hooks = root / "hooks.json"
+            hooks.write_text(json.dumps({"hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "/usr/bin/python3 /old/install/scripts/lifecycle_hook.py"}]}],
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/bin/python3 /old/install/scripts/controller_scoring_hook.py"}]}],
+            }}), encoding="utf-8")
+            report = detect_host_capabilities(
+                codex_executable=codex, ai_bridge_executable=root / "missing-bridge",
+                hooks_file=hooks, zshenv_file=root / ".zshenv", skill_root=skill_root,
+            )
+
+        self.assertFalse(report["desktop_adapter"]["configured"])
+        self.assertIn("not fully configured", report["desktop_adapter"]["reason"] )
+
     def test_capability_report_rejects_stale_web_bridge_block_from_another_install(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -158,6 +181,30 @@ class HostAdapterInstallationTests(unittest.TestCase):
                 self.assertIn(event, config["hooks"])
             self.assertIn('"matcher": "*"', json.dumps(config["hooks"]["PostToolUse"]))
 
+    def test_codex_hook_install_preserves_other_handlers_inside_same_group(self):
+        import json
+        from scripts.install_skill import install_codex_hooks
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / "adaptive-delivery"
+            (target / "scripts").mkdir(parents=True)
+            hooks = root / "hooks.json"
+            mixed = {
+                "matcher": "*",
+                "hooks": [
+                    {"type": "command", "command": "/old/lifecycle_hook.py"},
+                    {"type": "command", "command": "echo keep-user-handler"},
+                ],
+            }
+            hooks.write_text(json.dumps({"hooks": {"PostToolUse": [mixed], "Stop": [mixed]}}), encoding="utf-8")
+
+            install_codex_hooks(hooks, target, python_executable="/usr/bin/python3")
+            config = json.loads(hooks.read_text(encoding="utf-8"))
+
+        self.assertEqual(sum("echo keep-user-handler" in str(entry) for entry in config["hooks"]["PostToolUse"]), 1)
+        self.assertEqual(sum("echo keep-user-handler" in str(entry) for entry in config["hooks"]["Stop"]), 1)
+        self.assertEqual(sum("lifecycle_hook.py" in str(entry) for entry in config["hooks"]["PostToolUse"]), 1)
+
     def test_ai_bridge_zshenv_install_preserves_user_content_and_replaces_legacy_block(self):
         from scripts.install_skill import install_ai_bridge_zshenv
         with tempfile.TemporaryDirectory() as d:
@@ -180,6 +227,24 @@ class HostAdapterInstallationTests(unittest.TestCase):
             self.assertEqual(twice.count("# >>> adaptive-delivery web lifecycle bridge >>>"), 1)
             self.assertIn(str((target / "scripts" / "web_lifecycle_bridge.py").resolve()), twice)
             self.assertIn(str(bridge.resolve()), twice)
+
+    def test_ai_bridge_zshenv_quotes_shell_metacharacters_in_paths(self):
+        from scripts.install_skill import install_ai_bridge_zshenv
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / 'skill $(touch SHOULD_NOT_RUN) "quoted"'
+            (target / "scripts").mkdir(parents=True)
+            (target / "scripts" / "web_lifecycle_bridge.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            bridge = root / 'bridge $(touch ALSO_NOT_RUN)'
+            bridge.write_text("#!/bin/sh\n", encoding="utf-8"); bridge.chmod(0o755)
+            zshenv = root / ".zshenv"
+
+            install_ai_bridge_zshenv(zshenv, target, bridge, python_executable="/usr/bin/python3")
+            text = zshenv.read_text(encoding="utf-8")
+
+        self.assertNotIn('if [[ "$_ad_web_parent" == *"' + str(bridge), text)
+        self.assertIn("_ad_web_bridge_executable=", text)
+        self.assertIn("post-shell", text)
 
     def test_configure_host_adapters_reports_actual_degradation_and_installed_web_bridge(self):
         from scripts.install_skill import configure_host_adapters
