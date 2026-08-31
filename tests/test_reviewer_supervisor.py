@@ -31,7 +31,7 @@ class ReviewerSupervisorCoreTests(unittest.TestCase):
         self.assertIn("FINDINGS", instructions)
         self.assertIn("focus on runtime safety", instructions)
 
-    def test_valid_pass_is_bound_to_exact_head(self):
+    def test_pass_requires_all_finding_lists_empty(self):
         head = "a" * 40
         payload = {
             "reviewed_head": head,
@@ -40,7 +40,20 @@ class ReviewerSupervisorCoreTests(unittest.TestCase):
             "important": [],
             "minor": ["small note"],
         }
-        self.assertEqual(validate_verdict(payload, head), payload)
+        with self.assertRaisesRegex(ValueError, "PASS"):
+            validate_verdict(payload, head)
+
+    def test_findings_requires_at_least_one_finding(self):
+        head = "a" * 40
+        payload = {
+            "reviewed_head": head,
+            "verdict": "FINDINGS",
+            "critical": [],
+            "important": [],
+            "minor": [],
+        }
+        with self.assertRaisesRegex(ValueError, "FINDINGS"):
+            validate_verdict(payload, head)
 
     def test_revision_mismatch_fails_closed(self):
         payload = {
@@ -84,7 +97,7 @@ class _FakeProcess:
         self.pid = 4242
         self._returncode = returncode
 
-    def wait(self):
+    def wait(self, timeout=None):
         return self._returncode
 
 
@@ -108,6 +121,10 @@ class ReviewerSupervisorLaunchTests(unittest.TestCase):
         argv, kwargs = calls[0]
         self.assertEqual(argv[0:2], ["/usr/bin/codex", "exec"])
         self.assertEqual(argv[-3:], ["review", "--base", "main"])
+        self.assertIn("--output-schema", argv)
+        schema_path = Path(argv[argv.index("--output-schema") + 1])
+        schema = json.loads(schema_path.read_text())
+        self.assertEqual(schema["required"], ["reviewed_head", "verdict", "critical", "important", "minor"])
         self.assertNotIn(contract.instructions, argv)
         self.assertNotIn("nohup", argv)
         self.assertNotIn("sh", argv)
@@ -144,10 +161,15 @@ class _SlowStdout:
 
 
 class _TimeoutProcess(_FakeProcess):
-    def __init__(self):
+    def __init__(self, *, stdout=None):
         super().__init__([], returncode=-15)
-        self.stdout = _SlowStdout()
+        self.stdout = stdout if stdout is not None else _SlowStdout()
         self.killed = False
+
+    def wait(self, timeout=None):
+        if not self.killed:
+            raise subprocess.TimeoutExpired("codex", timeout or 0)
+        return self._returncode
 
 
 class ReviewerSupervisorTimeoutTests(unittest.TestCase):
@@ -168,6 +190,21 @@ class ReviewerSupervisorTimeoutTests(unittest.TestCase):
         self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
         self.assertIn("timeout", result.diagnostic.lower())
 
+    def test_timeout_tracks_child_even_when_stdout_closes_early(self):
+        holder = []
+        killed = []
+        def factory(argv, **kwargs):
+            proc = _TimeoutProcess(stdout=iter([])); holder.append(proc); return proc
+        def killer(pid):
+            killed.append(pid); holder[0].killed = True
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "main", "e" * 40, "schema", root / "events", root / "final")
+        started = time.monotonic()
+        result = run_attempt(contract, 0, popen_factory=factory, codex_executable="codex", timeout_seconds=0.05, process_group_killer=killer)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(killed, [4242])
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertIn("timeout", result.diagnostic.lower())
 
 
 class ReviewerSupervisorRunTests(unittest.TestCase):
@@ -194,7 +231,11 @@ class ReviewerSupervisorRunTests(unittest.TestCase):
     def test_findings_are_terminal_and_not_retried(self):
         calls = []
         def attempt(contract, number):
-            calls.append(number); self._write_final(contract, "FINDINGS")
+            calls.append(number)
+            contract.final_path.write_text(json.dumps({
+                "reviewed_head": contract.head, "verdict": "FINDINGS",
+                "critical": [], "important": ["issue"], "minor": [],
+            }))
             return AttemptResult("RUNNING", 1, 0, True, "s")
         result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt)
         self.assertEqual(result.state, "FINDINGS")
@@ -228,6 +269,20 @@ class ReviewerSupervisorRunTests(unittest.TestCase):
             return AttemptResult("RUNNING", 1, 0, True, "s")
         result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
         self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+
+    def test_base_ref_is_resolved_once_to_immutable_commit(self):
+        base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        seen = []
+        def attempt(contract, number):
+            seen.append(contract.base)
+            self._write_final(contract)
+            return AttemptResult("RUNNING", 1, 0, True, "s")
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
+        self.assertEqual(result.state, "PASS")
+        self.assertEqual(seen, [base_sha])
+        state = json.loads(result.state_path.read_text())
+        self.assertEqual(state["base_ref"], "HEAD")
+        self.assertEqual(state["base_revision"], base_sha)
 
     def test_dirty_worktree_is_rejected_before_attempt(self):
         with tempfile.TemporaryDirectory() as td:
@@ -264,7 +319,7 @@ class ReviewerSupervisorRunTests(unittest.TestCase):
                 subprocess.run(["git", "add", "y.txt"], cwd=repo, check=True)
                 subprocess.run(["git", "commit", "-qm", "move head"], cwd=repo, check=True)
                 return AttemptResult("RUNNING", 1, 0, True, "s")
-            result = run_review(repo, "HEAD~1", "review", attempt_runner=attempt, max_infra_retries=0)
+            result = run_review(repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
             self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
             state = json.loads(result.state_path.read_text())
             self.assertIn("head changed", state["diagnostic"].lower())

@@ -50,6 +50,13 @@ def validate_verdict(payload: dict, expected_head: str) -> dict:
     for field in ("critical", "important", "minor"):
         if not isinstance(payload.get(field), list):
             raise ValueError(f"{field} must be a list")
+        if not all(isinstance(item, str) and item.strip() for item in payload[field]):
+            raise ValueError(f"{field} findings must be non-empty strings")
+    finding_count = sum(len(payload[field]) for field in ("critical", "important", "minor"))
+    if payload["verdict"] == "PASS" and finding_count:
+        raise ValueError("PASS requires critical, important, and minor to be empty")
+    if payload["verdict"] == "FINDINGS" and finding_count == 0:
+        raise ValueError("FINDINGS requires at least one finding")
     return payload
 
 
@@ -109,6 +116,22 @@ def _kill_process_group(pid: int) -> None:
         return
 
 
+def _review_output_schema(expected_head: str) -> dict:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["reviewed_head", "verdict", "critical", "important", "minor"],
+        "properties": {
+            "reviewed_head": {"type": "string", "enum": [expected_head]},
+            "verdict": {"type": "string", "enum": ["PASS", "FINDINGS"]},
+            "critical": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "important": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "minor": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        },
+    }
+
+
 def run_attempt(
     contract: ReviewContract,
     attempt: int,
@@ -120,12 +143,16 @@ def run_attempt(
 ) -> AttemptResult:
     contract.event_path.parent.mkdir(parents=True, exist_ok=True)
     contract.final_path.parent.mkdir(parents=True, exist_ok=True)
+    schema_path = contract.final_path.with_name(contract.final_path.name + ".schema.json")
+    atomic_write_json(schema_path, _review_output_schema(contract.head))
     argv = [
         codex_executable,
         "exec",
         "--ignore-user-config",
         "--ignore-rules",
         "--ephemeral",
+        "--output-schema",
+        str(schema_path),
         "--json",
         "-o",
         str(contract.final_path),
@@ -169,28 +196,34 @@ def run_attempt(
 
     reader = threading.Thread(target=consume_stdout, name=f"reviewer-events-{attempt}", daemon=True)
     reader.start()
-    reader.join(timeout_seconds)
-    timed_out = reader.is_alive()
-    if timed_out:
+    try:
+        exit_code = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
         process_group_killer(process.pid)
-        reader.join(0.2)
         try:
             exit_code = process.wait(timeout=5.0)
-        except TypeError:
-            exit_code = process.wait()
         except subprocess.TimeoutExpired:
             exit_code = -signal.SIGTERM
-        diagnostic = f"reviewer timeout after {timeout_seconds:g}s; process group terminated"
+        reader.join(0.2)
         return AttemptResult(
             state="REVIEW_INFRA_FAILED",
             pid=process.pid,
             exit_code=exit_code,
             running_observed=bool(observed["running"]),
             session_id=observed["session_id"],
-            diagnostic=diagnostic,
+            diagnostic=f"reviewer timeout after {timeout_seconds:g}s; process group terminated",
+        )
+    reader.join(1.0)
+    if reader.is_alive():
+        return AttemptResult(
+            state="REVIEW_INFRA_FAILED",
+            pid=process.pid,
+            exit_code=exit_code,
+            running_observed=bool(observed["running"]),
+            session_id=observed["session_id"],
+            diagnostic="reviewer event stream did not close after child exit",
         )
 
-    exit_code = process.wait()
     running_observed = bool(observed["running"])
     state = "RUNNING" if running_observed and exit_code == 0 else "REVIEW_INFRA_FAILED"
     return AttemptResult(
@@ -219,8 +252,12 @@ class ReviewRunResult:
     state_path: Path
 
 
+def _git_revision(repo: Path, ref: str) -> str:
+    return subprocess.check_output(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=repo, text=True).strip()
+
+
 def _git_head(repo: Path) -> str:
-    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    return _git_revision(repo, "HEAD")
 
 
 def _git_status(repo: Path) -> str:
@@ -247,6 +284,7 @@ def run_review(
 ) -> ReviewRunResult:
     repo = Path(repo).resolve()
     head = _git_head(repo)
+    base_revision = _git_revision(repo, base)
     run_id = uuid.uuid4().hex
     root = git_common_state_root(repo)
     root.mkdir(parents=True, exist_ok=True)
@@ -258,7 +296,8 @@ def run_review(
     base_state = {
         "run_id": run_id,
         "repo": str(repo),
-        "base": base,
+        "base_ref": base,
+        "base_revision": base_revision,
         "candidate_head": head,
         "instructions_sha256": instruction_hash,
         "state": "STARTING",
@@ -281,7 +320,7 @@ def run_review(
     for attempt in range(max_infra_retries + 1):
         event_path = root / f"{run_id}.attempt-{attempt}.events.jsonl"
         final_path = root / f"{run_id}.attempt-{attempt}.final.json"
-        contract = ReviewContract(repo, base, head, review_instructions, event_path, final_path)
+        contract = ReviewContract(repo, base_revision, head, review_instructions, event_path, final_path)
         if runner is None:
             result = run_attempt(
                 contract, attempt, codex_executable=codex, timeout_seconds=timeout_seconds
