@@ -1340,15 +1340,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if status == "pending":
                     print(f"web lifecycle receipt outcome unknown; reconcile before replay: {_audit_receipt_key(receipt)}", file=sys.stderr)
                     return 3
-                _set_audit_receipt_status(cursor_path, receipt, "pending")
+                retry_wake_only = status == "wake_pending"
+                if not retry_wake_only:
+                    _set_audit_receipt_status(cursor_path, receipt, "pending")
                 try:
                     if args.capture_events:
                         append_captured_event(Path(args.capture_events), event)
                     else:
-                        dispatch_code = dispatch_event(event)
-                        if dispatch_code != 0:
-                            print(f"web lifecycle dispatch failed for {_audit_receipt_key(receipt)}: exit {dispatch_code}", file=sys.stderr)
-                            return dispatch_code
+                        if not retry_wake_only:
+                            dispatch_code = dispatch_event(event)
+                            if dispatch_code != 0:
+                                print(f"web lifecycle dispatch failed for {_audit_receipt_key(receipt)}: exit {dispatch_code}", file=sys.stderr)
+                                return dispatch_code
+                            _set_audit_receipt_status(cursor_path, receipt, "wake_pending")
                         lifecycle_state = _load_lifecycle_state(args.session_id)
                         wake_receipt = dispatch_pending_lifecycle_wake(
                             lifecycle_state=lifecycle_state,

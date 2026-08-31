@@ -1400,6 +1400,44 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertNotEqual(native, 0)
             self.assertFalse(marker.exists())
 
+    def test_audit_once_retries_wake_after_dispatch_succeeded_but_wake_deferred(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            audit = root / "audit.jsonl"
+            receipt = {
+                "receiptId": "wake-retry-1", "childTool": "shell_command", "state": "succeeded",
+                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
+                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            cursor = root / "cursor.json"
+            state = {"pending_control_event": True, "triggers": ["READY:F1"]}
+            wake_results = [
+                {"result": "DEFERRED", "decision": "DEFER", "pending_control_event": True},
+                {"result": "CONFIRMED", "decision": "RESUME_CURRENT_HOST", "pending_control_event": True},
+            ]
+            args = [
+                "audit-once", "--repo", str(repo), "--session-id", "controller-1",
+                "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry),
+                "--codex", str(codex),
+            ]
+            with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch, patch.object(
+                web_bridge, "_load_lifecycle_state", return_value=state
+            ), patch.object(web_bridge, "dispatch_pending_lifecycle_wake", side_effect=wake_results) as wake:
+                first = web_bridge.main(args)
+                second = web_bridge.main(args)
+            self.assertNotEqual(first, 0)
+            self.assertEqual(second, 0)
+            self.assertEqual(dispatch.call_count, 1)
+            self.assertEqual(wake.call_count, 2)
+            state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["receipts"]["wake-retry-1"], "handled")
+            self.assertEqual(json.loads(cursor.read_text(encoding="utf-8"))["offset"], audit.stat().st_size)
+
     def test_audit_once_keeps_receipt_pending_when_pending_wake_dispatch_returns_none(self) -> None:
         from unittest.mock import patch
 
@@ -1425,7 +1463,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertNotEqual(code, 0)
             state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
             saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["receipts"]["wake-none-1"], "pending")
+            self.assertEqual(saved["receipts"]["wake-none-1"], "wake_pending")
 
     def test_audit_once_does_not_mark_receipt_handled_when_wake_is_not_confirmed(self) -> None:
         from unittest.mock import patch
@@ -1456,7 +1494,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertNotEqual(code, 0)
             state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
             saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["receipts"]["wake-fail-1"], "pending")
+            self.assertEqual(saved["receipts"]["wake-fail-1"], "wake_pending")
 
     def test_post_shell_audit_and_native_stop_route_pending_events_through_one_dispatcher(self) -> None:
         from unittest.mock import patch
