@@ -4,6 +4,10 @@
 
 它会根据任务风险选择最小够用的流程，并把需求、设计、开发、测试、真实验收、主线集成、发布门禁和跨会话恢复连接起来。
 
+### Controller scoring window
+
+Formal long-term controller scoring defaults to the most recent 24 hours, using at most five valid control events plus a separate inspection of all current major unresolved anomalies and critical-path stalls. Sparse windows are disclosed rather than backfilled with older convenient events. Controller Self-Check remains lightweight, non-numeric, and does not execute the full formal scoring window.
+
 ## 产品身份与兼容性
 
 **Adaptive Agent Runtime** 是新的对外产品名；`adaptive-agent-runtime` 是产品 slug。为保证已有项目、显式调用、Hook、handshake、receipt 与安装路径零中断，底层 Skill ID 暂继续使用稳定兼容标识 `adaptive-delivery`（legacy machine identifier）。这不是第二个产品或第二套规则：机器运行事实仍只使用既有 `.git/adaptive-delivery/` canonical state，不创建双 Skill/runtime。未来只有宿主标准提供可靠 alias/迁移语义时才考虑切换技术 ID。

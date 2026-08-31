@@ -235,7 +235,7 @@ class ControllerScoringHookTests(unittest.TestCase):
             )
             output, state = hook.evaluate_event(
                 {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-1", "cwd": str(repo),
-                 "last_assistant_message": "当前总控履职评分：86/100。\n评估窗口：最近两个闭合控制事件 + 24h 异常。"},
+                 "last_assistant_message": "当前总控履职评分：86/100。\n评估窗口：最近 24 小时内最多 5 个有效控制事件 + 当前重大未闭环异常单独检查。"},
                 skill_root=ROOT, prior_state=state,
             )
             self.assertEqual({}, output)
@@ -244,7 +244,7 @@ class ControllerScoringHookTests(unittest.TestCase):
             self.assertEqual("controller-1", history["controller_session_id"])
             self.assertEqual("turn-1", history["turn_id"])
             self.assertEqual(hook.scoring_model_sha256(ROOT), history["model_sha256"])
-            self.assertIn("最近两个闭合控制事件", history["window_summary"])
+            self.assertIn("最近 24 小时内最多 5 个有效控制事件", history["window_summary"])
             self.assertNotIn("当前总控履职评分", history.get("window_summary", ""))
 
     def test_failed_score_guard_does_not_pollute_score_history(self):
