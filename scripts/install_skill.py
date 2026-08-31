@@ -275,8 +275,12 @@ if [[ \"$_ad_web_parent\" == *\"$_ad_web_bridge_executable\"* ]]; then
   _ad_web_lifecycle_exit() {{
     local _ad_web_exit_code=$?
     trap - EXIT
-    {python_literal} {script_literal} post-shell --cwd \"$_ad_web_cwd\" --command \"$_ad_web_command\" --exit-code \"$_ad_web_exit_code\" || true
-    exit \"$_ad_web_exit_code\"
+    {python_literal} {script_literal} post-shell --cwd \"$_ad_web_cwd\" --command \"$_ad_web_command\" --exit-code \"$_ad_web_exit_code\"
+    local _ad_web_bridge_exit_code=$?
+    if [[ \"$_ad_web_exit_code\" -ne 0 ]]; then
+      exit \"$_ad_web_exit_code\"
+    fi
+    exit \"$_ad_web_bridge_exit_code\"
   }}
   trap _ad_web_lifecycle_exit EXIT
 fi

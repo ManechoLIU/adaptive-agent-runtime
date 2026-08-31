@@ -78,6 +78,29 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertEqual(report["web_local_adapter"]["status"], "degraded")
         self.assertFalse(report["web_local_adapter"]["configured"])
 
+    def test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence(self):
+        import subprocess
+        from scripts.install_skill import _web_zshenv_block
+
+        block = _web_zshenv_block(Path("/tmp/skill"), Path("/tmp/ai-bridge"), "/usr/bin/python3")
+        self.assertNotIn("|| true", block)
+        function = block.split("  _ad_web_lifecycle_exit() {", 1)[1].split("  }\n  trap", 1)[0]
+        function = "_ad_web_lifecycle_exit() {" + function + "}"
+        bridge_call = '/usr/bin/python3 /tmp/skill/scripts/web_lifecycle_bridge.py post-shell --cwd "$_ad_web_cwd" --command "$_ad_web_command" --exit-code "$_ad_web_exit_code"'
+
+        def run_exit_function(original_exit: int, bridge_exit: int) -> int:
+            script = (
+                "_ad_web_cwd=/tmp; _ad_web_command=true; "
+                + function.replace(bridge_call, f"/bin/sh -c 'exit {bridge_exit}'")
+                + f"\n/bin/sh -c 'exit {original_exit}'; _ad_web_lifecycle_exit"
+            )
+            return subprocess.run(["/bin/zsh", "-c", script], check=False).returncode
+
+        self.assertEqual(run_exit_function(0, 0), 0)
+        self.assertEqual(run_exit_function(0, 78), 78)
+        self.assertEqual(run_exit_function(7, 0), 7)
+        self.assertEqual(run_exit_function(7, 78), 7)
+
     def test_capability_report_enables_detected_ai_bridge_without_making_it_core_dependency(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
