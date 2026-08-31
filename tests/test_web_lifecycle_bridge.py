@@ -904,6 +904,106 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertEqual(receipt["result"], "DEFERRED")
             self.assertEqual(receipt["reason"], "common_dir_wake_locked")
             self.assertFalse(marker.exists())
+            self.assertEqual(
+                json.loads(receipt_path.read_text(encoding="utf-8"))["decision"],
+                "DEFER",
+            )
+            self.assertFalse(list(root.glob(f".{receipt_path.name}.*")))
+
+    def test_common_dir_resolution_failure_persists_a_bounded_atomic_receipt(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, _ = self.make_controller(root)
+            failure = subprocess.CalledProcessError(
+                128,
+                ["git", "rev-parse", "--git-common-dir"],
+                stderr="x" * 4096,
+            )
+
+            with patch.object(web_bridge, "_git_common_dir", side_effect=failure):
+                receipt = web_bridge.wake_existing_controller(
+                    lifecycle_state={"pending_control_event": True, "triggers": ["READY:F1"]},
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex=str(codex),
+                    receipt_path=receipt_path,
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                )
+
+            saved = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt, saved)
+            self.assertEqual(saved["decision"], "DEAD_BLOCK")
+            self.assertEqual(saved["result"], "BLOCKED")
+            self.assertLessEqual(len(saved["reason"]), 512)
+            self.assertFalse(list(root.glob(f".{receipt_path.name}.*")))
+
+    def test_current_host_adapter_is_ignored_for_native_preflighted_resume(self) -> None:
+        from unittest.mock import patch
+
+        adapter_calls: list[dict] = []
+
+        def supplied_current_host_adapter(**kwargs: object) -> dict:
+            adapter_calls.append(dict(kwargs))
+            return {"result": "CONFIRMED", "operation": "untrusted-current-host-adapter"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                web_bridge,
+                "execute_native_resume",
+                wraps=web_bridge.execute_native_resume,
+            ) as native_resume:
+                receipt, _, marker = self.wake(
+                    Path(tmp),
+                    lifecycle_state={"pending_control_event": True, "triggers": ["READY:F1"]},
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                    resume_adapters={"web": supplied_current_host_adapter},
+                )
+
+            self.assertEqual(receipt["decision"], "RESUME_CURRENT_HOST")
+            self.assertEqual(receipt["operation"], "native_resume")
+            self.assertEqual(adapter_calls, [])
+            self.assertEqual(native_resume.call_count, 1)
+            self.assertIn("resume controller-1", marker.read_text(encoding="utf-8"))
+
+    def test_peer_adapter_metadata_is_json_safe_bounded_and_persisted(self) -> None:
+        calls: list[dict] = []
+
+        def desktop_resume(**kwargs: object) -> dict:
+            calls.append(dict(kwargs))
+            return {
+                "result": "CONFIRMED",
+                "operation": "peer-operation-" * 1024,
+                "command": ["peer-resume", object(), "unbounded-command-argument" * 1024],
+                "stderr_tail": {"diagnostic": object()},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt, receipt_path, _ = self.wake(
+                Path(tmp),
+                lifecycle_state={"pending_control_event": True, "triggers": ["READY:F1"]},
+                host_facts={
+                    "controller_host": "web",
+                    "active_writer": False,
+                    "resume_state": "RESUME_FAILED",
+                    "failure_class": "quota_exhausted",
+                    "fallback_eligible": True,
+                    "peer_host_available": True,
+                    "peer_host": "desktop_codex",
+                    "fallback_safe": True,
+                },
+                resume_adapters={"desktop_codex": desktop_resume},
+            )
+
+            saved = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt, saved)
+            self.assertEqual(len(calls), 1)
+            self.assertLessEqual(len(saved["operation"]), 512)
+            self.assertNotIn("command", saved)
+            self.assertLessEqual(len(saved["diagnostics"]), web_bridge.STDERR_TAIL_LIMIT)
+            self.assertIn("non-text adapter diagnostics", saved["diagnostics"])
 
     def test_linked_worktree_uses_registered_controller_from_its_common_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

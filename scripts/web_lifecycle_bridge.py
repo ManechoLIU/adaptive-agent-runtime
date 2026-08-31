@@ -590,6 +590,38 @@ def _wake_event_fingerprint(lifecycle_state: dict[str, Any]) -> str:
     return __import__("hashlib").sha256(encoded).hexdigest()
 
 
+def _bounded_adapter_operation(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return f"<non-text adapter operation: {type(value).__name__}>"
+    return _bounded_text(value, 512)[0]
+
+
+def _bounded_adapter_command(value: Any) -> list[str] | None:
+    if not isinstance(value, (list, tuple)):
+        return None
+    remaining = STDERR_TAIL_LIMIT
+    command: list[str] = []
+    for argument in value[:64]:
+        if not isinstance(argument, str):
+            return None
+        if remaining <= 0:
+            break
+        normalized, _ = _bounded_text(argument, min(1024, remaining))
+        command.append(normalized)
+        remaining -= len(normalized.encode("utf-8"))
+    return command
+
+
+def _bounded_adapter_diagnostics(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return f"<non-text adapter diagnostics: {type(value).__name__}>"
+    return bounded_tail(value)
+
+
 def _wake_receipt(
     *,
     common_dir: Path,
@@ -599,10 +631,10 @@ def _wake_receipt(
     decision: str,
     selected_host: str | None,
     reason: str,
-    operation: str | None,
+    operation: Any,
     result: str,
-    command: list[str] | None = None,
-    diagnostics: str | None = None,
+    command: Any = None,
+    diagnostics: Any = None,
 ) -> dict[str, Any]:
     now = int(time.time() * 1000)
     receipt: dict[str, Any] = {
@@ -617,16 +649,18 @@ def _wake_receipt(
         "reason": bounded_tail(reason, 512),
         "started_at_unix_ms": now,
         "completed_at_unix_ms": now,
-        "operation": operation,
+        "operation": _bounded_adapter_operation(operation),
         "result": result,
         # A host confirmation proves only the same-thread launch.  Lifecycle closure
         # remains the control-event guard's responsibility.
         "pending_control_event": True,
     }
-    if command is not None:
-        receipt["command"] = command
-    if diagnostics:
-        receipt["diagnostics"] = bounded_tail(diagnostics)
+    normalized_command = _bounded_adapter_command(command)
+    if normalized_command is not None:
+        receipt["command"] = normalized_command
+    normalized_diagnostics = _bounded_adapter_diagnostics(diagnostics)
+    if normalized_diagnostics:
+        receipt["diagnostics"] = normalized_diagnostics
     return receipt
 
 
@@ -648,7 +682,7 @@ def wake_existing_controller(
         common_dir = _git_common_dir(repo)
     except (OSError, subprocess.SubprocessError) as exc:
         health = derive_controller_health({})
-        return _wake_receipt(
+        receipt = _wake_receipt(
             common_dir=repo,
             session_id=session_id,
             event_fingerprint=_wake_event_fingerprint(lifecycle_state),
@@ -659,6 +693,8 @@ def wake_existing_controller(
             operation=None,
             result="BLOCKED",
         )
+        _write_json_atomic_file(receipt_path, receipt)
+        return receipt
 
     facts = dict(host_facts) if isinstance(host_facts, dict) else {}
     facts.update({
@@ -675,14 +711,14 @@ def wake_existing_controller(
     fingerprint = _wake_event_fingerprint(lifecycle_state)
     reason = str(facts.get("failure_class") or health["state"])
 
-    lock_path = controller_wake_lock_path(repo)
+    lock_path = common_dir / "adaptive-delivery" / "controller-wake.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = lock_path.open("a+")
     try:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return _wake_receipt(
+            receipt = _wake_receipt(
                 common_dir=common_dir,
                 session_id=session_id,
                 event_fingerprint=fingerprint,
@@ -693,6 +729,8 @@ def wake_existing_controller(
                 operation=None,
                 result="DEFERRED",
             )
+            _write_json_atomic_file(receipt_path, receipt)
+            return receipt
 
         if decision == "NOOP_ACTIVE":
             receipt = _wake_receipt(
@@ -713,35 +751,36 @@ def wake_existing_controller(
                 operation=None, result="BLOCKED",
             )
         else:
-            adapter = (resume_adapters or {}).get(str(selected_host))
-            if adapter is None and selected_host == health.get("controller_host"):
+            if selected_host == health.get("controller_host"):
                 attempt = execute_native_resume(
                     session_id=session_id, repo=repo, registry=registry, codex=codex,
                     runtime_path=runtime_path,
                 )
-            elif adapter is None:
-                attempt = {
-                    "operation": None,
-                    "result": "DEFERRED",
-                    "state": "RESUME_DEFERRED",
-                    "stderr_tail": f"no authorized adapter for peer host {selected_host}",
-                }
             else:
-                try:
-                    attempt = adapter(
-                        session_id=session_id,
-                        repo=repo,
-                        registry=registry,
-                        codex=codex,
-                        runtime_path=runtime_path,
-                    )
-                except (OSError, subprocess.SubprocessError) as exc:
+                adapter = (resume_adapters or {}).get(str(selected_host))
+                if adapter is None:
                     attempt = {
-                        "operation": f"{selected_host}_resume",
-                        "result": "FAILED",
-                        "state": "RESUME_FAILED",
-                        "stderr_tail": f"host adapter error: {exc}",
+                        "operation": None,
+                        "result": "DEFERRED",
+                        "state": "RESUME_DEFERRED",
+                        "stderr_tail": f"no authorized adapter for peer host {selected_host}",
                     }
+                else:
+                    try:
+                        attempt = adapter(
+                            session_id=session_id,
+                            repo=repo,
+                            registry=registry,
+                            codex=codex,
+                            runtime_path=runtime_path,
+                        )
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        attempt = {
+                            "operation": f"{selected_host}_resume",
+                            "result": "FAILED",
+                            "state": "RESUME_FAILED",
+                            "stderr_tail": f"host adapter error: {exc}",
+                        }
             result = str(attempt.get("result", "FAILED"))
             receipt = _wake_receipt(
                 common_dir=common_dir, session_id=session_id, event_fingerprint=fingerprint,
