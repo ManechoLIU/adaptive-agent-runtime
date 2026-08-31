@@ -270,9 +270,22 @@ def run_attempt(
     try:
         process_group_id = process_group_getter(process.pid)
     except (OSError, RuntimeError, ValueError) as exc:
+        # start_new_session=True makes the launched child's PID the session/process-group id.
+        # Even if PGID lookup itself fails, use that invariant to clean up the started child.
+        process_group_id = process.pid
+        exit_code, retry_safe, cleanup = _terminate_process_group(
+            process, process_group_id, process_group_killer, process_group_exists,
+            termination_grace_seconds, send_term=True,
+        )
+        for stream in (getattr(process, "stdin", None), getattr(process, "stdout", None)):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError, AttributeError):
+                pass
         return AttemptResult(
-            state="REVIEW_INFRA_FAILED", pid=process.pid, exit_code=70, running_observed=False,
-            diagnostic=f"reviewer process-group capture failed: {exc}", retry_safe=False,
+            state="REVIEW_INFRA_FAILED", pid=process.pid, exit_code=exit_code, running_observed=False,
+            diagnostic=f"reviewer process-group capture failed: {exc}; cleanup={cleanup}", retry_safe=retry_safe,
         )
     if process.stdin is None:
         exit_code, retry_safe, cleanup = _terminate_process_group(
@@ -366,40 +379,38 @@ def run_attempt(
 
     writer.join(0.2)
     reader.join(1.0)
-    if writer_state["error"] is not None:
-        return AttemptResult(
-            state="REVIEW_INFRA_FAILED",
-            pid=process.pid,
-            exit_code=exit_code,
-            running_observed=bool(observed["running"]),
-            session_id=observed["session_id"],
-            diagnostic=f"reviewer stdin delivery failed: {writer_state['error']}",
+
+    def post_wait_infra_failure(reason: str) -> AttemptResult:
+        cleanup_exit, retry_safe, cleanup = _terminate_process_group(
+            process, process_group_id, process_group_killer, process_group_exists,
+            termination_grace_seconds, send_term=True,
         )
-    if not writer_state["done"]:
+        writer.join(0.05)
+        reader.join(0.2)
         return AttemptResult(
             state="REVIEW_INFRA_FAILED",
             pid=process.pid,
-            exit_code=exit_code,
+            exit_code=cleanup_exit,
             running_observed=bool(observed["running"]),
             session_id=observed["session_id"],
-            diagnostic="reviewer stdin delivery did not complete before child exit",
-            retry_safe=False,
-        )
-    if reader.is_alive():
-        return AttemptResult(
-            state="REVIEW_INFRA_FAILED",
-            pid=process.pid,
-            exit_code=exit_code,
-            running_observed=bool(observed["running"]),
-            session_id=observed["session_id"],
-            diagnostic="reviewer event stream did not close after child exit",
-            retry_safe=False,
+            diagnostic=f"{reason}; cleanup={cleanup}",
+            retry_safe=retry_safe,
         )
 
+    if writer_state["error"] is not None:
+        return post_wait_infra_failure(f"reviewer stdin delivery failed: {writer_state['error']}")
+    if not writer_state["done"]:
+        return post_wait_infra_failure("reviewer stdin delivery did not complete before child exit")
+    if reader.is_alive():
+        return post_wait_infra_failure("reviewer event stream did not close after child exit")
+
     running_observed = bool(observed["running"])
-    state = "RUNNING" if running_observed and exit_code == 0 else "REVIEW_INFRA_FAILED"
+    if not running_observed or exit_code != 0:
+        return post_wait_infra_failure(
+            f"review process exit={exit_code} running_observed={running_observed}"
+        )
     return AttemptResult(
-        state=state,
+        state="RUNNING",
         pid=process.pid,
         exit_code=exit_code,
         running_observed=running_observed,

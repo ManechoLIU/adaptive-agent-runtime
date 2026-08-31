@@ -381,6 +381,68 @@ class _LeaderExitsDescendantSurvivesProcess(_FakeProcess):
 
 
 class ReviewerSupervisorProcessGroupCleanupTests(unittest.TestCase):
+    def test_process_group_capture_failure_still_cleans_started_child_using_session_leader_pid(self):
+        sent = []
+        group_alive = {4242: True}
+        proc = _FakeProcess([], returncode=0)
+
+        def factory(argv, **kwargs):
+            return proc
+
+        def getter(pid):
+            raise PermissionError("pgid lookup failed")
+
+        def signaler(pgid, sig):
+            sent.append((pgid, sig))
+            group_alive[pgid] = False
+
+        def group_exists(pgid):
+            return group_alive.get(pgid, False)
+
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "a" * 40, "b" * 40, "schema", root / "events", root / "final")
+        result = run_attempt(
+            contract, 0, popen_factory=factory, codex_executable="codex",
+            process_group_getter=getter, process_group_killer=signaler,
+            process_group_exists=group_exists, termination_grace_seconds=0.01,
+        )
+
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertEqual(sent, [(4242, signal.SIGTERM)])
+        self.assertTrue(result.retry_safe)
+        self.assertIn("capture", result.diagnostic.lower())
+        self.assertIn("cleanup", result.diagnostic.lower())
+
+    def test_reader_still_alive_after_leader_exit_triggers_group_cleanup(self):
+        sent = []
+        group_alive = {4242: True}
+        proc = _FakeProcess([], returncode=0)
+        proc.stdout = _SlowStdout()
+
+        def factory(argv, **kwargs):
+            return proc
+
+        def signaler(pgid, sig):
+            sent.append((pgid, sig))
+            group_alive[pgid] = False
+
+        def group_exists(pgid):
+            return group_alive.get(pgid, False)
+
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "a" * 40, "b" * 40, "schema", root / "events", root / "final")
+        result = run_attempt(
+            contract, 0, popen_factory=factory, codex_executable="codex",
+            process_group_getter=lambda pid: 4242, process_group_killer=signaler,
+            process_group_exists=group_exists, termination_grace_seconds=0.01,
+        )
+
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertEqual(sent, [(4242, signal.SIGTERM)])
+        self.assertTrue(result.retry_safe)
+        self.assertIn("event stream", result.diagnostic.lower())
+        self.assertIn("cleanup", result.diagnostic.lower())
+
     def test_leader_exit_after_term_does_not_make_retry_safe_while_descendant_survives(self):
         holder = []
         sent = []
