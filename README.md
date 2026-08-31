@@ -4,6 +4,10 @@
 
 它会根据任务风险选择最小够用的流程，并把需求、设计、开发、测试、真实验收、主线集成、发布门禁和跨会话恢复连接起来。
 
+### Controller scoring window
+
+Formal long-term controller scoring defaults to the most recent 24 hours, using the five most recent valid control events, capped at five plus a separate inspection of all current major unresolved anomalies and critical-path stalls. Sparse windows are disclosed rather than backfilled with older convenient events. Controller Self-Check remains lightweight, non-numeric, and does not execute the full formal scoring window.
+
 ## 产品身份与兼容性
 
 **Adaptive Agent Runtime** 是新的对外产品名；`adaptive-agent-runtime` 是产品 slug。为保证已有项目、显式调用、Hook、handshake、receipt 与安装路径零中断，底层 Skill ID 暂继续使用稳定兼容标识 `adaptive-delivery`（legacy machine identifier）。这不是第二个产品或第二套规则：机器运行事实仍只使用既有 `.git/adaptive-delivery/` canonical state，不创建双 Skill/runtime。未来只有宿主标准提供可靠 alias/迁移语义时才考虑切换技术 ID。
@@ -310,7 +314,7 @@ python3 ~/.agents/skills/adaptive-delivery/scripts/controller_scoring_hook.py --
 
 该命令在保留现有 Hook 的前提下增加 `UserPromptSubmit` 与 `Stop`：评分/履职审计请求进入时，`UserPromptSubmit` 自动把**当前安装的** `references/controller-performance-scoring.md` 正文和 SHA-256 完整注入模型上下文；`Stop` 在最终回复前复核同一精确模型。若模型中途变化，`Stop` 必须 fail closed，且不得把受长度限制的 Stop 文本冒充“完整重载”；必须重新提交评分/审计请求，由新的 `UserPromptSubmit` 完整注入当前版本后才能输出评分。评分门状态无法持久化时同样 fail closed。Hook 的模型根固定为其自身安装目录，调用方不能用 `--skill-root` 切换到另一份评分表。仍须在 Codex `/hooks` 中确认这两个 handler 为 Active / trusted；未激活时不能声称机器门已生效。
 
-不提供 `UserPromptSubmit / Stop` 的宿主（包括无法暴露最终文本生命周期事件的 Web 宿主）无法由本机 Codex Hook 强制拦截最终回复。此时只能走 `controller_scoring_guard.py record-read --repo <project>` → `score-guard --repo <project>` 的 fail-closed 路径；任一步未通过就禁止输出分数，不能把这条兼容路径描述成宿主级自动拦截。
+不提供 `UserPromptSubmit / Stop` 的宿主（包括无法暴露最终文本生命周期事件的 Web 宿主）无法由本机 Codex Hook 强制拦截最终回复。此时正式数值评分走 `controller_scoring_guard.py record-read --repo <project>` → `finalize-score --repo <project> --controller-session <id> --score <n> ...`；`finalize-score` 会消费同一 exact-model guard 并把最小评分摘要写入 Git common-dir 的 `adaptive-delivery/controller-score-history.jsonl`。查询“上次评分”使用 `latest-score --repo <project> --controller-session <id>`；无记录返回 `UNKNOWN`。低层 `score-guard` 仍保留给只需一次性放行、但不产生正式数值评分记录的兼容场景。任一步未通过就禁止输出分数，不能把这条兼容路径描述成宿主级自动拦截。
 
 ChatGPT Web + AI-Bridge 需要额外的 Web bridge，因为 Web 工具调用不会天然触发 Codex Hook。`scripts/web_lifecycle_bridge.py` 可把**唯一 registered controller** 项目下由 AI-Bridge 启动的 shell 调用桥接为 `PostToolUse`，并从 AI-Bridge 审计收据确认 `control_event_guard.py` 的真实 `control-event: allowed` 输出。未登记项目静默跳过；同一 repo 若登记多个 controller 则拒绝映射；没有 repo 归属的 `computer` 事件不自动猜测归属。Web 平台没有可验证的“最终文字回复已结束”本地事件，因此 bridge 不伪造这个信号：在真实 allowed 控制收据后做短 debounce，并可自动调用 `native-stop`，复用原 controller session 走 Codex 原生生命周期；更新的收据会使旧延迟 Stop 失效，不会 fork 第二 controller。
 

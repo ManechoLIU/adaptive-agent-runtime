@@ -164,7 +164,7 @@ class ControllerScoringHookTests(unittest.TestCase):
             {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "turn_id": "t1", "cwd": str(ROOT), "prompt": "给总控评分"},
             skill_root=ROOT, prior_state={},
         )
-        with patch.object(hook, "consume_score_guard", side_effect=OSError("receipt vanished")):
+        with patch.object(hook, "finalize_score", side_effect=ValueError("receipt vanished")):
             output, state = hook.evaluate_event(
                 {"hook_event_name": "Stop", "session_id": "s1", "turn_id": "t1", "cwd": str(ROOT), "last_assistant_message": "当前总控履职评分：82/100。"},
                 skill_root=ROOT, prior_state=state,
@@ -222,6 +222,49 @@ class ControllerScoringHookTests(unittest.TestCase):
         output = json.loads(stdout.getvalue())
         self.assertEqual("block", output["decision"])
         self.assertIn("persist", output["reason"])
+
+    def test_successful_formal_score_appends_machine_history_after_guard_passes(self):
+        import json, subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-1", "cwd": str(repo), "prompt": "给总控评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, state = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-1", "cwd": str(repo),
+                 "last_assistant_message": "当前总控履职评分：86/100。\n评估窗口：最近 24 小时内最多 5 个有效控制事件 + 当前重大未闭环异常单独检查。"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual({}, output)
+            history = hook.latest_score_history(repo, controller_session_id="controller-1")
+            self.assertEqual(86.0, history["score"])
+            self.assertEqual("controller-1", history["controller_session_id"])
+            self.assertEqual("turn-1", history["turn_id"])
+            self.assertEqual(hook.scoring_model_sha256(ROOT), history["model_sha256"])
+            self.assertIn("最近 24 小时内最多 5 个有效控制事件", history["window_summary"])
+            self.assertNotIn("当前总控履职评分", history.get("window_summary", ""))
+
+    def test_failed_score_guard_does_not_pollute_score_history(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-1", "cwd": str(repo), "prompt": "给总控评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            Path(state["receipt_path"]).unlink()
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-1", "cwd": str(repo),
+                 "last_assistant_message": "当前总控履职评分：86/100。"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual("block", output["decision"])
+            self.assertIsNone(hook.latest_score_history(repo, controller_session_id="controller-1"))
 
     def test_install_hooks_preserves_existing_stop_and_adds_scoring_handlers_idempotently(self):
         hook = load_module()

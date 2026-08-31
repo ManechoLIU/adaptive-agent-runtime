@@ -114,6 +114,65 @@ class ControllerScoringGuardTests(unittest.TestCase):
             import hashlib
             self.assertEqual(hashlib.sha256(content).hexdigest(), receipt["model_sha256"])
 
+    def test_score_history_is_shared_by_git_common_dir_and_latest_is_controller_scoped(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            linked = Path(td) / "linked"
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+            (root / "x").write_text("x", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "x"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "init"], check=True)
+            subprocess.run(["git", "-C", str(root), "worktree", "add", "-qb", "linked", str(linked)], check=True)
+            guard.append_score_history(root, {"controller_session_id": "c1", "score": 81.0, "recorded_at": "2026-08-31T10:00:00+00:00"})
+            guard.append_score_history(linked, {"controller_session_id": "c2", "score": 90.0, "recorded_at": "2026-08-31T10:01:00+00:00"})
+            guard.append_score_history(linked, {"controller_session_id": "c1", "score": 86.0, "recorded_at": "2026-08-31T10:02:00+00:00"})
+            self.assertEqual(guard.score_history_path(root), guard.score_history_path(linked))
+            self.assertEqual(86.0, guard.latest_score_history(root, controller_session_id="c1")["score"])
+            self.assertEqual(90.0, guard.latest_score_history(linked, controller_session_id="c2")["score"])
+            self.assertIsNone(guard.latest_score_history(root, controller_session_id="missing"))
+
+    def test_finalize_score_consumes_guard_and_records_history_for_manual_web_path(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            guard.record_model_read(repo, skill_root=ROOT)
+            record = guard.finalize_score(
+                repo, skill_root=ROOT, controller_session_id="controller-1", turn_id="web-turn-1",
+                score=86.0, window_summary="最近两个闭合控制事件 + 24h 异常", message_sha256="abc",
+            )
+            self.assertEqual(86.0, record["score"])
+            self.assertFalse(guard.receipt_path(repo).exists())
+            self.assertEqual(86.0, guard.latest_score_history(repo, controller_session_id="controller-1")["score"])
+
+    def test_finalize_score_fails_closed_without_valid_guard_and_writes_no_history(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            with self.assertRaisesRegex(ValueError, "score-guard"):
+                guard.finalize_score(
+                    repo, skill_root=ROOT, controller_session_id="controller-1", turn_id="web-turn-1",
+                    score=86.0, window_summary=None, message_sha256=None,
+                )
+            self.assertIsNone(guard.latest_score_history(repo, controller_session_id="controller-1"))
+
+    def test_latest_score_cli_returns_unknown_when_no_controller_record_exists(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            completed = subprocess.run([
+                "python3", str(SCRIPT), "latest-score", "--repo", str(repo), "--controller-session", "c1"
+            ], check=True, capture_output=True, text=True)
+            self.assertEqual("UNKNOWN", completed.stdout.strip())
+
     def test_cli_rejects_skill_root_override(self):
         import subprocess
         completed = subprocess.run([

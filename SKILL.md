@@ -50,8 +50,9 @@ description: Use when initializing or governing a long-running project, choosing
 - 选择方法、标准/严格档调度、初始化档案或跨会话续接：读 [methods](references/methods.md)；多问题、多 Agent 或共享事实源任务使用其中的“质量保真加速协议”。
 - 子 Agent 分派、前后端模型选择、模型降级或并发配置：读 [Agent and model routing](references/agent-model-routing.md) 与 [Agent delivery contract](references/agent-delivery-contract.md)。需要配置、登录、预检或执行 Kimi/Grok 外部 Agent 时，再读 [External Agent authentication and execution](references/external-agent-auth.md)；该流程由 Adaptive Delivery 直接执行，不依赖任务生命周期插件。
 - 长期项目、Goal、台账粒度、候选分支或共享环境治理：读 [long-task governance](references/long-task-governance.md)。
-- 用户要求审计 / 评分项目总控履职、比较近期表现或检查“假繁荣”时：使用 [controller performance scoring](references/controller-performance-scoring.md)。支持 `UserPromptSubmit + Stop` 的宿主必须启用 `controller_scoring_hook.py` 机器门，自动注入当前安装模型并在输出前校验；不提供 UserPromptSubmit / Stop 的宿主必须执行 `controller_scoring_guard.py record-read` 与 `score-guard`，未通过则禁止输出分数。评分只按该模型的固定窗口、七维权重、防刷分和封顶规则。
+- 用户要求审计 / 评分项目总控履职、比较近期表现或检查“假繁荣”时：使用 [controller performance scoring](references/controller-performance-scoring.md)。支持 `UserPromptSubmit + Stop` 的宿主必须启用 `controller_scoring_hook.py` 机器门，自动注入当前安装模型并在输出前校验，同时把成功正式评分摘要写入 Git common-dir 评分历史；不提供 UserPromptSubmit / Stop 的宿主必须执行 `controller_scoring_guard.py record-read` 与 `finalize-score`，未通过则禁止输出分数。比较“上次评分”时先用 `latest-score` 查询同一 controller，返回 `UNKNOWN` 时禁止凭记忆推断升降。评分只按该模型的固定窗口、七维权重、防刷分和封顶规则。
 - 长期总控的 SessionStart 与异常/控制事件同时注入由正式评分模型即时派生的 **Controller Self-Check**；只暴露优秀履职标准，不暴露或推算实时总分/维度分。自检用于纠偏，不构成新评分系统，也不得因单次事故自动新增全局治理规则。
+- 长期正式履职评分默认使用**最近 24 小时内时间上最近的最多 5 个有效控制事件 + 当前所有重大未闭环异常/关键路径停滞的单独检查**；事件不足 5 个时如实报告样本不足，不跨 24 小时凑漂亮样本。Self-Check 不运行这套重型窗口，只做非数值轻量纠偏。
 - 上下文、Compact、Raw Sources、Wiki、长期记忆、知识目录初始化或资料摄取：读 [context governance](references/context-governance.md)。
 - 涉及风险证据、外部服务、本地/Web 发布或恢复：读 [Harness and release](references/harness-and-release.md)。
 - 用户明确认可视觉参考，或任务涉及视觉基线：读 [visual reference governance](references/visual-reference-governance.md)。
