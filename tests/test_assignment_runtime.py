@@ -204,7 +204,7 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
             terminal_state="failed", transport_outcome="failed", delivery_outcome="fail",
             summary="provider proved no mutation committed", evidence=[], artifacts=[], next_action="retry",
             retry_class="transport_error", side_effect=True, result_unknown=False,
-            reconciliation_evidence=["receipt:provider/no-write-1"],
+            reconciliation_evidence=[{"provider":"grok","resource":"no-write-1","locator":"receipt:provider/grok/no-write-1","idempotency_key":None}],
         ), now=T0 + timedelta(minutes=1))
         self.assertFalse(state["leases"]["a1"]["result_unknown"])
         recovered = apply_receipt(state, receipt(
@@ -257,6 +257,34 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
                 "assignment_heartbeat", T0 + timedelta(minutes=2), attempt=1, lease_id="lease-1", event_seq=3
             ), now=T0 + timedelta(minutes=2))
 
+    def test_reconciliation_evidence_rejects_idempotency_key_prefix_collision(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1, side_effect=True, idempotency_key="abc"
+        ), now=T0)
+        bad = {"provider":"grok","resource":"post:42","locator":"receipt:provider/grok/post:42","idempotency_key":"abc-extra"}
+        with self.assertRaisesRegex(ValueError, "exact idempotency key"):
+            apply_receipt(state, receipt(
+                "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+                terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
+                summary="published", evidence=["receipt:provider/grok/post:42"], artifacts=["artifact:publish-1"],
+                next_action="done", retry_class="none", side_effect=True, idempotency_key="abc", result_unknown=False,
+                reconciliation_evidence=[bad],
+            ), now=T0 + timedelta(minutes=1))
+
+    def test_reconciliation_evidence_requires_concrete_resource_identity(self):
+        state = apply_receipt({}, receipt(
+            "assignment_started", attempt=1, lease_id="lease-1", event_seq=1, side_effect=True, idempotency_key="abc"
+        ), now=T0)
+        bad = {"provider":"grok","resource":"","locator":"receipt:provider/grok/unknown","idempotency_key":"abc"}
+        with self.assertRaisesRegex(ValueError, "resource identity"):
+            apply_receipt(state, receipt(
+                "assignment_terminal", T0 + timedelta(minutes=1), attempt=1, lease_id="lease-1", event_seq=2,
+                terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
+                summary="published", evidence=["receipt:provider/grok/unknown"], artifacts=["artifact:publish-1"],
+                next_action="done", retry_class="none", side_effect=True, idempotency_key="abc", result_unknown=False,
+                reconciliation_evidence=[bad],
+            ), now=T0 + timedelta(minutes=1))
+
     def test_side_effect_pass_requires_provider_reconciliation_bound_to_idempotency_key(self):
         state = apply_receipt({}, receipt(
             "assignment_started", attempt=1, lease_id="lease-1", event_seq=1,
@@ -277,7 +305,7 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
             summary="published", evidence=["receipt:provider/publish:release-42"], artifacts=["artifact:publish-1"],
             next_action="done", retry_class="none", side_effect=True,
             idempotency_key="publish:release-42", result_unknown=False,
-            reconciliation_evidence=["receipt:provider/publish:release-42"],
+            reconciliation_evidence=[{"provider":"grok","resource":"release-42","locator":"receipt:provider/grok/release-42","idempotency_key":"publish:release-42"}],
         ), now=T0 + timedelta(minutes=1))
         self.assertFalse(confirmed["leases"]["a1"]["result_unknown"])
 
@@ -290,7 +318,7 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
             terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
             summary="published once", evidence=["receipt:provider/publish-1"], artifacts=["artifact:publish-1"],
             next_action="done", retry_class="none", side_effect=True, result_unknown=False,
-            reconciliation_evidence=["receipt:provider/publish-1"],
+            reconciliation_evidence=[{"provider":"grok","resource":"publish-1","locator":"receipt:provider/grok/publish-1","idempotency_key":None}],
         ), now=T0 + timedelta(minutes=1))
         with self.assertRaisesRegex(ValueError, "completed assignment cannot be recovered"):
             apply_receipt(state, receipt(
@@ -364,7 +392,7 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
             terminal_state="failed", transport_outcome="failed", delivery_outcome="fail",
             summary="known failure", evidence=[], artifacts=[], next_action="retry", retry_class="transport_error",
             side_effect=True, idempotency_key="resource:create-1", result_unknown=False,
-            reconciliation_evidence=["receipt:provider/no-write-drift-test/resource:create-1"],
+            reconciliation_evidence=[{"provider":"grok","resource":"no-write-drift-test","locator":"receipt:provider/grok/no-write-drift-test","idempotency_key":"resource:create-1"}],
         ), now=T0 + timedelta(minutes=1))
         with self.assertRaisesRegex(ValueError, "side-effect contract drift"):
             apply_receipt(state, receipt(

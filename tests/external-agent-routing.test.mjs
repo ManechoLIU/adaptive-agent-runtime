@@ -534,7 +534,7 @@ test("side-effect PASS propagates provider reconciliation evidence into terminal
     delivery_outcome: "pass", summary: "provider confirmed publish",
     evidence: [`receipt:provider/${key}`], artifacts: ["artifact:publish-1"],
     next_action: "done", retry_class: "none",
-    reconciliation_evidence: [`receipt:provider/${key}`],
+    reconciliation_evidence: [{ provider: "grok-build", resource: "release-42", locator: "receipt:provider/grok-build/release-42", idempotency_key: key }],
   }));
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
@@ -544,7 +544,7 @@ test("side-effect PASS propagates provider reconciliation evidence into terminal
   ], { encoding: "utf8", input: "publish once", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
   assert.equal(result.status, 0, result.stderr);
   const events = (await readFile(receipts, "utf8")).trim().split("\n").map(JSON.parse);
-  assert.deepEqual(events.at(-1).reconciliation_evidence, [`receipt:provider/${key}`]);
+  assert.deepEqual(events.at(-1).reconciliation_evidence, [{ provider: "grok-build", resource: "release-42", locator: "receipt:provider/grok-build/release-42", idempotency_key: key }]);
   assert.equal(events.at(-1).result_unknown, false);
 });
 

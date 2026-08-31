@@ -295,15 +295,24 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
                 if not isinstance(reconciliation_evidence, list) or not reconciliation_evidence:
                     raise ValueError("clearing side-effect result_unknown requires provider reconciliation evidence")
                 stable_key = str(existing.get("idempotency_key") or "").strip() or None
+                expected_provider = str(existing.get("provider") or "").strip()
                 for item in reconciliation_evidence:
-                    if not _traceable_locator(item, RECONCILIATION_EVIDENCE_SCHEMES):
+                    if not isinstance(item, dict):
+                        raise ValueError("provider reconciliation evidence must be structured objects")
+                    provider = str(item.get("provider") or "").strip()
+                    resource = str(item.get("resource") or "").strip()
+                    locator = item.get("locator")
+                    evidence_key = item.get("idempotency_key")
+                    if provider != expected_provider:
+                        raise ValueError("provider reconciliation evidence provider mismatch")
+                    if not resource:
+                        raise ValueError("provider reconciliation evidence requires concrete resource identity")
+                    if not _traceable_locator(locator, RECONCILIATION_EVIDENCE_SCHEMES):
                         raise ValueError("provider reconciliation evidence must use receipt/artifact locators")
-                    token = str(item).strip()
-                    scheme, locator = token.split(":", 1)
-                    if not locator.startswith("provider/"):
-                        raise ValueError("provider reconciliation evidence must identify the provider/resource")
-                    if stable_key is not None and stable_key not in locator:
+                    if stable_key is not None and evidence_key != stable_key:
                         raise ValueError("provider reconciliation evidence must bind the exact idempotency key")
+                    if stable_key is None and evidence_key not in (None, ""):
+                        raise ValueError("provider reconciliation evidence cannot introduce an idempotency key")
             elif reconciliation_evidence and not isinstance(reconciliation_evidence, list):
                 raise ValueError("reconciliation_evidence must be a list")
         else:
