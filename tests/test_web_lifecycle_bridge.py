@@ -904,10 +904,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertEqual(receipt["result"], "DEFERRED")
             self.assertEqual(receipt["reason"], "common_dir_wake_locked")
             self.assertFalse(marker.exists())
-            self.assertEqual(
-                json.loads(receipt_path.read_text(encoding="utf-8"))["decision"],
-                "DEFER",
-            )
+            self.assertFalse(receipt_path.exists())
             self.assertFalse(list(root.glob(f".{receipt_path.name}.*")))
 
     def test_common_dir_resolution_failure_persists_a_bounded_atomic_receipt(self) -> None:
@@ -1112,11 +1109,80 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertTrue(second.get("debounced") is True)
             self.assertEqual(marker.read_text(encoding="utf-8").count("resume controller-1"), 1)
 
+    def test_deferred_wake_is_retryable_for_same_pending_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, marker = self.make_controller(root)
+            state = {
+                "pending_control_event": True,
+                "triggers": ["active_lease_expired:F1"],
+                "controller_host": "web",
+            }
+            first = web_bridge.dispatch_pending_lifecycle_wake(
+                lifecycle_state=state,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                receipt_path=receipt_path,
+                host_facts={"controller_host": "web", "active_writer": True},
+            )
+            second = web_bridge.dispatch_pending_lifecycle_wake(
+                lifecycle_state=state,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                receipt_path=receipt_path,
+                host_facts={"controller_host": "web", "resume_actionable": True},
+            )
+            self.assertEqual(first["result"], "DEFERRED")
+            self.assertEqual(second["result"], "CONFIRMED")
+            self.assertFalse(second.get("debounced", False))
+            self.assertIn("resume controller-1", marker.read_text(encoding="utf-8"))
+
+    def test_lock_contention_does_not_overwrite_shared_wake_receipt(self) -> None:
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, marker = self.make_controller(root)
+            prior = {"event_fingerprint": "prior", "result": "CONFIRMED", "decision": "RESUME_CURRENT_HOST"}
+            receipt_path.write_text(json.dumps(prior), encoding="utf-8")
+            lock_path = web_bridge.controller_wake_lock_path(repo)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            holder = lock_path.open("a+")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                receipt = web_bridge.wake_existing_controller(
+                    lifecycle_state={"pending_control_event": True, "triggers": ["READY:F1"]},
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex=str(codex),
+                    receipt_path=receipt_path,
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                )
+            finally:
+                fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+                holder.close()
+            self.assertEqual(receipt["result"], "DEFERRED")
+            self.assertEqual(json.loads(receipt_path.read_text(encoding="utf-8")), prior)
+            self.assertFalse(marker.exists())
+
     def test_confirmed_wake_stays_pending_until_control_event_guard_closes(self) -> None:
         spec = importlib.util.spec_from_file_location("task4_lifecycle_hook", ROOT / "scripts" / "lifecycle_hook.py")
         assert spec is not None and spec.loader is not None
         lifecycle = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(lifecycle)
+        scripts_dir = str(ROOT / "scripts")
+        inserted = scripts_dir not in sys.path
+        if inserted:
+            sys.path.insert(0, scripts_dir)
+        try:
+            spec.loader.exec_module(lifecycle)
+        finally:
+            if inserted:
+                sys.path.remove(scripts_dir)
         snapshot = {
             "head": "abc123",
             "ledger_sha256": "ledger-2",
@@ -1168,6 +1234,63 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             )
             self.assertFalse(closed["pending_control_event"])
             self.assertEqual(closed["triggers"], [])
+
+    def test_entrypoints_fail_closed_when_wake_is_not_confirmed(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            state = {"pending_control_event": True, "triggers": ["READY:F1"], "controller_host": "web"}
+            for result in ("DEFERRED", "FAILED", "BLOCKED"):
+                with self.subTest(result=result), patch.object(
+                    web_bridge, "_load_lifecycle_state", return_value=state
+                ), patch.object(
+                    web_bridge, "dispatch_pending_lifecycle_wake", return_value={
+                        "result": result, "decision": "DEFER", "pending_control_event": True
+                    }
+                ), patch.object(web_bridge, "dispatch_event", return_value=0):
+                    post = web_bridge.main([
+                        "post-shell", "--cwd", str(repo), "--command", "true",
+                        "--exit-code", "0", "--registry", str(registry),
+                    ])
+                    native = web_bridge.main([
+                        "native-stop", "--session-id", "controller-1", "--repo", str(repo),
+                        "--registry", str(registry), "--codex", str(codex),
+                    ])
+                    self.assertNotEqual(post, 0)
+                    self.assertNotEqual(native, 0)
+
+    def test_audit_once_does_not_mark_receipt_handled_when_wake_is_not_confirmed(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            audit = root / "audit.jsonl"
+            receipt = {
+                "receiptId": "wake-fail-1", "childTool": "shell_command", "state": "succeeded",
+                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
+                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            cursor = root / "cursor.json"
+            with patch.object(web_bridge, "dispatch_event", return_value=0), patch.object(
+                web_bridge, "_load_lifecycle_state", return_value={"pending_control_event": True, "triggers": ["READY:F1"]}
+            ), patch.object(
+                web_bridge, "dispatch_pending_lifecycle_wake", return_value={
+                    "result": "FAILED", "decision": "DEFER", "pending_control_event": True
+                }
+            ):
+                code = web_bridge.main([
+                    "audit-once", "--repo", str(repo), "--session-id", "controller-1",
+                    "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry),
+                    "--codex", str(codex),
+                ])
+            self.assertNotEqual(code, 0)
+            state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["receipts"]["wake-fail-1"], "pending")
 
     def test_post_shell_audit_and_native_stop_route_pending_events_through_one_dispatcher(self) -> None:
         from unittest.mock import patch

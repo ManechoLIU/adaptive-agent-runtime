@@ -729,7 +729,6 @@ def wake_existing_controller(
                 operation=None,
                 result="DEFERRED",
             )
-            _write_json_atomic_file(receipt_path, receipt)
             return receipt
 
         if decision == "NOOP_ACTIVE":
@@ -842,12 +841,7 @@ def dispatch_pending_lifecycle_wake(
         target_receipt = receipt_path
     fingerprint = _wake_event_fingerprint(lifecycle_state)
     prior = load_json(target_receipt)
-    if prior.get("event_fingerprint") == fingerprint and prior.get("result") in {
-        "CONFIRMED",
-        "DEFERRED",
-        "BLOCKED",
-        "FAILED",
-    }:
+    if prior.get("event_fingerprint") == fingerprint and prior.get("result") == "CONFIRMED":
         debounced = dict(prior)
         debounced["debounced"] = True
         return debounced
@@ -876,6 +870,10 @@ def dispatch_pending_lifecycle_wake(
         runtime_path=runtime_path,
     )
 
+
+
+def wake_receipt_confirmed(receipt: dict[str, Any] | None) -> bool:
+    return isinstance(receipt, dict) and receipt.get("result") == "CONFIRMED"
 
 def successful_guard_event_from_receipt(
     receipt: dict[str, Any], *, session_id: str, repo: Path
@@ -1275,13 +1273,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         dispatch_code = dispatch_event(event)
         if dispatch_code != 0:
             return dispatch_code
-        dispatch_pending_lifecycle_wake(
+        wake_receipt = dispatch_pending_lifecycle_wake(
             lifecycle_state=_load_lifecycle_state(session_id),
             session_id=session_id,
             repo=repo,
             registry=Path(args.registry).expanduser(),
             codex="/opt/homebrew/bin/codex",
         )
+        if wake_receipt is not None and not wake_receipt_confirmed(wake_receipt):
+            return 78
         return 0
 
     if args.command_name == "audit-once":
@@ -1329,7 +1329,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         if dispatch_code != 0:
                             print(f"web lifecycle dispatch failed for {_audit_receipt_key(receipt)}: exit {dispatch_code}", file=sys.stderr)
                             return dispatch_code
-                        dispatch_pending_lifecycle_wake(
+                        wake_receipt = dispatch_pending_lifecycle_wake(
                             lifecycle_state=_load_lifecycle_state(args.session_id),
                             session_id=args.session_id,
                             repo=repo,
@@ -1337,6 +1337,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                             codex=args.codex,
                             runtime_path=args.runtime_path,
                         )
+                        if wake_receipt is not None and not wake_receipt_confirmed(wake_receipt):
+                            print(
+                                f"web lifecycle wake not confirmed for {_audit_receipt_key(receipt)}: {wake_receipt.get('result')}",
+                                file=sys.stderr,
+                            )
+                            return 78
                     if args.auto_native_stop and guard_event is not None:
                         receipt_id = str(receipt.get("receiptId") or "web-guard")
                         state_path = (
@@ -1446,7 +1452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             runtime_path=args.runtime_path,
         )
         if wake_receipt is not None:
-            return 0 if wake_receipt.get("result") != "BLOCKED" else 78
+            return 0 if wake_receipt_confirmed(wake_receipt) else 78
         ok, error, env = preflight_native_resume(
             session_id=args.session_id, repo=repo, registry=Path(args.registry).expanduser(), codex=args.codex, runtime_path=args.runtime_path
         )
