@@ -60,7 +60,7 @@ State writes are atomic. The record contains run identity, requested and observe
 
 Initial interface:
 
-`python3 scripts/reviewer_supervisor.py run --repo <repo> --base <branch> --output <optional-path>`
+`python3 scripts/reviewer_supervisor.py run --repo <repo> --base <branch> [--timeout-seconds <seconds>]`
 
 The command is synchronous from the caller's perspective: it supervises the child until a terminal state and exits only after the state record is durable. A later asynchronous wrapper can be added without changing the state contract, but is outside this scope.
 

@@ -1,10 +1,11 @@
 import json
 import subprocess
+import time
 import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.reviewer_supervisor import ReviewContract, AttemptResult, run_attempt, run_review, git_common_state_root, validate_verdict
+from scripts.reviewer_supervisor import ReviewContract, AttemptResult, build_review_instructions, run_attempt, run_review, git_common_state_root, validate_verdict
 
 
 class ReviewerSupervisorCoreTests(unittest.TestCase):
@@ -15,6 +16,20 @@ class ReviewerSupervisorCoreTests(unittest.TestCase):
         if not common_path.is_absolute():
             common_path = (repo / common_path).resolve()
         self.assertEqual(git_common_state_root(repo), common_path / "adaptive-delivery" / "reviewer-runs")
+
+
+    def test_review_instructions_define_full_schema_and_exact_head(self):
+        head = "c" * 40
+        instructions = build_review_instructions("focus on runtime safety", head)
+        self.assertIn(head, instructions)
+        self.assertIn('"reviewed_head"', instructions)
+        self.assertIn('"verdict"', instructions)
+        self.assertIn('"critical"', instructions)
+        self.assertIn('"important"', instructions)
+        self.assertIn('"minor"', instructions)
+        self.assertIn("PASS", instructions)
+        self.assertIn("FINDINGS", instructions)
+        self.assertIn("focus on runtime safety", instructions)
 
     def test_valid_pass_is_bound_to_exact_head(self):
         head = "a" * 40
@@ -119,7 +134,56 @@ class ReviewerSupervisorLaunchTests(unittest.TestCase):
         self.assertEqual(result.pid, 4242)
 
 
+class _SlowStdout:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        time.sleep(5)
+        return json.dumps({"type": "thread.started", "thread_id": "late"}) + "\n"
+
+
+class _TimeoutProcess(_FakeProcess):
+    def __init__(self):
+        super().__init__([], returncode=-15)
+        self.stdout = _SlowStdout()
+        self.killed = False
+
+
+class ReviewerSupervisorTimeoutTests(unittest.TestCase):
+    def test_timeout_kills_process_group_and_fails_closed(self):
+        holder = []
+        killed = []
+        def factory(argv, **kwargs):
+            proc = _TimeoutProcess(); holder.append(proc); return proc
+        def killer(pid):
+            killed.append(pid); holder[0].killed = True
+
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "main", "d" * 40, "schema", root / "events", root / "final")
+        started = time.monotonic()
+        result = run_attempt(contract, 0, popen_factory=factory, codex_executable="codex", timeout_seconds=0.05, process_group_killer=killer)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(killed, [4242])
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertIn("timeout", result.diagnostic.lower())
+
+
+
 class ReviewerSupervisorRunTests(unittest.TestCase):
+    def setUp(self):
+        self._repo_tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._repo_tmp.name)
+        subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo, check=True)
+        (self.repo / "base.txt").write_text("base")
+        subprocess.run(["git", "add", "base.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=self.repo, check=True)
+
+    def tearDown(self):
+        self._repo_tmp.cleanup()
+
     def _write_final(self, contract, verdict="PASS", head=None):
         contract.final_path.write_text(json.dumps({
             "reviewed_head": head or contract.head,
@@ -132,7 +196,7 @@ class ReviewerSupervisorRunTests(unittest.TestCase):
         def attempt(contract, number):
             calls.append(number); self._write_final(contract, "FINDINGS")
             return AttemptResult("RUNNING", 1, 0, True, "s")
-        result = run_review(Path.cwd(), "main", "review", attempt_runner=attempt)
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt)
         self.assertEqual(result.state, "FINDINGS")
         self.assertEqual(calls, [0])
 
@@ -144,7 +208,7 @@ class ReviewerSupervisorRunTests(unittest.TestCase):
                 return AttemptResult("REVIEW_INFRA_FAILED", 1, 1, False, None, "start failed")
             self._write_final(contract)
             return AttemptResult("RUNNING", 2, 0, True, "s")
-        result = run_review(Path.cwd(), "main", "review", attempt_runner=attempt)
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt)
         self.assertEqual(result.state, "PASS")
         self.assertEqual(len(seen), 2)
         self.assertEqual(seen[0], seen[1])
@@ -154,7 +218,7 @@ class ReviewerSupervisorRunTests(unittest.TestCase):
         def attempt(contract, number):
             calls.append(number)
             return AttemptResult("RUNNING", number + 1, 0, True, "s")
-        result = run_review(Path.cwd(), "main", "review", attempt_runner=attempt)
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt)
         self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
         self.assertEqual(calls, [0, 1])
 
@@ -162,8 +226,48 @@ class ReviewerSupervisorRunTests(unittest.TestCase):
         def attempt(contract, number):
             self._write_final(contract, head="f" * 40)
             return AttemptResult("RUNNING", 1, 0, True, "s")
-        result = run_review(Path.cwd(), "main", "review", attempt_runner=attempt, max_infra_retries=0)
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
         self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+
+    def test_dirty_worktree_is_rejected_before_attempt(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            (repo / "x.txt").write_text("one")
+            subprocess.run(["git", "add", "x.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+            (repo / "x.txt").write_text("dirty")
+            calls = []
+            def attempt(contract, number):
+                calls.append(number)
+                return AttemptResult("RUNNING", 1, 0, True, "s")
+            result = run_review(repo, "HEAD~0", "review", attempt_runner=attempt, max_infra_retries=0)
+            self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+            self.assertEqual(calls, [])
+            state = json.loads(result.state_path.read_text())
+            self.assertIn("dirty", state["diagnostic"].lower())
+
+    def test_head_change_during_review_invalidates_pass(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            (repo / "x.txt").write_text("one")
+            subprocess.run(["git", "add", "x.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+            def attempt(contract, number):
+                self._write_final(contract)
+                (repo / "y.txt").write_text("two")
+                subprocess.run(["git", "add", "y.txt"], cwd=repo, check=True)
+                subprocess.run(["git", "commit", "-qm", "move head"], cwd=repo, check=True)
+                return AttemptResult("RUNNING", 1, 0, True, "s")
+            result = run_review(repo, "HEAD~1", "review", attempt_runner=attempt, max_infra_retries=0)
+            self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+            state = json.loads(result.state_path.read_text())
+            self.assertIn("head changed", state["diagnostic"].lower())
 
 
 if __name__ == "__main__":

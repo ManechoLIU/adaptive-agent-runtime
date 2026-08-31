@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import tempfile
+import signal
+import threading
 
 
 def git_common_state_root(repo: Path) -> Path:
@@ -15,6 +17,27 @@ def git_common_state_root(repo: Path) -> Path:
     if not common.is_absolute():
         common = (repo / common).resolve()
     return common / "adaptive-delivery" / "reviewer-runs"
+
+
+def build_review_instructions(user_instructions: str, expected_head: str) -> str:
+    schema_example = {
+        "reviewed_head": expected_head,
+        "verdict": "PASS",
+        "critical": [],
+        "important": [],
+        "minor": [],
+    }
+    return (
+        f"Review the exact candidate revision {expected_head}.\n"
+        f"Additional review focus: {user_instructions.strip() or 'none'}\n\n"
+        "Your final response MUST be ONLY one JSON object with exactly these keys. "
+        "The verdict value is restricted to PASS or FINDINGS. Example shape:\n"
+        + json.dumps(schema_example, ensure_ascii=False, indent=2)
+        + "\nUse empty arrays when there are no findings at that severity. "
+        "Use PASS only when critical, important, and minor are all empty; otherwise use FINDINGS. "
+        "reviewed_head MUST equal the exact revision stated above. "
+        "Do not wrap the JSON in markdown fences and do not include prose before or after it."
+    )
 
 
 def validate_verdict(payload: dict, expected_head: str) -> dict:
@@ -79,12 +102,21 @@ def _session_id_from_event(event: dict) -> Optional[str]:
     return None
 
 
+def _kill_process_group(pid: int) -> None:
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+
 def run_attempt(
     contract: ReviewContract,
     attempt: int,
     *,
     popen_factory: Callable = subprocess.Popen,
     codex_executable: str = "codex",
+    timeout_seconds: float = 600.0,
+    process_group_killer: Callable[[int], None] = _kill_process_group,
 ) -> AttemptResult:
     contract.event_path.parent.mkdir(parents=True, exist_ok=True)
     contract.final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,11 +147,14 @@ def run_attempt(
         raise RuntimeError("reviewer stdin pipe unavailable")
     process.stdin.write(contract.instructions)
     process.stdin.close()
-    running_observed = False
-    session_id = None
-    diagnostics = []
-    with contract.event_path.open("w", encoding="utf-8") as event_log:
-        if process.stdout is not None:
+
+    observed = {"running": False, "session_id": None}
+    diagnostics: list[str] = []
+
+    def consume_stdout() -> None:
+        with contract.event_path.open("w", encoding="utf-8") as event_log:
+            if process.stdout is None:
+                return
             for line in process.stdout:
                 event_log.write(line)
                 event_log.flush()
@@ -129,19 +164,41 @@ def run_attempt(
                     diagnostics.append(line.strip())
                     continue
                 if isinstance(event, dict):
-                    running_observed = True
-                    session_id = session_id or _session_id_from_event(event)
+                    observed["running"] = True
+                    observed["session_id"] = observed["session_id"] or _session_id_from_event(event)
+
+    reader = threading.Thread(target=consume_stdout, name=f"reviewer-events-{attempt}", daemon=True)
+    reader.start()
+    reader.join(timeout_seconds)
+    timed_out = reader.is_alive()
+    if timed_out:
+        process_group_killer(process.pid)
+        reader.join(0.2)
+        try:
+            exit_code = process.wait(timeout=5.0)
+        except TypeError:
+            exit_code = process.wait()
+        except subprocess.TimeoutExpired:
+            exit_code = -signal.SIGTERM
+        diagnostic = f"reviewer timeout after {timeout_seconds:g}s; process group terminated"
+        return AttemptResult(
+            state="REVIEW_INFRA_FAILED",
+            pid=process.pid,
+            exit_code=exit_code,
+            running_observed=bool(observed["running"]),
+            session_id=observed["session_id"],
+            diagnostic=diagnostic,
+        )
+
     exit_code = process.wait()
-    if not running_observed:
-        state = "REVIEW_INFRA_FAILED"
-    else:
-        state = "RUNNING" if exit_code == 0 else "REVIEW_INFRA_FAILED"
+    running_observed = bool(observed["running"])
+    state = "RUNNING" if running_observed and exit_code == 0 else "REVIEW_INFRA_FAILED"
     return AttemptResult(
         state=state,
         pid=process.pid,
         exit_code=exit_code,
         running_observed=running_observed,
-        session_id=session_id,
+        session_id=observed["session_id"],
         diagnostic="\n".join(diagnostics)[-4000:],
     )
 
@@ -166,6 +223,12 @@ def _git_head(repo: Path) -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
 
 
+def _git_status(repo: Path) -> str:
+    return subprocess.check_output(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=repo, text=True
+    )
+
+
 def _sha256(path: Path) -> Optional[str]:
     if not path.exists():
         return None
@@ -180,6 +243,7 @@ def run_review(
     max_infra_retries: int = 1,
     attempt_runner=None,
     codex_executable: Optional[str] = None,
+    timeout_seconds: float = 600.0,
 ) -> ReviewRunResult:
     repo = Path(repo).resolve()
     head = _git_head(repo)
@@ -187,7 +251,8 @@ def run_review(
     root = git_common_state_root(repo)
     root.mkdir(parents=True, exist_ok=True)
     state_path = root / f"{run_id}.json"
-    instruction_hash = hashlib.sha256(instructions.encode("utf-8")).hexdigest()
+    review_instructions = build_review_instructions(instructions, head)
+    instruction_hash = hashlib.sha256(review_instructions.encode("utf-8")).hexdigest()
     runner = attempt_runner
     codex = codex_executable or shutil.which("codex") or "codex"
     base_state = {
@@ -200,14 +265,27 @@ def run_review(
         "started_at": time.time(),
         "retry_count": 0,
     }
+    dirty = _git_status(repo)
+    if dirty:
+        blocked = dict(base_state)
+        blocked.update({
+            "state": "REVIEW_INFRA_FAILED",
+            "diagnostic": "dirty worktree; exact candidate review requires a clean worktree",
+            "completed_at": time.time(),
+        })
+        atomic_write_json(state_path, blocked)
+        return ReviewRunResult(run_id, "REVIEW_INFRA_FAILED", head, None, 0, state_path)
+
     atomic_write_json(state_path, base_state)
     last_diag = ""
     for attempt in range(max_infra_retries + 1):
         event_path = root / f"{run_id}.attempt-{attempt}.events.jsonl"
         final_path = root / f"{run_id}.attempt-{attempt}.final.json"
-        contract = ReviewContract(repo, base, head, instructions, event_path, final_path)
+        contract = ReviewContract(repo, base, head, review_instructions, event_path, final_path)
         if runner is None:
-            result = run_attempt(contract, attempt, codex_executable=codex)
+            result = run_attempt(
+                contract, attempt, codex_executable=codex, timeout_seconds=timeout_seconds
+            )
         else:
             result = runner(contract, attempt)
         snapshot = dict(base_state)
@@ -220,6 +298,18 @@ def run_review(
             "event_sha256": _sha256(event_path),
             "final_sha256": _sha256(final_path),
         })
+        current_head = _git_head(repo)
+        current_status = _git_status(repo)
+        if current_head != head:
+            last_diag = f"HEAD changed during review: expected {head}, observed {current_head}"
+            snapshot.update({"state": "REVIEW_INFRA_FAILED", "diagnostic": last_diag})
+            atomic_write_json(state_path, snapshot)
+            continue
+        if current_status:
+            last_diag = "worktree became dirty during review; exact candidate binding invalidated"
+            snapshot.update({"state": "REVIEW_INFRA_FAILED", "diagnostic": last_diag})
+            atomic_write_json(state_path, snapshot)
+            continue
         if result.state == "REVIEW_INFRA_FAILED" or result.exit_code != 0 or not result.running_observed:
             last_diag = result.diagnostic or f"review process exit={result.exit_code} running_observed={result.running_observed}"
             snapshot.update({"state": "REVIEW_INFRA_FAILED", "diagnostic": last_diag[-4000:]})
@@ -256,9 +346,10 @@ def main(argv=None) -> int:
     run = sub.add_parser("run")
     run.add_argument("--repo", required=True)
     run.add_argument("--base", default="main")
-    run.add_argument("--instructions", default="Review the exact candidate revision. Return only the required structured verdict JSON.")
+    run.add_argument("--instructions", default="Review correctness, migration safety, runtime safety, and test coverage.")
+    run.add_argument("--timeout-seconds", type=float, default=600.0)
     args = parser.parse_args(argv)
-    result = run_review(Path(args.repo), args.base, args.instructions)
+    result = run_review(Path(args.repo), args.base, args.instructions, timeout_seconds=args.timeout_seconds)
     print(json.dumps({"run_id": result.run_id, "state": result.state, "reviewed_head": result.reviewed_head, "state_path": str(result.state_path)}, ensure_ascii=False))
     return 0 if result.state == "PASS" else 10 if result.state == "FINDINGS" else 20
 
