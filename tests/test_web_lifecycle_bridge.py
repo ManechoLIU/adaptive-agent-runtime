@@ -1261,6 +1261,57 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                     self.assertNotEqual(post, 0)
                     self.assertNotEqual(native, 0)
 
+    def test_entrypoints_fail_closed_when_pending_wake_dispatch_returns_none(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, marker = self.make_controller(root)
+            state = {"pending_control_event": True, "triggers": ["READY:F1"], "controller_host": "web"}
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=state), patch.object(
+                web_bridge, "dispatch_pending_lifecycle_wake", return_value=None
+            ), patch.object(web_bridge, "dispatch_event", return_value=0), patch.object(
+                web_bridge, "preflight_native_resume", side_effect=AssertionError("direct resume must not run")
+            ):
+                post = web_bridge.main([
+                    "post-shell", "--cwd", str(repo), "--command", "true",
+                    "--exit-code", "0", "--registry", str(registry),
+                ])
+                native = web_bridge.main([
+                    "native-stop", "--session-id", "controller-1", "--repo", str(repo),
+                    "--registry", str(registry), "--codex", str(codex),
+                ])
+            self.assertNotEqual(post, 0)
+            self.assertNotEqual(native, 0)
+            self.assertFalse(marker.exists())
+
+    def test_audit_once_keeps_receipt_pending_when_pending_wake_dispatch_returns_none(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            audit = root / "audit.jsonl"
+            receipt = {
+                "receiptId": "wake-none-1", "childTool": "shell_command", "state": "succeeded",
+                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
+                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            cursor = root / "cursor.json"
+            with patch.object(web_bridge, "dispatch_event", return_value=0), patch.object(
+                web_bridge, "_load_lifecycle_state", return_value={"pending_control_event": True, "triggers": ["READY:F1"]}
+            ), patch.object(web_bridge, "dispatch_pending_lifecycle_wake", return_value=None):
+                code = web_bridge.main([
+                    "audit-once", "--repo", str(repo), "--session-id", "controller-1",
+                    "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry),
+                    "--codex", str(codex),
+                ])
+            self.assertNotEqual(code, 0)
+            state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["receipts"]["wake-none-1"], "pending")
+
     def test_audit_once_does_not_mark_receipt_handled_when_wake_is_not_confirmed(self) -> None:
         from unittest.mock import patch
 

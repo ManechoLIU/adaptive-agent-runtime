@@ -1273,14 +1273,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         dispatch_code = dispatch_event(event)
         if dispatch_code != 0:
             return dispatch_code
+        lifecycle_state = _load_lifecycle_state(session_id)
         wake_receipt = dispatch_pending_lifecycle_wake(
-            lifecycle_state=_load_lifecycle_state(session_id),
+            lifecycle_state=lifecycle_state,
             session_id=session_id,
             repo=repo,
             registry=Path(args.registry).expanduser(),
             codex="/opt/homebrew/bin/codex",
         )
-        if wake_receipt is not None and not wake_receipt_confirmed(wake_receipt):
+        if lifecycle_state.get("pending_control_event") is True and not wake_receipt_confirmed(wake_receipt):
             return 78
         return 0
 
@@ -1329,17 +1330,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                         if dispatch_code != 0:
                             print(f"web lifecycle dispatch failed for {_audit_receipt_key(receipt)}: exit {dispatch_code}", file=sys.stderr)
                             return dispatch_code
+                        lifecycle_state = _load_lifecycle_state(args.session_id)
                         wake_receipt = dispatch_pending_lifecycle_wake(
-                            lifecycle_state=_load_lifecycle_state(args.session_id),
+                            lifecycle_state=lifecycle_state,
                             session_id=args.session_id,
                             repo=repo,
                             registry=Path(args.registry).expanduser(),
                             codex=args.codex,
                             runtime_path=args.runtime_path,
                         )
-                        if wake_receipt is not None and not wake_receipt_confirmed(wake_receipt):
+                        if lifecycle_state.get("pending_control_event") is True and not wake_receipt_confirmed(wake_receipt):
+                            result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
                             print(
-                                f"web lifecycle wake not confirmed for {_audit_receipt_key(receipt)}: {wake_receipt.get('result')}",
+                                f"web lifecycle wake not confirmed for {_audit_receipt_key(receipt)}: {result}",
                                 file=sys.stderr,
                             )
                             return 78
@@ -1443,14 +1446,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             print(json.dumps(command, ensure_ascii=False))
             return 0
+        lifecycle_state = _load_lifecycle_state(args.session_id)
         wake_receipt = dispatch_pending_lifecycle_wake(
-            lifecycle_state=_load_lifecycle_state(args.session_id),
+            lifecycle_state=lifecycle_state,
             session_id=args.session_id,
             repo=repo,
             registry=Path(args.registry).expanduser(),
             codex=args.codex,
             runtime_path=args.runtime_path,
         )
+        if lifecycle_state.get("pending_control_event") is True:
+            return 0 if wake_receipt_confirmed(wake_receipt) else 78
         if wake_receipt is not None:
             return 0 if wake_receipt_confirmed(wake_receipt) else 78
         ok, error, env = preflight_native_resume(
