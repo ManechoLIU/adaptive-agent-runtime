@@ -1161,7 +1161,7 @@ if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* ]]; then
   _ad_web_lifecycle_exit() {{
     local _ad_web_exit_code=$?
     trap - EXIT
-    "$_ad_web_bridge_python" "$_ad_web_bridge_script" post-shell \\n      --cwd "$_ad_web_cwd" \\n      --command "$_ad_web_command" \\n      --exit-code "$_ad_web_exit_code"
+    "$_ad_web_bridge_python" "$_ad_web_bridge_script" post-shell --cwd "$_ad_web_cwd" --command "$_ad_web_command" --exit-code "$_ad_web_exit_code"
     local _ad_web_bridge_exit_code=$?
     if [[ "$_ad_web_exit_code" -ne 0 ]]; then
       exit "$_ad_web_exit_code"

@@ -196,11 +196,28 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(capture.read_text(encoding="utf-8"))["session_id"], "controller-1")
 
-    def test_zshenv_exit_bridge_propagates_lifecycle_failure_over_successful_shell(self) -> None:
+    def test_zshenv_exit_bridge_executes_and_preserves_exit_precedence(self) -> None:
         block = web_bridge.zshenv_block()
         self.assertNotIn("|| true", block)
-        self.assertIn("_ad_web_bridge_exit_code", block)
-        self.assertIn('exit "$_ad_web_bridge_exit_code"', block)
+        self.assertNotIn("\\n      --cwd", block)
+        self.assertIn('post-shell --cwd "$_ad_web_cwd"', block)
+
+        function = block.split("  _ad_web_lifecycle_exit() {", 1)[1].split("  }\n  trap", 1)[0]
+        function = "_ad_web_lifecycle_exit() {" + function + "}"
+        bridge_call = '"$_ad_web_bridge_python" "$_ad_web_bridge_script" post-shell --cwd "$_ad_web_cwd" --command "$_ad_web_command" --exit-code "$_ad_web_exit_code"'
+
+        def run_exit_function(original_exit: int, bridge_exit: int) -> int:
+            script = (
+                "_ad_web_cwd=/tmp; _ad_web_command=true; "
+                + function.replace(bridge_call, f"/bin/sh -c 'exit {bridge_exit}'")
+                + f"\n/bin/sh -c 'exit {original_exit}'; _ad_web_lifecycle_exit"
+            )
+            return subprocess.run(["/bin/zsh", "-c", script], check=False).returncode
+
+        self.assertEqual(run_exit_function(0, 0), 0)
+        self.assertEqual(run_exit_function(0, 78), 78)
+        self.assertEqual(run_exit_function(7, 0), 7)
+        self.assertEqual(run_exit_function(7, 78), 7)
 
     def test_print_zshenv_block_is_scoped_to_ai_bridge_parent(self) -> None:
         result = self.run_bridge("print-zshenv-block")
