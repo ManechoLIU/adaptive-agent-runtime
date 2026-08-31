@@ -40,6 +40,7 @@ LINEAGE_CONTRACT_FIELDS = ("primary_goal", "success_criteria", "owned_scope", "s
 LINEAGE_WHITESPACE_RE = re.compile(r"[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
 PASS_EVIDENCE_SCHEMES = {"test-log", "green-test", "receipt", "git", "file", "artifact"}
 PASS_ARTIFACT_SCHEMES = {"git", "file", "artifact"}
+RECONCILIATION_EVIDENCE_SCHEMES = {"receipt", "file", "artifact"}
 
 @dataclass(frozen=True)
 class RuntimePolicy:
@@ -150,6 +151,12 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
         if not existing and attempt != 1:
             raise ValueError("new Assignment must start at attempt 1")
         if existing:
+            successful_terminal = (
+                existing.get("terminal_state") == "completed"
+                and (existing.get("delivery_outcome") == "pass" or existing.get("outcome") == "success")
+            )
+            if successful_terminal:
+                raise ValueError("completed assignment cannot be recovered; create a new Assignment for new work")
             current_attempt = int(existing.get("attempt", 1))
             if attempt != current_attempt + 1:
                 raise ValueError("recovery attempt must increment by exactly one")
@@ -281,6 +288,16 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             elif "result_unknown" in receipt and not isinstance(receipt.get("result_unknown"), bool):
                 raise ValueError("result_unknown must be a boolean")
             result_unknown = receipt.get("result_unknown", False)
+            reconciliation_evidence = receipt.get("reconciliation_evidence", [])
+            if lease.get("side_effect") and not result_unknown:
+                successful_delivery = terminal == "completed" and delivery_outcome == "pass"
+                if not successful_delivery:
+                    if not isinstance(reconciliation_evidence, list) or not reconciliation_evidence:
+                        raise ValueError("clearing side-effect result_unknown requires reconciliation evidence")
+                    if not all(_traceable_locator(item, RECONCILIATION_EVIDENCE_SCHEMES) for item in reconciliation_evidence):
+                        raise ValueError("reconciliation evidence must be traceable receipt/file/artifact locators")
+            elif reconciliation_evidence and not isinstance(reconciliation_evidence, list):
+                raise ValueError("reconciliation_evidence must be a list")
         else:
             if "result_unknown" in receipt and not isinstance(receipt.get("result_unknown"), bool):
                 raise ValueError("result_unknown must be a boolean")
@@ -291,6 +308,8 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             else:
                 result_unknown = legacy_outcome != "success"
         lease["result_unknown"] = result_unknown
+        if existing_contract_version >= 2 and receipt.get("reconciliation_evidence"):
+            lease["reconciliation_evidence"] = list(receipt["reconciliation_evidence"])
         lease["terminal_state"] = terminal; lease["terminal_at"] = _iso(issued); lease["summary"] = summary
         if transport_outcome is None and delivery_outcome is None:
             lease["outcome"] = legacy_outcome
