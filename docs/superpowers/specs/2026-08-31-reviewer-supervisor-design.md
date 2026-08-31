@@ -14,7 +14,7 @@ The existing technical Skill ID and runtime roots remain unchanged. Reviewer sta
 
 Add `scripts/reviewer_supervisor.py` as the single local entry point for supervised Codex review execution.
 
-The supervisor launches `codex exec review` directly with `subprocess.Popen([...], start_new_session=True)` and no `nohup`, `sh -c`, or PID obtained from a wrapper shell. Each run receives a generated `run_id`, canonical repository root, exact candidate HEAD, base branch, start time, direct child PID, event-log path, final-message path, and state path.
+The supervisor launches a dedicated read-only structured `codex exec` Reviewer directly with `subprocess.Popen([...], start_new_session=True)` and no `nohup`, `sh -c`, or PID obtained from a wrapper shell. The requested base ref is resolved once to an immutable commit SHA, and the Reviewer is instructed to inspect exactly `base_sha..candidate_head`. Codex `--output-schema` constrains the terminal response. Native `codex exec review` remains available for interactive review, but is not the machine-verdict path because the current CLI may emit its native human review format even when an output schema is supplied. Each run receives a generated `run_id`, canonical repository root, exact candidate HEAD, base ref plus resolved base revision, start time, direct child PID, event-log path, final-message path, and state path.
 
 The Codex process runs with `--json` so the supervisor can observe real execution events. A run is not `RUNNING` merely because `Popen` returned. Startup is confirmed only after the direct child is alive and at least one valid Codex event is received. If the event stream exposes a session/thread identifier, it is persisted as additional identity evidence; absence of a session identifier in a CLI version that does not expose one is not by itself fatal as long as the direct process and valid Codex events are proven.
 
@@ -72,7 +72,7 @@ Exit behavior:
 
 ## Safety and Compatibility
 
-The change must not alter existing Assignment runtime state, controller registry, rule handshake, host adapter configuration, Skill ID, or installed path. Existing manual `codex exec review` remains usable; the supervisor becomes the recommended machine path for required final review.
+The change must not alter existing Assignment runtime state, controller registry, rule handshake, host adapter configuration, Skill ID, or installed path. Existing manual `codex exec review` remains usable; the supervisor’s read-only structured `codex exec` Reviewer becomes the recommended machine path for required final review.
 
 No shell PID heuristic is accepted as proof of reviewer liveness. No review result is accepted solely from process exit code. No infrastructure retry may change candidate HEAD or silently widen the review scope.
 

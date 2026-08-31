@@ -4,7 +4,7 @@
 
 **Goal:** Replace fragile background-shell Reviewer launching with a directly supervised, revision-bound, fail-closed Codex review execution path.
 
-**Architecture:** Add one focused Python supervisor that launches `codex exec review` directly, consumes JSON events, persists ephemeral run evidence under the existing Git common-dir runtime root, validates a structured terminal verdict against the captured candidate HEAD, and retries infrastructure failure at most once. It does not create project task state or alter when review is required.
+**Architecture:** Add one focused Python supervisor that launches a dedicated read-only structured `codex exec` Reviewer directly, resolves the requested base ref to an immutable commit, constrains the terminal response with `--output-schema`, consumes JSON events, persists ephemeral run evidence under the existing Git common-dir runtime root, validates a structured terminal verdict against the captured candidate HEAD, and retries infrastructure failure at most once. Native `codex exec review` remains a manual/interactive path because its native final formatting is not reliable as a machine verdict contract. The supervisor does not create project task state or alter when review is required.
 
 **Tech Stack:** Python 3 standard library (`subprocess`, `json`, `hashlib`, `pathlib`, `tempfile`), existing unittest suite, Codex CLI.
 

@@ -1,4 +1,5 @@
 import json
+import signal
 import subprocess
 import time
 import tempfile
@@ -20,8 +21,9 @@ class ReviewerSupervisorCoreTests(unittest.TestCase):
 
     def test_review_instructions_define_full_schema_and_exact_head(self):
         head = "c" * 40
-        instructions = build_review_instructions("focus on runtime safety", head)
+        instructions = build_review_instructions("focus on runtime safety", head, "b" * 40)
         self.assertIn(head, instructions)
+        self.assertIn("b" * 40, instructions)
         self.assertIn('"reviewed_head"', instructions)
         self.assertIn('"verdict"', instructions)
         self.assertIn('"critical"', instructions)
@@ -120,7 +122,9 @@ class ReviewerSupervisorLaunchTests(unittest.TestCase):
         result = run_attempt(contract, 0, popen_factory=factory, codex_executable="/usr/bin/codex")
         argv, kwargs = calls[0]
         self.assertEqual(argv[0:2], ["/usr/bin/codex", "exec"])
-        self.assertEqual(argv[-3:], ["review", "--base", "main"])
+        self.assertEqual(argv[-1], "-")
+        self.assertNotIn("review", argv)
+        self.assertNotIn("--base", argv)
         self.assertIn("--output-schema", argv)
         schema_path = Path(argv[argv.index("--output-schema") + 1])
         schema = json.loads(schema_path.read_text())
@@ -178,15 +182,15 @@ class ReviewerSupervisorTimeoutTests(unittest.TestCase):
         killed = []
         def factory(argv, **kwargs):
             proc = _TimeoutProcess(); holder.append(proc); return proc
-        def killer(pid):
-            killed.append(pid); holder[0].killed = True
+        def killer(pid, sig):
+            killed.append((pid, sig)); holder[0].killed = True
 
         root = Path(tempfile.mkdtemp())
         contract = ReviewContract(Path.cwd(), "main", "d" * 40, "schema", root / "events", root / "final")
         started = time.monotonic()
         result = run_attempt(contract, 0, popen_factory=factory, codex_executable="codex", timeout_seconds=0.05, process_group_killer=killer)
         self.assertLess(time.monotonic() - started, 1.0)
-        self.assertEqual(killed, [4242])
+        self.assertEqual(killed, [(4242, signal.SIGTERM)])
         self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
         self.assertIn("timeout", result.diagnostic.lower())
 
@@ -195,16 +199,44 @@ class ReviewerSupervisorTimeoutTests(unittest.TestCase):
         killed = []
         def factory(argv, **kwargs):
             proc = _TimeoutProcess(stdout=iter([])); holder.append(proc); return proc
-        def killer(pid):
-            killed.append(pid); holder[0].killed = True
+        def killer(pid, sig):
+            killed.append((pid, sig)); holder[0].killed = True
         root = Path(tempfile.mkdtemp())
         contract = ReviewContract(Path.cwd(), "main", "e" * 40, "schema", root / "events", root / "final")
         started = time.monotonic()
         result = run_attempt(contract, 0, popen_factory=factory, codex_executable="codex", timeout_seconds=0.05, process_group_killer=killer)
         self.assertLess(time.monotonic() - started, 1.0)
-        self.assertEqual(killed, [4242])
+        self.assertEqual(killed, [(4242, signal.SIGTERM)])
         self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
         self.assertIn("timeout", result.diagnostic.lower())
+
+
+class _TermIgnoringProcess(_FakeProcess):
+    def __init__(self):
+        super().__init__([], returncode=-signal.SIGKILL)
+        self.signals = []
+
+    def wait(self, timeout=None):
+        if signal.SIGKILL not in self.signals:
+            raise subprocess.TimeoutExpired("codex", timeout or 0)
+        return self._returncode
+
+
+class ReviewerSupervisorForcedCleanupTests(unittest.TestCase):
+    def test_timeout_escalates_term_to_kill_and_reaps_before_return(self):
+        holder = []
+        sent = []
+        def factory(argv, **kwargs):
+            proc = _TermIgnoringProcess(); holder.append(proc); return proc
+        def signaler(pid, sig):
+            sent.append((pid, sig)); holder[0].signals.append(sig)
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "a" * 40, "b" * 40, "schema", root / "events", root / "final")
+        result = run_attempt(contract, 0, popen_factory=factory, codex_executable="codex", timeout_seconds=0.01, process_group_killer=signaler, termination_grace_seconds=0.01)
+        self.assertEqual(sent, [(4242, signal.SIGTERM), (4242, signal.SIGKILL)])
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertEqual(result.exit_code, -signal.SIGKILL)
+        self.assertIn("SIGKILL", result.diagnostic)
 
 
 class ReviewerSupervisorRunTests(unittest.TestCase):

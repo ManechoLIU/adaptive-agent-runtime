@@ -19,7 +19,7 @@ def git_common_state_root(repo: Path) -> Path:
     return common / "adaptive-delivery" / "reviewer-runs"
 
 
-def build_review_instructions(user_instructions: str, expected_head: str) -> str:
+def build_review_instructions(user_instructions: str, expected_head: str, base_revision: str) -> str:
     schema_example = {
         "reviewed_head": expected_head,
         "verdict": "PASS",
@@ -28,7 +28,8 @@ def build_review_instructions(user_instructions: str, expected_head: str) -> str
         "minor": [],
     }
     return (
-        f"Review the exact candidate revision {expected_head}.\n"
+        f"Act as an independent read-only code reviewer. Review exactly the immutable Git range {base_revision}..{expected_head}. "
+        f"Inspect that exact range with Git and do not substitute mutable branch names or uncommitted content.\n"
         f"Additional review focus: {user_instructions.strip() or 'none'}\n\n"
         "Your final response MUST be ONLY one JSON object with exactly these keys. "
         "The verdict value is restricted to PASS or FINDINGS. Example shape:\n"
@@ -96,6 +97,7 @@ class AttemptResult:
     running_observed: bool
     session_id: Optional[str] = None
     diagnostic: str = ""
+    retry_safe: bool = True
 
 
 def _session_id_from_event(event: dict) -> Optional[str]:
@@ -109,9 +111,9 @@ def _session_id_from_event(event: dict) -> Optional[str]:
     return None
 
 
-def _kill_process_group(pid: int) -> None:
+def _signal_process_group(pid: int, sig: int) -> None:
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        os.killpg(os.getpgid(pid), sig)
     except ProcessLookupError:
         return
 
@@ -139,7 +141,8 @@ def run_attempt(
     popen_factory: Callable = subprocess.Popen,
     codex_executable: str = "codex",
     timeout_seconds: float = 600.0,
-    process_group_killer: Callable[[int], None] = _kill_process_group,
+    process_group_killer: Callable[[int, int], None] = _signal_process_group,
+    termination_grace_seconds: float = 5.0,
 ) -> AttemptResult:
     contract.event_path.parent.mkdir(parents=True, exist_ok=True)
     contract.final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -151,14 +154,14 @@ def run_attempt(
         "--ignore-user-config",
         "--ignore-rules",
         "--ephemeral",
+        "--sandbox",
+        "read-only",
         "--output-schema",
         str(schema_path),
         "--json",
         "-o",
         str(contract.final_path),
-        "review",
-        "--base",
-        contract.base,
+        "-",
     ]
     process = popen_factory(
         argv,
@@ -199,19 +202,31 @@ def run_attempt(
     try:
         exit_code = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
-        process_group_killer(process.pid)
+        process_group_killer(process.pid, signal.SIGTERM)
+        forced_kill = False
+        retry_safe = True
         try:
-            exit_code = process.wait(timeout=5.0)
+            exit_code = process.wait(timeout=termination_grace_seconds)
         except subprocess.TimeoutExpired:
-            exit_code = -signal.SIGTERM
+            forced_kill = True
+            process_group_killer(process.pid, signal.SIGKILL)
+            try:
+                exit_code = process.wait(timeout=termination_grace_seconds)
+            except subprocess.TimeoutExpired:
+                exit_code = -signal.SIGKILL
+                retry_safe = False
         reader.join(0.2)
+        cleanup = "SIGKILL after SIGTERM grace" if forced_kill else "SIGTERM"
+        if not retry_safe:
+            cleanup += "; process could not be reaped, retry disabled"
         return AttemptResult(
             state="REVIEW_INFRA_FAILED",
             pid=process.pid,
             exit_code=exit_code,
             running_observed=bool(observed["running"]),
             session_id=observed["session_id"],
-            diagnostic=f"reviewer timeout after {timeout_seconds:g}s; process group terminated",
+            diagnostic=f"reviewer timeout after {timeout_seconds:g}s; cleanup={cleanup}",
+            retry_safe=retry_safe,
         )
     reader.join(1.0)
     if reader.is_alive():
@@ -289,7 +304,7 @@ def run_review(
     root = git_common_state_root(repo)
     root.mkdir(parents=True, exist_ok=True)
     state_path = root / f"{run_id}.json"
-    review_instructions = build_review_instructions(instructions, head)
+    review_instructions = build_review_instructions(instructions, head, base_revision)
     instruction_hash = hashlib.sha256(review_instructions.encode("utf-8")).hexdigest()
     runner = attempt_runner
     codex = codex_executable or shutil.which("codex") or "codex"
@@ -351,8 +366,10 @@ def run_review(
             continue
         if result.state == "REVIEW_INFRA_FAILED" or result.exit_code != 0 or not result.running_observed:
             last_diag = result.diagnostic or f"review process exit={result.exit_code} running_observed={result.running_observed}"
-            snapshot.update({"state": "REVIEW_INFRA_FAILED", "diagnostic": last_diag[-4000:]})
+            snapshot.update({"state": "REVIEW_INFRA_FAILED", "diagnostic": last_diag[-4000:], "retry_safe": result.retry_safe})
             atomic_write_json(state_path, snapshot)
+            if not result.retry_safe:
+                return ReviewRunResult(run_id, "REVIEW_INFRA_FAILED", head, None, attempt + 1, state_path)
             continue
         try:
             if not final_path.exists() or not final_path.read_text(encoding="utf-8").strip():
