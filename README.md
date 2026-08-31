@@ -388,7 +388,17 @@ Adaptive Agent Runtime 的 Core 不依赖 AI-Bridge。检测到 AI-Bridge 时，
 
 ## 安装
 
-安装整个仓库，不要只复制 `SKILL.md`；否则会缺少 references、scripts 和测试。
+安装整个仓库，不要只复制 `SKILL.md`；否则会缺少 references、scripts 和测试。推荐使用同一个安装入口完成 Core 与当前机器可用 Host Adapter 的配置：
+
+```bash
+python3 scripts/install_skill.py \
+  --source /path/to/adaptive-delivery-source \
+  --summary "Install Adaptive Agent Runtime" \
+  --impact none \
+  --stop-condition "installation verified"
+```
+
+安装器保持技术 Skill ID 与机器状态路径 `adaptive-delivery` 不变，但 manifest 对外记录 `Adaptive Agent Runtime / adaptive-agent-runtime`。检测到 Codex 时会幂等合并 lifecycle + scoring hooks；检测到 AI-Bridge 时会幂等安装 Web shell bridge；已有 Hook 和 `.zshenv` 其他内容不会被覆盖。Codex 非托管 Hook 的 **Active / trusted** 仍必须由宿主自身确认，因此即使配置已写入，能力报告在无法机器验证 trust 时仍为 `degraded`，不会虚报完全启用。没有 AI-Bridge 时安装本身仍成功，Web 本地能力明确降级为 `pure_web_file`。如只需要复制 Core、明确不希望安装器修改宿主配置，可加 `--no-configure-host-adapters`。
 
 ### Codex
 

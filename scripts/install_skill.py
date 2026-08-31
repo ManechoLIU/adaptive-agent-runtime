@@ -9,6 +9,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import shlex
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -20,9 +22,28 @@ PRODUCT_SLUG = "adaptive-agent-runtime"
 LEGACY_SKILL_IDS = ("adaptive-delivery",)
 DEFAULT_AI_BRIDGE_EXECUTABLE = Path("/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge")
 DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
+DEFAULT_ZSHENV = Path.home() / ".zshenv"
+WEB_BLOCK_START = "# >>> adaptive-delivery web lifecycle bridge >>>"
+WEB_BLOCK_END = "# <<< adaptive-delivery web lifecycle bridge <<<"
 MANIFEST_NAME = ".adaptive-delivery-install.json"
 IMPACTS = {"none", "live_assignments"}
 
+
+
+def _hooks_contain(path: Path, needle: str) -> bool:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return needle in json.dumps(data, ensure_ascii=False)
+
+
+def _zshenv_has_web_bridge(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return WEB_BLOCK_START in text and WEB_BLOCK_END in text
 
 
 def detect_host_capabilities(
@@ -30,45 +51,213 @@ def detect_host_capabilities(
     codex_executable: str | Path | None = None,
     ai_bridge_executable: str | Path = DEFAULT_AI_BRIDGE_EXECUTABLE,
     hooks_file: str | Path = DEFAULT_CODEX_HOOKS,
-) -> dict[str, dict[str, str]]:
+    zshenv_file: str | Path = DEFAULT_ZSHENV,
+) -> dict[str, dict[str, Any]]:
     codex_path = Path(codex_executable).expanduser() if codex_executable else None
     if codex_path is None:
         discovered = shutil.which("codex")
         codex_path = Path(discovered) if discovered else None
     bridge_path = Path(ai_bridge_executable).expanduser()
     hooks_path = Path(hooks_file).expanduser()
+    zshenv_path = Path(zshenv_file).expanduser()
 
-    desktop = (
-        {
-            "status": "degraded",
-            "adapter": "codex-native",
-            "reason": "hook trust/activation must be verified by the host",
-        }
-        if codex_path is not None and codex_path.is_file()
-        else {
-            "status": "blocked",
-            "adapter": "codex-native",
+    codex_available = bool(codex_path and codex_path.is_file() and os.access(codex_path, os.X_OK))
+    lifecycle_configured = _hooks_contain(hooks_path, "lifecycle_hook.py")
+    scoring_configured = _hooks_contain(hooks_path, "controller_scoring_hook.py")
+    if not codex_available:
+        desktop = {
+            "status": "blocked", "adapter": "codex-native", "configured": False,
             "reason": "codex executable not detected",
         }
-    )
-    if desktop["status"] == "degraded" and hooks_path.is_file():
-        desktop["reason"] = "hooks file detected; host trust/activation still requires verification"
-
-    web = (
-        {"status": "enabled", "adapter": "ai-bridge", "mode": "local_bridge", "reason": "AI-Bridge executable detected"}
-        if bridge_path.is_file()
-        else {
-            "status": "degraded",
-            "adapter": "none",
-            "mode": "pure_web_file",
-            "reason": "AI-Bridge not detected; local repo/runtime access is unavailable",
+    elif lifecycle_configured and scoring_configured:
+        desktop = {
+            "status": "degraded", "adapter": "codex-native", "configured": True,
+            "reason": "hooks configured; host trust/activation still requires verification",
         }
-    )
+    else:
+        desktop = {
+            "status": "degraded", "adapter": "codex-native", "configured": False,
+            "reason": "codex detected; lifecycle/scoring hooks are not fully configured",
+        }
+
+    bridge_available = bridge_path.is_file() and os.access(bridge_path, os.X_OK)
+    bridge_configured = _zshenv_has_web_bridge(zshenv_path)
+    if bridge_available and bridge_configured:
+        web = {
+            "status": "enabled", "adapter": "ai-bridge", "mode": "local_bridge",
+            "configured": True, "reason": "AI-Bridge executable and shell lifecycle bridge detected",
+        }
+    elif bridge_available:
+        web = {
+            "status": "degraded", "adapter": "ai-bridge", "mode": "local_bridge",
+            "configured": False, "reason": "AI-Bridge detected; shell lifecycle bridge is not configured",
+        }
+    else:
+        web = {
+            "status": "degraded", "adapter": "none", "mode": "pure_web_file",
+            "configured": False, "reason": "AI-Bridge not detected; local repo/runtime access is unavailable",
+        }
     return {
-        "core": {"status": "enabled", "adapter": "adaptive-agent-runtime", "reason": "core governance is host-neutral"},
+        "core": {"status": "enabled", "adapter": "adaptive-agent-runtime", "configured": True, "reason": "core governance is host-neutral"},
         "desktop_adapter": desktop,
         "web_local_adapter": web,
     }
+
+
+def _read_hooks_config(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        value = {}
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid hooks JSON: {path}") from error
+    if not isinstance(value, dict):
+        raise ValueError("hooks config root must be an object")
+    hooks = value.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("hooks must be an object")
+    return value
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def install_codex_hooks(
+    hooks_file: str | Path,
+    target: str | Path,
+    *,
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    path = Path(hooks_file).expanduser().resolve()
+    target_path = Path(target).expanduser().resolve()
+    config = _read_hooks_config(path)
+    hooks = config["hooks"]
+    python = python_executable or sys.executable
+    lifecycle_command = f"{shlex.quote(str(python))} {shlex.quote(str(target_path / 'scripts' / 'lifecycle_hook.py'))}"
+    scoring_command = f"{shlex.quote(str(python))} {shlex.quote(str(target_path / 'scripts' / 'controller_scoring_hook.py'))}"
+
+    lifecycle_specs = {
+        "SessionStart": ("startup|resume|clear|compact", "Loading Adaptive Agent Runtime controller state", True),
+        "PostToolUse": ("*", "Checking Adaptive Agent Runtime lifecycle", True),
+        "SubagentStop": (None, "Recording Adaptive Agent Runtime candidate", False),
+        "Stop": (None, "Closing Adaptive Agent Runtime control event", False),
+    }
+    for event_name, (matcher, status, inject_context) in lifecycle_specs.items():
+        entries = hooks.setdefault(event_name, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"{event_name} hooks must be a list")
+        entries[:] = [entry for entry in entries if "lifecycle_hook.py" not in str(entry)]
+        handler: dict[str, Any] = {
+            "type": "command", "command": lifecycle_command, "timeout": 5, "statusMessage": status,
+        }
+        if inject_context:
+            handler["additionalContextLimit"] = 4096
+        group: dict[str, Any] = {"hooks": [handler]}
+        if matcher is not None:
+            group["matcher"] = matcher
+        entries.append(group)
+
+    for event_name, inject_context in (("UserPromptSubmit", True), ("Stop", False)):
+        entries = hooks.setdefault(event_name, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"{event_name} hooks must be a list")
+        entries[:] = [entry for entry in entries if "controller_scoring_hook.py" not in str(entry)]
+        handler = {
+            "type": "command", "command": scoring_command, "timeout": 5,
+            "statusMessage": "Enforcing Adaptive Agent Runtime controller scoring model",
+        }
+        if inject_context:
+            handler["additionalContextLimit"] = 0
+        entries.append({"hooks": [handler]})
+
+    _write_text_atomic(path, json.dumps(config, ensure_ascii=False, indent=2) + "\n")
+    return config
+
+
+def _web_zshenv_block(target: Path, bridge: Path, python_executable: str) -> str:
+    script = target / "scripts" / "web_lifecycle_bridge.py"
+    return f'''{WEB_BLOCK_START}
+_ad_web_parent=$(/bin/ps -p "$PPID" -o command= 2>/dev/null)
+if [[ "$_ad_web_parent" == *"{bridge}"* ]]; then
+  _ad_web_cwd="$PWD"
+  _ad_web_command="$ZSH_EXECUTION_STRING"
+  _ad_web_lifecycle_exit() {{
+    local _ad_web_exit_code=$?
+    trap - EXIT
+    "{python_executable}" "{script}" post-shell --cwd "$_ad_web_cwd" --command "$_ad_web_command" --exit-code "$_ad_web_exit_code" || true
+    exit "$_ad_web_exit_code"
+  }}
+  trap _ad_web_lifecycle_exit EXIT
+fi
+unset _ad_web_parent
+{WEB_BLOCK_END}'''
+
+
+def install_ai_bridge_zshenv(
+    zshenv_file: str | Path,
+    target: str | Path,
+    ai_bridge_executable: str | Path = DEFAULT_AI_BRIDGE_EXECUTABLE,
+    *,
+    python_executable: str | None = None,
+) -> None:
+    path = Path(zshenv_file).expanduser().resolve()
+    target_path = Path(target).expanduser().resolve()
+    bridge = Path(ai_bridge_executable).expanduser().resolve()
+    python = python_executable or sys.executable
+    try:
+        current = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        current = ""
+    start = current.find(WEB_BLOCK_START)
+    if start >= 0:
+        end = current.find(WEB_BLOCK_END, start)
+        if end < 0:
+            raise ValueError("existing web lifecycle bridge block is unterminated")
+        end += len(WEB_BLOCK_END)
+        current = current[:start].rstrip() + "\n" + current[end:].lstrip("\n")
+    block = _web_zshenv_block(target_path, bridge, python)
+    prefix = current.rstrip()
+    text = (prefix + "\n\n" if prefix else "") + block + "\n"
+    _write_text_atomic(path, text)
+
+
+def configure_host_adapters(
+    target: str | Path,
+    *,
+    codex_executable: str | Path | None = None,
+    ai_bridge_executable: str | Path = DEFAULT_AI_BRIDGE_EXECUTABLE,
+    hooks_file: str | Path = DEFAULT_CODEX_HOOKS,
+    zshenv_file: str | Path = DEFAULT_ZSHENV,
+    python_executable: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    target_path = Path(target).expanduser().resolve()
+    codex_path = Path(codex_executable).expanduser() if codex_executable else None
+    if codex_path is None:
+        discovered = shutil.which("codex")
+        codex_path = Path(discovered) if discovered else None
+    if codex_path is not None and codex_path.is_file() and os.access(codex_path, os.X_OK):
+        install_codex_hooks(hooks_file, target_path, python_executable=python_executable)
+    bridge = Path(ai_bridge_executable).expanduser()
+    if bridge.is_file() and os.access(bridge, os.X_OK):
+        install_ai_bridge_zshenv(zshenv_file, target_path, bridge, python_executable=python_executable)
+    return detect_host_capabilities(
+        codex_executable=codex_path,
+        ai_bridge_executable=bridge,
+        hooks_file=hooks_file,
+        zshenv_file=zshenv_file,
+    )
+
 
 def _git(source: Path, *args: str) -> str:
     result = subprocess.run(
@@ -204,13 +393,18 @@ def install_skill(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Install an exact Adaptive Delivery revision with manifest evidence.")
+    parser = argparse.ArgumentParser(description="Install an exact Adaptive Agent Runtime revision with manifest and host-adapter evidence.")
     parser.add_argument("--source", required=True)
     parser.add_argument("--target", default=str(Path.home() / ".agents" / "skills" / "adaptive-delivery"))
     parser.add_argument("--summary", required=True)
     parser.add_argument("--impact", required=True, choices=sorted(IMPACTS))
     parser.add_argument("--stop-condition", required=True)
     parser.add_argument("--previous-revision")
+    parser.add_argument("--no-configure-host-adapters", action="store_true")
+    parser.add_argument("--codex")
+    parser.add_argument("--ai-bridge", default=str(DEFAULT_AI_BRIDGE_EXECUTABLE))
+    parser.add_argument("--hooks-file", default=str(DEFAULT_CODEX_HOOKS))
+    parser.add_argument("--zshenv-file", default=str(DEFAULT_ZSHENV))
     args = parser.parse_args(argv)
     try:
         manifest = install_skill(
@@ -224,6 +418,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"adaptive-delivery-install: blocked: {error}")
         return 1
+    if not args.no_configure_host_adapters:
+        try:
+            manifest["capabilities"] = configure_host_adapters(
+                args.target,
+                codex_executable=args.codex,
+                ai_bridge_executable=args.ai_bridge,
+                hooks_file=args.hooks_file,
+                zshenv_file=args.zshenv_file,
+            )
+            _write_json_atomic(Path(args.target).expanduser().resolve() / MANIFEST_NAME, manifest)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            print(f"adaptive-agent-runtime-install: host adapter configuration degraded: {error}")
+            manifest["capabilities"] = detect_host_capabilities(
+                codex_executable=args.codex, ai_bridge_executable=args.ai_bridge,
+                hooks_file=args.hooks_file, zshenv_file=args.zshenv_file,
+            )
     print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
     return 0
 

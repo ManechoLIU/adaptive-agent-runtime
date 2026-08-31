@@ -127,11 +127,11 @@
 - Fresh install exposes new product name/slug while retaining the stable technical Skill ID `adaptive-delivery`.
 - Old manifest/handshake remains consumable, and install-time capabilities are reported as enabled/degraded/blocked.
 
-- [ ] Write clean-install and existing-install migration RED tests in temporary homes/repos.
-- [ ] Run focused tests and confirm RED.
-- [ ] Implement compatibility discovery/migration metadata and idempotent installer behavior.
-- [ ] Run focused tests and confirm GREEN.
-- [ ] Commit locally.
+- [x] Write clean-install and existing-install migration RED tests in temporary homes/repos.
+- [x] Run focused tests and confirm RED.
+- [x] Implement compatibility discovery/migration metadata and idempotent installer behavior.
+- [x] Run focused tests and confirm GREEN.
+- [x] Commit locally.
 
 ### Task 7: Full regression, independent review, and installed-copy rollout
 
