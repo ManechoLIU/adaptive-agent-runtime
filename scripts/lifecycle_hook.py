@@ -265,6 +265,7 @@ def pending_event_fingerprint(state: dict[str, Any]) -> str:
     value = {
         "pending_control_event": state.get("pending_control_event") is True,
         "triggers": state.get("triggers", []),
+        "wake_generation": int(state.get("wake_generation", 0) or 0),
     }
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return sha256_bytes(encoded)
@@ -349,6 +350,11 @@ def evaluate_event(
     if snapshot is None:
         return {}, {}
     state = dict(prior_state or {})
+    prior_pending = bool((prior_state or {}).get("pending_control_event"))
+    prior_generation = int((prior_state or {}).get("wake_generation", 0) or 0)
+    if prior_pending and prior_generation <= 0:
+        prior_generation = 1
+    state["wake_generation"] = prior_generation
     state["snapshot"] = snapshot
     state["session_id"] = str(event.get("session_id", ""))
     event_host = str(event.get("controller_host", "")).strip()
@@ -374,6 +380,8 @@ def evaluate_event(
                 "stop_continuations": 0,
             }
         )
+        if triggers and not prior_pending:
+            state["wake_generation"] = prior_generation + 1
         if not triggers:
             return {
                 "hookSpecificOutput": {
@@ -398,7 +406,8 @@ def evaluate_event(
     if event_name == "SubagentStop":
         triggers = set(state.get("triggers", []))
         agent_id = str(event.get("agent_id", "unknown"))
-        triggers.add(f"subagent_stopped:{agent_id}")
+        trigger = f"subagent_stopped:{agent_id}"
+        triggers.add(trigger)
         state.update(
             {
                 "pending_control_event": True,
@@ -406,6 +415,8 @@ def evaluate_event(
                 "stop_continuations": 0,
             }
         )
+        if not prior_pending:
+            state["wake_generation"] = prior_generation + 1
         return {}, state
 
     if successful_control_receipt(event, snapshot) and not snapshot.get("runnable_ids", snapshot.get("ready_ids")):
@@ -417,6 +428,8 @@ def evaluate_event(
                 "stop_continuations": 0,
                 "rule_wake_policy": "after_event",
             })
+            if rule_triggers and not prior_pending:
+                state["wake_generation"] = prior_generation + 1
         else:
             state.update(
                 {
@@ -451,6 +464,8 @@ def evaluate_event(
     if wake_policy == "after_event" and prior_nonrule_pending:
         pending = True
     state.update({"pending_control_event": pending, "triggers": triggers})
+    if pending and not prior_pending:
+        state["wake_generation"] = prior_generation + 1
 
     if event_name == "PostToolUse":
         progress_labels = {

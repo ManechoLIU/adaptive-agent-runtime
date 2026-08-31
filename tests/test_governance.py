@@ -427,6 +427,48 @@ class GovernanceTests(unittest.TestCase):
         triggers = lifecycle_hook.lifecycle_triggers(snapshot, None)
         self.assertIn("rule_install_integrity_error:rev-bad", triggers)
 
+    def test_lifecycle_wake_generation_increments_after_closed_event_reoccurs(self) -> None:
+        snapshot = {
+            "root": "/tmp/project",
+            "head": "h1",
+            "ledger_sha256": "l1",
+            "worktree_status_sha256": "s1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "installed_revision": "rev-1"},
+        }
+        _, first = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "SubagentStop", "session_id": "controller-1", "agent_id": "writer-1"},
+            snapshot=snapshot,
+            prior_state=None,
+        )
+        self.assertTrue(first["pending_control_event"])
+        self.assertEqual(first["wake_generation"], 1)
+
+        _, closed = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "controller-1",
+                "tool_input": {"command": "python3 scripts/control_event_guard.py receipt.json --repo ."},
+                "tool_response": {"output": "control-event: allowed", "exit_code": 0},
+            },
+            snapshot=snapshot,
+            prior_state=first,
+        )
+        self.assertFalse(closed["pending_control_event"])
+        self.assertEqual(closed["wake_generation"], 1)
+
+        _, second = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "SubagentStop", "session_id": "controller-1", "agent_id": "writer-1"},
+            snapshot=snapshot,
+            prior_state=closed,
+        )
+        self.assertTrue(second["pending_control_event"])
+        self.assertEqual(second["triggers"], first["triggers"])
+        self.assertEqual(second["wake_generation"], 2)
+
     def test_lifecycle_hook_surfaces_unhealthy_active_runtime_without_git_change(self) -> None:
         snapshot = {
             "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",

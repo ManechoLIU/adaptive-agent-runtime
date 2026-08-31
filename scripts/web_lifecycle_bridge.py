@@ -619,6 +619,7 @@ def _wake_event_fingerprint(lifecycle_state: dict[str, Any]) -> str:
     value = {
         "pending_control_event": lifecycle_state.get("pending_control_event") is True,
         "triggers": lifecycle_state.get("triggers", []),
+        "wake_generation": int(lifecycle_state.get("wake_generation", 0) or 0),
         "event_generation": generation,
     }
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -876,7 +877,20 @@ def dispatch_pending_lifecycle_wake(
         target_receipt = receipt_path
     fingerprint = _wake_event_fingerprint(lifecycle_state)
     prior = load_json(target_receipt)
-    if prior.get("event_fingerprint") == fingerprint and prior.get("result") == "CONFIRMED":
+    try:
+        current_common_dir = str(_git_common_dir(repo))
+        current_registered = _registered_controller_for_common_dir(repo, registry)
+    except (OSError, subprocess.SubprocessError):
+        current_common_dir = None
+        current_registered = None
+    if (
+        prior.get("event_fingerprint") == fingerprint
+        and prior.get("result") == "CONFIRMED"
+        and prior.get("controller_session_id") == session_id
+        and current_registered == session_id
+        and current_common_dir is not None
+        and prior.get("canonical_common_dir") == current_common_dir
+    ):
         debounced = dict(prior)
         debounced["debounced"] = True
         return debounced
