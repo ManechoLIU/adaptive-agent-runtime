@@ -261,13 +261,27 @@ def evaluate_lease(lease: dict[str, Any] | None, now: datetime | None = None, po
     return {"state": "healthy", "reason": "runtime_evidence_current"}
 
 
-def retry_decision(retry_class: str, attempt: int, base_delay_seconds: int = 5) -> dict[str, Any]:
+def retry_decision(
+    retry_class: str,
+    attempt: int,
+    base_delay_seconds: int = 5,
+    *,
+    side_effect: bool = False,
+    result_unknown: bool = False,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    stable_key = str(idempotency_key or "").strip() or None
+    if side_effect and result_unknown and stable_key is None:
+        return {"retry": False, "reason": "non_idempotent_unknown_outcome"}
     retry = retry_class in TRANSIENT_RETRY_CLASSES and attempt < MAX_ATTEMPTS
     if not retry:
         return {"retry": False, "reason": "non_retryable" if retry_class not in TRANSIENT_RETRY_CLASSES else "attempt_budget_exhausted"}
     # Deterministic envelope; caller adds random jitter within this range.
     delay = base_delay_seconds * (2 ** max(0, attempt - 1))
-    return {"retry": True, "next_attempt": attempt + 1, "backoff_seconds": delay, "jitter_max_seconds": max(1, delay // 2)}
+    decision = {"retry": True, "next_attempt": attempt + 1, "backoff_seconds": delay, "jitter_max_seconds": max(1, delay // 2)}
+    if stable_key is not None:
+        decision["idempotency_key"] = stable_key
+    return decision
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Apply Adaptive Delivery runtime receipts to canonical Git state.")

@@ -135,6 +135,27 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
         self.assertFalse(retry_decision("transport_error", attempt=3)["retry"])
         self.assertFalse(retry_decision("permission", attempt=1)["retry"])
 
+    def test_unknown_non_idempotent_side_effect_never_auto_retries(self):
+        from scripts.assignment_runtime import retry_decision
+        decision = retry_decision(
+            "transport_error", attempt=1, side_effect=True, result_unknown=True, idempotency_key=None
+        )
+        self.assertFalse(decision["retry"])
+        self.assertEqual(decision["reason"], "non_idempotent_unknown_outcome")
+
+    def test_unknown_side_effect_with_stable_idempotency_key_respects_existing_budget(self):
+        from scripts.assignment_runtime import retry_decision
+        allowed = retry_decision(
+            "transport_error", attempt=1, side_effect=True, result_unknown=True, idempotency_key="publish:release-42"
+        )
+        exhausted = retry_decision(
+            "transport_error", attempt=3, side_effect=True, result_unknown=True, idempotency_key="publish:release-42"
+        )
+        self.assertTrue(allowed["retry"])
+        self.assertEqual(allowed["idempotency_key"], "publish:release-42")
+        self.assertFalse(exhausted["retry"])
+        self.assertEqual(exhausted["reason"], "attempt_budget_exhausted")
+
 class EvidenceDeltaAndRecoveryBudgetTests(unittest.TestCase):
     def test_no_delta_progress_refreshes_heartbeat_but_not_progress_deadline(self):
         start = receipt(

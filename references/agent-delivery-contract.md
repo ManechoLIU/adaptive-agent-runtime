@@ -29,6 +29,8 @@ When code or a versioned artifact is produced, Delivery PASS requires explicit e
 
 Runtime heartbeat is liveness only. A progress receipt extends the progress deadline only when at least one authoritative fingerprint changes (Git HEAD, tracked status hash, evidence receipt, artifact, or blocker evidence). Repeating the same fingerprint does not count as progress. Same-contract recovery is bounded to two recovery attempts; after exhaustion the same Assignment cannot start another attempt. Strategy-changing execution must use a new Assignment contract rather than silently resetting the counter. Checkpoint governance stays risk-tailored: checkpoint 只作为恢复锚点，ordinary short assignments do not gain a new mandatory approval step or controller-authored runtime field.
 
+For external side effects (for example payment, publish, message send, resource creation, or third-party writes), automatic recovery must additionally bind an idempotency fact. If the previous result is unknown/ambiguous and no stable idempotency key or equivalent provider guarantee exists, retry is machine-blocked even when the transport failure class would normally be transient. A stable idempotency key permits retry only inside the existing attempt/recovery budget; it never resets that budget or turns an unknown result into success.
+
 ## 3. Integration Gate — Evidence Chain
 
 For implementation work, completion evidence should form the shortest applicable causal chain:
