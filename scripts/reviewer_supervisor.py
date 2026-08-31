@@ -104,13 +104,17 @@ def run_attempt(
     process = popen_factory(
         argv,
         cwd=str(contract.repo),
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
         start_new_session=True,
-        input=contract.instructions,
     )
+    if process.stdin is None:
+        raise RuntimeError("reviewer stdin pipe unavailable")
+    process.stdin.write(contract.instructions)
+    process.stdin.close()
     running_observed = False
     session_id = None
     diagnostics = []

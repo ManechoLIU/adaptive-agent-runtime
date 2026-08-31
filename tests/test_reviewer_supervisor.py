@@ -50,9 +50,22 @@ class ReviewerSupervisorCoreTests(unittest.TestCase):
             validate_verdict(payload, "a" * 40)
 
 
+class _FakeStdin:
+    def __init__(self):
+        self.value = ""
+        self.closed = False
+
+    def write(self, text):
+        self.value += text
+
+    def close(self):
+        self.closed = True
+
+
 class _FakeProcess:
     def __init__(self, lines, returncode=0):
         self.stdout = iter(lines)
+        self.stdin = _FakeStdin()
         self.pid = 4242
         self._returncode = returncode
 
@@ -64,9 +77,12 @@ class ReviewerSupervisorLaunchTests(unittest.TestCase):
     def test_direct_child_requires_valid_codex_event_before_running(self):
         calls = []
 
+        proc_holder = []
         def factory(argv, **kwargs):
             calls.append((argv, kwargs))
-            return _FakeProcess(["not-json\n"], returncode=1)
+            proc = _FakeProcess(["not-json\n"], returncode=1)
+            proc_holder.append(proc)
+            return proc
 
         contract = ReviewContract(
             repo=Path.cwd(), base="main", head="a" * 40, instructions="review exact head",
@@ -78,10 +94,13 @@ class ReviewerSupervisorLaunchTests(unittest.TestCase):
         self.assertEqual(argv[0:2], ["/usr/bin/codex", "exec"])
         self.assertEqual(argv[-3:], ["review", "--base", "main"])
         self.assertNotIn(contract.instructions, argv)
-        self.assertEqual(kwargs["input"], contract.instructions)
         self.assertNotIn("nohup", argv)
         self.assertNotIn("sh", argv)
         self.assertTrue(kwargs["start_new_session"])
+        self.assertIs(kwargs["stdin"], subprocess.PIPE)
+        self.assertNotIn("input", kwargs)
+        self.assertEqual(proc_holder[0].stdin.value, contract.instructions)
+        self.assertTrue(proc_holder[0].stdin.closed)
         self.assertFalse(result.running_observed)
         self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
 
