@@ -411,6 +411,67 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
             with self.subTest(prompt=prompt):
                 self.assertTrue(hook.is_controller_scoring_request(prompt))
 
+    def test_unguarded_cycle_extrema_summary_is_blocked(self):
+        hook = load_module()
+        samples = (
+            "最佳回合：91/100，最差回合：42/100。",
+            "Controller best cycle: 91/100; worst cycle: 42/100.",
+            "能力上限：91分；能力下限：42分。",
+        )
+        for message in samples:
+            with self.subTest(message=message):
+                output, _ = hook.evaluate_event(
+                    {
+                        "hook_event_name": "Stop",
+                        "session_id": "controller-1",
+                        "turn_id": "turn-extrema-unguarded",
+                        "cwd": str(ROOT),
+                        "last_assistant_message": message,
+                    },
+                    skill_root=ROOT, prior_state={},
+                )
+                self.assertEqual("block", output.get("decision"))
+                self.assertIn("score-guard", output.get("reason", ""))
+
+    def test_formal_request_blocks_cycle_extrema_summary(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-formal-extrema", "cwd": str(repo), "prompt": "给总控正式履职评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-formal-extrema", "cwd": str(repo),
+                 "last_assistant_message": "最佳回合：91/100，最差回合：42/100。"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual("block", output.get("decision"))
+            self.assertIn("mode", output.get("reason", ""))
+
+    def test_cycle_request_allows_guarded_extrema_summary_without_new_cycle_record(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-cycle-extrema", "cwd": str(repo), "prompt": "分析总控能力上限和下限"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-cycle-extrema", "cwd": str(repo),
+                 "last_assistant_message": "能力上限：91分；能力下限：42分。"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual({}, output)
+            self.assertEqual(
+                {"best": None, "worst": None},
+                hook.cycle_score_extremes(repo, controller_session_id="controller-1", model_sha256=hook.scoring_model_sha256(ROOT)),
+            )
+
     def test_formal_request_blocks_cycle_score_when_regexes_overlap(self):
         import subprocess
         hook = load_module()

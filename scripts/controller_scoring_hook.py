@@ -29,6 +29,10 @@ _CONTROLLER_TERMS = re.compile(r"(?:总控|项目总控|controller|orchestrator)
 _SCORE_VALUE = r"(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)"
 _CYCLE_REQUEST = re.compile(r"(?:单回合|闭环回合|最佳(?:闭环)?回合|最差(?:闭环)?回合|最佳闭环|最差闭环|能力上限|能力下限|single[ -]?cycle|best[ -]?(?:closed[ -]?loop[ -]?)?cycle|worst[ -]?(?:closed[ -]?loop[ -]?)?cycle)", re.IGNORECASE)
 _CYCLE_OUTPUT_SCORE = re.compile(r"(?:单回合诊断评分|单回合评分|single[ -]?cycle(?: diagnostic)? score).{0,20}?(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)", re.IGNORECASE | re.DOTALL)
+_CYCLE_EXTREMA_OUTPUT = re.compile(
+    rf"(?:最佳(?:闭环)?回合|最差(?:闭环)?回合|能力上限|能力下限|best[ -]?(?:closed[ -]?loop[ -]?)?cycle|worst[ -]?(?:closed[ -]?loop[ -]?)?cycle).{{0,20}}?{_SCORE_VALUE}",
+    re.IGNORECASE | re.DOTALL,
+)
 _OUTPUT_SCORE = re.compile(
     rf"(?:总控|项目总控|controller|orchestrator).{{0,80}}?(?:评分|得分|score|performance).{{0,40}}?{_SCORE_VALUE}",
     re.IGNORECASE | re.DOTALL,
@@ -67,7 +71,12 @@ def is_controller_scoring_request(prompt: str) -> bool:
 
 def looks_like_controller_score_output(message: str) -> bool:
     text = str(message or "")
-    return bool(_OUTPUT_SCORE.search(text) or _FORMAL_SCORE_LABEL.search(text) or _CYCLE_OUTPUT_SCORE.search(text))
+    return bool(
+        _OUTPUT_SCORE.search(text)
+        or _FORMAL_SCORE_LABEL.search(text)
+        or _CYCLE_OUTPUT_SCORE.search(text)
+        or _CYCLE_EXTREMA_OUTPUT.search(text)
+    )
 
 
 def _extract_score_value(message: str) -> float | None:
@@ -261,7 +270,7 @@ def evaluate_event(
                 "decision": "block",
                 "reason": "controller scoring blocked: score output mode mismatch; cycle diagnostic requested",
             }, state
-        if scoring_mode == "formal" and cycle_score is not None:
+        if scoring_mode == "formal" and (cycle_score is not None or _CYCLE_EXTREMA_OUTPUT.search(message)):
             return {
                 "decision": "block",
                 "reason": "controller scoring blocked: score output mode mismatch; formal scoring requested",
