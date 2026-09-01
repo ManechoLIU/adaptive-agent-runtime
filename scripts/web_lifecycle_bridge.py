@@ -1386,14 +1386,14 @@ def zshenv_block() -> str:
     script = Path(__file__).resolve()
     python = Path("/Library/Frameworks/Python.framework/Versions/3.11/bin/python3")
     return f'''# >>> adaptive-delivery web lifecycle bridge >>>
-_ad_web_parent=$(/bin/ps -p "$PPID" -o command= 2>/dev/null)
+_ad_web_parent=$(/bin/ps -p "$PPID" -o comm= 2>/dev/null)
 _ad_web_session_id="${{ADAPTIVE_DELIVERY_WEB_SESSION_ID:-}}"
 _ad_web_bridge_script="{script}"
 _ad_web_bridge_python="{python}"
-if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* && -z "$_ad_web_session_id" ]]; then
+if [[ "$_ad_web_parent" == "{AI_BRIDGE_EXECUTABLE}" && -z "$_ad_web_session_id" ]]; then
   _ad_web_session_id=$("$_ad_web_bridge_python" "$_ad_web_bridge_script" resolve-manual-web-session --cwd "$PWD" 2>/dev/null)
 fi
-if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* && -n "$_ad_web_session_id" ]]; then
+if [[ "$_ad_web_parent" == "{AI_BRIDGE_EXECUTABLE}" && -n "$_ad_web_session_id" ]]; then
   _ad_web_cwd="$PWD"
   _ad_web_command="$ZSH_EXECUTION_STRING"
   _ad_web_lifecycle_exit() {{
@@ -1576,7 +1576,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         print(json.dumps({
             **record,
-            "mode": "manual_user_authorized_resume_only",
             "lease_file": str(lease_path),
         }, ensure_ascii=False))
         return 0

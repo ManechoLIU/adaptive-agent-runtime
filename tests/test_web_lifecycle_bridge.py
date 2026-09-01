@@ -267,7 +267,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             saved = json.loads(lease.read_text(encoding="utf-8"))
             item = saved["leases"]["controller-1"]
-            self.assertEqual(payload["mode"], "manual_user_authorized_resume_only")
+            self.assertEqual(payload["mode"], "resume_only")
             self.assertEqual(item["repo"], str(repo.resolve()))
             self.assertEqual(item["web_session_id"], "web-session-1")
             self.assertEqual(item["provenance"], "manual_user_authorized")
@@ -465,6 +465,8 @@ class WebLifecycleBridgeTests(unittest.TestCase):
         self.assertNotIn("\\n      --cwd", block)
         self.assertIn('post-shell --cwd "$_ad_web_cwd"', block)
         self.assertIn('ADAPTIVE_DELIVERY_WEB_SESSION_ID', block)
+        self.assertIn('-o comm=', block)
+        self.assertNotIn('== *\"', block)
         self.assertIn('resolve-manual-web-session --cwd "$PWD"', block)
         self.assertIn('--web-session-id "$_ad_web_session_id"', block)
         self.assertNotIn("unset _ad_web_parent _ad_web_session_id", block)

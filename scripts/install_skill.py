@@ -268,12 +268,12 @@ def _web_zshenv_block(target: Path, bridge: Path, python_executable: str) -> str
     script_literal = shlex.quote(str(script))
     return f"""{WEB_BLOCK_START}
 _ad_web_bridge_executable={bridge_literal}
-_ad_web_parent=$(/bin/ps -p \"$PPID\" -o command= 2>/dev/null)
+_ad_web_parent=$(/bin/ps -p \"$PPID\" -o comm= 2>/dev/null)
 _ad_web_session_id=\"${{ADAPTIVE_DELIVERY_WEB_SESSION_ID:-}}\"
-if [[ \"$_ad_web_parent\" == *\"$_ad_web_bridge_executable\"* && -z \"$_ad_web_session_id\" ]]; then
+if [[ \"$_ad_web_parent\" == \"$_ad_web_bridge_executable\" && -z \"$_ad_web_session_id\" ]]; then
   _ad_web_session_id=$({python_literal} {script_literal} resolve-manual-web-session --cwd \"$PWD\" 2>/dev/null)
 fi
-if [[ \"$_ad_web_parent\" == *\"$_ad_web_bridge_executable\"* && -n \"$_ad_web_session_id\" ]]; then
+if [[ \"$_ad_web_parent\" == \"$_ad_web_bridge_executable\" && -n \"$_ad_web_session_id\" ]]; then
   _ad_web_cwd=\"$PWD\"
   _ad_web_command=\"$ZSH_EXECUTION_STRING\"
   _ad_web_lifecycle_exit() {{
