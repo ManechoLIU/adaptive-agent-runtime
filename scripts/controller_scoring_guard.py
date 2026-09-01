@@ -82,24 +82,41 @@ def latest_score_history(repo: str | Path, *, controller_session_id: str) -> dic
     return latest
 
 
+def _valid_cycle_history_record(
+    value: dict[str, Any], *, controller_session_id: str, model_sha256: str
+) -> bool:
+    controller = str(controller_session_id).strip()
+    if not controller or str(value.get("controller_session_id", "")).strip() != controller:
+        return False
+    if value.get("record_kind") != "cycle":
+        return False
+    if str(value.get("model_sha256", "")) != str(model_sha256):
+        return False
+    if str(value.get("terminal_status", "")).upper().strip() not in TERMINAL_CYCLE_STATUSES:
+        return False
+    if not str(value.get("cycle_id", "")).strip():
+        return False
+    if not str(value.get("evidence_summary", "")).strip():
+        return False
+    message_sha256 = str(value.get("message_sha256", "")).strip()
+    if len(message_sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in message_sha256):
+        return False
+    try:
+        score = float(value["score"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return 0 <= score <= 100
+
+
 def cycle_score_extremes(
     repo: str | Path, *, controller_session_id: str, model_sha256: str
 ) -> dict[str, dict[str, Any] | None]:
-    eligible: list[dict[str, Any]] = []
-    for value in _score_history_records(repo):
-        if str(value.get("controller_session_id", "")) != str(controller_session_id):
-            continue
-        if value.get("record_kind") != "cycle":
-            continue
-        if str(value.get("model_sha256", "")) != str(model_sha256):
-            continue
-        if str(value.get("terminal_status", "")).upper() not in TERMINAL_CYCLE_STATUSES:
-            continue
-        try:
-            float(value["score"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        eligible.append(value)
+    eligible = [
+        value for value in _score_history_records(repo)
+        if _valid_cycle_history_record(
+            value, controller_session_id=controller_session_id, model_sha256=model_sha256
+        )
+    ]
     if not eligible:
         return {"best": None, "worst": None}
     return {
@@ -215,11 +232,21 @@ def finalize_cycle_score(
     evidence_summary: str | None,
     message_sha256: str | None,
 ) -> dict[str, Any]:
+    controller = str(controller_session_id).strip()
     status = str(terminal_status).upper().strip()
+    cycle = str(cycle_id).strip()
+    evidence = str(evidence_summary or "").strip()
+    message_ref = str(message_sha256 or "").strip()
+    if not controller:
+        raise ValueError("cycle score requires a non-empty controller session identity")
     if status not in TERMINAL_CYCLE_STATUSES:
         raise ValueError("cycle score requires a terminal cycle status")
-    if not str(cycle_id).strip():
+    if not cycle:
         raise ValueError("cycle score requires a non-empty cycle_id")
+    if not evidence:
+        raise ValueError("cycle score requires a non-empty evidence summary")
+    if len(message_ref) != 64 or any(char not in "0123456789abcdefABCDEF" for char in message_ref):
+        raise ValueError("cycle score requires a valid message sha256 reference")
     if not 0 <= float(score) <= 100:
         raise ValueError("cycle score must be within 0..100")
     errors = consume_score_guard(repo, skill_root=skill_root)
@@ -228,15 +255,15 @@ def finalize_cycle_score(
     record = {
         "schema_version": 1,
         "record_kind": "cycle",
-        "controller_session_id": str(controller_session_id),
+        "controller_session_id": controller,
         "turn_id": str(turn_id),
         "recorded_at": datetime.now(timezone.utc).isoformat(),
-        "cycle_id": str(cycle_id).strip(),
+        "cycle_id": cycle,
         "terminal_status": status,
         "score": float(score),
-        "evidence_summary": evidence_summary,
+        "evidence_summary": evidence,
         "model_sha256": scoring_model_sha256(skill_root),
-        "message_sha256": message_sha256,
+        "message_sha256": message_ref.lower(),
     }
     return append_score_history(repo, record)
 

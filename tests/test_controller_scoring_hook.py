@@ -358,5 +358,26 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
             self.assertTrue(state2["pending_scoring"])
 
 
+    def test_output_detector_recognizes_standalone_cycle_score(self):
+        hook = load_module()
+        self.assertTrue(hook.looks_like_controller_score_output("单回合诊断评分：91/100"))
+
+    def test_stop_blocks_cycle_score_when_no_scoring_state_exists(self):
+        hook = load_module()
+        output, _ = hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "turn_id": "turn-cycle",
+                "cwd": str(ROOT),
+                "last_assistant_message": "单回合诊断评分：91/100\n控制回合：cycle-1\n回合终态：CLOSED\n证据摘要：reviewed and integrated",
+            },
+            skill_root=ROOT,
+            prior_state={},
+        )
+        self.assertEqual("block", output["decision"])
+        self.assertIn("score-guard", output["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

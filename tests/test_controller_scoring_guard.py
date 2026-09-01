@@ -189,8 +189,8 @@ class ControllerScoringGuardTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             model = guard.scoring_model_sha256(ROOT)
             guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "formal", "score": 88.0, "model_sha256": model})
-            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "good", "terminal_status": "CLOSED", "score": 94.0, "model_sha256": model})
-            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "bad", "terminal_status": "FAILED", "score": 52.0, "model_sha256": model})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "good", "terminal_status": "CLOSED", "score": 94.0, "model_sha256": model, "evidence_summary": "closed", "message_sha256": "a" * 64})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "bad", "terminal_status": "FAILED", "score": 52.0, "model_sha256": model, "evidence_summary": "failed", "message_sha256": "b" * 64})
             self.assertEqual(88.0, guard.latest_score_history(repo, controller_session_id="c1")["score"])
             extremes = guard.cycle_score_extremes(repo, controller_session_id="c1", model_sha256=model)
             self.assertEqual("good", extremes["best"]["cycle_id"])
@@ -203,9 +203,9 @@ class ControllerScoringGuardTests(unittest.TestCase):
             repo = Path(td)
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             model = guard.scoring_model_sha256(ROOT)
-            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "active", "terminal_status": "ACTIVE", "score": 5.0, "model_sha256": model})
-            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "old-model", "terminal_status": "CLOSED", "score": 99.0, "model_sha256": "other"})
-            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "valid", "terminal_status": "BLOCKED", "score": 70.0, "model_sha256": model})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "active", "terminal_status": "ACTIVE", "score": 5.0, "model_sha256": model, "evidence_summary": "active", "message_sha256": "c" * 64})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "old-model", "terminal_status": "CLOSED", "score": 99.0, "model_sha256": "other", "evidence_summary": "old", "message_sha256": "d" * 64})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "valid", "terminal_status": "BLOCKED", "score": 70.0, "model_sha256": model, "evidence_summary": "blocked", "message_sha256": "e" * 64})
             extremes = guard.cycle_score_extremes(repo, controller_session_id="c1", model_sha256=model)
             self.assertEqual("valid", extremes["best"]["cycle_id"])
             self.assertEqual("valid", extremes["worst"]["cycle_id"])
@@ -220,7 +220,7 @@ class ControllerScoringGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "terminal"):
                 guard.finalize_cycle_score(repo, skill_root=ROOT, controller_session_id="c1", turn_id="t1", cycle_id="cycle-1", terminal_status="ACTIVE", score=80.0, evidence_summary="still running", message_sha256="x")
             guard.record_model_read(repo, skill_root=ROOT)
-            record = guard.finalize_cycle_score(repo, skill_root=ROOT, controller_session_id="c1", turn_id="t2", cycle_id="cycle-1", terminal_status="CLOSED", score=82.0, evidence_summary="closed with reviewer", message_sha256="y")
+            record = guard.finalize_cycle_score(repo, skill_root=ROOT, controller_session_id="c1", turn_id="t2", cycle_id="cycle-1", terminal_status="CLOSED", score=82.0, evidence_summary="closed with reviewer", message_sha256="a" * 64)
             self.assertEqual("cycle", record["record_kind"])
             self.assertIsNone(guard.latest_score_history(repo, controller_session_id="c1"))
 
@@ -231,12 +231,97 @@ class ControllerScoringGuardTests(unittest.TestCase):
             repo = Path(td)
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             model = guard.scoring_model_sha256(ROOT)
-            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "best", "terminal_status": "CLOSED", "score": 93.0, "model_sha256": model})
-            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "worst", "terminal_status": "FAILED", "score": 61.0, "model_sha256": model})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "best", "terminal_status": "CLOSED", "score": 93.0, "model_sha256": model, "evidence_summary": "best", "message_sha256": "f" * 64})
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "worst", "terminal_status": "FAILED", "score": 61.0, "model_sha256": model, "evidence_summary": "worst", "message_sha256": "1" * 64})
             completed = subprocess.run(["python3", str(SCRIPT), "cycle-extremes", "--repo", str(repo), "--controller-session", "c1"], check=True, capture_output=True, text=True)
             payload = json.loads(completed.stdout)
             self.assertEqual("best", payload["best"]["cycle_id"])
             self.assertEqual("worst", payload["worst"]["cycle_id"])
+
+
+    def test_finalize_cycle_score_rejects_empty_controller_session(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            guard.record_model_read(repo, skill_root=ROOT)
+            with self.assertRaisesRegex(ValueError, "controller"):
+                guard.finalize_cycle_score(
+                    repo, skill_root=ROOT, controller_session_id="", turn_id="t1",
+                    cycle_id="cycle-1", terminal_status="CLOSED", score=80.0,
+                    evidence_summary="reviewer pass", message_sha256="a" * 64,
+                )
+
+    def test_finalize_cycle_score_rejects_missing_evidence_summary(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            guard.record_model_read(repo, skill_root=ROOT)
+            with self.assertRaisesRegex(ValueError, "evidence"):
+                guard.finalize_cycle_score(
+                    repo, skill_root=ROOT, controller_session_id="c1", turn_id="t1",
+                    cycle_id="cycle-1", terminal_status="CLOSED", score=80.0,
+                    evidence_summary=" ", message_sha256="a" * 64,
+                )
+
+    def test_finalize_cycle_score_rejects_invalid_message_reference(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            guard.record_model_read(repo, skill_root=ROOT)
+            with self.assertRaisesRegex(ValueError, "message"):
+                guard.finalize_cycle_score(
+                    repo, skill_root=ROOT, controller_session_id="c1", turn_id="t1",
+                    cycle_id="cycle-1", terminal_status="CLOSED", score=80.0,
+                    evidence_summary="reviewer pass", message_sha256="short",
+                )
+
+    def test_cycle_extremes_ignore_malformed_cycle_records(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            model = guard.scoring_model_sha256(ROOT)
+            valid = {
+                "controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "valid",
+                "terminal_status": "CLOSED", "score": 80.0, "model_sha256": model,
+                "evidence_summary": "reviewed and integrated", "message_sha256": "a" * 64,
+            }
+            guard.append_score_history(repo, valid)
+            for record in (
+                {**valid, "cycle_id": "", "score": 100.0},
+                {**valid, "cycle_id": "no-evidence", "score": 99.0, "evidence_summary": ""},
+                {**valid, "cycle_id": "no-message", "score": 1.0, "message_sha256": None},
+                {**valid, "cycle_id": "too-high", "score": 101.0},
+                {**valid, "cycle_id": "too-low", "score": -1.0},
+            ):
+                guard.append_score_history(repo, record)
+            extremes = guard.cycle_score_extremes(repo, controller_session_id="c1", model_sha256=model)
+            self.assertEqual("valid", extremes["best"]["cycle_id"])
+            self.assertEqual("valid", extremes["worst"]["cycle_id"])
+
+    def test_cycle_extremes_refuse_blank_controller_identity(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            model = guard.scoring_model_sha256(ROOT)
+            guard.append_score_history(repo, {
+                "controller_session_id": "", "record_kind": "cycle", "cycle_id": "anonymous",
+                "terminal_status": "CLOSED", "score": 90.0, "model_sha256": model,
+                "evidence_summary": "anonymous", "message_sha256": "a" * 64,
+            })
+            self.assertEqual(
+                {"best": None, "worst": None},
+                guard.cycle_score_extremes(repo, controller_session_id="", model_sha256=model),
+            )
 
 
 if __name__ == "__main__":
