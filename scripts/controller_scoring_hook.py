@@ -27,7 +27,7 @@ STATE_ROOT = Path(
 
 _CONTROLLER_TERMS = re.compile(r"(?:总控|项目总控|controller|orchestrator)", re.IGNORECASE)
 _SCORE_VALUE = r"(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)"
-_CYCLE_REQUEST = re.compile(r"(?:单回合|闭环回合|最佳闭环|最差闭环|single[ -]?cycle)", re.IGNORECASE)
+_CYCLE_REQUEST = re.compile(r"(?:单回合|闭环回合|最佳(?:闭环)?回合|最差(?:闭环)?回合|最佳闭环|最差闭环|能力上限|能力下限|single[ -]?cycle|best[ -]?(?:closed[ -]?loop[ -]?)?cycle|worst[ -]?(?:closed[ -]?loop[ -]?)?cycle)", re.IGNORECASE)
 _CYCLE_OUTPUT_SCORE = re.compile(r"(?:单回合诊断评分|单回合评分|single[ -]?cycle(?: diagnostic)? score).{0,20}?(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)", re.IGNORECASE | re.DOTALL)
 _OUTPUT_SCORE = re.compile(
     rf"(?:总控|项目总控|controller|orchestrator).{{0,80}}?(?:评分|得分|score|performance).{{0,40}}?{_SCORE_VALUE}",

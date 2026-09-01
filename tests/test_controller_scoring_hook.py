@@ -400,8 +400,16 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
 
     def test_cycle_diagnostic_language_triggers_scoring_gate(self):
         hook = load_module()
-        self.assertTrue(hook.is_controller_scoring_request("分析总控的最佳闭环和最差闭环"))
-        self.assertTrue(hook.is_controller_scoring_request("做一次总控单回合诊断"))
+        prompts = (
+            "分析总控的最佳闭环和最差闭环",
+            "做一次总控单回合诊断",
+            "分析总控最佳回合和最差回合",
+            "评估总控能力上限和下限",
+            "compare controller best cycle and worst cycle",
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertTrue(hook.is_controller_scoring_request(prompt))
 
     def test_formal_request_blocks_cycle_score_when_regexes_overlap(self):
         import subprocess
