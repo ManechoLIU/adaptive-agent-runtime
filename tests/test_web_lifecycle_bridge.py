@@ -80,7 +80,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
 
-    def test_post_shell_resolves_the_single_registered_controller_for_repo(self) -> None:
+    def test_post_shell_refuses_registered_repo_without_verified_web_controller_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             repo = tmp_path / "repo"
@@ -94,6 +94,31 @@ class WebLifecycleBridgeTests(unittest.TestCase):
 
             result = self.run_bridge(
                 "post-shell",
+                "--cwd", str(repo),
+                "--command", "git status --short",
+                "--exit-code", "0",
+                "--registry", str(registry),
+                "--capture-event", str(capture),
+            )
+
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("verified Web Controller Session identity", result.stderr)
+            self.assertFalse(capture.exists())
+
+    def test_post_shell_resolves_the_single_registered_controller_for_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = tmp_path / "controllers.json"
+            registry.write_text(
+                json.dumps({"controller-1": str(repo), "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}}}) + "\n", encoding="utf-8"
+            )
+            capture = tmp_path / "capture.json"
+
+            result = self.run_bridge(
+                "post-shell",
                 "--cwd",
                 str(repo),
                 "--command",
@@ -102,6 +127,8 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "0",
                 "--registry",
                 str(registry),
+                "--web-session-id",
+                "web-session-1",
                 "--capture-event",
                 str(capture),
             )
@@ -109,8 +136,39 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             event = json.loads(capture.read_text(encoding="utf-8"))
             self.assertEqual(event["session_id"], "controller-1")
+            self.assertEqual(event["controller_id"], "controller-1")
+            self.assertEqual(event["controller_session_id"], "web-session-1")
+            self.assertEqual(event["event_source"], "web")
+            self.assertEqual(event["execution_host"], "web")
             self.assertEqual(event["cwd"], str(repo.resolve()))
             self.assertEqual(event["tool_response"]["exit_code"], 0)
+
+    def test_post_shell_refuses_web_session_bound_to_another_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            other = root / "other"
+            other.mkdir()
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "controller-2": str(other),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-owner"]},
+                    "controller-2": {"web": ["web-other"]},
+                },
+            }), encoding="utf-8")
+
+            result = self.run_bridge(
+                "post-shell", "--cwd", str(repo), "--command", "git status --short",
+                "--exit-code", "0", "--registry", str(registry),
+                "--web-session-id", "web-other",
+            )
+
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("verified Web Controller Session identity", result.stderr)
 
     def test_post_shell_silently_skips_unregistered_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -187,11 +245,13 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             registry.write_text(json.dumps({
                 "controller-1": str(main.resolve()),
                 "__controller_surfaces__": {"controller-1": str(surface.resolve())},
+                "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
             capture = root / "capture.json"
             result = self.run_bridge(
                 "post-shell", "--cwd", str(surface), "--command", "git status --short",
-                "--exit-code", "0", "--registry", str(registry), "--capture-event", str(capture),
+                "--exit-code", "0", "--registry", str(registry), "--web-session-id", "web-session-1",
+                "--capture-event", str(capture),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(capture.read_text(encoding="utf-8"))["session_id"], "controller-1")
@@ -374,7 +434,10 @@ class WebLifecycleAuditTests(unittest.TestCase):
             repo = base / "repo"
             repo.mkdir()
             registry = base / "controllers.json"
-            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            registry.write_text(json.dumps({
+            "controller-1": str(repo.resolve()),
+            "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
+        }), encoding="utf-8")
             state_path = base / "auto-stop.json"
             capture = base / "capture.json"
             result = web_bridge.maybe_schedule_rule_wake(
@@ -781,7 +844,11 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
         registry = root / "controllers.json"
         registry.write_text(
-            json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8"
+            json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
+            }),
+            encoding="utf-8",
         )
         marker = root / "resume.txt"
         codex = root / "codex"
@@ -1864,6 +1931,8 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                         "0",
                         "--registry",
                         str(registry),
+                        "--web-session-id",
+                        "web-session-1",
                     ]
                 )
                 native = web_bridge.main(
@@ -1883,6 +1952,58 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertEqual(native, 0)
             self.assertGreaterEqual(len(calls), 2)
 
+
+
+class WebControllerSessionIdentityTests(unittest.TestCase):
+    def run_bridge(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["/usr/bin/python3", str(BRIDGE), *args], text=True, capture_output=True, check=False)
+
+    def test_session_start_refuses_repo_only_controller_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "AGENTS.md").write_text("rules\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo)}), encoding="utf-8")
+
+            result = self.run_bridge("session-start", "--repo", str(repo), "--registry", str(registry))
+
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("verified Web Controller Session identity", result.stderr)
+
+    def test_session_start_accepts_only_bound_web_controller_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "AGENTS.md").write_text("rules\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
+            }), encoding="utf-8")
+
+            result = self.run_bridge(
+                "session-start", "--repo", str(repo), "--registry", str(registry),
+                "--web-session-id", "web-session-1",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["controller_id"], "controller-1")
+            self.assertEqual(payload["controller_session_id"], "web-session-1")
+            self.assertEqual(payload["event_source"], "web")
 
 
 class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
@@ -1992,14 +2113,20 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
             subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
             registry = root / "controllers.json"
-            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
+            }), encoding="utf-8")
             result = subprocess.run(
-                ["/usr/bin/python3", str(BRIDGE), "session-start", "--repo", str(repo), "--registry", str(registry)],
+                ["/usr/bin/python3", str(BRIDGE), "session-start", "--repo", str(repo), "--registry", str(registry),
+                 "--web-session-id", "web-session-1"],
                 text=True, capture_output=True, check=False,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["controller_session"], "controller-1")
+        self.assertEqual(payload["controller_id"], "controller-1")
+        self.assertEqual(payload["controller_session_id"], "web-session-1")
         self.assertEqual(payload["restore_order"][-1], "git_runtime")
 
 

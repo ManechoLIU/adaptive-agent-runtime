@@ -79,6 +79,37 @@ def registered_controller_for_repo(repo: Path, registry_path: Path) -> str | Non
     return next(iter(matches))
 
 
+def registered_controller_session(
+    *, controller_id: str, session_id: str, host: str, registry_path: Path
+) -> bool:
+    registry = load_json(registry_path)
+    sessions = registry.get("__controller_sessions__")
+    if not isinstance(sessions, dict):
+        return False
+    controller_sessions = sessions.get(controller_id)
+    if not isinstance(controller_sessions, dict):
+        return False
+    host_sessions = controller_sessions.get(host)
+    if isinstance(host_sessions, str):
+        host_sessions = [host_sessions]
+    if not isinstance(host_sessions, list):
+        return False
+    return session_id in {value for value in host_sessions if isinstance(value, str)}
+
+
+def require_web_controller_session(
+    *, controller_id: str, web_session_id: str | None, registry_path: Path
+) -> str:
+    value = str(web_session_id or "").strip()
+    if not value or not registered_controller_session(
+        controller_id=controller_id, session_id=value, host="web", registry_path=registry_path
+    ):
+        raise PermissionError(
+            "verified Web Controller Session identity required; refusing repository-only Controller attribution"
+        )
+    return value
+
+
 def post_tool_event(
     *,
     session_id: str,
@@ -87,13 +118,19 @@ def post_tool_event(
     exit_code: int | None = None,
     output: str = "",
     turn_id: str = "web-ai-bridge",
+    controller_session_id: str | None = None,
+    execution_host: str = "web",
 ) -> dict[str, Any]:
     response: dict[str, Any] = {"output": output}
     if exit_code is not None:
         response["exit_code"] = exit_code
     return {
         "hook_event_name": "PostToolUse",
-        "controller_host": "web",
+        "controller_host": execution_host,
+        "execution_host": execution_host,
+        "event_source": "web",
+        "controller_id": session_id,
+        "controller_session_id": controller_session_id,
         "session_id": session_id,
         "turn_id": turn_id,
         "cwd": str(repo),
@@ -386,6 +423,10 @@ def computer_event_from_receipt(
     event = {
         "hook_event_name": "PostToolUse",
         "controller_host": "web",
+        "execution_host": "web",
+        "event_source": "web",
+        "controller_id": session_id,
+        "controller_session_id": lease.get("controller_session_id"),
         "session_id": session_id,
         "turn_id": f"web-audit:{receipt.get('receiptId') or 'computer'}",
         "cwd": str(repo.resolve()),
@@ -1218,12 +1259,14 @@ def build_parser() -> argparse.ArgumentParser:
     session_start = subparsers.add_parser("session-start")
     session_start.add_argument("--repo", required=True)
     session_start.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    session_start.add_argument("--web-session-id")
 
     post_shell = subparsers.add_parser("post-shell")
     post_shell.add_argument("--cwd", required=True)
     post_shell.add_argument("--command", required=True)
     post_shell.add_argument("--exit-code", required=True, type=int)
     post_shell.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    post_shell.add_argument("--web-session-id")
     post_shell.add_argument("--capture-event")
 
     audit_once = subparsers.add_parser("audit-once")
@@ -1289,11 +1332,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command_name == "session-start":
         repo = canonical_root(args.repo)
+        registry_path = Path(args.registry).expanduser()
         try:
-            payload = web_session_restore_payload(repo, Path(args.registry).expanduser())
+            controller_id = registered_controller_for_repo(repo, registry_path)
+            if controller_id is None:
+                raise ValueError(f"no registered controller for {repo}")
+            web_session_id = require_web_controller_session(
+                controller_id=controller_id,
+                web_session_id=args.web_session_id,
+                registry_path=registry_path,
+            )
+            payload = web_session_restore_payload(repo, registry_path)
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
         except (OSError, ValueError, subprocess.CalledProcessError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
+        payload["controller_id"] = controller_id
+        payload["controller_session_id"] = web_session_id
+        payload["event_source"] = "web"
         print(json.dumps(payload, ensure_ascii=False))
         return 0
 
@@ -1308,11 +1366,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         if session_id is None:
             return 0
+        registry_path = Path(args.registry).expanduser()
+        try:
+            web_session_id = require_web_controller_session(
+                controller_id=session_id,
+                web_session_id=args.web_session_id,
+                registry_path=registry_path,
+            )
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
         event = post_tool_event(
             session_id=session_id,
             repo=repo,
             command=args.command,
             exit_code=args.exit_code,
+            controller_session_id=web_session_id,
+            execution_host="web",
         )
         if args.capture_event:
             Path(args.capture_event).write_text(
