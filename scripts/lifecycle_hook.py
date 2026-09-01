@@ -305,6 +305,7 @@ def continuation_reason(
     rule_handshake: dict[str, Any] | None = None,
     root: str | None = None,
     session_id: str | None = None,
+    next_action: str | None = None,
 ) -> str:
     runnable_ids = list(runnable_ids or ready_ids)
     ready = ", ".join(runnable_ids) if runnable_ids else "无可执行工作"
@@ -332,6 +333,9 @@ def continuation_reason(
         errors = "; ".join(str(item) for item in handshake.get("errors", []))
         rule_text = f" Adaptive Agent Runtime 安装完整性失败：{errors}；禁止 ACK 或启动受影响 Assignment。"
     actions = ["请立即核对真实 main / 台账 / live Agent"]
+    pending_next_action = str(next_action or "").strip()
+    if pending_next_action:
+        actions.append(f"先完成已持久化的明确下一步：{pending_next_action}")
     if candidate_revisions:
         actions.append("处理候选审查、集成、验收")
     if runnable_ids:
@@ -365,6 +369,21 @@ def evaluate_event(
     event_host = str(event.get("controller_host", "")).strip()
     state["controller_host"] = event_host if event_host in {"web", "desktop_codex"} else "desktop_codex"
     event_name = event.get("hook_event_name")
+    event_next_action = str(event.get("next_action") or "").strip()
+    event_requires_user = event.get("requires_user")
+    if event_name == "PostToolUse" and event_next_action and isinstance(event_requires_user, bool):
+        state["next_action"] = event_next_action
+        state["requires_user"] = event_requires_user
+        current_triggers = {str(item) for item in state.get("triggers", [])}
+        if event_requires_user is False:
+            current_triggers.add("next_action_pending")
+        else:
+            current_triggers.discard("next_action_pending")
+            prior_event_triggers = {str(item) for item in (prior_state or {}).get("triggers", [])}
+            pending_receipts = [item for item in state.get("pending_terminal_receipts", []) if str(item).strip()]
+            if prior_event_triggers.issubset({"next_action_pending"}) and not pending_receipts:
+                state["pending_control_event"] = False
+        state["triggers"] = sorted(current_triggers)
     handshake = snapshot.get("rule_handshake", {}) if isinstance(snapshot.get("rule_handshake"), dict) else {}
     prior_nonrule_pending = bool(_non_rule_triggers(set((prior_state or {}).get("triggers", []))))
     wake_policy = derive_rule_wake_policy(
@@ -382,11 +401,15 @@ def evaluate_event(
             str(item) for item in state.get("pending_terminal_receipts", [])
             if isinstance(item, str) and item.strip()
         ]
+        pending_next_action = str(state.get("next_action") or "").strip()
+        continuation_pending = bool(pending_next_action) and state.get("requires_user") is False
         if pending_terminal_receipts:
             triggers = sorted(set(triggers) | set(str(item) for item in state.get("triggers", [])) | {"terminal_receipt_pending"})
+        if continuation_pending:
+            triggers = sorted(set(triggers) | set(str(item) for item in state.get("triggers", [])) | {"next_action_pending"})
         state.update(
             {
-                "pending_control_event": bool(triggers) or bool(pending_terminal_receipts),
+                "pending_control_event": bool(triggers) or bool(pending_terminal_receipts) or continuation_pending,
                 "triggers": triggers,
                 "stop_continuations": 0,
                 "pending_terminal_receipts": pending_terminal_receipts,
@@ -407,6 +430,7 @@ def evaluate_event(
             list(snapshot.get("candidate_revisions", [])),
             runnable_ids=list(snapshot.get("runnable_ids", snapshot.get("ready_ids", []))),
             rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
+            next_action=pending_next_action if continuation_pending else None,
         )
         if pending_terminal_receipts:
             context += " 待处理 terminal receipt：" + "；".join(pending_terminal_receipts) + "。恢复后先读取这些持久结果再继续。"
@@ -450,6 +474,8 @@ def evaluate_event(
                 "stop_continuations": 0,
                 "rule_wake_policy": "after_event",
                 "pending_terminal_receipts": [],
+                "next_action": "",
+                "requires_user": False,
             })
             if rule_triggers and not prior_pending:
                 state["wake_generation"] = prior_generation + 1
@@ -460,6 +486,8 @@ def evaluate_event(
                     "triggers": [],
                     "stop_continuations": 0,
                     "pending_terminal_receipts": [],
+                    "next_action": "",
+                    "requires_user": False,
                 }
             )
         return {}, state
@@ -482,8 +510,12 @@ def evaluate_event(
         and not (item.startswith("CANDIDATE:") and item.removeprefix("CANDIDATE:") not in current_candidates)
     }
     triggers = sorted(prior_triggers | set(detected))
-    pending = bool(state.get("pending_control_event")) or bool(triggers)
-    if wake_policy == "next_turn" and event_name != "SessionStart" and not _non_rule_triggers(triggers):
+    pending_next_action = str(state.get("next_action") or "").strip()
+    continuation_pending = bool(pending_next_action) and state.get("requires_user") is False
+    if continuation_pending and "next_action_pending" not in triggers:
+        triggers = sorted(set(triggers) | {"next_action_pending"})
+    pending = bool(state.get("pending_control_event")) or bool(triggers) or continuation_pending
+    if wake_policy == "next_turn" and event_name != "SessionStart" and not _non_rule_triggers(triggers) and not continuation_pending:
         pending = False
     if wake_policy == "after_event" and prior_nonrule_pending:
         pending = True
@@ -509,6 +541,7 @@ def evaluate_event(
             list(snapshot.get("candidate_revisions", [])),
             runnable_ids=list(snapshot.get("runnable_ids", snapshot.get("ready_ids", []))),
             rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
+            next_action=pending_next_action if continuation_pending else None,
         )
         return {
             "hookSpecificOutput": {
@@ -526,14 +559,9 @@ def evaluate_event(
             list(snapshot.get("candidate_revisions", [])),
             runnable_ids=list(snapshot.get("runnable_ids", snapshot.get("ready_ids", []))),
             rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
+            next_action=pending_next_action if continuation_pending else None,
         )
-        if snapshot.get("runnable_ids", snapshot.get("ready_ids")) or continuations <= 1:
-            return {"decision": "block", "reason": reason}, state
-        return {
-            "continue": False,
-            "stopReason": "Adaptive Agent Runtime controller lifecycle gate failed closed.",
-            "systemMessage": reason,
-        }, state
+        return {"decision": "block", "reason": reason}, state
     return {}, state
 
 

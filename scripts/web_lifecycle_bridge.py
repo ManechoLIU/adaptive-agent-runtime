@@ -569,6 +569,9 @@ def computer_event_from_receipt(
 
     detail = receipt.get("detail")
     target = receipt.get("targetLabel")
+    detail_text = detail if isinstance(detail, str) else ""
+    observational_operations = ("get_app_state", "get app state", "screenshot", "screen", "list_windows", "list windows", "observe")
+    requires_followup = not any(operation in detail_text.casefold() for operation in observational_operations)
     event = {
         "hook_event_name": "PostToolUse",
         "controller_host": "web",
@@ -587,6 +590,9 @@ def computer_event_from_receipt(
         },
         "tool_response": {"state": receipt.get("state")},
     }
+    if requires_followup:
+        event["next_action"] = "observe and read the result of the computer action before yielding"
+        event["requires_user"] = False
     remaining -= 1
     if remaining <= 0:
         lease_path.unlink(missing_ok=True)
@@ -690,7 +696,8 @@ def rotate_launcher_log(path: Path, max_bytes: int = LAUNCHER_LOG_LIMIT) -> None
 
 
 def native_resume_command(
-    *, codex: str, session_id: str, repo: Path, terminal_receipts: Sequence[str] | None = None
+    *, codex: str, session_id: str, repo: Path, terminal_receipts: Sequence[str] | None = None,
+    next_action: str | None = None,
 ) -> list[str]:
     prompt = (
         "Adaptive Agent Runtime Web Stop checkpoint. Continue this existing registered controller "
@@ -706,6 +713,9 @@ def native_resume_command(
     receipts = [str(item).strip() for item in (terminal_receipts or []) if str(item).strip()]
     if receipts:
         prompt += " Pending terminal receipts: " + "; ".join(receipts) + ". Read these durable results first and continue from them."
+    pending_next_action = str(next_action or "").strip()
+    if pending_next_action:
+        prompt += " Persisted non-user next action: " + pending_next_action + ". Complete it before yielding."
     return [codex, "exec", "-C", str(repo.resolve()), "resume", session_id, prompt]
 
 
@@ -717,10 +727,12 @@ def execute_native_resume(
     codex: str,
     runtime_path: str | None = None,
     terminal_receipts: Sequence[str] | None = None,
+    next_action: str | None = None,
 ) -> dict[str, Any]:
     """Run one bounded, preflighted same-thread native resume attempt."""
     command = native_resume_command(
-        codex=codex, session_id=session_id, repo=repo, terminal_receipts=terminal_receipts
+        codex=codex, session_id=session_id, repo=repo, terminal_receipts=terminal_receipts,
+        next_action=next_action,
     )
     try:
         ok, preflight_error, env = preflight_native_resume(
@@ -991,6 +1003,7 @@ def wake_existing_controller(
                     session_id=session_id, repo=repo, registry=registry, codex=codex,
                     runtime_path=runtime_path,
                     terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []),
+                    next_action=str(lifecycle_state.get("next_action") or "").strip() or None,
                 )
             else:
                 adapter = (resume_adapters or {}).get(str(selected_host))
@@ -1268,6 +1281,8 @@ def schedule_auto_native_stop(
     capture_path: Path | None = None,
     runtime_path: str | None = None,
 ) -> None:
+    prior = load_json(state_path)
+    same_receipt = prior.get("receipt_id") == receipt_id
     value = {
         "receipt_id": receipt_id,
         "session_id": session_id,
@@ -1275,7 +1290,12 @@ def schedule_auto_native_stop(
         "scheduled_at_unix_ms": int(time.time() * 1000),
         "state": "RESUME_PENDING",
         "pending_control_event": True,
+        "retry_count": int(prior.get("retry_count", 0) or 0) if same_receipt else 0,
     }
+    if same_receipt and prior.get("failure_class") == "active_writer_present":
+        value["last_deferred_state"] = "RESUME_DEFERRED_ACTIVE_WRITER"
+        value["failure_class"] = "active_writer_present"
+        value["stderr_tail"] = bounded_tail(str(prior.get("stderr_tail", "")))
     write_auto_stop_state(state_path, value)
     command = [
         sys.executable,
@@ -1345,9 +1365,12 @@ def run_auto_native_stop(
         "runtime_path": runtime_path or DEFAULT_RUNTIME_PATH,
     })
     write_auto_stop_state(state_path, latest)
+    lifecycle_state = _load_lifecycle_state(session_id)
     attempt = execute_native_resume(
         session_id=session_id, repo=repo, registry=registry, codex=codex,
         runtime_path=runtime_path,
+        terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
+        next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
     )
     latest = load_json(state_path)
     if latest.get("receipt_id") == receipt_id:
@@ -1379,6 +1402,17 @@ def run_auto_native_stop(
     stderr_tail = str(attempt.get("stderr_tail", ""))
     if stderr_tail:
         print(stderr_tail, file=sys.stderr, end="" if stderr_tail.endswith("\n") else "\n")
+    if attempt.get("state") == "RESUME_DEFERRED_ACTIVE_WRITER":
+        current = load_json(state_path)
+        if current.get("receipt_id") == receipt_id:
+            current["retry_count"] = int(current.get("retry_count", 0) or 0) + 1
+            write_auto_stop_state(state_path, current)
+            retry_delay = min(30.0, max(1.0, 2.0 ** min(current["retry_count"], 4)))
+            schedule_auto_native_stop(
+                session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+                codex=codex, delay_seconds=retry_delay, state_path=state_path, runtime_path=runtime_path,
+            )
+        return 0
     return int(attempt["returncode"])
 
 
@@ -1673,8 +1707,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             registered = registered_controller_for_repo(repo, registry_path)
             if registered is None or registered != args.session_id:
                 raise PermissionError("audit-once controller does not match registered Controller")
+            supplied_web_session_id = str(args.web_session_id or "").strip()
+            if not supplied_web_session_id:
+                supplied_web_session_id = resolve_manual_web_session(
+                    cwd=repo, registry_path=registry_path, lease_path=DEFAULT_MANUAL_WEB_LEASES
+                ) or ""
             web_session_id = require_web_controller_session(
-                controller_id=registered, web_session_id=args.web_session_id, registry_path=registry_path
+                controller_id=registered, web_session_id=supplied_web_session_id, registry_path=registry_path
             )
         except PermissionError as exc:
             print(str(exc), file=sys.stderr)
@@ -1735,6 +1774,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         )
                         if not wake_receipt_confirmed(wake_receipt):
                             result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
+                            if args.auto_native_stop and result == "DEFERRED":
+                                state_path = Path(args.auto_stop_state).expanduser() if args.auto_stop_state else default_auto_stop_state_path(args.session_id)
+                                schedule_auto_native_stop(
+                                    session_id=args.session_id, repo=repo,
+                                    receipt_id=str(receipt.get("receiptId") or _audit_receipt_key(receipt)),
+                                    registry=Path(args.registry).expanduser(), codex=args.codex,
+                                    delay_seconds=max(1.0, args.auto_stop_delay_seconds), state_path=state_path,
+                                    capture_path=Path(args.capture_auto_stop).expanduser() if args.capture_auto_stop else None,
+                                    runtime_path=args.runtime_path,
+                                )
                             print(
                                 f"web lifecycle wake not confirmed for {_audit_receipt_key(receipt)}: {result}",
                                 file=sys.stderr,
@@ -1789,6 +1838,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                             )
                             if not wake_receipt_confirmed(wake_receipt):
                                 result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
+                                if args.auto_native_stop and result == "DEFERRED":
+                                    state_path = Path(args.auto_stop_state).expanduser() if args.auto_stop_state else default_auto_stop_state_path(args.session_id)
+                                    schedule_auto_native_stop(
+                                        session_id=args.session_id, repo=repo,
+                                        receipt_id=str(receipt.get("receiptId") or _audit_receipt_key(receipt)),
+                                        registry=Path(args.registry).expanduser(), codex=args.codex,
+                                        delay_seconds=max(1.0, args.auto_stop_delay_seconds), state_path=state_path,
+                                        capture_path=Path(args.capture_auto_stop).expanduser() if args.capture_auto_stop else None,
+                                        runtime_path=args.runtime_path,
+                                    )
                                 print(
                                     f"web lifecycle wake not confirmed for {_audit_receipt_key(receipt)}: {result}",
                                     file=sys.stderr,
