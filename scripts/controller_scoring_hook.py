@@ -33,6 +33,10 @@ _OUTPUT_SCORE = re.compile(
     rf"(?:总控|项目总控|controller|orchestrator).{{0,80}}?(?:评分|得分|score|performance).{{0,40}}?{_SCORE_VALUE}",
     re.IGNORECASE | re.DOTALL,
 )
+_FORMAL_SCORE_LABEL = re.compile(
+    rf"(?:正式(?:总控)?(?:履职)?评分|履职评分|formal(?: controller)? score|controller performance score).{{0,20}}?{_SCORE_VALUE}",
+    re.IGNORECASE | re.DOTALL,
+)
 
 _SCORE_TERMS = re.compile(
     r"(?:评分|打分|分数|多少分|履职评估|履职评分|performance\s+(?:score|scoring|evaluation)|score\s+(?:the\s+)?(?:controller|orchestrator)|rate\s+(?:the\s+)?(?:controller|orchestrator))",
@@ -85,7 +89,8 @@ def _extract_cycle_score_value(message: str) -> float | None:
 def _has_distinct_formal_score_output(message: str) -> bool:
     text = str(message or "")
     cycle_spans = [match.span() for match in _CYCLE_OUTPUT_SCORE.finditer(text)]
-    for formal in _OUTPUT_SCORE.finditer(text):
+    formal_matches = list(_OUTPUT_SCORE.finditer(text)) + list(_FORMAL_SCORE_LABEL.finditer(text))
+    for formal in formal_matches:
         formal_start, formal_end = formal.span()
         if not any(max(formal_start, cycle_start) < min(formal_end, cycle_end) for cycle_start, cycle_end in cycle_spans):
             return True

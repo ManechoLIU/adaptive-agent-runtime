@@ -444,6 +444,28 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
                 hook.cycle_score_extremes(repo, controller_session_id="controller-1", model_sha256=hook.scoring_model_sha256(ROOT)),
             )
 
+    def test_cycle_request_blocks_shared_controller_subject_with_second_formal_score(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-cycle-shared-subject", "cwd": str(repo), "prompt": "给总控做单回合诊断评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-cycle-shared-subject", "cwd": str(repo),
+                 "last_assistant_message": "总控：单回合诊断评分：91/100，正式履职评分：82/100。\n控制回合：cycle-1\n回合终态：CLOSED\n证据摘要：reviewed"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual("block", output.get("decision"))
+            self.assertIn("mode", output.get("reason", ""))
+            self.assertEqual(
+                {"best": None, "worst": None},
+                hook.cycle_score_extremes(repo, controller_session_id="controller-1", model_sha256=hook.scoring_model_sha256(ROOT)),
+            )
+
     def test_cycle_request_allows_single_cycle_score_even_when_regexes_overlap(self):
         import subprocess
         hook = load_module()
