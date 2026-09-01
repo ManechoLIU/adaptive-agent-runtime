@@ -101,6 +101,8 @@
 
 仅靠结束时手动运行门禁不足以约束长回合。持续总控注册为 **registered controller** 后，使用 `scripts/lifecycle_hook.py` 接入 `SessionStart / PostToolUse / SubagentStop / Stop`：会话启动时建立真实主线与台账基线；工具调用后检测 `main`、工作区、台账、`READY` 或任一 worktree 的未合入候选变化；子 Agent 停止时登记待处理候选事件；总控准备停止时，若这些变化尚未由带 `--repo` 的成功 `control_event_guard.py` 收据闭合，则自动继续当前 turn。通过的控制收据会原子确认当时全部 READY、候选和运行中任务的决定并清除 pending；同一批未变化对象不会在下一次工具调用时重复触发，只有集合、状态或证据发生新变化才开启下一控制事件。首次 Stop 只允许一次受控续作；若此后 `main / 台账 / 工作区 / READY / 候选队列` 均无可验证变化，第二次 Stop 直接 fail closed，不把长时间分析或重复检查伪装成持续推进。出现真实快照变化后才重置该计数。Hook 只对登记的唯一总控和 canonical `main` 生效，Writer / Reviewer 工作树不受影响；它只能触发检查与续作，不能代替总控调用 `spawn_agent`、判断文件冲突或选择优先级。非托管 Hook 必须完成运行平台的定义审核与信任后才算生效，具体命令只放在平台安装指南中。
 
+
+长时外部 Agent / Reviewer 的结束不能只依赖同步 shell 返回。需要自动接续时，`run_external_agent.mjs` 先持久化标准 `external_agent_terminal` receipt（可绑定已持久化 `result_path`），再由 `terminal_continuation.py` 以 Git common-dir 找到现有唯一 Controller，写入 `SubagentStop` lifecycle event 并调用现有 Wake Supervisor；lifecycle state 只暂存待消费 receipt 路径，native resume 明确要求先读这些结果。成功 control-event receipt 后清空已消费路径。该机制只补“结果可持久化 → 结束可触发 → 恢复可继续”的最短闭环，不引入第二 Controller、watchdog 或另一套任务状态机。
 ### Controller Health 与 Wake Supervisor
 
 Adaptive Agent Runtime 只保留一个 registered controller。`Controller Health` 是从现有 controller binding、生命周期、host adapter 与 runtime 事实即时派生的只读投影，不是 `no mutable health ledger` 之外的新状态源；`Wake Supervisor` 也是确定性基础设施，不是第二个 Agent、第二个 controller 或第二套项目状态机。项目身份边界仍是 `Git common-dir`，controller worktree events require binding proof；普通 Writer / Reviewer worktree 不能凭同一 common-dir 冒充总控执行面。

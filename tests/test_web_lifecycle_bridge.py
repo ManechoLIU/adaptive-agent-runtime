@@ -842,6 +842,16 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
             self.assertGreater(value["expires_at_unix_ms"], value["issued_at_unix_ms"])
 
 
+class TerminalReceiptResumeContextTests(unittest.TestCase):
+    def test_native_resume_prompt_names_pending_terminal_receipt(self) -> None:
+        receipt = "/tmp/reviewer-terminal.json"
+        command = web_bridge.native_resume_command(
+            codex="/usr/bin/codex", session_id="controller-1", repo=Path("/tmp/project"),
+            terminal_receipts=[receipt],
+        )
+        self.assertIn(receipt, command[-1])
+
+
 class WebLifecycleNativeStopTests(unittest.TestCase):
     def run_bridge(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -1381,6 +1391,33 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertEqual(receipt["result"], "CONFIRMED")
             self.assertEqual(receipt["canonical_common_dir"], str(web_bridge._git_common_dir(repo)))
             self.assertIn("resume controller-1", marker.read_text(encoding="utf-8"))
+
+    def test_wake_passes_pending_terminal_receipts_to_native_resume(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, _ = self.make_controller(root)
+            terminal = str(root / "reviewer-terminal.json")
+            with patch.object(
+                web_bridge, "execute_native_resume",
+                return_value={
+                    "operation": "native_resume", "result": "CONFIRMED",
+                    "state": "RESUME_SUCCEEDED", "pending_control_event": True,
+                    "returncode": 0, "stdout_tail": "", "stderr_tail": "",
+                },
+            ) as resume:
+                receipt = web_bridge.wake_existing_controller(
+                    lifecycle_state={
+                        "pending_control_event": True, "triggers": ["subagent_stopped:reviewer-1"],
+                        "pending_terminal_receipts": [terminal],
+                    },
+                    session_id="controller-1", repo=repo, registry=registry, codex=str(codex),
+                    receipt_path=receipt_path,
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                )
+            self.assertEqual(receipt["result"], "CONFIRMED")
+            self.assertEqual(resume.call_args.kwargs["terminal_receipts"], [terminal])
 
     def test_confirmed_wake_keeps_pending_control_event_true(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

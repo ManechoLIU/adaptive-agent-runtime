@@ -596,7 +596,9 @@ def rotate_launcher_log(path: Path, max_bytes: int = LAUNCHER_LOG_LIMIT) -> None
         return
 
 
-def native_resume_command(*, codex: str, session_id: str, repo: Path) -> list[str]:
+def native_resume_command(
+    *, codex: str, session_id: str, repo: Path, terminal_receipts: Sequence[str] | None = None
+) -> list[str]:
     prompt = (
         "Adaptive Delivery Web Stop checkpoint. Continue this existing registered controller "
         "thread only; do not create or fork another controller. Reconcile any pending lifecycle "
@@ -608,6 +610,9 @@ def native_resume_command(*, codex: str, session_id: str, repo: Path) -> list[st
         "control_event_guard; if no pending control action or Goal rollover remains, stop without "
         "starting unrelated work."
     )
+    receipts = [str(item).strip() for item in (terminal_receipts or []) if str(item).strip()]
+    if receipts:
+        prompt += " Pending terminal receipts: " + "; ".join(receipts) + ". Read these durable results first and continue from them."
     return [codex, "exec", "-C", str(repo.resolve()), "resume", session_id, prompt]
 
 
@@ -618,9 +623,12 @@ def execute_native_resume(
     registry: Path,
     codex: str,
     runtime_path: str | None = None,
+    terminal_receipts: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Run one bounded, preflighted same-thread native resume attempt."""
-    command = native_resume_command(codex=codex, session_id=session_id, repo=repo)
+    command = native_resume_command(
+        codex=codex, session_id=session_id, repo=repo, terminal_receipts=terminal_receipts
+    )
     try:
         ok, preflight_error, env = preflight_native_resume(
             session_id=session_id,
@@ -889,6 +897,7 @@ def wake_existing_controller(
                 attempt = execute_native_resume(
                     session_id=session_id, repo=repo, registry=registry, codex=codex,
                     runtime_path=runtime_path,
+                    terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []),
                 )
             else:
                 adapter = (resume_adapters or {}).get(str(selected_host))

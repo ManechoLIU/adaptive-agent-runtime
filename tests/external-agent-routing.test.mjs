@@ -420,6 +420,42 @@ test("OAuth and API execution stay on distinct Kimi and Grok credential paths", 
   assert.deepEqual(grokApiCall.args.slice(-2), ["--reasoning-effort", "low"]);
 });
 
+test("external execute persists terminal receipt and invokes controller continuation helper", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-terminal-continuation-"));
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const terminalReceipt = path.join(bin, "terminal.json");
+  const resultPath = path.join(bin, "review-output.log");
+  const helperMarker = path.join(bin, "helper-args.json");
+  await writeFile(resultPath, "review verdict: FINDINGS\n");
+  const helper = path.join(bin, "continuation-helper.py");
+  await writeFile(helper, `#!/usr/bin/env python3
+import json, os, sys
+open(os.environ["HELPER_MARKER"], "w", encoding="utf-8").write(json.dumps(sys.argv[1:]))
+`);
+  await chmod(helper, 0o755);
+
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", skillRoot,
+    "--terminal-receipt", terminalReceipt, "--result-path", resultPath,
+  ], { encoding: "utf8", input: "bounded review", env: {
+    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
+    AD_TERMINAL_CONTINUATION_HELPER: helper, HELPER_MARKER: helperMarker,
+  } });
+
+  assert.equal(result.status, 0, result.stderr);
+  const receipt = JSON.parse(await readFile(terminalReceipt, "utf8"));
+  assert.equal(receipt.event_type, "external_agent_terminal");
+  assert.equal(receipt.engine, "grok-build");
+  assert.equal(receipt.exit_code, 0);
+  assert.equal(receipt.result_path, resultPath);
+  const helperArgs = JSON.parse(await readFile(helperMarker, "utf8"));
+  assert.deepEqual(helperArgs, ["consume", "--repo", skillRoot, "--receipt", terminalReceipt]);
+});
+
 test("login mode delegates to the official CLI without a model request", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-login-"));
   await fakeRunner(bin, "kimi", "--version");

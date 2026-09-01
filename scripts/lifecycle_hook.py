@@ -11,7 +11,10 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
-from lint_governance import task_records, task_rows
+try:
+    from lint_governance import task_records, task_rows
+except ModuleNotFoundError:
+    from scripts.lint_governance import task_records, task_rows
 try:
     from controller_state import derive_runnable_tasks, project_task_state
 except ModuleNotFoundError:
@@ -409,11 +412,19 @@ def evaluate_event(
         agent_id = str(event.get("agent_id", "unknown"))
         trigger = f"subagent_stopped:{agent_id}"
         triggers.add(trigger)
+        terminal_receipt = str(event.get("terminal_receipt", "")).strip()
+        pending_terminal_receipts = [
+            str(item) for item in state.get("pending_terminal_receipts", [])
+            if isinstance(item, str) and item.strip()
+        ]
+        if terminal_receipt and terminal_receipt not in pending_terminal_receipts:
+            pending_terminal_receipts.append(terminal_receipt)
         state.update(
             {
                 "pending_control_event": True,
                 "triggers": sorted(triggers),
                 "stop_continuations": 0,
+                "pending_terminal_receipts": pending_terminal_receipts,
             }
         )
         if not prior_pending:
@@ -428,6 +439,7 @@ def evaluate_event(
                 "triggers": rule_triggers,
                 "stop_continuations": 0,
                 "rule_wake_policy": "after_event",
+                "pending_terminal_receipts": [],
             })
             if rule_triggers and not prior_pending:
                 state["wake_generation"] = prior_generation + 1
@@ -437,6 +449,7 @@ def evaluate_event(
                     "pending_control_event": False,
                     "triggers": [],
                     "stop_continuations": 0,
+                    "pending_terminal_receipts": [],
                 }
             )
         return {}, state

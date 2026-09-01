@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -204,7 +204,7 @@ export function parseArgs(argv) {
     runtimeRepo: null,
     workPackage: null, category: null, status: null, detail: null,
     assignmentId: null, taskId: null, agentId: null, sessionId: null,
-    attempt: 1, leaseId: null, runtimeReceipts: null, assignmentAck: null, deliveryReceipt: null,
+    attempt: 1, leaseId: null, runtimeReceipts: null, assignmentAck: null, deliveryReceipt: null, terminalReceipt: null, resultPath: null,
     workType: null, complexity: null, failureClass: null, controllerHost: null, currentHostFailureClass: null, peerHostAvailable: false, highRisk: false, providerPinned: false, resultUnknown: false, partialWritePossible: false, billingBoundary: false, authorizationBoundary: false,
   };
 
@@ -225,7 +225,7 @@ export function parseArgs(argv) {
     else if (argument === "--billing-boundary") options.billingBoundary = true;
     else if (argument === "--authorization-boundary") options.authorizationBoundary = true;
     else if (argument === "--peer-host-available") options.peerHostAvailable = true;
-    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--runtime-repo", "--work-package", "--category", "--status", "--detail", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts", "--assignment-ack", "--delivery-receipt", "--work-type", "--complexity", "--failure-class", "--controller-host", "--current-host-failure-class"].includes(argument)) {
+    else if (["--engine", "--model", "--reasoning-effort", "--auth-mode", "--region", "--cwd", "--runtime-repo", "--work-package", "--category", "--status", "--detail", "--assignment-id", "--task-id", "--agent-id", "--session-id", "--attempt", "--lease-id", "--runtime-receipts", "--assignment-ack", "--delivery-receipt", "--terminal-receipt", "--result-path", "--work-type", "--complexity", "--failure-class", "--controller-host", "--current-host-failure-class"].includes(argument)) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`Missing value for ${argument}`);
       if (argument === "--auth-mode") options.authMode = value;
@@ -241,6 +241,8 @@ export function parseArgs(argv) {
       else if (argument === "--work-package") options.workPackage = value;
       else if (argument === "--assignment-ack") options.assignmentAck = value;
       else if (argument === "--delivery-receipt") options.deliveryReceipt = value;
+      else if (argument === "--terminal-receipt") options.terminalReceipt = value;
+      else if (argument === "--result-path") options.resultPath = value;
       else if (argument === "--work-type") options.workType = value;
       else if (argument === "--complexity") options.complexity = value;
       else if (argument === "--failure-class") options.failureClass = value;
@@ -545,6 +547,43 @@ function recordRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
   if (result.error) throw new Error(`runtime receipt apply failed: ${result.error.message}`);
   if (result.status !== 0) throw new Error(`runtime receipt apply failed: ${(result.stdout || result.stderr).trim()}`);
   if (options.runtimeReceipts) appendFileSync(options.runtimeReceipts, `${JSON.stringify(receipt)}\n`, "utf8");
+}
+
+
+function atomicWriteJson(pathname, payload) {
+  const target = path.resolve(pathname);
+  mkdirSync(path.dirname(target), { recursive: true });
+  const temporary = `${target}.tmp-${process.pid}`;
+  writeFileSync(temporary, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  renameSync(temporary, target);
+  return target;
+}
+
+function persistExternalTerminalReceipt(options, { exitCode, summary, deliveryOutcome = "unresolved" }) {
+  if (!options.terminalReceipt) return null;
+  const target = atomicWriteJson(options.terminalReceipt, {
+    schema_version: 1,
+    event_type: "external_agent_terminal",
+    engine: options.engine,
+    model: options.model,
+    cwd: path.resolve(options.cwd),
+    repo: path.resolve(runtimeRepository(options)),
+    exit_code: exitCode,
+    summary: String(summary || "external agent finished"),
+    delivery_outcome: deliveryOutcome,
+    result_path: options.resultPath ? path.resolve(options.resultPath) : null,
+    assignment_id: options.assignmentId || null,
+    task_id: options.taskId || null,
+    agent_id: options.agentId || null,
+    session_id: options.sessionId || null,
+    completed_at: new Date().toISOString(),
+  });
+  const helper = process.env.AD_TERMINAL_CONTINUATION_HELPER || fileURLToPath(new URL("./terminal_continuation.py", import.meta.url));
+  const python = process.env.AD_PYTHON || "python3";
+  const result = spawnSync(python, [helper, "consume", "--repo", runtimeRepository(options), "--receipt", target], { encoding: "utf8", env: process.env });
+  if (result.error) throw new Error(`terminal continuation helper failed: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(`terminal continuation helper failed: ${(result.stderr || result.stdout || `exit ${result.status}`).trim()}`);
+  return target;
 }
 
 function runtimeGitSnapshot(cwd) {
@@ -859,6 +898,7 @@ async function main() {
       if (heartbeat) clearInterval(heartbeat);
       eventSeq += 1;
       recordRuntimeReceipt(options, "assignment_terminal", eventSeq, { terminal_state: "failed", transport_outcome: "failed", delivery_outcome: "unresolved", summary: error.message, evidence: [], artifacts: [], next_action: "inspect external agent failure", retry_class: "transport_error", result_unknown: Boolean(options.sideEffect) });
+      persistExternalTerminalReceipt(options, { exitCode: 1, summary: error.message, deliveryOutcome: "unresolved" });
       throw error;
     }
     if (heartbeat) clearInterval(heartbeat);
@@ -882,6 +922,11 @@ async function main() {
       retry_class: delivery?.retry_class || (deliveryError ? "none" : code === 0 ? "none" : "provider_exit"),
       reconciliation_evidence: delivery?.reconciliation_evidence || [],
       result_unknown: Boolean(options.sideEffect) && (code !== 0 || deliveryError !== null || delivery?.delivery_outcome === "unresolved" || delivery === null),
+    });
+    persistExternalTerminalReceipt(options, {
+      exitCode: code,
+      summary: delivery?.summary || deliveryError?.message || (code === 0 ? "external agent process completed" : `external agent exited ${code}`),
+      deliveryOutcome: delivery?.delivery_outcome || "unresolved",
     });
     if (deliveryError) throw deliveryError;
     process.exitCode = code;

@@ -493,6 +493,45 @@ class GovernanceTests(unittest.TestCase):
         self.assertEqual(second["triggers"], first["triggers"])
         self.assertEqual(second["wake_generation"], 2)
 
+    def test_subagent_stop_preserves_terminal_receipt_path_for_controller_resume(self) -> None:
+        snapshot = {
+            "root": "/tmp/project", "head": "h1", "ledger_sha256": "l1",
+            "worktree_status_sha256": "s1", "ready_ids": [], "runnable_ids": [],
+            "candidate_revisions": [], "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "installed_revision": "rev-1"},
+        }
+        receipt = "/tmp/reviewer-terminal.json"
+        _, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "SubagentStop", "session_id": "controller-1",
+                "agent_id": "reviewer-1", "terminal_receipt": receipt,
+            },
+            snapshot=snapshot, prior_state=None,
+        )
+        self.assertEqual(state["pending_terminal_receipts"], [receipt])
+
+    def test_successful_control_receipt_clears_consumed_terminal_receipts(self) -> None:
+        snapshot = {
+            "root": "/tmp/project", "head": "h1", "ledger_sha256": "l1",
+            "worktree_status_sha256": "s1", "ready_ids": [], "runnable_ids": [],
+            "candidate_revisions": [], "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "installed_revision": "rev-1"},
+        }
+        _, pending = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "SubagentStop", "session_id": "controller-1",
+                "agent_id": "reviewer-1", "terminal_receipt": "/tmp/reviewer-terminal.json",
+            }, snapshot=snapshot, prior_state=None,
+        )
+        _, closed = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse", "session_id": "controller-1",
+                "tool_input": {"command": "python3 scripts/control_event_guard.py receipt.json --repo ."},
+                "tool_response": {"output": "control-event: allowed", "exit_code": 0},
+            }, snapshot=snapshot, prior_state=pending,
+        )
+        self.assertEqual(closed.get("pending_terminal_receipts", []), [])
+
     def test_lifecycle_hook_surfaces_unhealthy_active_runtime_without_git_change(self) -> None:
         snapshot = {
             "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",
