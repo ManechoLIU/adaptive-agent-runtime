@@ -45,6 +45,8 @@ REGISTRY_PATH = Path(
 ).expanduser()
 LEDGER_NAMES = ("TASK_LEDGER.md", "PROJECT_STATUS.md")
 CONTROLLER_SURFACES_KEY = "__controller_surfaces__"
+CONTROLLER_SESSIONS_KEY = "__controller_sessions__"
+DESKTOP_SESSION_HOST = "desktop_codex"
 
 
 
@@ -366,6 +368,9 @@ def evaluate_event(
     state["wake_generation"] = prior_generation
     state["snapshot"] = snapshot
     state["session_id"] = str(event.get("session_id", ""))
+    state["source_session_id"] = str(
+        event.get("source_session_id", event.get("session_id", ""))
+    )
     event_host = str(event.get("controller_host", "")).strip()
     state["controller_host"] = event_host if event_host in {"web", "desktop_codex"} else "desktop_codex"
     event_name = event.get("hook_event_name")
@@ -582,9 +587,36 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def registered_controller_id(session_id: str) -> str | None:
+    session_id = session_id.strip()
+    if not session_id:
+        return None
+    registry = load_json(REGISTRY_PATH)
+    owners: set[str] = set()
+    if isinstance(registry.get(session_id), str):
+        owners.add(session_id)
+    sessions = registry.get(CONTROLLER_SESSIONS_KEY)
+    if isinstance(sessions, dict):
+        for controller_id, controller_sessions in sessions.items():
+            if not isinstance(controller_id, str) or not isinstance(controller_sessions, dict):
+                continue
+            desktop_sessions = controller_sessions.get(DESKTOP_SESSION_HOST)
+            if isinstance(desktop_sessions, str):
+                desktop_sessions = [desktop_sessions]
+            if isinstance(desktop_sessions, list) and session_id in {
+                value for value in desktop_sessions if isinstance(value, str)
+            }:
+                owners.add(controller_id)
+    if len(owners) != 1:
+        return None
+    controller_id = next(iter(owners))
+    return controller_id if isinstance(registry.get(controller_id), str) else None
+
+
 def registered_root(session_id: str) -> Path | None:
     registry = load_json(REGISTRY_PATH)
-    value = registry.get(session_id)
+    controller_id = registered_controller_id(session_id)
+    value = registry.get(controller_id) if controller_id is not None else None
     if not isinstance(value, str) or not value.strip():
         return None
     return Path(value).expanduser().resolve()
@@ -592,12 +624,15 @@ def registered_root(session_id: str) -> Path | None:
 
 def registered_controller_surface(session_id: str, expected_root: Path) -> Path | None:
     registry = load_json(REGISTRY_PATH)
+    controller_id = registered_controller_id(session_id)
+    if controller_id is None:
+        return None
     surfaces = registry.get(CONTROLLER_SURFACES_KEY)
     if surfaces is None:
         return expected_root.resolve()
     if not isinstance(surfaces, dict):
         return None
-    value = surfaces.get(session_id)
+    value = surfaces.get(controller_id)
     if not isinstance(value, str) or not value.strip():
         return None
     return Path(value).expanduser().resolve()
@@ -613,6 +648,18 @@ def register_controller(session_id: str, root: Path) -> None:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             registry = load_json(REGISTRY_PATH)
+            sessions = registry.get(CONTROLLER_SESSIONS_KEY)
+            if isinstance(sessions, dict):
+                for controller_id, controller_sessions in sessions.items():
+                    if controller_id == session_id or not isinstance(controller_sessions, dict):
+                        continue
+                    desktop_sessions = controller_sessions.get(DESKTOP_SESSION_HOST)
+                    if isinstance(desktop_sessions, str):
+                        desktop_sessions = [desktop_sessions]
+                    if isinstance(desktop_sessions, list) and session_id in desktop_sessions:
+                        raise ValueError(
+                            "controller session is already bound as a desktop entry to another Controller"
+                        )
             for registered_session, registered_path in registry.items():
                 if registered_session == session_id or not isinstance(registered_path, str):
                     continue
@@ -626,6 +673,71 @@ def register_controller(session_id: str, root: Path) -> None:
                 raise ValueError("controller surface registry is invalid")
             surfaces[session_id] = str(root.resolve())
             registry[CONTROLLER_SURFACES_KEY] = surfaces
+            write_json(REGISTRY_PATH, registry)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def bind_desktop_session(
+    *, controller_id: str, desktop_session_id: str, repo: Path
+) -> None:
+    controller_id = controller_id.strip()
+    desktop_session_id = desktop_session_id.strip()
+    if not controller_id or not desktop_session_id:
+        raise ValueError("controller-id and desktop-session-id are required")
+    canonical_root = canonical_main_root(repo)
+    if canonical_root is None:
+        raise ValueError("desktop session binding requires a canonical Git project")
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            registry = load_json(REGISTRY_PATH)
+            registered_path = registry.get(controller_id)
+            if (
+                not isinstance(registered_path, str)
+                or Path(registered_path).expanduser().resolve() != canonical_root.resolve()
+            ):
+                raise PermissionError(
+                    "desktop session binding requires the registered Controller for this repository"
+                )
+            direct_owner = registry.get(desktop_session_id)
+            if isinstance(direct_owner, str) and desktop_session_id != controller_id:
+                raise PermissionError(
+                    "Desktop Controller Session is already a registered Controller"
+                )
+            sessions = registry.get(CONTROLLER_SESSIONS_KEY)
+            if not isinstance(sessions, dict):
+                sessions = {}
+            for candidate_controller, controller_sessions in sessions.items():
+                if candidate_controller == controller_id or not isinstance(controller_sessions, dict):
+                    continue
+                desktop_sessions = controller_sessions.get(DESKTOP_SESSION_HOST)
+                if isinstance(desktop_sessions, str):
+                    desktop_sessions = [desktop_sessions]
+                if isinstance(desktop_sessions, list) and desktop_session_id in desktop_sessions:
+                    raise PermissionError(
+                        "Desktop Controller Session is already bound to another Controller"
+                    )
+            controller_sessions = sessions.get(controller_id)
+            if not isinstance(controller_sessions, dict):
+                controller_sessions = {}
+            desktop_sessions = controller_sessions.get(DESKTOP_SESSION_HOST)
+            if isinstance(desktop_sessions, str):
+                desktop_sessions = [desktop_sessions]
+            if not isinstance(desktop_sessions, list):
+                desktop_sessions = []
+            normalized = [
+                value
+                for value in desktop_sessions
+                if isinstance(value, str) and value.strip()
+            ]
+            if desktop_session_id not in normalized:
+                normalized.append(desktop_session_id)
+            controller_sessions[DESKTOP_SESSION_HOST] = normalized
+            sessions[controller_id] = controller_sessions
+            registry[CONTROLLER_SESSIONS_KEY] = sessions
             write_json(REGISTRY_PATH, registry)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -654,6 +766,25 @@ def state_path(session_id: str) -> Path:
     return STATE_ROOT / f"{safe_id or 'unknown'}.json"
 
 
+def persist_event_state(
+    path: Path, event: dict[str, Any], snapshot: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            output, next_state = evaluate_event(
+                event,
+                snapshot=snapshot,
+                prior_state=load_json(path),
+            )
+            write_json(path, next_state)
+            return output, next_state
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def run_hook() -> int:
     try:
         event = json.load(sys.stdin)
@@ -661,21 +792,22 @@ def run_hook() -> int:
         return 0
     if not isinstance(event, dict):
         return 0
-    session_id = str(event.get("session_id", "")).strip()
+    source_session_id = str(event.get("session_id", "")).strip()
     cwd = Path(str(event.get("cwd", "."))).expanduser().resolve()
-    expected_root = registered_root(session_id)
-    if expected_root is None:
+    controller_id = registered_controller_id(source_session_id)
+    expected_root = registered_root(source_session_id)
+    if controller_id is None or expected_root is None:
         return 0
     snapshot = project_snapshot(cwd)
     if snapshot is None or not controller_event_is_managed(event, cwd, expected_root):
         return 0
-    path = state_path(session_id)
-    output, next_state = evaluate_event(
-        event,
-        snapshot=snapshot,
-        prior_state=load_json(path),
-    )
-    write_json(path, next_state)
+    normalized_event = dict(event)
+    normalized_event["source_session_id"] = source_session_id
+    normalized_event["controller_session_id"] = controller_id
+    normalized_event["session_id"] = controller_id
+    normalized_event["controller_host"] = DESKTOP_SESSION_HOST
+    path = state_path(controller_id)
+    output, _next_state = persist_event_state(path, normalized_event, snapshot)
     if output:
         print(json.dumps(output, ensure_ascii=False))
     return 0
@@ -686,6 +818,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Turn Adaptive Agent Runtime controller lifecycle changes into Codex hook events."
     )
     parser.add_argument("--register-controller", nargs=2, metavar=("SESSION_ID", "REPO"))
+    parser.add_argument(
+        "--bind-desktop-session",
+        nargs=3,
+        metavar=("CONTROLLER_ID", "DESKTOP_SESSION_ID", "REPO"),
+    )
     args = parser.parse_args(argv)
     if args.register_controller:
         session_id, repo = args.register_controller
@@ -694,6 +831,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("REPO must be the canonical project checkout")
         register_controller(session_id, root)
         print(f"adaptive-delivery lifecycle controller registered: {session_id} -> {root}")
+        return 0
+    if args.bind_desktop_session:
+        controller_id, desktop_session_id, repo = args.bind_desktop_session
+        root = Path(repo).expanduser().resolve()
+        try:
+            bind_desktop_session(
+                controller_id=controller_id,
+                desktop_session_id=desktop_session_id,
+                repo=root,
+            )
+        except PermissionError as error:
+            print(str(error), file=sys.stderr)
+            return 78
+        except (OSError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        print(
+            json.dumps(
+                {
+                    "controller_id": controller_id,
+                    "controller_session_id": controller_id,
+                    "desktop_session_id": desktop_session_id,
+                    "event_source": DESKTOP_SESSION_HOST,
+                },
+                ensure_ascii=False,
+            )
+        )
         return 0
     return run_hook()
 

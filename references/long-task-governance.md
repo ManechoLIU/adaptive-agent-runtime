@@ -101,6 +101,8 @@
 
 仅靠结束时手动运行门禁不足以约束长回合。持续总控注册为 **registered controller** 后，使用 `scripts/lifecycle_hook.py` 接入 `SessionStart / PostToolUse / SubagentStop / Stop`：会话启动时建立真实主线与台账基线；工具调用后检测 `main`、工作区、台账、`READY` 或任一 worktree 的未合入候选变化；子 Agent 停止时登记待处理候选事件；总控准备停止时，若这些变化尚未由带 `--repo` 的成功 `control_event_guard.py` 收据闭合，则自动继续当前 turn。通过的控制收据会原子确认当时全部 READY、候选和运行中任务的决定并清除 pending；同一批未变化对象不会在下一次工具调用时重复触发，只有集合、状态或证据发生新变化才开启下一控制事件。只要 `pending_control_event=true` 且没有既有闭合收据、真正用户依赖或可验证阻塞，每一次原生 `Stop` 都必须返回 block；重复 Stop 不能成为逃生口。真实快照变化仍可刷新 continuation 上下文，但不作为允许停止的替代条件。Hook 只对登记的唯一总控和 canonical `main` 生效，Writer / Reviewer 工作树不受影响；它只能触发检查与续作，不能代替总控调用 `spawn_agent`、判断文件冲突或选择优先级。非托管 Hook 必须完成运行平台的定义审核与信任后才算生效，具体命令只放在平台安装指南中。
 
+同一个逻辑 Controller 可以显式绑定多个原生桌面任务入口，但入口不是新的 Controller。`--bind-desktop-session <controller-id> <desktop-session-id> <repo>` 只登记桌面会话别名；Hook 先把入口 ID 解析为 canonical controller ID，再以 canonical ID 读写同一 lifecycle state，并把真实入口保留为 `source_session_id`。绑定要求 registered repo 与 Controller checkout surface 同时匹配；一个入口不能归属两个 Controller，也不能随后提升为另一项目的 Controller。未绑定入口不接管项目。入口只改变进入控制面的会话，不合并聊天历史、不复制 Goal / 台账，也不授予并行执行权；多个入口同时触发时仍按唯一 Controller 的现有控制事件与租约门串行闭合。
+
 
 长时外部 Agent / Reviewer 的结束不能只依赖同步 shell 返回。需要自动接续时，`run_external_agent.mjs` 先持久化标准 `external_agent_terminal` receipt（可绑定已持久化 `result_path`），再由 `terminal_continuation.py` 强制校验 receipt 自带仓库身份并以 Git common-dir 找到现有唯一 Controller；同步阶段只写入 `SubagentStop` lifecycle event 与待消费 receipt 路径，Wake 由独立子进程调用现有 Supervisor，因此 `DEFERRED` 不会把已完成 Agent 重新标成失败。未消费 receipt 在 `SessionStart` 仍保持 pending，native resume 明确要求先读这些结果；只有真正闭合该 pending control event 的成功 control-event receipt 才清空已消费路径。该机制只补“结果可持久化 → 结束可触发 → 恢复可继续”的最短闭环，不引入第二 Controller、watchdog 或另一套任务状态机。
 ### Controller Health 与 Wake Supervisor

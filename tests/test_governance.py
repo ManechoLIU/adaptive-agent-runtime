@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import io
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -217,6 +219,212 @@ class GovernanceTests(unittest.TestCase):
         saved = lifecycle_hook.load_json(registry)
         self.assertEqual(saved["__controller_sessions__"]["controller-1"]["web"], ["web-session-1"])
         self.assertEqual(saved["controller-1"], str(main.resolve()))
+
+    def test_lifecycle_binds_desktop_entry_to_registered_controller_without_creating_another_controller(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        registry.write_text(json.dumps({
+            "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}}
+        }), encoding="utf-8")
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+            lifecycle_hook.bind_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-2",
+                repo=main,
+            )
+            lifecycle_hook.bind_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-2",
+                repo=main,
+            )
+
+            self.assertEqual(
+                lifecycle_hook.registered_controller_id("desktop-entry-2"),
+                "controller-1",
+            )
+            self.assertEqual(lifecycle_hook.registered_root("desktop-entry-2"), main.resolve())
+
+        saved = lifecycle_hook.load_json(registry)
+        self.assertEqual(saved["__controller_sessions__"]["controller-1"]["web"], ["web-session-1"])
+        self.assertEqual(
+            saved["__controller_sessions__"]["controller-1"]["desktop_codex"],
+            ["desktop-entry-2"],
+        )
+        self.assertNotIn("desktop-entry-2", {
+            key for key, value in saved.items() if isinstance(value, str)
+        })
+
+    def test_lifecycle_refuses_desktop_entry_owned_by_another_controller(self) -> None:
+        from unittest.mock import patch
+
+        first, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            second = Path(directory) / "second"
+            second.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=second, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=second, check=True)
+            subprocess.run(["git", "config", "user.name", "Tests"], cwd=second, check=True)
+            (second / "TASK_LEDGER.md").write_text(
+                "| ID | 状态 | 负责人 | 下一步 |\n|---|---|---|---|\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=second, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=second, check=True, capture_output=True)
+
+            with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+                lifecycle_hook.register_controller("controller-1", first)
+                lifecycle_hook.register_controller("controller-2", second)
+                lifecycle_hook.bind_desktop_session(
+                    controller_id="controller-1",
+                    desktop_session_id="desktop-shared",
+                    repo=first,
+                )
+
+                with self.assertRaisesRegex(PermissionError, "another Controller"):
+                    lifecycle_hook.bind_desktop_session(
+                        controller_id="controller-2",
+                        desktop_session_id="desktop-shared",
+                        repo=second,
+                    )
+
+    def test_lifecycle_refuses_promoting_bound_desktop_entry_to_second_controller(self) -> None:
+        from unittest.mock import patch
+
+        first, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            second = Path(directory) / "second"
+            second.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=second, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=second, check=True)
+            subprocess.run(["git", "config", "user.name", "Tests"], cwd=second, check=True)
+            (second / "TASK_LEDGER.md").write_text(
+                "| ID | 状态 | 负责人 | 下一步 |\n|---|---|---|---|\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=second, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=second, check=True, capture_output=True)
+
+            with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+                lifecycle_hook.register_controller("controller-1", first)
+                lifecycle_hook.bind_desktop_session(
+                    controller_id="controller-1",
+                    desktop_session_id="desktop-shared",
+                    repo=first,
+                )
+
+                with self.assertRaisesRegex(ValueError, "already bound"):
+                    lifecycle_hook.register_controller("desktop-shared", second)
+
+    def test_lifecycle_desktop_entry_uses_canonical_controller_state(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        state_root = main.parent / "lifecycle-state"
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry), patch.object(
+            lifecycle_hook, "STATE_ROOT", state_root
+        ):
+            lifecycle_hook.register_controller("controller-1", main)
+            lifecycle_hook.bind_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-2",
+                repo=main,
+            )
+            event = {
+                "hook_event_name": "SessionStart",
+                "session_id": "desktop-entry-2",
+                "cwd": str(main),
+            }
+            with patch("sys.stdin", io.StringIO(json.dumps(event))), patch(
+                "sys.stdout", new_callable=io.StringIO
+            ):
+                self.assertEqual(lifecycle_hook.run_hook(), 0)
+            controller_state = lifecycle_hook.state_path("controller-1")
+            alias_state = lifecycle_hook.state_path("desktop-entry-2")
+
+        self.assertTrue(controller_state.is_file())
+        self.assertFalse(alias_state.exists())
+        saved = lifecycle_hook.load_json(controller_state)
+        self.assertEqual(saved["session_id"], "controller-1")
+        self.assertEqual(saved["source_session_id"], "desktop-entry-2")
+        self.assertEqual(saved["controller_host"], "desktop_codex")
+
+    def test_lifecycle_bind_desktop_session_cli_reports_canonical_controller(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+            with patch("sys.stdout", new_callable=io.StringIO) as output:
+                result = lifecycle_hook.main([
+                    "--bind-desktop-session",
+                    "controller-1",
+                    "desktop-entry-2",
+                    str(main),
+                ])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "controller_id": "controller-1",
+                "controller_session_id": "controller-1",
+                "desktop_session_id": "desktop-entry-2",
+                "event_source": "desktop_codex",
+            },
+        )
+
+    def test_lifecycle_serializes_state_updates_from_multiple_desktop_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "controller.json"
+            helper = root / "update_state.py"
+            helper.write_text(
+                """
+import importlib.util
+import json
+import sys
+import time
+from pathlib import Path
+
+skill_root = Path(sys.argv[1])
+sys.path.insert(0, str(skill_root / "scripts"))
+spec = importlib.util.spec_from_file_location("isolated_lifecycle_hook", skill_root / "scripts" / "lifecycle_hook.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+def slow_evaluate(event, *, snapshot, prior_state):
+    state = dict(prior_state or {})
+    triggers = list(state.get("triggers", []))
+    time.sleep(0.25)
+    triggers.append(event["trigger"])
+    state["triggers"] = sorted(set(triggers))
+    return {}, state
+
+module.evaluate_event = slow_evaluate
+module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            processes = [
+                subprocess.Popen(
+                    [sys.executable, str(helper), str(SKILL_ROOT), str(state), trigger],
+                    cwd=SKILL_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for trigger in ("entry-a", "entry-b")
+            ]
+            results = [process.communicate(timeout=10) for process in processes]
+
+            self.assertEqual([process.returncode for process in processes], [0, 0], results)
+            self.assertEqual(
+                json.loads(state.read_text(encoding="utf-8"))["triggers"],
+                ["entry-a", "entry-b"],
+            )
 
     def test_lifecycle_rejects_second_controller_session_for_canonical_project(self) -> None:
         from unittest.mock import patch

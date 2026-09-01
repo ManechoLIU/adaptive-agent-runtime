@@ -148,6 +148,8 @@ Goal 不是必须由用户每次手动开启。用户明确要求长期持续推
 
 Adaptive Agent Runtime 的 `Controller Health` 只从现有机器事实派生，`Wake Supervisor` 只负责把待处理控制事件送回**同一个** registered controller；public Skill ID 是 `adaptive-agent-runtime`，legacy machine state path 仍为 `adaptive-delivery`，no second controller，no mutable health ledger。main 与已明确绑定的总控 worktree 以 `Git common-dir` 共享同一所有权，但 controller worktree events require binding proof，普通 Writer / Reviewer worktree 不会变成总控。
 
+原生桌面宿主可以把另一条可信任务会话显式绑定为同一 Controller 的入口：`python3 scripts/lifecycle_hook.py --bind-desktop-session <controller-id> <desktop-session-id> <repo>`。绑定只在 registry 的 `__controller_sessions__` 中增加桌面入口别名，不创建第二个 Controller；该入口的生命周期事件统一写入原 Controller state，并保留 `source_session_id` 供追踪。入口必须运行在原 Controller 已绑定的 checkout surface；一个 desktop session 只能归属一个 Controller，未绑定入口、跨项目入口和归属冲突均 fail closed。不同桌面会话的聊天历史不会被合并，任务状态仍从唯一台账和 canonical runtime 恢复；同一时刻仍只有一个 Controller 执行权，不能把入口别名当成并行总控。
+
 所有 `pending_control_event` 复用同一唤醒路径：`ACTIVE` 不重复启动，`DEFERRED` 保持 pending，宿主恢复走 same-controller continuation；只有既有安全条件满足才允许授权 peer-host fallback。`DEAD` 不会自动更换总控，而是 fail closed 并要求 explicit Resume/Replace handling。wake success does not clear pending；只有总控完成原控制事件并产生既有闭合证据后才清除 pending。
 
 ### 候选不能无限堆积
