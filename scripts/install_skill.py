@@ -269,13 +269,14 @@ def _web_zshenv_block(target: Path, bridge: Path, python_executable: str) -> str
     return f"""{WEB_BLOCK_START}
 _ad_web_bridge_executable={bridge_literal}
 _ad_web_parent=$(/bin/ps -p \"$PPID\" -o command= 2>/dev/null)
-if [[ \"$_ad_web_parent\" == *\"$_ad_web_bridge_executable\"* ]]; then
+_ad_web_session_id=\"${{ADAPTIVE_DELIVERY_WEB_SESSION_ID:-}}\"
+if [[ \"$_ad_web_parent\" == *\"$_ad_web_bridge_executable\"* && -n \"$_ad_web_session_id\" ]]; then
   _ad_web_cwd=\"$PWD\"
   _ad_web_command=\"$ZSH_EXECUTION_STRING\"
   _ad_web_lifecycle_exit() {{
     local _ad_web_exit_code=$?
     trap - EXIT
-    {python_literal} {script_literal} post-shell --cwd \"$_ad_web_cwd\" --command \"$_ad_web_command\" --exit-code \"$_ad_web_exit_code\"
+    {python_literal} {script_literal} post-shell --cwd \"$_ad_web_cwd\" --command \"$_ad_web_command\" --exit-code \"$_ad_web_exit_code\" --web-session-id \"$_ad_web_session_id\"
     local _ad_web_bridge_exit_code=$?
     if [[ \"$_ad_web_exit_code\" -ne 0 ]]; then
       exit \"$_ad_web_exit_code\"

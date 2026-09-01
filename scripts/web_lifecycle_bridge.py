@@ -1303,7 +1303,7 @@ if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* && -n "$_ad_web_session_id
   }}
   trap _ad_web_lifecycle_exit EXIT
 fi
-unset _ad_web_parent _ad_web_session_id
+unset _ad_web_parent
 # <<< adaptive-delivery web lifecycle bridge <<<'''
 
 

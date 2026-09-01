@@ -84,9 +84,11 @@ class InstallCapabilityTests(unittest.TestCase):
 
         block = _web_zshenv_block(Path("/tmp/skill"), Path("/tmp/ai-bridge"), "/usr/bin/python3")
         self.assertNotIn("|| true", block)
+        self.assertIn("ADAPTIVE_DELIVERY_WEB_SESSION_ID", block)
+        self.assertIn('--web-session-id "$_ad_web_session_id"', block)
         function = block.split("  _ad_web_lifecycle_exit() {", 1)[1].split("  }\n  trap", 1)[0]
         function = "_ad_web_lifecycle_exit() {" + function + "}"
-        bridge_call = '/usr/bin/python3 /tmp/skill/scripts/web_lifecycle_bridge.py post-shell --cwd "$_ad_web_cwd" --command "$_ad_web_command" --exit-code "$_ad_web_exit_code"'
+        bridge_call = '/usr/bin/python3 /tmp/skill/scripts/web_lifecycle_bridge.py post-shell --cwd "$_ad_web_cwd" --command "$_ad_web_command" --exit-code "$_ad_web_exit_code" --web-session-id "$_ad_web_session_id"'
 
         def run_exit_function(original_exit: int, bridge_exit: int) -> int:
             script = (

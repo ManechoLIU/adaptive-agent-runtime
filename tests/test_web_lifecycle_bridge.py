@@ -203,6 +203,27 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 78)
             self.assertIn("verified Web Controller Session identity", result.stderr)
 
+    def test_bind_web_session_cli_refuses_session_already_bound_to_other_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            other = root / "other"; other.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "controller-2": str(other),
+                "__controller_sessions__": {"controller-2": {"web": ["web-shared"]}},
+            }), encoding="utf-8")
+
+            result = self.run_bridge(
+                "bind-web-session", "--repo", str(repo), "--controller-id", "controller-1",
+                "--web-session-id", "web-shared", "--registry", str(registry),
+            )
+
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("already bound to another Controller", result.stderr)
+
     def test_bind_web_session_persists_unique_binding_for_registered_controller(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -313,6 +334,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
         self.assertIn('post-shell --cwd "$_ad_web_cwd"', block)
         self.assertIn('ADAPTIVE_DELIVERY_WEB_SESSION_ID', block)
         self.assertIn('--web-session-id "$_ad_web_session_id"', block)
+        self.assertNotIn("unset _ad_web_parent _ad_web_session_id", block)
 
         function = block.split("  _ad_web_lifecycle_exit() {", 1)[1].split("  }\n  trap", 1)[0]
         function = "_ad_web_lifecycle_exit() {" + function + "}"
@@ -670,6 +692,39 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 78)
             self.assertIn("verified Web Controller Session identity", result.stderr)
+
+    def test_audit_once_ignores_computer_lease_bound_to_different_web_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-session-1", "web-session-2"]}},
+            }), encoding="utf-8")
+            audit = root / "audit.jsonl"
+            audit.write_text(json.dumps({
+                "receiptId":"computer-mismatch", "childTool":"computer", "state":"succeeded",
+                "targetLabel":"Google Chrome", "detail":"电脑操作：click · 应用 Google Chrome"
+            }) + "\n", encoding="utf-8")
+            cursor = root / "cursor.json"
+            capture = root / "events.jsonl"
+            lease = root / "lease.json"
+            lease.write_text(json.dumps({
+                "session_id":"controller-1", "web_session_id":"web-session-2",
+                "repo":str(repo.resolve()), "expires_at_unix_ms":4102444800000, "remaining_uses":1
+            }), encoding="utf-8")
+
+            result = self.run_bridge(
+                "audit-once", "--session-id", "controller-1", "--repo", str(repo),
+                "--registry", str(registry), "--web-session-id", "web-session-1",
+                "--audit-log", str(audit), "--cursor", str(cursor),
+                "--computer-lease", str(lease), "--capture-events", str(capture),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(capture.exists())
+            self.assertTrue(lease.exists())
 
     def test_audit_once_ignores_computer_without_valid_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1740,7 +1795,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 ), patch.object(web_bridge, "dispatch_event", return_value=0):
                     post = web_bridge.main([
                         "post-shell", "--cwd", str(repo), "--command", "true",
-                        "--exit-code", "0", "--registry", str(registry),
+                        "--exit-code", "0", "--registry", str(registry), "--web-session-id", "web-session-1",
                     ])
                     native = web_bridge.main([
                         "native-stop", "--session-id", "controller-1", "--repo", str(repo),
@@ -1763,7 +1818,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             ):
                 post = web_bridge.main([
                     "post-shell", "--cwd", str(repo), "--command", "true",
-                    "--exit-code", "0", "--registry", str(registry),
+                    "--exit-code", "0", "--registry", str(registry), "--web-session-id", "web-session-1",
                 ])
                 native = web_bridge.main([
                     "native-stop", "--session-id", "controller-1", "--repo", str(repo),

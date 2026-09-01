@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -555,21 +556,28 @@ def register_controller(session_id: str, root: Path) -> None:
     canonical_root = canonical_main_root(root)
     if canonical_root is None:
         raise ValueError("controller registration requires a canonical main worktree")
-    registry = load_json(REGISTRY_PATH)
-    for registered_session, registered_path in registry.items():
-        if registered_session == session_id or not isinstance(registered_path, str):
-            continue
-        if Path(registered_path).expanduser().resolve() == canonical_root.resolve():
-            raise ValueError("canonical project already has a different controller session")
-    registry[session_id] = str(canonical_root)
-    surfaces = registry.get(CONTROLLER_SURFACES_KEY)
-    if surfaces is None:
-        surfaces = {}
-    elif not isinstance(surfaces, dict):
-        raise ValueError("controller surface registry is invalid")
-    surfaces[session_id] = str(root.resolve())
-    registry[CONTROLLER_SURFACES_KEY] = surfaces
-    write_json(REGISTRY_PATH, registry)
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            registry = load_json(REGISTRY_PATH)
+            for registered_session, registered_path in registry.items():
+                if registered_session == session_id or not isinstance(registered_path, str):
+                    continue
+                if Path(registered_path).expanduser().resolve() == canonical_root.resolve():
+                    raise ValueError("canonical project already has a different controller session")
+            registry[session_id] = str(canonical_root)
+            surfaces = registry.get(CONTROLLER_SURFACES_KEY)
+            if surfaces is None:
+                surfaces = {}
+            elif not isinstance(surfaces, dict):
+                raise ValueError("controller surface registry is invalid")
+            surfaces[session_id] = str(root.resolve())
+            registry[CONTROLLER_SURFACES_KEY] = surfaces
+            write_json(REGISTRY_PATH, registry)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def controller_event_is_managed(

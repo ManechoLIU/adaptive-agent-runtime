@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import importlib.util
 import sys
 import tempfile
@@ -193,6 +194,29 @@ class GovernanceTests(unittest.TestCase):
                     main,
                 )
             )
+
+    def test_lifecycle_controller_registration_uses_shared_registry_lock(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+
+        self.assertTrue(registry.with_suffix(registry.suffix + ".lock").exists())
+
+    def test_lifecycle_controller_registration_preserves_existing_web_session_bindings(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        registry.write_text(json.dumps({
+            "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}}
+        }), encoding="utf-8")
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+
+        saved = lifecycle_hook.load_json(registry)
+        self.assertEqual(saved["__controller_sessions__"]["controller-1"]["web"], ["web-session-1"])
+        self.assertEqual(saved["controller-1"], str(main.resolve()))
 
     def test_lifecycle_rejects_second_controller_session_for_canonical_project(self) -> None:
         from unittest.mock import patch
