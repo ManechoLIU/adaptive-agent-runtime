@@ -82,6 +82,16 @@ def _extract_cycle_score_value(message: str) -> float | None:
     return float(value.group(0)) if value else None
 
 
+def _has_distinct_formal_score_output(message: str) -> bool:
+    text = str(message or "")
+    cycle_spans = [match.span() for match in _CYCLE_OUTPUT_SCORE.finditer(text)]
+    for formal in _OUTPUT_SCORE.finditer(text):
+        formal_start, formal_end = formal.span()
+        if not any(max(formal_start, cycle_start) < min(formal_end, cycle_end) for cycle_start, cycle_end in cycle_spans):
+            return True
+    return False
+
+
 def _extract_labeled_value(message: str, labels: tuple[str, ...]) -> str | None:
     for raw_line in str(message or "").splitlines():
         line = raw_line.strip()
@@ -237,7 +247,10 @@ def evaluate_event(
         scoring_mode = str(state.get("scoring_mode", "formal"))
         cycle_score = _extract_cycle_score_value(message)
         formal_score = _extract_score_value(message)
-        if scoring_mode == "cycle" and cycle_score is None and formal_score is not None:
+        if scoring_mode == "cycle" and (
+            (cycle_score is None and formal_score is not None)
+            or _has_distinct_formal_score_output(message)
+        ):
             return {
                 "decision": "block",
                 "reason": "controller scoring blocked: score output mode mismatch; cycle diagnostic requested",
