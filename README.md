@@ -297,7 +297,7 @@ python3 scripts/control_event_guard.py \
 - `SessionStart`：读取 canonical `main` 与唯一台账基线，并立即暴露台账一致性错误；
 - `PostToolUse`：主线、工作区、台账、`READY` 或任一 worktree 未合入候选改变后立即给总控追加控制上下文；
 - `SubagentStop`：把子 Agent 完成登记为待审候选事件；
-- `Stop`：仍有待处理事件且没有通过的控制收据时，只允许一次受控续作；若快照没有真实变化，第二次 Stop 直接 fail closed，避免把长回合伪装成推进。
+- `Stop`：仍有待处理事件且没有通过的控制收据时，每一次原生 `Stop` 都返回 block；重复 Stop 不能成为逃生口，只有既有闭合收据、真正用户依赖或可验证阻塞才能释放 pending。
 
 先把唯一总控登记到本机状态；临时 Writer / Reviewer 不登记：
 

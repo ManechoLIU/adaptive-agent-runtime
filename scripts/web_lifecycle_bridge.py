@@ -570,8 +570,15 @@ def computer_event_from_receipt(
     detail = receipt.get("detail")
     target = receipt.get("targetLabel")
     detail_text = detail if isinstance(detail, str) else ""
-    observational_operations = ("get_app_state", "get app state", "screenshot", "screen", "list_windows", "list windows", "observe")
-    requires_followup = not any(operation in detail_text.casefold() for operation in observational_operations)
+    normalized_detail = detail_text.casefold().strip()
+    operation = ""
+    for marker in ("电脑操作：", "电脑操作:", "computer operation:", "computer operation："):
+        marker_index = normalized_detail.find(marker)
+        if marker_index >= 0:
+            operation = normalized_detail[marker_index + len(marker):].split("·", 1)[0].strip()
+            break
+    observational_operations = {"get_app_state", "get app state", "screenshot", "list_windows", "list windows", "observe"}
+    requires_followup = operation not in observational_operations
     event = {
         "hook_event_name": "PostToolUse",
         "controller_host": "web",

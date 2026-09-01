@@ -873,6 +873,14 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("candidate-123", second_output["reason"])
         self.assertEqual(second_state["stop_continuations"], 2)
 
+    def test_stop_gate_docs_do_not_describe_second_stop_escape(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        for relative in ("README.md", "references/long-task-governance.md"):
+            text = (repo_root / relative).read_text(encoding="utf-8")
+            self.assertNotIn("第二次 Stop", text, relative)
+            self.assertNotIn("首次 Stop 只允许一次受控续作", text, relative)
+            self.assertIn("重复 Stop", text, relative)
+
     def test_explicit_non_user_next_action_survives_tool_use_and_blocks_stop(self) -> None:
         snapshot = {
             "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",

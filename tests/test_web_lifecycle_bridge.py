@@ -969,6 +969,52 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
             self.assertEqual(event["next_action"], "observe and read the result of the computer action before yielding")
             self.assertFalse(event["requires_user"])
 
+    def test_computer_mutation_with_screen_word_still_requires_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            lease = root / "lease.json"
+            lease.write_text(json.dumps({
+                "session_id": "controller-1", "web_session_id": "web-session-1",
+                "repo": str(repo.resolve()), "issued_at_unix_ms": 1000,
+                "expires_at_unix_ms": 9999999999999, "remaining_uses": 1,
+            }), encoding="utf-8")
+            event = web_bridge.computer_event_from_receipt(
+                {
+                    "receiptId": "claim-click-onscreen-1", "childTool": "computer", "state": "succeeded",
+                    "targetLabel": "Google Chrome", "detail": "电脑操作：click onscreen button · 应用 Google Chrome",
+                    "occurredAtUnixMs": 2000,
+                },
+                session_id="controller-1", repo=repo, lease_path=lease, web_session_id="web-session-1",
+                now_unix_ms=3000,
+            )
+            self.assertIsNotNone(event)
+            self.assertEqual(event["next_action"], "observe and read the result of the computer action before yielding")
+            self.assertFalse(event["requires_user"])
+
+    def test_computer_exact_observation_does_not_create_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            lease = root / "lease.json"
+            lease.write_text(json.dumps({
+                "session_id": "controller-1", "web_session_id": "web-session-1",
+                "repo": str(repo.resolve()), "issued_at_unix_ms": 1000,
+                "expires_at_unix_ms": 9999999999999, "remaining_uses": 1,
+            }), encoding="utf-8")
+            event = web_bridge.computer_event_from_receipt(
+                {
+                    "receiptId": "observe-state-1", "childTool": "computer", "state": "succeeded",
+                    "targetLabel": "Google Chrome", "detail": "电脑操作：get_app_state · 应用 Google Chrome",
+                    "occurredAtUnixMs": 2000,
+                },
+                session_id="controller-1", repo=repo, lease_path=lease, web_session_id="web-session-1",
+                now_unix_ms=3000,
+            )
+            self.assertIsNotNone(event)
+            self.assertNotIn("next_action", event)
+            self.assertNotIn("requires_user", event)
+
     def test_audit_once_consumes_one_computer_event_from_valid_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
