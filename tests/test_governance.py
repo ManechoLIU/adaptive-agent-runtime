@@ -532,6 +532,25 @@ class GovernanceTests(unittest.TestCase):
         )
         self.assertEqual(closed.get("pending_terminal_receipts", []), [])
 
+    def test_session_start_keeps_unconsumed_terminal_receipt_pending(self) -> None:
+        receipt = "/tmp/reviewer-terminal.json"
+        snapshot = {
+            "root": "/tmp/project", "head": "h1", "ledger_sha256": "l1", "worktree_status_sha256": "s1",
+            "ready_ids": [], "runnable_ids": [], "candidate_revisions": [], "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "installed_revision": "rev-1"},
+        }
+        prior = {
+            "pending_control_event": True, "triggers": ["subagent_stopped:reviewer-1"],
+            "pending_terminal_receipts": [receipt], "wake_generation": 1, "controller_host": "web",
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "SessionStart", "session_id": "controller-1", "controller_host": "web"},
+            snapshot=snapshot, prior_state=prior,
+        )
+        self.assertTrue(state["pending_control_event"])
+        self.assertEqual(state["pending_terminal_receipts"], [receipt])
+        self.assertIn(receipt, str(output))
+
     def test_lifecycle_hook_surfaces_unhealthy_active_runtime_without_git_change(self) -> None:
         snapshot = {
             "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",

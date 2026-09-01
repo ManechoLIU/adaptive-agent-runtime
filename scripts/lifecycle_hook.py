@@ -377,16 +377,23 @@ def evaluate_event(
 
     if event_name == "SessionStart":
         triggers = lifecycle_triggers(snapshot, None)
+        pending_terminal_receipts = [
+            str(item) for item in state.get("pending_terminal_receipts", [])
+            if isinstance(item, str) and item.strip()
+        ]
+        if pending_terminal_receipts:
+            triggers = sorted(set(triggers) | set(str(item) for item in state.get("triggers", [])) | {"terminal_receipt_pending"})
         state.update(
             {
-                "pending_control_event": bool(triggers),
+                "pending_control_event": bool(triggers) or bool(pending_terminal_receipts),
                 "triggers": triggers,
                 "stop_continuations": 0,
+                "pending_terminal_receipts": pending_terminal_receipts,
             }
         )
-        if triggers and not prior_pending:
+        if state["pending_control_event"] and not prior_pending:
             state["wake_generation"] = prior_generation + 1
-        if not triggers:
+        if not state["pending_control_event"]:
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
@@ -400,6 +407,8 @@ def evaluate_event(
             runnable_ids=list(snapshot.get("runnable_ids", snapshot.get("ready_ids", []))),
             rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
         )
+        if pending_terminal_receipts:
+            context += " 待处理 terminal receipt：" + "；".join(pending_terminal_receipts) + "。恢复后先读取这些持久结果再继续。"
         return {
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -41,6 +43,7 @@ def consume_terminal_receipt(
     registry_path: Path = web_bridge.DEFAULT_REGISTRY,
     wake_dispatcher: Callable[..., dict[str, Any] | None] | None = None,
     codex: str = "/opt/homebrew/bin/codex",
+    dispatch_wake: bool = True,
 ) -> dict[str, Any]:
     repo = Path(repo).expanduser().resolve()
     receipt_path = Path(receipt_path).expanduser().resolve()
@@ -48,14 +51,15 @@ def consume_terminal_receipt(
     receipt = _load_terminal_receipt(receipt_path)
 
     receipt_repo = str(receipt.get("repo") or "").strip()
-    if receipt_repo:
-        try:
-            if web_bridge._git_common_dir(Path(receipt_repo).expanduser().resolve()) != web_bridge._git_common_dir(repo):
-                raise PermissionError("terminal receipt repository does not match continuation repository")
-        except Exception as exc:
-            if isinstance(exc, PermissionError):
-                raise
-            raise ValueError(f"cannot verify terminal receipt repository: {exc}") from exc
+    if not receipt_repo:
+        raise ValueError("terminal receipt repository identity is required")
+    try:
+        if web_bridge._git_common_dir(Path(receipt_repo).expanduser().resolve()) != web_bridge._git_common_dir(repo):
+            raise PermissionError("terminal receipt repository does not match continuation repository")
+    except Exception as exc:
+        if isinstance(exc, PermissionError):
+            raise
+        raise ValueError(f"cannot verify terminal receipt repository: {exc}") from exc
 
     controller_id = web_bridge._registered_controller_for_common_dir(repo, registry_path)
     if not controller_id:
@@ -87,14 +91,16 @@ def consume_terminal_receipt(
     _, lifecycle_state = lifecycle.evaluate_event(event, snapshot=snapshot, prior_state=prior_state)
     lifecycle.write_json(state_path, lifecycle_state)
 
-    dispatcher = wake_dispatcher or web_bridge.dispatch_pending_lifecycle_wake
-    wake_receipt = dispatcher(
-        lifecycle_state=lifecycle_state,
-        session_id=controller_id,
-        repo=controller_repo,
-        registry=registry_path,
-        codex=codex,
-    )
+    wake_receipt = None
+    if dispatch_wake:
+        dispatcher = wake_dispatcher or web_bridge.dispatch_pending_lifecycle_wake
+        wake_receipt = dispatcher(
+            lifecycle_state=lifecycle_state,
+            session_id=controller_id,
+            repo=controller_repo,
+            registry=registry_path,
+            codex=codex,
+        )
     return {
         "controller_id": controller_id,
         "terminal_receipt": str(receipt_path),
@@ -118,19 +124,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command != "consume":
         return 2
+    wake_child = os.environ.get("AD_TERMINAL_CONTINUATION_WAKE_CHILD") == "1"
     try:
         result = consume_terminal_receipt(
             repo=Path(args.repo),
             receipt_path=Path(args.receipt),
             registry_path=Path(args.registry),
             codex=args.codex,
+            dispatch_wake=wake_child,
         )
     except (OSError, ValueError, PermissionError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 78
     print(json.dumps(result, ensure_ascii=False))
-    wake_result = result.get("wake_result")
-    return 0 if web_bridge.wake_receipt_confirmed(wake_result) else 78
+    if wake_child:
+        # The durable receipt + lifecycle pending state already exist. A legitimate
+        # DEFERRED/NOOP wake must not rewrite the external Agent's completed outcome.
+        return 0
+    env = dict(os.environ)
+    env["AD_TERMINAL_CONTINUATION_WAKE_CHILD"] = "1"
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "consume", "--repo", args.repo,
+             "--receipt", args.receipt, "--registry", args.registry, "--codex", args.codex],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env, start_new_session=True, close_fds=True,
+        )
+    except OSError as exc:
+        # The pending lifecycle state remains durable for the existing Supervisor's next
+        # observation; do not turn a completed Agent into a failed Assignment attempt.
+        print(f"terminal wake launch deferred: {exc}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":
