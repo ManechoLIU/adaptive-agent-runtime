@@ -837,7 +837,7 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("BLOCKED", output["reason"])
         self.assertTrue(next_state["pending_control_event"])
 
-    def test_lifecycle_hook_second_stop_without_progress_fails_closed(self) -> None:
+    def test_lifecycle_hook_repeated_stop_without_progress_stays_blocked_while_pending(self) -> None:
         snapshot = {
             "head": "abc123",
             "ledger_sha256": "ledger-1",
@@ -869,9 +869,71 @@ class GovernanceTests(unittest.TestCase):
             prior_state=first_state,
         )
 
-        self.assertFalse(second_output["continue"])
-        self.assertIn("failed closed", second_output["stopReason"])
+        self.assertEqual(second_output["decision"], "block")
+        self.assertIn("candidate-123", second_output["reason"])
         self.assertEqual(second_state["stop_continuations"], 2)
+
+    def test_stop_gate_docs_do_not_describe_second_stop_escape(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        for relative in ("README.md", "references/long-task-governance.md"):
+            text = (repo_root / relative).read_text(encoding="utf-8")
+            self.assertNotIn("第二次 Stop", text, relative)
+            self.assertNotIn("首次 Stop 只允许一次受控续作", text, relative)
+            self.assertIn("重复 Stop", text, relative)
+
+    def test_explicit_non_user_next_action_survives_tool_use_and_blocks_stop(self) -> None:
+        snapshot = {
+            "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",
+            "ready_ids": [], "runnable_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {}, "rule_handshake": {"state": "current", "blocking": False},
+        }
+        post_output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse", "session_id": "controller-1",
+                "controller_host": "web", "tool_name": "AI-Bridge.computer",
+                "tool_input": {"detail": "电脑操作：click · 应用 Google Chrome"},
+                "tool_response": {"state": "succeeded"},
+                "next_action": "read the claimed task result and continue the workflow",
+                "requires_user": False,
+            },
+            snapshot=snapshot, prior_state={"pending_control_event": False, "triggers": [], "stop_continuations": 0},
+        )
+        self.assertTrue(state["pending_control_event"])
+        self.assertEqual(state["next_action"], "read the claimed task result and continue the workflow")
+        self.assertFalse(state["requires_user"])
+        self.assertIn("read the claimed task result", post_output["hookSpecificOutput"]["additionalContext"])
+
+        stop_output, stopped = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "Stop", "session_id": "controller-1", "controller_host": "web"},
+            snapshot=snapshot, prior_state=state,
+        )
+        self.assertEqual(stop_output["decision"], "block")
+        self.assertTrue(stopped["pending_control_event"])
+
+    def test_explicit_user_required_next_action_releases_continuation_only_pending_state(self) -> None:
+        snapshot = {
+            "head": "abc123", "ledger_sha256": "ledger-1", "worktree_status_sha256": "status-1",
+            "ready_ids": [], "runnable_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {}, "rule_handshake": {"state": "current", "blocking": False},
+        }
+        prior = {
+            "pending_control_event": True, "triggers": ["next_action_pending"],
+            "next_action": "read result", "requires_user": False, "stop_continuations": 0,
+            "snapshot": snapshot,
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse", "session_id": "controller-1",
+                "next_action": "user must choose which account to use", "requires_user": True,
+                "tool_name": "Bash", "tool_input": {}, "tool_response": {"exit_code": 0},
+            },
+            snapshot=snapshot, prior_state=prior,
+        )
+        self.assertEqual(output, {})
+        self.assertFalse(state["pending_control_event"])
+        self.assertEqual(state["next_action"], "user must choose which account to use")
+        self.assertTrue(state["requires_user"])
+
 
     def test_lifecycle_hook_snapshot_progress_resets_stop_continuation(self) -> None:
         output, next_state = lifecycle_hook.evaluate_event(

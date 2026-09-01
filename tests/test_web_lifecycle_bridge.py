@@ -630,6 +630,34 @@ class WebLifecycleAuditTests(unittest.TestCase):
         self.assertNotEqual(code2, 0)
         self.assertEqual(second.call_count, 0)
 
+    def test_auto_native_stop_reschedules_same_controller_after_active_writer_deferral(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "pending-click-1", "session_id": "controller-1",
+                "repo": str(repo.resolve()), "state": "RESUME_PENDING", "pending_control_event": True,
+            }), encoding="utf-8")
+            deferred = {
+                "operation": "native_resume", "result": "DEFERRED", "state": "RESUME_DEFERRED_ACTIVE_WRITER",
+                "pending_control_event": True, "returncode": 1, "stdout_tail": "",
+                "stderr_tail": "thread already has an active writer", "failure_class": "active_writer_present",
+            }
+            with patch.object(web_bridge, "execute_native_resume", return_value=deferred), patch.object(
+                web_bridge, "schedule_auto_native_stop"
+            ) as schedule:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="pending-click-1",
+                    registry=root / "registry.json", codex="/opt/homebrew/bin/codex", delay_seconds=0,
+                    state_path=state, runtime_path="/opt/homebrew/bin:/usr/bin:/bin",
+                )
+            self.assertEqual(code, 0)
+            schedule.assert_called_once()
+            self.assertEqual(schedule.call_args.kwargs["receipt_id"], "pending-click-1")
+            self.assertEqual(schedule.call_args.kwargs["session_id"], "controller-1")
+
     def test_rule_wake_schedule_immediate_is_ready_now(self) -> None:
         decision = web_bridge.rule_wake_schedule_decision({
             "rule_wake_policy": "immediate",
@@ -805,6 +833,34 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
             check=False,
         )
 
+    def test_audit_once_resolves_authorized_manual_web_session_when_launchagent_omits_argument(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
+            }), encoding="utf-8")
+            lease_file = root / "manual-leases.json"
+            lease_file.write_text(json.dumps({
+                "schema_version": 1, "leases": {"controller-1": {
+                    "repo": str(repo.resolve()), "controller_id": "controller-1",
+                    "web_session_id": "web-session-1", "authorized_at_unix": 1,
+                    "expires_at_unix": 4102444800, "provenance": "manual_user_authorized", "mode": "resume_only",
+                }}
+            }), encoding="utf-8")
+            audit = root / "audit.jsonl"; audit.write_text("", encoding="utf-8")
+            cursor = root / "cursor.json"
+            with patch.object(web_bridge, "DEFAULT_MANUAL_WEB_LEASES", lease_file):
+                code = web_bridge.main([
+                    "audit-once", "--session-id", "controller-1", "--repo", str(repo),
+                    "--registry", str(registry), "--audit-log", str(audit), "--cursor", str(cursor),
+                ])
+            self.assertEqual(code, 0)
+
     def test_audit_once_refuses_registered_repo_without_verified_web_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -889,6 +945,75 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(capture.exists())
+
+    def test_computer_click_event_declares_non_user_followup_to_read_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            lease = root / "lease.json"
+            lease.write_text(json.dumps({
+                "session_id": "controller-1", "web_session_id": "web-session-1",
+                "repo": str(repo.resolve()), "issued_at_unix_ms": 1000,
+                "expires_at_unix_ms": 9999999999999, "remaining_uses": 1,
+            }), encoding="utf-8")
+            event = web_bridge.computer_event_from_receipt(
+                {
+                    "receiptId": "claim-click-1", "childTool": "computer", "state": "succeeded",
+                    "targetLabel": "Google Chrome", "detail": "电脑操作：click · 应用 Google Chrome",
+                    "occurredAtUnixMs": 2000,
+                },
+                session_id="controller-1", repo=repo, lease_path=lease, web_session_id="web-session-1",
+                now_unix_ms=3000,
+            )
+            self.assertIsNotNone(event)
+            self.assertEqual(event["next_action"], "observe and read the result of the computer action before yielding")
+            self.assertFalse(event["requires_user"])
+
+    def test_computer_mutation_with_screen_word_still_requires_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            lease = root / "lease.json"
+            lease.write_text(json.dumps({
+                "session_id": "controller-1", "web_session_id": "web-session-1",
+                "repo": str(repo.resolve()), "issued_at_unix_ms": 1000,
+                "expires_at_unix_ms": 9999999999999, "remaining_uses": 1,
+            }), encoding="utf-8")
+            event = web_bridge.computer_event_from_receipt(
+                {
+                    "receiptId": "claim-click-onscreen-1", "childTool": "computer", "state": "succeeded",
+                    "targetLabel": "Google Chrome", "detail": "电脑操作：click onscreen button · 应用 Google Chrome",
+                    "occurredAtUnixMs": 2000,
+                },
+                session_id="controller-1", repo=repo, lease_path=lease, web_session_id="web-session-1",
+                now_unix_ms=3000,
+            )
+            self.assertIsNotNone(event)
+            self.assertEqual(event["next_action"], "observe and read the result of the computer action before yielding")
+            self.assertFalse(event["requires_user"])
+
+    def test_computer_exact_observation_does_not_create_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            lease = root / "lease.json"
+            lease.write_text(json.dumps({
+                "session_id": "controller-1", "web_session_id": "web-session-1",
+                "repo": str(repo.resolve()), "issued_at_unix_ms": 1000,
+                "expires_at_unix_ms": 9999999999999, "remaining_uses": 1,
+            }), encoding="utf-8")
+            event = web_bridge.computer_event_from_receipt(
+                {
+                    "receiptId": "observe-state-1", "childTool": "computer", "state": "succeeded",
+                    "targetLabel": "Google Chrome", "detail": "电脑操作：get_app_state · 应用 Google Chrome",
+                    "occurredAtUnixMs": 2000,
+                },
+                session_id="controller-1", repo=repo, lease_path=lease, web_session_id="web-session-1",
+                now_unix_ms=3000,
+            )
+            self.assertIsNotNone(event)
+            self.assertNotIn("next_action", event)
+            self.assertNotIn("requires_user", event)
 
     def test_audit_once_consumes_one_computer_event_from_valid_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -978,6 +1103,14 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
 
 
 class TerminalReceiptResumeContextTests(unittest.TestCase):
+    def test_native_resume_prompt_names_persisted_non_user_next_action(self) -> None:
+        command = web_bridge.native_resume_command(
+            codex="/usr/bin/codex", session_id="controller-1", repo=Path("/tmp/project"),
+            next_action="read the claimed task result and continue",
+        )
+        self.assertIn("read the claimed task result and continue", command[-1])
+        self.assertIn("before yielding", command[-1])
+
     def test_native_resume_prompt_names_pending_terminal_receipt(self) -> None:
         receipt = "/tmp/reviewer-terminal.json"
         command = web_bridge.native_resume_command(
@@ -2147,6 +2280,51 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 stored["wake_fingerprints"]["wake-generation-1"],
                 web_bridge._wake_event_fingerprint(first_state),
             )
+
+    def test_audit_once_schedules_background_retry_when_computer_wake_hits_active_writer(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            audit = root / "audit.jsonl"
+            receipt = {
+                "receiptId": "claim-click-deferred-1", "childTool": "computer", "state": "succeeded",
+                "targetLabel": "Google Chrome", "detail": "电脑操作：click · 应用 Google Chrome",
+                "occurredAtUnixMs": 2000,
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            cursor = root / "cursor.json"
+            lease = root / "lease.json"
+            lease.write_text(json.dumps({
+                "session_id": "controller-1", "web_session_id": "web-session-1",
+                "repo": str(repo.resolve()), "issued_at_unix_ms": 1000,
+                "expires_at_unix_ms": 9999999999999, "remaining_uses": 1,
+            }), encoding="utf-8")
+            state = {
+                "pending_control_event": True, "triggers": ["next_action_pending"],
+                "next_action": "observe and read the result of the computer action before yielding",
+                "requires_user": False,
+            }
+            args = [
+                "audit-once", "--repo", str(repo), "--session-id", "controller-1",
+                "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry),
+                "--web-session-id", "web-session-1", "--codex", str(codex),
+                "--computer-lease", str(lease), "--auto-native-stop", "--auto-stop-delay-seconds", "5",
+                "--auto-stop-state", str(root / "auto-stop.json"),
+            ]
+            with patch.object(web_bridge, "dispatch_event", return_value=0), patch.object(
+                web_bridge, "_load_lifecycle_state", return_value=state
+            ), patch.object(
+                web_bridge, "dispatch_pending_lifecycle_wake", return_value={
+                    "result": "DEFERRED", "decision": "DEFER", "pending_control_event": True,
+                    "reason": "active_writer_present",
+                }
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                code = web_bridge.main(args)
+            self.assertNotEqual(code, 0)
+            schedule.assert_called_once()
+            self.assertEqual(schedule.call_args.kwargs["receipt_id"], "claim-click-deferred-1")
+            self.assertEqual(schedule.call_args.kwargs["session_id"], "controller-1")
 
     def test_audit_once_retries_wake_without_reconsuming_one_use_computer_lease(self) -> None:
         from unittest.mock import patch
