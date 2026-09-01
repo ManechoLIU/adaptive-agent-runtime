@@ -1,6 +1,6 @@
 # External Agent authentication and execution
 
-Adaptive Delivery owns this workflow end to end. Task Navigator and Codex Continuity are never required for login, credential discovery, preflight, or external model execution. Kimi Code CLI and Grok Build CLI remain the official model runners and must be installed separately.
+Adaptive Agent Runtime owns this workflow end to end. Task Navigator and Codex Continuity are never required for login, credential discovery, preflight, or external model execution. Kimi Code CLI and Grok Build CLI remain the official model runners and must be installed separately.
 
 ## Supported routes
 

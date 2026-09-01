@@ -32,10 +32,10 @@
 - Create/Modify: `tests/test_install_skill.py` if a focused installer test file is clearer.
 
 **Interfaces:**
-- Produces `Adaptive Agent Runtime` product metadata while keeping `adaptive-delivery` as the stable technical Skill ID and only canonical machine identity.
+- Produces `Adaptive Agent Runtime` product metadata and public Skill ID `adaptive-agent-runtime`, while keeping `adaptive-delivery` only as the canonical legacy machine-state identity.
 - Produces an installer capability report with `enabled/degraded/blocked` status without changing canonical runtime location.
 
-- [x] Write failing tests proving the public product name/slug coexist with the stable `adaptive-delivery` technical ID while `.git/adaptive-delivery` remains the single canonical state root.
+- [x] Write failing tests proving the public product name/slug/Skill ID use `adaptive-agent-runtime` while `.git/adaptive-delivery` remains the single canonical state root.
 - [x] Run focused tests and confirm RED.
 - [x] Implement minimal identity metadata/installer capability detection; do not rename existing machine-state paths.
 - [x] Run focused tests and confirm GREEN.
@@ -124,7 +124,7 @@
 
 **Interfaces:**
 - Existing install is upgraded in place without duplicating runtime/controller/receipt stores.
-- Fresh install exposes new product name/slug while retaining the stable technical Skill ID `adaptive-delivery`.
+- Fresh install exposes the new product name, slug, Skill ID, and install directory `adaptive-agent-runtime`; an existing `adaptive-delivery` install upgrades in place while retaining its canonical machine state.
 - Old manifest/handshake remains consumable, and install-time capabilities are reported as enabled/degraded/blocked.
 
 - [x] Write clean-install and existing-install migration RED tests in temporary homes/repos.

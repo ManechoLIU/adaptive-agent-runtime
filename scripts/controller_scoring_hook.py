@@ -111,7 +111,7 @@ def _model_context(skill_root: str | Path, digest: str) -> str:
     model = scoring_model_path(skill_root)
     content = model.read_text(encoding="utf-8")
     return (
-        "Adaptive Delivery controller-scoring machine gate is active. "
+        "Adaptive Agent Runtime controller-scoring machine gate is active. "
         "The following is the exact installed scoring model and is authoritative for this scoring turn. "
         "Do not substitute another rubric. The Stop gate will fail closed if this exact model changes before the response completes.\n"
         f"installed_scoring_model_sha256={digest}\n"
@@ -142,7 +142,7 @@ def evaluate_event(
             content, receipt = read_and_record_model(repo, skill_root=skill_root)
             digest = str(receipt["model_sha256"])
             context = (
-                "Adaptive Delivery controller-scoring machine gate is active. "
+                "Adaptive Agent Runtime controller-scoring machine gate is active. "
                 "The following is the exact installed scoring model and is authoritative for this scoring turn. "
                 "Do not substitute another rubric. The Stop gate will fail closed if this exact model changes before the response completes.\n"
                 f"installed_scoring_model_sha256={digest}\n"
@@ -270,7 +270,7 @@ def install_hooks(
             "type": "command",
             "command": command,
             "timeout": 5,
-            "statusMessage": "Enforcing Adaptive Delivery controller scoring model",
+            "statusMessage": "Enforcing Adaptive Agent Runtime controller scoring model",
         }
         if inject_context:
             # The scoring rubric is intentionally not spilled/truncated before model injection.

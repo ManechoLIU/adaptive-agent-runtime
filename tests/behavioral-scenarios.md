@@ -130,7 +130,7 @@
 
 **基线缺口：** 当前 durable 初始化只创建八份文档，明确不创建知识目录和项目级流程入口；新资料到来后仍需临时决定 Raw Sources、Wiki、收录日志和固定工作流放在哪里。
 
-**通过标准：** 使用 durable 初始化文章模板中的 `AGENTS.md`、`TASK_LEDGER.md`、`WIKI_INDEX.md`、`MEMORY.md`、项目级 `SKILL.md`、`raw_sources/`、`wiki/`、`logs/ingestion/`，并结合 Adaptive Delivery 增加 `SPEC.md`、`DESIGN.md`、`TECHNICAL.md` 和 `EVOLUTION.md`。当前上下文和 Compact 不创建项目文件。说明每个文件和目录的职责，不把空目录本身当成知识资产或完成证据。
+**通过标准：** 使用 durable 初始化文章模板中的 `AGENTS.md`、`TASK_LEDGER.md`、`WIKI_INDEX.md`、`MEMORY.md`、项目级 `SKILL.md`、`raw_sources/`、`wiki/`、`logs/ingestion/`，并结合 Adaptive Agent Runtime 增加 `SPEC.md`、`DESIGN.md`、`TECHNICAL.md` 和 `EVOLUTION.md`。当前上下文和 Compact 不创建项目文件。说明每个文件和目录的职责，不把空目录本身当成知识资产或完成证据。
 
 ### 17. 询问项目应采用什么台账（失败场景）
 

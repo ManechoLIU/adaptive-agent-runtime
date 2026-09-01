@@ -320,16 +320,17 @@ def continuation_reason(
         stop = str(handshake.get("stop_condition", "")).strip()
         repo_arg = f" --repo {root}" if root else " --repo <repo>"
         session_arg = f" --controller-session {session_id}" if session_id else " --controller-session <controller-session>"
+        handshake_script = Path(__file__).resolve().parent / "rule_handshake.py"
         rule_text = (
             f" 规则更新待加载：{revision}；摘要：{summary}；影响：{impact}；停止条件：{stop}。"
             "先读取已安装的新规则，再执行 "
-            f"python3 ~/.agents/skills/adaptive-delivery/scripts/rule_handshake.py ack{repo_arg}{session_arg} --revision {revision}，随后同步现有台账规则版本行。"
+            f'python3 "{handshake_script}" ack{repo_arg}{session_arg} --revision {revision}，随后同步现有台账规则版本行。'
         )
     elif state == "ledger_stale":
         rule_text = f" 已有 LOADED ACK {revision}，但台账规则版本仍旧；先把现有规则版本行同步到精确 revision {revision}。"
     elif state == "integrity_error":
         errors = "; ".join(str(item) for item in handshake.get("errors", []))
-        rule_text = f" Adaptive Delivery 安装完整性失败：{errors}；禁止 ACK 或启动受影响 Assignment。"
+        rule_text = f" Adaptive Agent Runtime 安装完整性失败：{errors}；禁止 ACK 或启动受影响 Assignment。"
     actions = ["请立即核对真实 main / 台账 / live Agent"]
     if candidate_revisions:
         actions.append("处理候选审查、集成、验收")
@@ -530,7 +531,7 @@ def evaluate_event(
             return {"decision": "block", "reason": reason}, state
         return {
             "continue": False,
-            "stopReason": "Adaptive Delivery controller lifecycle gate failed closed.",
+            "stopReason": "Adaptive Agent Runtime controller lifecycle gate failed closed.",
             "systemMessage": reason,
         }, state
     return {}, state
@@ -654,7 +655,7 @@ def run_hook() -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Turn Adaptive Delivery controller lifecycle changes into Codex hook events."
+        description="Turn Adaptive Agent Runtime controller lifecycle changes into Codex hook events."
     )
     parser.add_argument("--register-controller", nargs=2, metavar=("SESSION_ID", "REPO"))
     args = parser.parse_args(argv)

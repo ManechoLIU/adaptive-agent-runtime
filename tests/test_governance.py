@@ -302,7 +302,11 @@ class GovernanceTests(unittest.TestCase):
         context = first["hookSpecificOutput"]["additionalContext"]
         self.assertIn("rev-new", context)
         self.assertIn("canonical runtime", context)
-        self.assertIn("rule_handshake.py ack", context)
+        self.assertIn("rule_handshake.py", context)
+        self.assertIn('" ack', context)
+        expected_handshake = Path(lifecycle_hook.__file__).resolve().parent / "rule_handshake.py"
+        self.assertIn(str(expected_handshake), context)
+        self.assertNotIn("~/.agents/skills/adaptive-delivery", context)
 
         receipt_event = {
             "hook_event_name": "PostToolUse", "session_id": "controller-1",

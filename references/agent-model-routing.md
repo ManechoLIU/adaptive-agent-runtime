@@ -2,7 +2,7 @@
 
 ## 职责边界
 
-Adaptive Delivery 负责把项目目标拆成可验收工作包，为每个工作包产出一次路由合同，并直接调用相应的原生子 Agent 或外部运行器执行。Task Navigator 等生命周期插件只选择 Codex 任务容器、保持续接、标题和最近进展；不得读取、执行或修改项目路由合同，也不得参与拆包、模型、供应商、认证、文件所有权、集成或验收。
+Adaptive Agent Runtime 负责把项目目标拆成可验收工作包，为每个工作包产出一次路由合同，并直接调用相应的原生子 Agent 或外部运行器执行。Task Navigator 等生命周期插件只选择 Codex 任务容器、保持续接、标题和最近进展；不得读取、执行或修改项目路由合同，也不得参与拆包、模型、供应商、认证、文件所有权、集成或验收。
 
 主 Agent 持有范围、共享契约、写入所有权、集成与最终验收。可用并发不是配额：只有两个以上文件所有权不重叠、无顺序依赖的 `READY` 工作包才并行；同一文件同一时刻只有一个 Writer。
 
@@ -48,7 +48,7 @@ Adaptive Delivery 负责把项目目标拆成可验收工作包，为每个工�
 - 同一种模型也可能支持两条通道：模型 ID 不足以证明实际计费路线，必须同时核对 `agent_type`、`auth_mode` 和凭据来源。
 - OAuth 与 API 仍是不同计费 / 认证边界：不得从 OAuth 自动切到 API、从 API 自动切到 OAuth。外部首选通道发生**安全失败**时，Dispatch Gate 可自动降级到项目已授权的 Codex 原生模型；这不是认证通道切换。
 - 当前用户的本地默认选择是：Kimi K3 使用 `api`，Grok 4.6 使用 `oauth`。项目或本轮的新选择可以覆盖它；该偏好不是公开插件对其他用户的默认值。
-- 需要登录、凭据配置、无调用预检或真实执行时，读取 [External Agent authentication and execution](external-agent-auth.md)。这些能力由 Adaptive Delivery 自己提供，不要求安装 Task Navigator 或 Codex Continuity。
+- 需要登录、凭据配置、无调用预检或真实执行时，读取 [External Agent authentication and execution](external-agent-auth.md)。这些能力由 Adaptive Agent Runtime 自己提供，不要求安装 Task Navigator 或 Codex Continuity。
 
 ## 外部模型门禁
 

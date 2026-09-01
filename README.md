@@ -10,11 +10,11 @@ Formal long-term controller scoring defaults to the most recent 24 hours, using 
 
 ## 产品身份与兼容性
 
-**Adaptive Agent Runtime** 是新的对外产品名；`adaptive-agent-runtime` 是产品 slug。为保证已有项目、显式调用、Hook、handshake、receipt 与安装路径零中断，底层 Skill ID 暂继续使用稳定兼容标识 `adaptive-delivery`（legacy machine identifier）。这不是第二个产品或第二套规则：机器运行事实仍只使用既有 `.git/adaptive-delivery/` canonical state，不创建双 Skill/runtime。未来只有宿主标准提供可靠 alias/迁移语义时才考虑切换技术 ID。
+**Adaptive Agent Runtime** 是对外产品名，主 Skill ID 与显式调用统一为 `adaptive-agent-runtime`。`adaptive-delivery` 只作为 legacy machine identifier，继续兼容既有安装目录、Hook、handshake、receipt 和 `.git/adaptive-delivery/` canonical state；它不再是对外主名称，也不会形成第二套 Skill/runtime。
 
 ## 先用一句话理解
 
-`adaptive-delivery` 不是项目管理软件，也不是常驻后台服务。它是一套交付运行合同：
+`adaptive-agent-runtime` 不是项目管理软件，也不是常驻后台服务。它是一套交付运行合同：
 
 - 小任务直接做，验证后停止。
 - 普通功能做成真实用户可走通的闭环。
@@ -64,52 +64,52 @@ Formal long-term controller scoring defaults to the most recent 24 hours, using 
 ### 1. 初始化长期项目
 
 ```text
-请使用 adaptive-delivery 初始化当前项目。这个项目会长期开发、跨会话并使用多个 Agent，请建立合适的事实源、唯一台账、Wiki 和长期记忆，但不要覆盖已有文件。
+请使用 adaptive-agent-runtime 初始化当前项目。这个项目会长期开发、跨会话并使用多个 Agent，请建立合适的事实源、唯一台账、Wiki 和长期记忆，但不要覆盖已有文件。
 ```
 
 ### 2. 只制定开发计划
 
 ```text
-请使用 adaptive-delivery 进入开发阶段，先给出里程碑、功能闭环、依赖、Agent 分工、验收和停止条件；先不修改代码。
+请使用 adaptive-agent-runtime 进入开发阶段，先给出里程碑、功能闭环、依赖、Agent 分工、验收和停止条件；先不修改代码。
 ```
 
 ### 3. 按计划开始开发
 
 ```text
-请使用 adaptive-delivery 按已确认计划开始开发。能并行的工作包并行，完成后及时验收、合入主线并更新唯一台账。
+请使用 adaptive-agent-runtime 按已确认计划开始开发。能并行的工作包并行，完成后及时验收、合入主线并更新唯一台账。
 ```
 
 ### 4. 从中断处继续
 
 ```text
-请使用 adaptive-delivery 继续开发。从当前 Git、唯一台账、候选和 worktree 对账后续接，不重做已经有效的成果。
+请使用 adaptive-agent-runtime 继续开发。从当前 Git、唯一台账、候选和 worktree 对账后续接，不重做已经有效的成果。
 ```
 
 ### 5. 恢复停滞项目
 
 ```text
-请使用 adaptive-delivery 检查项目为什么停滞。核对总控、Goal、台账、Agent ACK、候选、主线和真实验收状态；从最近可运行检查点恢复，并继续派发不受阻塞影响的 READY 工作。
+请使用 adaptive-agent-runtime 检查项目为什么停滞。核对总控、Goal、台账、Agent ACK、候选、主线和真实验收状态；从最近可运行检查点恢复，并继续派发不受阻塞影响的 READY 工作。
 ```
 
 ### 6. 登记并执行视觉参考
 
 ```text
-请使用 adaptive-delivery 把这张图登记为当前页面的绑定视觉参考，记录精确文件、哈希、适用状态和排除项；后续开发与验收严格按同一参考执行。
+请使用 adaptive-agent-runtime 把这张图登记为当前页面的绑定视觉参考，记录精确文件、哈希、适用状态和排除项；后续开发与验收严格按同一参考执行。
 ```
 
 ### 7. 治理项目上下文
 
 ```text
-请使用 adaptive-delivery 检查当前项目的上下文治理：区分台账、Wiki、Raw Sources、长期记忆和 Compact，删除重复职责，但不要把治理文档当作开发产出。
+请使用 adaptive-agent-runtime 检查当前项目的上下文治理：区分台账、Wiki、Raw Sources、长期记忆和 Compact，删除重复职责，但不要把治理文档当作开发产出。
 ```
 
 ### 8. 配置外部模型路线
 
 ```text
-请使用 adaptive-delivery 配置 Agent 路由：前端使用 Kimi K3，后端使用 Grok 4.6，其他任务由主 Agent 按复杂度选择 Codex 原生模型；每个工作包都选择最低可靠推理强度。分别让我选择 OAuth 会员或 API Key，先只做不调用模型的预检。真实调用前再次确认，不要静默切换认证、计费路线、模型或推理强度。
+请使用 adaptive-agent-runtime 配置 Agent 路由：前端使用 Kimi K3，后端使用 Grok 4.6，其他任务由主 Agent 按复杂度选择 Codex 原生模型；每个工作包都选择最低可靠推理强度。分别让我选择 OAuth 会员或 API Key，先只做不调用模型的预检。真实调用前再次确认，不要静默切换认证、计费路线、模型或推理强度。
 ```
 
-该能力由 Adaptive Delivery 独立提供，不要求安装 Task Navigator 或 Codex Continuity；但仍需安装对应的官方 Kimi Code CLI 或 Grok Build CLI。API Key 应通过环境变量或系统凭据库提供，不粘贴到对话中。
+该能力由 Adaptive Agent Runtime 独立提供，不要求安装 Task Navigator 或 Codex Continuity；但仍需安装对应的官方 Kimi Code CLI 或 Grok Build CLI。API Key 应通过环境变量或系统凭据库提供，不粘贴到对话中。
 
 ## 三种执行档位
 
@@ -146,7 +146,7 @@ Goal 不是必须由用户每次手动开启。用户明确要求长期持续推
 
 ### Controller Health 与自动唤醒
 
-Adaptive Agent Runtime 的 `Controller Health` 只从现有机器事实派生，`Wake Supervisor` 只负责把待处理控制事件送回**同一个** registered controller；technical Skill ID/path remain `adaptive-delivery`，no second controller，no mutable health ledger。main 与已明确绑定的总控 worktree 以 `Git common-dir` 共享同一所有权，但 controller worktree events require binding proof，普通 Writer / Reviewer worktree 不会变成总控。
+Adaptive Agent Runtime 的 `Controller Health` 只从现有机器事实派生，`Wake Supervisor` 只负责把待处理控制事件送回**同一个** registered controller；public Skill ID 是 `adaptive-agent-runtime`，legacy machine state path 仍为 `adaptive-delivery`，no second controller，no mutable health ledger。main 与已明确绑定的总控 worktree 以 `Git common-dir` 共享同一所有权，但 controller worktree events require binding proof，普通 Writer / Reviewer worktree 不会变成总控。
 
 所有 `pending_control_event` 复用同一唤醒路径：`ACTIVE` 不重复启动，`DEFERRED` 保持 pending，宿主恢复走 same-controller continuation；只有既有安全条件满足才允许授权 peer-host fallback。`DEAD` 不会自动更换总控，而是 fail closed 并要求 explicit Resume/Replace handling。wake success does not clear pending；只有总控完成原控制事件并产生既有闭合证据后才清除 pending。
 
@@ -302,7 +302,7 @@ python3 scripts/control_event_guard.py \
 先把唯一总控登记到本机状态；临时 Writer / Reviewer 不登记：
 
 ```bash
-python3 ~/.agents/skills/adaptive-delivery/scripts/lifecycle_hook.py \
+python3 ~/.agents/skills/adaptive-agent-runtime/scripts/lifecycle_hook.py \
   --register-controller <controller-session-id> /path/to/canonical/main
 ```
 
@@ -311,7 +311,7 @@ python3 ~/.agents/skills/adaptive-delivery/scripts/lifecycle_hook.py \
 总控履职评分另有独立的机器门。安装副本就绪后执行：
 
 ```bash
-python3 ~/.agents/skills/adaptive-delivery/scripts/controller_scoring_hook.py --install-hooks
+python3 ~/.agents/skills/adaptive-agent-runtime/scripts/controller_scoring_hook.py --install-hooks
 ```
 
 该命令在保留现有 Hook 的前提下增加 `UserPromptSubmit` 与 `Stop`：评分/履职审计请求进入时，`UserPromptSubmit` 自动把**当前安装的** `references/controller-performance-scoring.md` 正文和 SHA-256 完整注入模型上下文；`Stop` 在最终回复前复核同一精确模型。若模型中途变化，`Stop` 必须 fail closed，且不得把受长度限制的 Stop 文本冒充“完整重载”；必须重新提交评分/审计请求，由新的 `UserPromptSubmit` 完整注入当前版本后才能输出评分。评分门状态无法持久化时同样 fail closed。Hook 的模型根固定为其自身安装目录，调用方不能用 `--skill-root` 切换到另一份评分表。仍须在 Codex `/hooks` 中确认这两个 handler 为 Active / trusted；未激活时不能声称机器门已生效。
@@ -412,26 +412,26 @@ python3 scripts/install_skill.py \
   --stop-condition "installation verified"
 ```
 
-安装器保持技术 Skill ID 与机器状态路径 `adaptive-delivery` 不变，但 manifest 对外记录 `Adaptive Agent Runtime / adaptive-agent-runtime`。安装目录属于机器管理内容：安装时先冻结精确 HEAD revision，再只从该 commit 的 Git objects 重建同目录 staging，校验 hash 后整体替换，因此旧版/缺失 manifest 也不会把已删除的陈旧脚本带进新安装；后续即使源工作树或 HEAD 并发变化，也不会让 manifest revision 与实际安装文件错配。检测到 Codex 时会幂等合并 lifecycle + scoring hooks；检测到 AI-Bridge 时会幂等安装 Web shell bridge；已有 Hook 和 `.zshenv` 其他内容不会被覆盖。默认的一键安装把目标 Skill、hooks 与 `.zshenv` 视为同一安装事务：从安装前快照、精确 revision staging、Host Adapter 配置到 commit/rollback 全程按确定顺序同时锁住目标 Skill、hooks 与 `.zshenv` 三类共享资源，`--no-configure-host-adapters` 也不能绕过；即使两个安装使用不同 target，只要共享 Host Adapter 配置文件也会互斥，并发安装会直接 fail closed，不会互相覆盖或用陈旧快照回滚成功安装。任一 Host Adapter 配置失败会恢复三者的安装前快照并以非零状态阻塞，不会把部分激活配置当作 degraded success。Codex 非托管 Hook 的 **Active / trusted** 仍必须由宿主自身确认，因此即使配置已写入，能力报告在无法机器验证 trust 时仍为 `degraded`，不会虚报完全启用。没有 AI-Bridge 时安装本身仍成功，Web 本地能力明确降级为 `pure_web_file`。副作用恢复同样 fail closed：同一 attempt 的首个 terminal receipt 一旦持久化，后续 heartbeat/progress/第二个 terminal 都不能改写；成功完成且 delivery PASS 的 Assignment 不能再次打开 recovery attempt。任何副作用终态（包括 PASS）若要把 `result_unknown` 清为 false，都必须附带结构化 provider/resource `reconciliation_evidence`：每条证据分别声明与 runtime 完全一致的 `provider`、非空具体 `resource`、可追溯 `receipt:`/`artifact:` `locator`，以及与 Assignment 完全相等的 `idempotency_key`（没有 key 时不得凭空引入）；前缀/子串匹配、普通 file/git 证据或执行方自报都不能解除安全锁。如只需要复制 Core、明确不希望安装器修改宿主配置，可加 `--no-configure-host-adapters`。
+安装器把主 Skill ID 记录为 `adaptive-agent-runtime`，但机器状态路径继续使用 `adaptive-delivery`。全新安装默认进入 `~/.agents/skills/adaptive-agent-runtime`；检测到既有 `~/.agents/skills/adaptive-delivery` 安装时原地升级，避免重复发现和双运行时。安装目录属于机器管理内容：安装时先冻结精确 HEAD revision，再只从该 commit 的 Git objects 重建同目录 staging，校验 hash 后整体替换，因此旧版/缺失 manifest 也不会把已删除的陈旧脚本带进新安装；后续即使源工作树或 HEAD 并发变化，也不会让 manifest revision 与实际安装文件错配。检测到 Codex 时会幂等合并 lifecycle + scoring hooks；检测到 AI-Bridge 时会幂等安装 Web shell bridge；已有 Hook 和 `.zshenv` 其他内容不会被覆盖。默认的一键安装把目标 Skill、hooks 与 `.zshenv` 视为同一安装事务：从安装前快照、精确 revision staging、Host Adapter 配置到 commit/rollback 全程按确定顺序同时锁住目标 Skill、hooks 与 `.zshenv` 三类共享资源，`--no-configure-host-adapters` 也不能绕过；即使两个安装使用不同 target，只要共享 Host Adapter 配置文件也会互斥，并发安装会直接 fail closed，不会互相覆盖或用陈旧快照回滚成功安装。任一 Host Adapter 配置失败会恢复三者的安装前快照并以非零状态阻塞，不会把部分激活配置当作 degraded success。Codex 非托管 Hook 的 **Active / trusted** 仍必须由宿主自身确认，因此即使配置已写入，能力报告在无法机器验证 trust 时仍为 `degraded`，不会虚报完全启用。没有 AI-Bridge 时安装本身仍成功，Web 本地能力明确降级为 `pure_web_file`。副作用恢复同样 fail closed：同一 attempt 的首个 terminal receipt 一旦持久化，后续 heartbeat/progress/第二个 terminal 都不能改写；成功完成且 delivery PASS 的 Assignment 不能再次打开 recovery attempt。任何副作用终态（包括 PASS）若要把 `result_unknown` 清为 false，都必须附带结构化 provider/resource `reconciliation_evidence`：每条证据分别声明与 runtime 完全一致的 `provider`、非空具体 `resource`、可追溯 `receipt:`/`artifact:` `locator`，以及与 Assignment 完全相等的 `idempotency_key`（没有 key 时不得凭空引入）；前缀/子串匹配、普通 file/git 证据或执行方自报都不能解除安全锁。如只需要复制 Core、明确不希望安装器修改宿主配置，可加 `--no-configure-host-adapters`。
 
 ### Codex
 
 ```text
-请使用 skill-installer 从 https://github.com/ManechoLIU/adaptive-delivery 安装 adaptive-delivery
+请使用 skill-installer 从 https://github.com/ManechoLIU/adaptive-delivery 安装 adaptive-agent-runtime
 ```
 
 或手动安装：
 
 ```bash
-git clone https://github.com/ManechoLIU/adaptive-delivery ~/.agents/skills/adaptive-delivery
+git clone https://github.com/ManechoLIU/adaptive-delivery ~/.agents/skills/adaptive-agent-runtime
 ```
 
-Codex 可以按描述自动选择，也可以显式写 `$adaptive-delivery`。
+Codex 可以按描述自动选择，也可以显式写 `$adaptive-agent-runtime`。
 
 ### Claude Code
 
 ```bash
-git clone https://github.com/ManechoLIU/adaptive-delivery ~/.claude/skills/adaptive-delivery
+git clone https://github.com/ManechoLIU/adaptive-delivery ~/.claude/skills/adaptive-agent-runtime
 ```
 
 ### Gemini CLI
@@ -479,7 +479,7 @@ https://github.com/ManechoLIU/adaptive-delivery
 ## 目录
 
 ```text
-adaptive-delivery/
+adaptive-agent-runtime/
 |-- SKILL.md
 |-- README.md
 |-- references/

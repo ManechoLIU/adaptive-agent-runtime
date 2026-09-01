@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Machine handshake between installed Adaptive Delivery rules and one project controller."""
+"""Machine handshake between installed Adaptive Agent Runtime rules and one project controller."""
 from __future__ import annotations
 
 import argparse
@@ -221,7 +221,7 @@ def acknowledge_rule_revision(
     manifest_path = install_manifest_path(skill_root)
     manifest = load_install_manifest(skill_root)
     if not manifest:
-        raise ValueError("installed Adaptive Delivery manifest is missing")
+        raise ValueError("installed Adaptive Agent Runtime manifest is missing")
     installed = str(manifest.get("revision", "")).strip()
     if revision != installed:
         raise ValueError("requested revision does not match installed revision")
@@ -260,7 +260,7 @@ def launch_guard_errors(repo: str | Path, *, skill_root: str | Path | None = Non
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Inspect or acknowledge Adaptive Delivery rule revision state.")
+    parser = argparse.ArgumentParser(description="Inspect or acknowledge Adaptive Agent Runtime rule revision state.")
     sub = parser.add_subparsers(dest="command", required=True)
     status = sub.add_parser("status")
     status.add_argument("--repo", required=True)

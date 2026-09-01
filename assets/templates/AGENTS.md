@@ -1,6 +1,6 @@
 # 项目协作规则
 
-- 长任务、台账粒度、Goal、Compact、Raw Sources、Wiki 和长期记忆统一遵循全局 `adaptive-delivery` Skill；本文件只保留项目入口、事实源路由、禁区和长期约束。
+- 长任务、台账粒度、Goal、Compact、Raw Sources、Wiki 和长期记忆统一遵循全局 `adaptive-agent-runtime` Skill；本文件只保留项目入口、事实源路由、禁区和长期约束。
 - 每次任务先固定 Git 根目录并检查 `HEAD`、`status` 和未提交 `diff`；非 Git 项目明确说明。
 - 先读取唯一任务台账：优先 `TASK_LEDGER.md`，仅存在 `PROJECT_STATUS.md` 时继续沿用；两者并存先对账，不建立双控制面。
 - 再读本任务涉及的 `SPEC.md`、`DESIGN.md`、`TECHNICAL.md`、`MEMORY.md`、`WIKI_INDEX.md` 或 `EVOLUTION.md`；涉及固定风格或专业流程时读取项目 `SKILL.md`，不默认加载无关文档。

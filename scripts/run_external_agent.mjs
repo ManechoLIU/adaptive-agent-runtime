@@ -797,7 +797,7 @@ async function executeExternalAgent({ cwd, engine, model, reasoningEffort, authM
     };
   } else if (engine === "kimi-code") {
     if (!credentialState(engine, authMode).configured) {
-      throw new Error("Kimi Code OAuth session not found; run the Adaptive Delivery login command first");
+      throw new Error("Kimi Code OAuth session not found; run the Adaptive Agent Runtime login command first");
     }
     args = ["-m", model, "-p", prompt, "--output-format", "stream-json"];
     env = {
@@ -817,7 +817,7 @@ async function executeExternalAgent({ cwd, engine, model, reasoningEffort, authM
     env = { ...process.env, GROK_HOME: isolatedHome, XAI_API_KEY: apiKey };
   } else {
     if (!credentialState(engine, authMode).configured) {
-      throw new Error("Grok OAuth session not found; run the Adaptive Delivery login command first");
+      throw new Error("Grok OAuth session not found; run the Adaptive Agent Runtime login command first");
     }
     args = commonGrokArgs(model, prompt, reasoningEffort);
     env = sanitizedEnvironment([], ["XAI_API_KEY"]);

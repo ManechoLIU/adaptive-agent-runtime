@@ -16,7 +16,7 @@ Raw Sources 不是第六个运行层，而是 Wiki 的原始资料层；Schema �
 
 ## 初始化
 
-用户要求“按上下文治理工作流初始化”时，使用 `scripts/init_project.py <root> --profile durable`。该档位组合两套目录：文章方法的 `AGENTS.md`、`TASK_LEDGER.md`、`WIKI_INDEX.md`、`MEMORY.md`、项目级 `SKILL.md`、`raw_sources/`、`wiki/`、`logs/ingestion/`，以及 Adaptive Delivery 的 `SPEC.md`、`DESIGN.md`、`TECHNICAL.md`、`EVOLUTION.md`。已有文件和目录逐项跳过，不覆盖、不静默合并；符号链接或类型冲突失败关闭。
+用户要求“按上下文治理工作流初始化”时，使用 `scripts/init_project.py <root> --profile durable`。该档位组合两套目录：文章方法的 `AGENTS.md`、`TASK_LEDGER.md`、`WIKI_INDEX.md`、`MEMORY.md`、项目级 `SKILL.md`、`raw_sources/`、`wiki/`、`logs/ingestion/`，以及 Adaptive Agent Runtime 的 `SPEC.md`、`DESIGN.md`、`TECHNICAL.md`、`EVOLUTION.md`。已有文件和目录逐项跳过，不覆盖、不静默合并；符号链接或类型冲突失败关闭。
 
 当前上下文和 Compact 不落盘。项目级 `SKILL.md` 负责路由本项目反复使用的固定风格、专业流程和引用；它不复制全局方法。普通短任务不因方法完整而强制初始化这些文件夹。
 

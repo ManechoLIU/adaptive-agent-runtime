@@ -168,7 +168,7 @@ def initialize_project(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="初始化与项目规模相称的 Adaptive Delivery 文档。"
+        description="初始化与项目规模相称的 Adaptive Agent Runtime 文档。"
     )
     parser.add_argument("root", nargs="?", default=".", help="项目根目录")
     parser.add_argument(

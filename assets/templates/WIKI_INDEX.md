@@ -28,6 +28,6 @@
 | Wiki 页面 | 尚无 | `wiki/` |
 | 摄取日志 | 尚无 | `logs/ingestion/` |
 
-资料的 Ingest / Query / Lint 方法统一遵循全局 `adaptive-delivery` Skill；本文件只更新当前项目的查询入口和资产状态。
+资料的 Ingest / Query / Lint 方法统一遵循全局 `adaptive-agent-runtime` Skill；本文件只更新当前项目的查询入口和资产状态。
 
 Wiki 和项目记忆都不能直接改变任务台账状态；只有当前验收证据可以推进工作包。

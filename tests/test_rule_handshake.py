@@ -69,7 +69,7 @@ class RuleHandshakeTests(unittest.TestCase):
             self.assertEqual(manifest["previous_revision"], "deadbeef")
             self.assertEqual(manifest["impact"], "live_assignments")
             self.assertEqual(manifest["product_name"], "Adaptive Agent Runtime")
-            self.assertEqual(manifest["skill_id"], "adaptive-delivery")
+            self.assertEqual(manifest["skill_id"], "adaptive-agent-runtime")
             self.assertEqual(manifest["product_slug"], "adaptive-agent-runtime")
             self.assertIn("adaptive-delivery", manifest["legacy_skill_ids"])
             self.assertEqual(set(manifest["files"]), {"SKILL.md", "scripts/x.py"})

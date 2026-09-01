@@ -439,7 +439,7 @@ def retry_decision(
     return decision
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Apply Adaptive Delivery runtime receipts to canonical Git state.")
+    parser = argparse.ArgumentParser(description="Apply Adaptive Agent Runtime receipts to canonical Git state.")
     sub = parser.add_subparsers(dest="command", required=True)
     apply_parser = sub.add_parser("apply")
     apply_parser.add_argument("--repo", required=True)

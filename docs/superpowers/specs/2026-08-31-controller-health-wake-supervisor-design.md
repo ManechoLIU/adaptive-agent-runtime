@@ -231,7 +231,7 @@ The implementation is not complete until machine tests prove at least:
 12. concurrent wake attempts for the same common-dir cannot produce duplicate continuations.
 13. existing Web Stop/native-stop behavior continues to work through the unified wake path.
 14. existing Desktop lifecycle, rule handshake, Assignment runtime, Reviewer Supervisor and scoring behavior regressions remain green.
-15. no duplicate technical Skill/runtime identity is introduced; `adaptive-delivery` remains the stable technical ID/path.
+15. no duplicate Skill/runtime identity is introduced; `adaptive-agent-runtime` is the public Skill ID while `adaptive-delivery` remains the stable legacy machine-state path.
 
 Final delivery requirements remain the existing project standard: TDD, full Python/Node regression, `git diff --check`, independent Reviewer Supervisor against exact candidate HEAD with no Critical/Important findings, integration to main, fresh merged-main regression, and only then update the installed Skill revision. No push unless explicitly requested.
 

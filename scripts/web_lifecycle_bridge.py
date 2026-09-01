@@ -693,7 +693,7 @@ def native_resume_command(
     *, codex: str, session_id: str, repo: Path, terminal_receipts: Sequence[str] | None = None
 ) -> list[str]:
     prompt = (
-        "Adaptive Delivery Web Stop checkpoint. Continue this existing registered controller "
+        "Adaptive Agent Runtime Web Stop checkpoint. Continue this existing registered controller "
         "thread only; do not create or fork another controller. Reconcile any pending lifecycle "
         "control event against the real main, ledger, live tasks, READY queue and candidates. "
         "Even when pending_control_event is false, perform one project-wide Goal rollover check: "
@@ -1414,7 +1414,7 @@ unset _ad_web_parent
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Bridge AI-Bridge Web tool events into Adaptive Delivery lifecycle hooks."
+        description="Bridge AI-Bridge Web tool events into Adaptive Agent Runtime lifecycle hooks."
     )
     subparsers = parser.add_subparsers(dest="command_name", required=True)
 

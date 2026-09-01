@@ -7,10 +7,10 @@
 ## Naming and compatibility
 
 - 对外产品名立即使用 **Adaptive Agent Runtime**。
-- 旧 `adaptive-delivery` 作为兼容 alias 保留；迁移期不允许形成第二套 canonical runtime/state。
+- 主 Skill ID 与显式调用使用 `adaptive-agent-runtime`；旧 `adaptive-delivery` 仅作为 legacy machine identifier 保留，迁移期不允许形成第二套 canonical runtime/state。
 - `.git/adaptive-delivery/`、旧 controller registry、旧 lifecycle/scoring state、旧 install manifest 与 Keychain service 继续可读；迁移只建立兼容解析或迁移入口，不复制运行事实。
 - 已存在的 `adaptive-delivery@<revision>` handshake/receipt 继续有效，除非规则内容本身变化触发现有握手机制。
-- 安装 manifest 记录 `product_name/product_slug` 与当次 host capability 报告，但技术 Skill ID、安装路径和 canonical state 继续沿用 `adaptive-delivery`。
+- 安装 manifest 记录 `product_name/product_slug/skill_id=adaptive-agent-runtime` 与当次 host capability 报告；全新安装目录使用 `adaptive-agent-runtime`，既有 `adaptive-delivery` 安装可原地升级，canonical state 继续沿用 `.git/adaptive-delivery/`。
 
 ## Core product architecture
 
@@ -70,7 +70,7 @@ Assignment 第一次启动时冻结可验证执行策略摘要，至少覆盖 pr
 - AI-Bridge 可用时启用 Web adapter。
 - 无 AI-Bridge 时不报失败，输出 Web degraded capability。
 - 安装结果必须报告 enabled/degraded/blocked 能力，不把“文件存在”当成“宿主已信任/已激活”。
-- 旧安装升级必须保持已有机器状态可读；新安装只向用户展示 Adaptive Agent Runtime 新名称。
+- 旧安装升级必须保持已有机器状态可读；所有安装只向用户展示 Adaptive Agent Runtime / `adaptive-agent-runtime` 新名称。
 
 ## Non-goals
 
@@ -78,8 +78,8 @@ Assignment 第一次启动时冻结可验证执行策略摘要，至少覆盖 pr
 
 ## Acceptance
 
-1. 现有安装升级后旧 `$adaptive-delivery`、旧 state/runtime/receipt/handshake 继续工作。
-2. 新安装对外暴露 `Adaptive Agent Runtime` / `adaptive-agent-runtime` 产品身份，但底层 Skill ID 继续为 `adaptive-delivery`，且不会创建两套 canonical runtime。
+1. 现有安装升级后旧 state/runtime/receipt/handshake 继续工作，旧安装目录可保留，但主显式调用切换为 `$adaptive-agent-runtime`。
+2. 新安装对外暴露 `Adaptive Agent Runtime` / `adaptive-agent-runtime` 产品身份与 Skill ID，且不会创建两套 canonical runtime。
 3. 无 AI-Bridge 时安装成功并明确降级；有 AI-Bridge 时启用 Web adapter。
 4. Web 新会话可得到项目绑定/恢复入口，恢复五层上下文而不新增项目状态层。
 5. lifecycle 异常保留 pending 事实；当前 host 合法失败时可按既有策略切已授权 peer host，保持唯一 controller 和 lineage。

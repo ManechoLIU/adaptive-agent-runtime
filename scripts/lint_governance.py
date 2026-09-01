@@ -226,7 +226,7 @@ def lint_project(root: Path, *, strict: bool = False) -> tuple[list[str], list[s
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="检查 Adaptive Delivery 项目的唯一台账、当前执行波次和治理文档链接。"
+        description="检查 Adaptive Agent Runtime 项目的唯一台账、当前执行波次和治理文档链接。"
     )
     parser.add_argument("root", nargs="?", default=".", help="项目根目录")
     parser.add_argument(

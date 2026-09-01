@@ -5,7 +5,7 @@ description: Use when this project requires a recurring fixed style, specialized
 
 # Project Workflow
 
-本文件只保存本项目反复使用的固定风格、专业流程和必要引用，不复制 `adaptive-delivery` 的通用上下文治理、台账粒度或交付方法。
+本文件只保存本项目反复使用的固定风格、专业流程和必要引用，不复制 `adaptive-agent-runtime` 的通用上下文治理、台账粒度或交付方法。
 
 ## 使用条件
 

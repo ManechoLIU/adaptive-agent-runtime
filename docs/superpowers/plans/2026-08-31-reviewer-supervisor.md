@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Keep technical Skill ID `adaptive-delivery`, installed path, Git common-dir runtime root, controller registry, handshake, and Assignment runtime unchanged.
+- Keep the Git common-dir runtime root, existing installed path, controller registry, handshake, and Assignment runtime compatible with legacy `adaptive-delivery`; the public Skill ID is `adaptive-agent-runtime`.
 - Reviewer Supervisor states are execution evidence only: `STARTING`, `RUNNING`, `PASS`, `FINDINGS`, `REVIEW_INFRA_FAILED`.
 - A PID or exit code alone never proves `RUNNING` or `PASS`.
 - `reviewed_head` must exactly equal the immutable candidate HEAD captured before launch.

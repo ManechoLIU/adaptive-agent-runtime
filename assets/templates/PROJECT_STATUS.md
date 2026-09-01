@@ -1,13 +1,13 @@
 # 项目状态（旧名称兼容模板）
 
-> 已有项目可继续把本文件作为唯一任务台账。只记录当前项目实例；状态定义、粒度方法和拆分规则由 `adaptive-delivery` Skill 负责。
+> 已有项目可继续把本文件作为唯一任务台账。只记录当前项目实例；状态定义、粒度方法和拆分规则由 `adaptive-agent-runtime` Skill 负责。
 
 ## 当前目标
 
 - 当前 Goal：`INIT-01` 确认首个可验收里程碑
 - 下一可见检查点：`INIT-01` 完成目标、边界和首个可观察结果对账
 - 当前阻塞：无
-- 规则版本：以当前项目 `AGENTS.md` 与已加载的 `adaptive-delivery` revision 为准
+- 规则版本：以当前项目 `AGENTS.md` 与已加载的 `adaptive-agent-runtime` revision 为准
 
 ## 任务拆分
 

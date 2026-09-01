@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install one exact Adaptive Delivery revision with a machine-readable manifest."""
+"""Install one exact Adaptive Agent Runtime revision with a machine-readable manifest."""
 from __future__ import annotations
 
 import argparse
@@ -19,7 +19,7 @@ from typing import Any, Sequence
 
 UTC = timezone.utc
 PRODUCT_NAME = "Adaptive Agent Runtime"
-SKILL_ID = "adaptive-delivery"
+SKILL_ID = "adaptive-agent-runtime"
 PRODUCT_SLUG = "adaptive-agent-runtime"
 LEGACY_SKILL_IDS = ("adaptive-delivery",)
 DEFAULT_AI_BRIDGE_EXECUTABLE = Path("/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge")
@@ -29,6 +29,32 @@ WEB_BLOCK_START = "# >>> adaptive-delivery web lifecycle bridge >>>"
 WEB_BLOCK_END = "# <<< adaptive-delivery web lifecycle bridge <<<"
 MANIFEST_NAME = ".adaptive-delivery-install.json"
 IMPACTS = {"none", "live_assignments"}
+
+
+def default_install_target(skills_root: str | Path | None = None) -> Path:
+    root = Path(skills_root).expanduser() if skills_root is not None else Path.home() / ".agents" / "skills"
+    current = root / SKILL_ID
+    legacy = root / LEGACY_SKILL_IDS[0]
+    if (current.exists() or current.is_symlink()) and (legacy.exists() or legacy.is_symlink()):
+        raise ValueError(f"multiple skill installs detected: {current} and {legacy}; keep one canonical install")
+    if current.exists() or current.is_symlink():
+        return current
+    if legacy.exists() or legacy.is_symlink():
+        return legacy
+    return current
+
+
+def _ensure_single_skill_install(target: Path) -> None:
+    if target.name not in {SKILL_ID, *LEGACY_SKILL_IDS}:
+        return
+    siblings = [target.parent / SKILL_ID, *(target.parent / value for value in LEGACY_SKILL_IDS)]
+    existing = [path for path in siblings if path.exists() or path.is_symlink()]
+    target_exists = target.exists() or target.is_symlink()
+    if len(existing) > 1 or (existing and not target_exists):
+        rendered = " and ".join(str(path) for path in existing)
+        raise ValueError(
+            f"multiple skill installs detected or would be created beside {rendered}; keep one canonical install"
+        )
 
 
 
@@ -477,6 +503,7 @@ def install_skill(
 ) -> dict[str, Any]:
     source_path = Path(source).expanduser().resolve()
     target_path = Path(target).expanduser().resolve()
+    _ensure_single_skill_install(target_path)
     if impact not in IMPACTS:
         raise ValueError("impact must be none or live_assignments")
     if not summary.strip() or not stop_condition.strip():
@@ -621,7 +648,7 @@ def _release_install_resource_locks(handles) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install an exact Adaptive Agent Runtime revision with manifest and host-adapter evidence.")
     parser.add_argument("--source", required=True)
-    parser.add_argument("--target", default=str(Path.home() / ".agents" / "skills" / "adaptive-delivery"))
+    parser.add_argument("--target")
     parser.add_argument("--summary", required=True)
     parser.add_argument("--impact", required=True, choices=sorted(IMPACTS))
     parser.add_argument("--stop-condition", required=True)
@@ -633,7 +660,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--zshenv-file", default=str(DEFAULT_ZSHENV))
     args = parser.parse_args(argv)
 
-    target_path = Path(args.target).expanduser().resolve(strict=False)
+    try:
+        selected_target = Path(args.target).expanduser() if args.target else default_install_target()
+    except ValueError as error:
+        print(f"adaptive-agent-runtime-install: blocked: {error}")
+        return 1
+    target_path = selected_target.resolve(strict=False)
     hooks_path = Path(args.hooks_file).expanduser().resolve(strict=False)
     zshenv_path = Path(args.zshenv_file).expanduser().resolve(strict=False)
     lock_paths = _install_resource_lock_paths(target_path, hooks_path, zshenv_path)

@@ -126,6 +126,73 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertFalse(report["web_local_adapter"]["configured"])
 
 class InstallMigrationContractTests(unittest.TestCase):
+    def test_cli_reports_default_target_conflict_without_traceback(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from scripts.install_skill import main
+
+        output = io.StringIO()
+        with patch("scripts.install_skill.default_install_target", side_effect=ValueError("multiple skill installs detected")):
+            with contextlib.redirect_stdout(output):
+                code = main([
+                    "--source", "/tmp/source", "--summary", "rename conflict",
+                    "--impact", "none", "--stop-condition", "choose one install",
+                    "--no-configure-host-adapters",
+                ])
+
+        self.assertEqual(code, 1)
+        self.assertIn("multiple skill installs", output.getvalue())
+
+    def test_default_target_uses_new_name_but_reuses_an_existing_legacy_install(self):
+        from scripts.install_skill import default_install_target
+        with tempfile.TemporaryDirectory() as d:
+            skills_root = Path(d) / "skills"
+
+            self.assertEqual(default_install_target(skills_root), skills_root / "adaptive-agent-runtime")
+
+            legacy = skills_root / "adaptive-delivery"
+            legacy.mkdir(parents=True)
+            self.assertEqual(default_install_target(skills_root), legacy)
+
+            current = skills_root / "adaptive-agent-runtime"
+            current.mkdir()
+            with self.assertRaisesRegex(ValueError, "multiple skill installs"):
+                default_install_target(skills_root)
+
+    def test_install_blocks_when_new_and_legacy_skill_directories_both_exist(self):
+        from scripts.install_skill import install_skill
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            skills_root = root / "installed"
+            legacy = skills_root / "adaptive-delivery"
+            current = skills_root / "adaptive-agent-runtime"
+            legacy.mkdir(parents=True)
+            current.mkdir()
+
+            with self.assertRaisesRegex(ValueError, "multiple skill installs"):
+                install_skill(
+                    source, current, summary="rename conflict", impact="none",
+                    stop_condition="choose one canonical install",
+                )
+
+    def test_install_blocks_explicit_new_target_beside_existing_legacy_install(self):
+        from scripts.install_skill import install_skill
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            skills_root = root / "installed"
+            legacy = skills_root / "adaptive-delivery"
+            current = skills_root / "adaptive-agent-runtime"
+            legacy.mkdir(parents=True)
+
+            with self.assertRaisesRegex(ValueError, "multiple skill installs"):
+                install_skill(
+                    source, current, summary="rename conflict", impact="none",
+                    stop_condition="reuse legacy install",
+                )
+
     def make_source(self, root: Path) -> Path:
         import subprocess
         source = root / "source"
@@ -133,7 +200,7 @@ class InstallMigrationContractTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(source), "init", "-b", "main"], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.com"], check=True)
         subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
-        (source / "SKILL.md").write_text("---\nname: adaptive-delivery\n---\n# Adaptive Agent Runtime\n", encoding="utf-8")
+        (source / "SKILL.md").write_text("---\nname: adaptive-agent-runtime\n---\n# Adaptive Agent Runtime\n", encoding="utf-8")
         (source / "scripts").mkdir()
         for name in ("web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py"):
             script = source / "scripts" / name
@@ -165,7 +232,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             self.assertEqual(target.name, "adaptive-delivery")
             self.assertEqual(manifest["product_name"], "Adaptive Agent Runtime")
             self.assertEqual(manifest["product_slug"], "adaptive-agent-runtime")
-            self.assertEqual(manifest["skill_id"], "adaptive-delivery")
+            self.assertEqual(manifest["skill_id"], "adaptive-agent-runtime")
             self.assertEqual(manifest["previous_revision"], old_revision)
             self.assertIn("capabilities", manifest)
             self.assertEqual(manifest["capabilities"]["core"]["status"], "enabled")
@@ -182,7 +249,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
 
             self.assertEqual(manifest["product_name"], "Adaptive Agent Runtime")
-            self.assertEqual(manifest["skill_id"], "adaptive-delivery")
+            self.assertEqual(manifest["skill_id"], "adaptive-agent-runtime")
             self.assertIn("capabilities", manifest)
             self.assertEqual(set(manifest["capabilities"]), {"core", "desktop_adapter", "web_local_adapter"})
 

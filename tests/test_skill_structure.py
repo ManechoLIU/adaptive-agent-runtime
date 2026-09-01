@@ -6,6 +6,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT / "SKILL.md"
+OPENAI_METADATA = ROOT / "agents" / "openai.yaml"
 REFERENCE_PATHS = {
     "methods": ROOT / "references" / "methods.md",
     "harness": ROOT / "references" / "harness-and-release.md",
@@ -62,7 +63,7 @@ class SkillStructureTests(unittest.TestCase):
         frontmatter, _ = split_frontmatter(read_entrypoint())
         fields = dict(re.findall(r"(?m)^([A-Za-z][\w-]*):\s*(.+?)\s*$", frontmatter))
 
-        self.assertEqual("adaptive-delivery", fields.get("name"))
+        self.assertEqual("adaptive-agent-runtime", fields.get("name"))
         description = fields.get("description", "").strip().strip('"')
         self.assertRegex(description, r"^Use when\b")
         self.assertLessEqual(len(frontmatter), 1024)
@@ -79,6 +80,29 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("legacy machine identifier", readme.casefold())
         self.assertIn(' / "adaptive-delivery"', project_state)
         self.assertNotIn(' / "adaptive-agent-runtime"', project_state)
+
+    def test_openai_metadata_exposes_runtime_name_and_new_invocation(self):
+        metadata = OPENAI_METADATA.read_text(encoding="utf-8")
+
+        self.assertIn('display_name: "Adaptive Agent Runtime"', metadata)
+        self.assertIn('$adaptive-agent-runtime', metadata)
+        self.assertNotIn('$adaptive-delivery', metadata)
+
+    def test_readme_uses_new_public_skill_id(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn('$adaptive-agent-runtime', readme)
+        self.assertNotIn('$adaptive-delivery', readme)
+
+    def test_project_templates_use_new_public_skill_id(self):
+        templates = (
+            "AGENTS.md", "TASK_LEDGER.md", "PROJECT_STATUS.md",
+            "MEMORY.md", "PROJECT_SKILL.md", "WIKI_INDEX.md",
+        )
+        for name in templates:
+            text = (ROOT / "assets" / "templates" / name).read_text(encoding="utf-8")
+            self.assertIn("adaptive-agent-runtime", text, name)
+            self.assertNotIn("`adaptive-delivery` Skill", text, name)
 
     def test_entrypoint_is_short(self):
         _, body = split_frontmatter(read_entrypoint())
@@ -297,7 +321,8 @@ class SkillStructureTests(unittest.TestCase):
         ):
             self.assertIn(phrase, combined)
         self.assertIn("Adaptive Agent Runtime", combined)
-        self.assertIn("technical Skill ID/path remain `adaptive-delivery`", combined)
+        self.assertIn("public Skill ID", combined)
+        self.assertIn("adaptive-agent-runtime", combined)
         self.assertIn("no second controller", combined)
         self.assertIn("no mutable health ledger", combined)
         self.assertIn("controller worktree events require binding proof", combined)
