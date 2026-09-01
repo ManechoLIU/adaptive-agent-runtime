@@ -56,6 +56,7 @@ def is_controller_scoring_request(prompt: str) -> bool:
     text = str(prompt or "").strip()
     return bool(
         (_CONTROLLER_TERMS.search(text) and _SCORE_TERMS.search(text))
+        or (_CONTROLLER_TERMS.search(text) and _CYCLE_REQUEST.search(text))
         or _PERFORMANCE_WORKFLOW.search(text)
     )
 
@@ -236,12 +237,12 @@ def evaluate_event(
         scoring_mode = str(state.get("scoring_mode", "formal"))
         cycle_score = _extract_cycle_score_value(message)
         formal_score = _extract_score_value(message)
-        if scoring_mode == "cycle" and formal_score is not None and cycle_score is None:
+        if scoring_mode == "cycle" and cycle_score is None and formal_score is not None:
             return {
                 "decision": "block",
                 "reason": "controller scoring blocked: score output mode mismatch; cycle diagnostic requested",
             }, state
-        if scoring_mode == "formal" and cycle_score is not None and formal_score is None:
+        if scoring_mode == "formal" and cycle_score is not None:
             return {
                 "decision": "block",
                 "reason": "controller scoring blocked: score output mode mismatch; formal scoring requested",

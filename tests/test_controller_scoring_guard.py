@@ -233,10 +233,25 @@ class ControllerScoringGuardTests(unittest.TestCase):
             model = guard.scoring_model_sha256(ROOT)
             guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "best", "terminal_status": "CLOSED", "score": 93.0, "model_sha256": model, "evidence_summary": "best", "message_sha256": "f" * 64})
             guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "worst", "terminal_status": "FAILED", "score": 61.0, "model_sha256": model, "evidence_summary": "worst", "message_sha256": "1" * 64})
+            guard.record_model_read(repo, skill_root=ROOT)
             completed = subprocess.run(["python3", str(SCRIPT), "cycle-extremes", "--repo", str(repo), "--controller-session", "c1"], check=True, capture_output=True, text=True)
             payload = json.loads(completed.stdout)
             self.assertEqual("best", payload["best"]["cycle_id"])
             self.assertEqual("worst", payload["worst"]["cycle_id"])
+
+
+    def test_cycle_extremes_cli_fails_closed_without_exact_model_receipt(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            model = guard.scoring_model_sha256(ROOT)
+            guard.append_score_history(repo, {"controller_session_id": "c1", "record_kind": "cycle", "cycle_id": "best", "terminal_status": "CLOSED", "score": 93.0, "model_sha256": model, "evidence_summary": "best", "message_sha256": "f" * 64})
+            completed = subprocess.run(["python3", str(SCRIPT), "cycle-extremes", "--repo", str(repo), "--controller-session", "c1"], check=False, capture_output=True, text=True)
+            self.assertNotEqual(0, completed.returncode)
+            self.assertNotIn('"score": 93.0', completed.stdout)
+            self.assertIn("controller scoring blocked", completed.stderr)
 
 
     def test_finalize_cycle_score_rejects_empty_controller_session(self):

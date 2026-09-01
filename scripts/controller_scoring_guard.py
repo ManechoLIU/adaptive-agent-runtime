@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -309,6 +310,11 @@ def main() -> int:
         print("UNKNOWN" if record is None else json.dumps(record, ensure_ascii=False, sort_keys=True))
         return 0
     if args.command == "cycle-extremes":
+        errors = consume_score_guard(args.repo, skill_root=installed_skill_root)
+        if errors:
+            for error in errors:
+                print(error, file=sys.stderr)
+            return 2
         payload = cycle_score_extremes(
             args.repo, controller_session_id=args.controller_session,
             model_sha256=scoring_model_sha256(installed_skill_root),

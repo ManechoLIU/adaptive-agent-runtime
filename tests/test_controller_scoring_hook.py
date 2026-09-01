@@ -398,6 +398,30 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
             self.assertIn("mode", output.get("reason", ""))
             self.assertIsNone(hook.latest_score_history(repo, controller_session_id="controller-1"))
 
+    def test_cycle_diagnostic_language_triggers_scoring_gate(self):
+        hook = load_module()
+        self.assertTrue(hook.is_controller_scoring_request("分析总控的最佳闭环和最差闭环"))
+        self.assertTrue(hook.is_controller_scoring_request("做一次总控单回合诊断"))
+
+    def test_formal_request_blocks_cycle_score_when_regexes_overlap(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-formal-overlap", "cwd": str(repo), "prompt": "给总控正式评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-formal-overlap", "cwd": str(repo),
+                 "last_assistant_message": "总控单回合诊断评分：91/100。\n控制回合：cycle-1\n回合终态：CLOSED\n证据摘要：reviewed"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual("block", output.get("decision"))
+            self.assertIn("mode", output.get("reason", ""))
+            self.assertIsNone(hook.latest_score_history(repo, controller_session_id="controller-1"))
+
     def test_formal_request_blocks_cycle_score_output_mode_mismatch(self):
         import subprocess
         hook = load_module()
