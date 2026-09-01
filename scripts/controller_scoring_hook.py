@@ -234,7 +234,19 @@ def evaluate_event(
                 ),
             }, state
         scoring_mode = str(state.get("scoring_mode", "formal"))
-        score = _extract_cycle_score_value(message) if scoring_mode == "cycle" else _extract_score_value(message)
+        cycle_score = _extract_cycle_score_value(message)
+        formal_score = _extract_score_value(message)
+        if scoring_mode == "cycle" and formal_score is not None and cycle_score is None:
+            return {
+                "decision": "block",
+                "reason": "controller scoring blocked: score output mode mismatch; cycle diagnostic requested",
+            }, state
+        if scoring_mode == "formal" and cycle_score is not None and formal_score is None:
+            return {
+                "decision": "block",
+                "reason": "controller scoring blocked: score output mode mismatch; formal scoring requested",
+            }, state
+        score = cycle_score if scoring_mode == "cycle" else formal_score
         try:
             if score is None:
                 errors = consume_score_guard(Path(repo_text), skill_root=skill_root)

@@ -379,5 +379,47 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
         self.assertIn("score-guard", output["reason"])
 
 
+    def test_cycle_request_blocks_formal_score_output_mode_mismatch(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-cycle", "cwd": str(repo), "prompt": "给总控这个单回合闭环评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-cycle", "cwd": str(repo),
+                 "last_assistant_message": "当前总控履职评分：91/100。"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual("block", output.get("decision"))
+            self.assertIn("mode", output.get("reason", ""))
+            self.assertIsNone(hook.latest_score_history(repo, controller_session_id="controller-1"))
+
+    def test_formal_request_blocks_cycle_score_output_mode_mismatch(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-formal", "cwd": str(repo), "prompt": "给总控正式评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-formal", "cwd": str(repo),
+                 "last_assistant_message": "单回合诊断评分：91/100。\n控制回合：cycle-1\n回合终态：CLOSED\n证据摘要：reviewed"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual("block", output.get("decision"))
+            self.assertIn("mode", output.get("reason", ""))
+            self.assertEqual(
+                {"best": None, "worst": None},
+                hook.cycle_score_extremes(repo, controller_session_id="controller-1", model_sha256=hook.scoring_model_sha256(ROOT)),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
