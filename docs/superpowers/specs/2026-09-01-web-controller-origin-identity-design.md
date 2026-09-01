@@ -19,7 +19,7 @@ Allow a ChatGPT Web conversation to resume an existing unique logical Controller
 - Do not reuse a desktop Codex thread ID as a Web conversation ID.
 - Do not add a second Controller registry or a parallel lifecycle state machine.
 - Do not patch or modify the signed `/Applications/AI-Bridge.app` binary in place.
-- Do not weaken current fail-closed behavior when origin identity is unavailable.
+- Do not silently weaken the trusted fail-closed path when origin identity is unavailable; any temporary downgrade must be explicit, time-bounded, and labeled as non-attested.
 
 ## Trust boundary
 
@@ -93,6 +93,22 @@ The following must fail closed:
 
 No fallback may use active browser tab, repository path, old Controller ID, or current process environment as a substitute identity.
 
+## Temporary manual downgrade
+
+The host-attested origin contract above remains the target trust model. Until AI-Bridge exposes it, an explicitly user-authorized manual lease may be used as a temporary operational downgrade when the user needs the existing unique Controller to resume immediately.
+
+The downgrade has strict limits:
+
+- The Web session must already be present in the existing `__controller_sessions__` binding for the existing logical Controller.
+- Authorization is stored separately as a time-bounded lease with `provenance=manual_user_authorized` and `mode=resume_only`; the default TTL is 30 days.
+- Resolution is scoped to the registered repository / Git common-dir and existing Controller. It never creates or replaces a Controller.
+- An explicit host-provided `ADAPTIVE_DELIVERY_WEB_SESSION_ID` takes precedence over the manual lease.
+- Missing, expired, repo-mismatched, Controller-mismatched, or no-longer-bound leases resolve to no identity and preserve fail-closed lifecycle behavior.
+- This mode does **not** attest which ChatGPT conversation originated an AI-Bridge call. While the lease is active, a different Web conversation that can invoke AI-Bridge shell work inside the same registered repository cannot be distinguished locally and may be attributed to the leased Web session. This limitation must be surfaced as a downgrade, not described as verified host identity.
+- Once host-attested origin identity is available, production Controller operation should migrate to that path and stop relying on the manual lease.
+
+This exception does not permit browser-tab scraping, repository-only automatic Controller creation, desktop-thread substitution, or global environment injection of a Web conversation ID.
+
 ## Rollout
 
 ### Phase A — AI-Bridge prerequisite
@@ -143,4 +159,4 @@ As of 2026-09-01 on this Mac:
 - AI-Bridge redacted audit exposes receipt-level metadata but no conversation/thread/session/origin identifier.
 - The installed AI-Bridge application bundle contains signed executables/resources, not editable source code.
 
-These facts justify retaining fail-closed Runtime behavior until Phase A exists.
+These facts justify retaining fail-closed behavior for the trusted path until Phase A exists. The explicitly user-authorized manual downgrade above is a temporary operational exception and must not be represented as host-attested identity.

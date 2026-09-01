@@ -20,6 +20,8 @@ except ModuleNotFoundError:
 
 
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
+DEFAULT_MANUAL_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
+DEFAULT_MANUAL_WEB_LEASE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_AUDIT_LOG = (
     Path.home()
     / "Library"
@@ -158,6 +160,97 @@ def require_web_controller_session(
             "verified Web Controller Session identity required; refusing repository-only Controller attribution"
         )
     return value
+
+
+def authorize_manual_web_session(
+    *,
+    repo: Path,
+    controller_id: str,
+    web_session_id: str,
+    registry_path: Path,
+    lease_path: Path,
+    ttl_seconds: int,
+) -> dict[str, Any]:
+    if ttl_seconds <= 0:
+        raise ValueError("ttl-seconds must be positive")
+    registered = registered_controller_for_repo(repo, registry_path)
+    if registered != controller_id:
+        raise PermissionError("manual Web lease requires the registered Controller for this repository")
+    if not registered_controller_session(
+        controller_id=controller_id, session_id=web_session_id, host="web", registry_path=registry_path
+    ):
+        raise PermissionError("manual Web lease requires a Web session that must already be bound to this Controller")
+
+    now = int(time.time())
+    record = {
+        "repo": str(repo.resolve()),
+        "controller_id": controller_id,
+        "web_session_id": web_session_id,
+        "authorized_at_unix": now,
+        "expires_at_unix": now + ttl_seconds,
+        "provenance": "manual_user_authorized",
+        "mode": "resume_only",
+    }
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = lease_path.with_suffix(lease_path.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            payload = load_json(lease_path)
+            leases = payload.get("leases")
+            if not isinstance(leases, dict):
+                leases = {}
+            leases[controller_id] = record
+            payload["schema_version"] = 1
+            payload["leases"] = leases
+            _write_json_atomic_file(lease_path, payload)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return record
+
+
+def resolve_manual_web_session(
+    *, cwd: Path, registry_path: Path, lease_path: Path, now_unix: int | None = None
+) -> str | None:
+    repo = canonical_root(cwd)
+    try:
+        controller_id = registered_controller_for_repo(repo, registry_path)
+    except ValueError:
+        return None
+    if controller_id is None:
+        return None
+    payload = load_json(lease_path)
+    leases = payload.get("leases")
+    if not isinstance(leases, dict):
+        return None
+    record = leases.get(controller_id)
+    if not isinstance(record, dict):
+        return None
+    if record.get("provenance") != "manual_user_authorized" or record.get("mode") != "resume_only":
+        return None
+    if record.get("controller_id") not in (None, controller_id):
+        return None
+    session_id = record.get("web_session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    expires_at = record.get("expires_at_unix")
+    if not isinstance(expires_at, int) or expires_at <= int(time.time() if now_unix is None else now_unix):
+        return None
+    lease_repo_value = record.get("repo")
+    if not isinstance(lease_repo_value, str) or not lease_repo_value.strip():
+        return None
+    lease_repo = Path(lease_repo_value).expanduser().resolve()
+    try:
+        if _git_common_dir(lease_repo) != _git_common_dir(repo):
+            return None
+    except (OSError, subprocess.SubprocessError):
+        if lease_repo != repo.resolve():
+            return None
+    if not registered_controller_session(
+        controller_id=controller_id, session_id=session_id, host="web", registry_path=registry_path
+    ):
+        return None
+    return session_id
 
 
 def post_tool_event(
@@ -1295,11 +1388,14 @@ def zshenv_block() -> str:
     return f'''# >>> adaptive-delivery web lifecycle bridge >>>
 _ad_web_parent=$(/bin/ps -p "$PPID" -o command= 2>/dev/null)
 _ad_web_session_id="${{ADAPTIVE_DELIVERY_WEB_SESSION_ID:-}}"
+_ad_web_bridge_script="{script}"
+_ad_web_bridge_python="{python}"
+if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* && -z "$_ad_web_session_id" ]]; then
+  _ad_web_session_id=$("$_ad_web_bridge_python" "$_ad_web_bridge_script" resolve-manual-web-session --cwd "$PWD" 2>/dev/null)
+fi
 if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* && -n "$_ad_web_session_id" ]]; then
   _ad_web_cwd="$PWD"
   _ad_web_command="$ZSH_EXECUTION_STRING"
-  _ad_web_bridge_script="{script}"
-  _ad_web_bridge_python="{python}"
   _ad_web_lifecycle_exit() {{
     local _ad_web_exit_code=$?
     trap - EXIT
@@ -1333,6 +1429,19 @@ def build_parser() -> argparse.ArgumentParser:
     bind_web.add_argument("--controller-id", required=True)
     bind_web.add_argument("--web-session-id", required=True)
     bind_web.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+
+    authorize_manual = subparsers.add_parser("authorize-manual-web-session")
+    authorize_manual.add_argument("--repo", required=True)
+    authorize_manual.add_argument("--controller-id", required=True)
+    authorize_manual.add_argument("--web-session-id", required=True)
+    authorize_manual.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    authorize_manual.add_argument("--lease-file", default=str(DEFAULT_MANUAL_WEB_LEASES))
+    authorize_manual.add_argument("--ttl-seconds", type=int, default=DEFAULT_MANUAL_WEB_LEASE_TTL_SECONDS)
+
+    resolve_manual = subparsers.add_parser("resolve-manual-web-session")
+    resolve_manual.add_argument("--cwd", required=True)
+    resolve_manual.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    resolve_manual.add_argument("--lease-file", default=str(DEFAULT_MANUAL_WEB_LEASES))
 
     session_start = subparsers.add_parser("session-start")
     session_start.add_argument("--repo", required=True)
@@ -1444,6 +1553,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             "web_session_id": args.web_session_id,
             "event_source": "web",
         }, ensure_ascii=False))
+        return 0
+
+    if args.command_name == "authorize-manual-web-session":
+        repo = canonical_root(args.repo)
+        registry_path = Path(args.registry).expanduser()
+        lease_path = Path(args.lease_file).expanduser()
+        try:
+            record = authorize_manual_web_session(
+                repo=repo,
+                controller_id=args.controller_id,
+                web_session_id=args.web_session_id,
+                registry_path=registry_path,
+                lease_path=lease_path,
+                ttl_seconds=args.ttl_seconds,
+            )
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
+        except (OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps({
+            **record,
+            "mode": "manual_user_authorized_resume_only",
+            "lease_file": str(lease_path),
+        }, ensure_ascii=False))
+        return 0
+
+    if args.command_name == "resolve-manual-web-session":
+        value = resolve_manual_web_session(
+            cwd=Path(args.cwd).expanduser(),
+            registry_path=Path(args.registry).expanduser(),
+            lease_path=Path(args.lease_file).expanduser(),
+        )
+        if value:
+            print(value)
         return 0
 
     if args.command_name == "session-start":

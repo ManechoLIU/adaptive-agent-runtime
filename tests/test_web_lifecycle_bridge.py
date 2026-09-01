@@ -241,6 +241,138 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             saved = json.loads(registry.read_text(encoding="utf-8"))
             self.assertEqual(saved["__controller_sessions__"]["controller-1"]["web"], ["web-session-1"])
 
+    def test_authorize_manual_web_session_persists_scoped_resume_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
+            }), encoding="utf-8")
+            lease = root / "manual-web-leases.json"
+
+            result = self.run_bridge(
+                "authorize-manual-web-session",
+                "--repo", str(repo),
+                "--controller-id", "controller-1",
+                "--web-session-id", "web-session-1",
+                "--registry", str(registry),
+                "--lease-file", str(lease),
+                "--ttl-seconds", str(30 * 24 * 60 * 60),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            saved = json.loads(lease.read_text(encoding="utf-8"))
+            item = saved["leases"]["controller-1"]
+            self.assertEqual(payload["mode"], "manual_user_authorized_resume_only")
+            self.assertEqual(item["repo"], str(repo.resolve()))
+            self.assertEqual(item["web_session_id"], "web-session-1")
+            self.assertEqual(item["provenance"], "manual_user_authorized")
+            self.assertEqual(item["mode"], "resume_only")
+            self.assertGreaterEqual(item["expires_at_unix"] - item["authorized_at_unix"], 30 * 24 * 60 * 60)
+
+    def test_authorize_manual_web_session_requires_existing_verified_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo)}), encoding="utf-8")
+            lease = root / "manual-web-leases.json"
+
+            result = self.run_bridge(
+                "authorize-manual-web-session",
+                "--repo", str(repo),
+                "--controller-id", "controller-1",
+                "--web-session-id", "web-session-1",
+                "--registry", str(registry),
+                "--lease-file", str(lease),
+            )
+
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("must already be bound", result.stderr)
+            self.assertFalse(lease.exists())
+
+    def test_resolve_manual_web_session_returns_only_live_verified_repo_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
+            }), encoding="utf-8")
+            lease = root / "manual-web-leases.json"
+            lease.write_text(json.dumps({
+                "schema_version": 1,
+                "leases": {
+                    "controller-1": {
+                        "repo": str(repo.resolve()),
+                        "web_session_id": "web-session-1",
+                        "authorized_at_unix": 1,
+                        "expires_at_unix": 4102444800,
+                        "provenance": "manual_user_authorized",
+                        "mode": "resume_only",
+                    }
+                },
+            }), encoding="utf-8")
+
+            result = self.run_bridge(
+                "resolve-manual-web-session",
+                "--cwd", str(repo),
+                "--registry", str(registry),
+                "--lease-file", str(lease),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "web-session-1")
+
+    def test_resolve_manual_web_session_silently_ignores_expired_or_unverified_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
+            }), encoding="utf-8")
+            lease = root / "manual-web-leases.json"
+            base = {
+                "schema_version": 1,
+                "leases": {
+                    "controller-1": {
+                        "repo": str(repo.resolve()),
+                        "web_session_id": "web-session-1",
+                        "authorized_at_unix": 1,
+                        "expires_at_unix": 2,
+                        "provenance": "manual_user_authorized",
+                        "mode": "resume_only",
+                    }
+                },
+            }
+            lease.write_text(json.dumps(base), encoding="utf-8")
+            expired = self.run_bridge(
+                "resolve-manual-web-session", "--cwd", str(repo),
+                "--registry", str(registry), "--lease-file", str(lease),
+            )
+            self.assertEqual(expired.returncode, 0, expired.stderr)
+            self.assertEqual(expired.stdout, "")
+
+            base["leases"]["controller-1"]["expires_at_unix"] = 4102444800
+            base["leases"]["controller-1"]["web_session_id"] = "web-not-bound"
+            lease.write_text(json.dumps(base), encoding="utf-8")
+            unverified = self.run_bridge(
+                "resolve-manual-web-session", "--cwd", str(repo),
+                "--registry", str(registry), "--lease-file", str(lease),
+            )
+            self.assertEqual(unverified.returncode, 0, unverified.stderr)
+            self.assertEqual(unverified.stdout, "")
+
     def test_post_shell_silently_skips_unregistered_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -333,6 +465,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
         self.assertNotIn("\\n      --cwd", block)
         self.assertIn('post-shell --cwd "$_ad_web_cwd"', block)
         self.assertIn('ADAPTIVE_DELIVERY_WEB_SESSION_ID', block)
+        self.assertIn('resolve-manual-web-session --cwd "$PWD"', block)
         self.assertIn('--web-session-id "$_ad_web_session_id"', block)
         self.assertNotIn("unset _ad_web_parent _ad_web_session_id", block)
 
