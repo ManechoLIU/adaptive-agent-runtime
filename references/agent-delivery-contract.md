@@ -15,6 +15,8 @@ RED, implementation, GREEN, review, and documentation are steps or evidence for 
 
 For Assignment-bound external execution, delivered ACK is a **launch gate**, not a retrospective quality check. The runner validates the exact Assignment/task/Agent identity plus repository root, branch, and current HEAD before spawning the external Agent. A useful result produced through a non-compliant launch may remain auxiliary evidence, but it cannot satisfy the required Assignment or Reviewer receipt.
 
+Before any new Assignment becomes launchable, the control receipt freezes its execution mode, unique owned files, and route evidence. Delegated execution must bind the actual provider/model/auth mode to the exact project policy file and SHA. A fallback is launchable only after the previous attempt is terminal, its result is known, and traceable failure evidence is present. Controller-authored implementation is still an Assignment: it requires an explicit bounded exception and stop condition, so omitting delegation cannot silently convert the Controller into a Writer.
+
 ## 2. Delivery Gate — Unified Result Envelope
 
 All execution transports (native subagent, Grok/Kimi runner, future A2A transport) keep **transport completion** separate from the **delivery verdict** in the runtime terminal receipt. New terminal receipts use:

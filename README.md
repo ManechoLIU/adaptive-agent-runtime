@@ -290,7 +290,7 @@ python3 scripts/control_event_guard.py \
   control-event.json
 ```
 
-该 JSON 只在当前事件中使用，不进入项目台账。除当前台账 SHA-256、派发前可用槽位、全部 `READY` 决定和显式声明的 Reviewer / 规则 ACK 外，还要带本轮 `event_contract`、`event_actions`、`terminal_receipt_issued=true`、全部未合入 worktree 的 `candidate_packages` 决定与本轮 `new_assignments`。脚本会复核整条动作链是否仍属于同一主任务和候选 revision，并直接用 Git 对账候选是否遗漏；延后 `READY` 必须使用结构化 `reason_code`，不能用“下一事件”或“稍后处理”留下空槽。门禁通过后删除临时输入，不新增治理文档。
+该 JSON 只在当前事件中使用，不进入项目台账。除当前台账 SHA-256、全部 `READY` 决定和显式声明的 Reviewer / 规则 ACK 外，还要带宿主容量投影 `capacity_projection`、本轮 `event_contract`、`event_actions`、`terminal_receipt_issued=true`、全部未合入 worktree 的 `candidate_packages` 决定与本轮 `new_assignments`。脚本会从总容量与 `ACTIVE / RECOVERING` 占用重算 `available_slots`，复核整条动作链是否仍属于同一主任务和候选 revision，并直接用 Git 对账候选是否遗漏；每个新 Assignment 必须冻结执行模式、文件所有权和绑定真实项目规则 SHA 的路由，root 自写和 fallback 都需要结构化例外证据。延后 `READY` 必须使用结构化 `reason_code`，不能用“下一事件”或“稍后处理”留下空槽。门禁通过后删除临时输入，不新增治理文档。
 
 ### 让控制事件自动触发，而不是等总控想起来
 

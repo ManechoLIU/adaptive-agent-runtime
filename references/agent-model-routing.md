@@ -110,4 +110,20 @@ stop: <完成、阻塞或交回条件>
 fallback: blocked | <经授权的替代路由>
 ```
 
+控制收据中的每个 `new_assignments` 额外使用以下机器字段，不写入项目台账：
+
+```yaml
+execution_mode: delegated | controller
+owned_files: [<唯一非空路径>]
+route:
+  decision: default | safe_fallback | controller_exception
+  policy_class: frontend | backend | general
+  provider: <实际 provider>
+  model: <实际 model>
+  auth_mode: <实际认证通道>
+  policy_source: {path: <绝对项目规则路径>, sha256: <当前文件哈希>}
+```
+
+`default` 的 provider / model / auth_mode 必须在 `policy_source` 对应类别的真实规则行中出现。`safe_fallback` 另需 `fallback_from`、可追溯 `failure_evidence`、`prior_attempt_terminal=true` 与 `result_unknown=false`；缺一项都不能降级。`controller_exception` 必须回指规则中的 `default_route`，并提供 `controller_exception.reason_code / reason / stop_condition`；reason code 只接受共享契约未稳定、不可安全拆分、既有 WIP 恢复或低风险微小改动。它是例外 Assignment，不是总控可以省略路由和文件租约的捷径。
+
 执行器如果不能精确保留合同中的模型或权限边界，应拒绝派发并把冲突交回主 Agent，不自行猜测。

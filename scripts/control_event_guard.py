@@ -38,6 +38,18 @@ DEFER_REASON_CODES = {
     "authorization",
 }
 HARD_DEFER_REASON_CODES = DEFER_REASON_CODES - {"capacity"}
+EXECUTION_MODES = {"delegated", "controller"}
+ROUTE_DECISIONS = {"default", "safe_fallback", "controller_exception"}
+CONTROLLER_EXCEPTION_REASONS = {
+    "shared_contract_unstable",
+    "unsafe_to_split",
+    "active_wip_recovery",
+    "low_risk_tiny_change",
+}
+ROUTE_CLASS_MARKERS = {
+    "backend": ("backend", "后端", "server"),
+    "frontend": ("frontend", "前端", "web", "小程序", "miniapp"),
+}
 
 
 def ready_ledger_package_ids(ledger: Path) -> set[str]:
@@ -464,6 +476,82 @@ def validate_candidate_queue(
             errors.append(
                 f"{task_id} cannot start: integration flow {flow} already has an unmerged candidate"
             )
+        execution_mode = str(assignment.get("execution_mode", "")).strip().lower()
+        if execution_mode not in EXECUTION_MODES:
+            errors.append(
+                f"{task_id or f'new_assignments[{index}]'} requires execution_mode delegated or controller"
+            )
+        owned_files = assignment.get("owned_files")
+        if not isinstance(owned_files, list) or not owned_files:
+            errors.append(f"{task_id or f'new_assignments[{index}]'} requires non-empty owned_files")
+        else:
+            normalized_files = [str(item).strip() for item in owned_files]
+            if any(not item for item in normalized_files) or len(set(normalized_files)) != len(normalized_files):
+                errors.append(
+                    f"{task_id or f'new_assignments[{index}]'} owned_files must contain unique non-empty paths"
+                )
+
+        route = assignment.get("route")
+        if not isinstance(route, dict):
+            if execution_mode == "delegated":
+                errors.append(f"{task_id} delegated assignment requires route")
+            elif execution_mode == "controller":
+                errors.append(f"{task_id} controller execution requires route")
+            continue
+        for field in ("decision", "policy_class", "provider", "model", "auth_mode"):
+            if not str(route.get(field, "")).strip():
+                errors.append(f"{task_id} route requires {field}")
+        policy_source = route.get("policy_source")
+        if not isinstance(policy_source, dict):
+            errors.append(f"{task_id} route requires policy_source")
+        else:
+            for field in ("path", "sha256"):
+                if not str(policy_source.get(field, "")).strip():
+                    errors.append(f"{task_id} route policy_source requires {field}")
+        errors.extend(route_policy_errors(task_id, route))
+
+        route_decision = str(route.get("decision", "")).strip().lower()
+        if route_decision not in ROUTE_DECISIONS:
+            errors.append(
+                f"{task_id} route decision must be default, safe_fallback, or controller_exception"
+            )
+        if execution_mode == "delegated" and route_decision == "controller_exception":
+            errors.append(f"{task_id} delegated assignment cannot use controller_exception")
+        if execution_mode == "controller":
+            if route_decision != "controller_exception":
+                errors.append(f"{task_id} controller execution requires controller_exception route decision")
+            exception = assignment.get("controller_exception")
+            if not isinstance(exception, dict):
+                errors.append(f"{task_id} controller execution requires controller_exception")
+            else:
+                reason_code = str(exception.get("reason_code", "")).strip().lower()
+                if reason_code not in CONTROLLER_EXCEPTION_REASONS:
+                    errors.append(
+                        f"{task_id} controller_exception reason_code must be one of: "
+                        + ", ".join(sorted(CONTROLLER_EXCEPTION_REASONS))
+                    )
+                for field in ("reason", "stop_condition"):
+                    if not str(exception.get(field, "")).strip():
+                        errors.append(f"{task_id} controller_exception requires {field}")
+        if route_decision == "safe_fallback":
+            missing_fallback: list[str] = []
+            fallback_from = route.get("fallback_from")
+            if not isinstance(fallback_from, dict):
+                missing_fallback.append("fallback_from")
+            else:
+                for field in ("provider", "model", "auth_mode"):
+                    if not str(fallback_from.get(field, "")).strip():
+                        missing_fallback.append(f"fallback_from.{field}")
+            if not str(route.get("failure_evidence", "")).strip():
+                missing_fallback.append("failure_evidence")
+            if route.get("prior_attempt_terminal") is not True:
+                missing_fallback.append("prior_attempt_terminal=true")
+            if route.get("result_unknown") is not False:
+                missing_fallback.append("result_unknown=false")
+            if missing_fallback:
+                errors.append(
+                    f"{task_id} safe fallback requires " + ", ".join(missing_fallback)
+                )
     return errors
 
 
@@ -531,6 +619,70 @@ def string_set(value: Any, field: str, errors: list[str]) -> set[str]:
     if len(result) != len(value):
         errors.append(f"{field} must contain unique non-empty task IDs")
     return result
+
+
+def traceable_runtime_evidence(value: Any) -> bool:
+    token = str(value or "").strip()
+    if ":" not in token:
+        return False
+    scheme, locator = token.split(":", 1)
+    return scheme in {"receipt", "artifact"} and bool(locator.strip())
+
+
+def route_policy_errors(task_id: str, route: dict[str, Any]) -> list[str]:
+    source = route.get("policy_source")
+    if not isinstance(source, dict):
+        return []
+    raw_path = str(source.get("path", "")).strip()
+    expected_sha = str(source.get("sha256", "")).strip().lower()
+    if not raw_path or not expected_sha:
+        return []
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        return [f"{task_id} route policy_source.path must be absolute"]
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        return [f"{task_id} route policy source is unreadable: {error}"]
+    if hashlib.sha256(payload).hexdigest() != expected_sha:
+        return [f"{task_id} route policy_source.sha256 does not match the policy file"]
+
+    decision = str(route.get("decision", "")).strip().lower()
+    if decision == "default":
+        selected: Any = route
+    elif decision == "safe_fallback":
+        selected = route.get("fallback_from")
+    elif decision == "controller_exception":
+        selected = route.get("default_route")
+        if not isinstance(selected, dict):
+            return [f"{task_id} controller_exception route requires default_route"]
+    else:
+        return []
+    if not isinstance(selected, dict):
+        return []
+    route_values = {
+        field: str(selected.get(field, "")).strip()
+        for field in ("provider", "model", "auth_mode")
+    }
+    if any(not value for value in route_values.values()):
+        return []
+    policy_class = str(route.get("policy_class", "")).strip().lower()
+    markers = ROUTE_CLASS_MARKERS.get(policy_class, (policy_class,)) if policy_class else ()
+    policy_text = payload.decode("utf-8", errors="replace")
+    for line in policy_text.splitlines():
+        lowered = line.casefold()
+        if markers and not any(marker.casefold() in lowered for marker in markers):
+            continue
+        if all(
+            re.search(
+                rf"{field}\s*=\s*{re.escape(value)}(?=$|[^A-Za-z0-9_.-])",
+                line,
+                re.IGNORECASE,
+            )
+            for field, value in route_values.items()
+        ):
+            return []
+    return [f"{task_id} route is not declared by policy source"]
 
 
 def validate_snapshot(
@@ -615,6 +767,39 @@ def validate_snapshot(
     slots = snapshot.get("available_slots")
     if not isinstance(slots, int) or slots < 0:
         errors.append("available_slots must be a non-negative integer")
+    projection = snapshot.get("capacity_projection")
+    if ledger_work_in_flight is not None:
+        if not isinstance(projection, dict):
+            errors.append("capacity_projection is required for machine-derived available_slots")
+        else:
+            if str(projection.get("source", "")).strip() != "host_runtime":
+                errors.append("capacity_projection.source must be host_runtime")
+            if not traceable_runtime_evidence(projection.get("evidence")):
+                errors.append("capacity_projection requires traceable evidence")
+            total_slots = projection.get("total_slots")
+            if not isinstance(total_slots, int) or isinstance(total_slots, bool) or total_slots < 0:
+                errors.append("capacity_projection.total_slots must be a non-negative integer")
+            occupied = projection.get("occupied_task_ids")
+            occupied_ids: set[str] = set()
+            if not isinstance(occupied, list):
+                errors.append("capacity_projection.occupied_task_ids must be a list")
+            else:
+                occupied_ids = {str(item).strip() for item in occupied if str(item).strip()}
+                if len(occupied_ids) != len(occupied):
+                    errors.append(
+                        "capacity_projection.occupied_task_ids must contain unique non-empty task IDs"
+                    )
+                expected_occupied = set(ledger_work_in_flight)
+                if occupied_ids != expected_occupied:
+                    errors.append(
+                        "capacity_projection occupied tasks do not match machine work-in-flight projection"
+                    )
+            if isinstance(total_slots, int) and not isinstance(total_slots, bool) and total_slots >= 0:
+                projected_slots = max(0, total_slots - len(occupied_ids))
+                if slots != projected_slots:
+                    errors.append(
+                        f"available_slots does not match machine projection: expected {projected_slots}"
+                    )
 
     raw_ready = snapshot.get("ready_packages")
     if not isinstance(raw_ready, list):

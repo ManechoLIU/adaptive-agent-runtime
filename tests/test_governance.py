@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import importlib.util
 import io
@@ -61,6 +62,42 @@ class GovernanceTests(unittest.TestCase):
                 }
             ],
             "terminal_receipt_issued": True,
+        }
+
+    def route_policy_source(self) -> dict[str, str]:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        policy = Path(directory.name) / "AGENTS.md"
+        policy.write_text(
+            "后端默认 provider=grok-build、model=grok-4.6、auth_mode=oauth。\n"
+            "前端默认 provider=kimi-code、model=kimi-k3、auth_mode=api。\n",
+            encoding="utf-8",
+        )
+        return {
+            "path": str(policy),
+            "sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+        }
+
+    def delegated_assignment(
+        self,
+        task_id: str,
+        integration_flow: str,
+        *,
+        policy_class: str = "backend",
+    ) -> dict[str, object]:
+        return {
+            "task_id": task_id,
+            "integration_flow": integration_flow,
+            "execution_mode": "delegated",
+            "owned_files": [f"owned/{task_id}.ts"],
+            "route": {
+                "decision": "default",
+                "policy_class": policy_class,
+                "provider": "grok-build" if policy_class == "backend" else "kimi-code",
+                "model": "grok-4.6" if policy_class == "backend" else "kimi-k3",
+                "auth_mode": "oauth" if policy_class == "backend" else "api",
+                "policy_source": self.route_policy_source(),
+            },
         }
 
     def test_lifecycle_hook_surfaces_ready_work_after_tool_use(self) -> None:
@@ -793,6 +830,12 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             {
                 "ledger_sha256": "x",
                 "available_slots": 0,
+                "capacity_projection": {
+                    "source": "host_runtime",
+                    "evidence": "receipt:host-runtime/capacity-exact",
+                    "total_slots": 2,
+                    "occupied_task_ids": ["F1", "F2"],
+                },
                 "ready_packages": [],
                 "assignment_liveness": {
                     "F1": {
@@ -817,6 +860,12 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             {
                 "ledger_sha256": "x",
                 "available_slots": 0,
+                "capacity_projection": {
+                    "source": "host_runtime",
+                    "evidence": "receipt:host-runtime/capacity-exact",
+                    "total_slots": 2,
+                    "occupied_task_ids": ["F1", "F2"],
+                },
                 "ready_packages": [],
                 "assignment_liveness": {
                     "F1": {
@@ -1895,6 +1944,261 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             [],
         )
 
+    def test_control_event_guard_rejects_fabricated_available_slots(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 0,
+            "capacity_projection": {
+                "source": "host_runtime",
+                "total_slots": 8,
+                "occupied_task_ids": [],
+            },
+            "ready_packages": [],
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), ledger_work_in_flight={}
+        )
+
+        self.assertTrue(any("available_slots" in error and "machine projection" in error for error in errors))
+
+    def test_control_event_guard_rejects_unrouted_delegated_assignment(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "candidate_packages": [],
+            "new_assignments": [{
+                "task_id": "SERVER-1",
+                "integration_flow": "server-main",
+                "execution_mode": "delegated",
+                "owned_files": ["apps/server/src/runtime.ts"],
+            }],
+        }
+
+        errors = control_event_guard.validate_candidate_queue(
+            snapshot, expected_candidates={}
+        )
+
+        self.assertTrue(any("SERVER-1 delegated assignment requires route" in error for error in errors))
+
+    def test_control_event_guard_rejects_controller_self_write_without_exception(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "candidate_packages": [],
+            "new_assignments": [{
+                "task_id": "SERVER-1",
+                "integration_flow": "server-main",
+                "execution_mode": "controller",
+                "owned_files": ["apps/server/src/runtime.ts"],
+                "route": {
+                    "decision": "controller_exception",
+                    "policy_class": "backend",
+                    "provider": "codex-native",
+                    "model": "current",
+                    "auth_mode": "host",
+                    "policy_source": {"path": "AGENTS.md", "sha256": "abc123"},
+                },
+            }],
+        }
+
+        errors = control_event_guard.validate_candidate_queue(
+            snapshot, expected_candidates={}
+        )
+
+        self.assertTrue(any("SERVER-1 controller execution requires controller_exception" in error for error in errors))
+
+    def test_control_event_guard_rejects_unproven_safe_fallback(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "candidate_packages": [],
+            "new_assignments": [{
+                "task_id": "SERVER-1",
+                "integration_flow": "server-main",
+                "execution_mode": "delegated",
+                "owned_files": ["apps/server/src/runtime.ts"],
+                "route": {
+                    "decision": "safe_fallback",
+                    "policy_class": "backend",
+                    "provider": "codex-native",
+                    "model": "gpt-5.6-terra",
+                    "auth_mode": "host",
+                    "policy_source": {"path": "AGENTS.md", "sha256": "abc123"},
+                    "fallback_from": {
+                        "provider": "grok-build",
+                        "model": "grok-4.6",
+                        "auth_mode": "oauth",
+                    },
+                },
+            }],
+        }
+
+        errors = control_event_guard.validate_candidate_queue(
+            snapshot, expected_candidates={}
+        )
+
+        self.assertTrue(any("SERVER-1 safe fallback requires" in error for error in errors))
+
+    def test_control_event_guard_requires_traceable_capacity_evidence(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 8,
+            "capacity_projection": {
+                "source": "host_runtime",
+                "total_slots": 8,
+                "occupied_task_ids": [],
+            },
+            "ready_packages": [],
+        }
+
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=set(), ledger_work_in_flight={}
+        )
+
+        self.assertIn("capacity_projection requires traceable evidence", errors)
+
+    def test_control_event_guard_rejects_route_not_declared_by_policy_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "AGENTS.md"
+            policy.write_text(
+                "后端默认 provider=grok-build、model=grok-4.6、auth_mode=oauth。\n",
+                encoding="utf-8",
+            )
+            source = {
+                "path": str(policy),
+                "sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+            }
+            snapshot = {
+                **self.complete_event_receipt(),
+                "candidate_packages": [],
+                "new_assignments": [{
+                    "task_id": "SERVER-1",
+                    "integration_flow": "server-main",
+                    "execution_mode": "delegated",
+                    "owned_files": ["apps/server/src/runtime.ts"],
+                    "route": {
+                        "decision": "default",
+                        "policy_class": "backend",
+                        "provider": "kimi-code",
+                        "model": "kimi-k3",
+                        "auth_mode": "api",
+                        "policy_source": source,
+                    },
+                }],
+            }
+
+            errors = control_event_guard.validate_candidate_queue(
+                snapshot, expected_candidates={}
+            )
+
+        self.assertTrue(any("SERVER-1 route is not declared by policy source" in error for error in errors))
+
+    def test_control_event_guard_accepts_machine_capacity_projection(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 7,
+            "capacity_projection": {
+                "source": "host_runtime",
+                "evidence": "receipt:host-runtime/capacity-1",
+                "total_slots": 8,
+                "occupied_task_ids": ["SERVER-ACTIVE"],
+            },
+            "assignment_liveness": {
+                "SERVER-ACTIVE": {
+                    "ledger_state": "ACTIVE",
+                    "state": "healthy",
+                    "reason": "live lease",
+                }
+            },
+            "ready_packages": [],
+        }
+
+        self.assertEqual(
+            control_event_guard.validate_snapshot(
+                snapshot,
+                ledger_ready_ids=set(),
+                ledger_work_in_flight={"SERVER-ACTIVE": "ACTIVE"},
+            ),
+            [],
+        )
+
+    def test_control_event_guard_accepts_declared_default_route(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "candidate_packages": [],
+            "new_assignments": [self.delegated_assignment("SERVER-1", "server-main")],
+        }
+
+        self.assertEqual(
+            control_event_guard.validate_candidate_queue(snapshot, expected_candidates={}),
+            [],
+        )
+
+    def test_control_event_guard_accepts_proven_safe_fallback(self) -> None:
+        assignment = self.delegated_assignment("SERVER-1", "server-main")
+        assignment["route"] = {
+            "decision": "safe_fallback",
+            "policy_class": "backend",
+            "provider": "codex-native",
+            "model": "gpt-5.6-terra",
+            "auth_mode": "host",
+            "policy_source": self.route_policy_source(),
+            "fallback_from": {
+                "provider": "grok-build",
+                "model": "grok-4.6",
+                "auth_mode": "oauth",
+            },
+            "failure_evidence": "receipt:grok/terminal-safe-failure",
+            "prior_attempt_terminal": True,
+            "result_unknown": False,
+        }
+        snapshot = {
+            **self.complete_event_receipt(),
+            "candidate_packages": [],
+            "new_assignments": [assignment],
+        }
+
+        self.assertEqual(
+            control_event_guard.validate_candidate_queue(snapshot, expected_candidates={}),
+            [],
+        )
+
+    def test_control_event_guard_accepts_bounded_controller_exception(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "candidate_packages": [],
+            "new_assignments": [{
+                "task_id": "SERVER-1",
+                "integration_flow": "server-main",
+                "execution_mode": "controller",
+                "owned_files": ["apps/server/src/runtime.ts"],
+                "route": {
+                    "decision": "controller_exception",
+                    "policy_class": "backend",
+                    "provider": "codex-native",
+                    "model": "current",
+                    "auth_mode": "host",
+                    "policy_source": self.route_policy_source(),
+                    "default_route": {
+                        "provider": "grok-build",
+                        "model": "grok-4.6",
+                        "auth_mode": "oauth",
+                    },
+                },
+                "controller_exception": {
+                    "reason_code": "low_risk_tiny_change",
+                    "reason": "one bounded compatibility edit",
+                    "stop_condition": "stop after the targeted test passes",
+                },
+            }],
+        }
+
+        self.assertEqual(
+            control_event_guard.validate_candidate_queue(snapshot, expected_candidates={}),
+            [],
+        )
+
     def test_control_event_guard_rejects_stale_ledger_and_omitted_expectations(self) -> None:
         snapshot = {
             **self.complete_event_receipt(),
@@ -2010,7 +2314,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 "absorbing_revision": "main-2",
                 "retention_reason": "retain QA evidence",
             }],
-            "new_assignments": [{"task_id": "WEB-2", "integration_flow": "web-main"}],
+            "new_assignments": [self.delegated_assignment("WEB-2", "web-main", policy_class="frontend")],
         }
 
         self.assertEqual(
@@ -2138,7 +2442,10 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
             subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
             ledger = root / "TASK_LEDGER.md"
-            ledger.write_text((SKILL_ROOT / "assets" / "templates" / "TASK_LEDGER.md").read_text(encoding="utf-8"), encoding="utf-8")
+            ledger.write_text(
+                (SKILL_ROOT / "assets" / "templates" / "TASK_LEDGER.md").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
             subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=root, check=True)
             subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
             subprocess.run(["git", "worktree", "add", "-b", "candidate", str(worktree)], cwd=root, check=True, capture_output=True)
@@ -2151,6 +2458,12 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 **self.complete_event_receipt(),
                 "ledger_sha256": control_event_guard.ledger_sha256(ledger),
                 "available_slots": 1,
+                "capacity_projection": {
+                    "source": "host_runtime",
+                    "evidence": "receipt:host-runtime/capacity-cli",
+                    "total_slots": 1,
+                    "occupied_task_ids": [],
+                },
                 "ready_packages": [{"id": "INIT-01", "decision": "active", "task_id": "INIT-01-WRITER", "delivered_ack": True}],
                 "candidate_packages": [{
                     "revision": revision,
@@ -2242,7 +2555,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 }
             ],
             "new_assignments": [
-                {"task_id": "MINI-1", "integration_flow": "mini-main"}
+                self.delegated_assignment("MINI-1", "mini-main", policy_class="frontend")
             ],
         }
 
