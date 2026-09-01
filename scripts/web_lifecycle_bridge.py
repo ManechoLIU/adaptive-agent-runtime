@@ -86,15 +86,65 @@ def registered_controller_session(
     sessions = registry.get("__controller_sessions__")
     if not isinstance(sessions, dict):
         return False
-    controller_sessions = sessions.get(controller_id)
-    if not isinstance(controller_sessions, dict):
-        return False
-    host_sessions = controller_sessions.get(host)
-    if isinstance(host_sessions, str):
-        host_sessions = [host_sessions]
-    if not isinstance(host_sessions, list):
-        return False
-    return session_id in {value for value in host_sessions if isinstance(value, str)}
+    owners: set[str] = set()
+    for candidate_controller, controller_sessions in sessions.items():
+        if not isinstance(candidate_controller, str) or not isinstance(controller_sessions, dict):
+            continue
+        host_sessions = controller_sessions.get(host)
+        if isinstance(host_sessions, str):
+            host_sessions = [host_sessions]
+        if not isinstance(host_sessions, list):
+            continue
+        if session_id in {value for value in host_sessions if isinstance(value, str)}:
+            owners.add(candidate_controller)
+    return owners == {controller_id}
+
+
+def bind_web_session_to_controller(
+    *, repo: Path, controller_id: str, web_session_id: str, registry_path: Path
+) -> dict[str, Any]:
+    controller_id = controller_id.strip()
+    web_session_id = web_session_id.strip()
+    if not controller_id or not web_session_id:
+        raise ValueError("controller-id and web-session-id are required")
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = registry_path.with_suffix(registry_path.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            registered = registered_controller_for_repo(repo, registry_path)
+            if registered != controller_id:
+                raise PermissionError("Web session binding requires the registered Controller for this repository")
+            registry = load_json(registry_path)
+            sessions = registry.get("__controller_sessions__")
+            if not isinstance(sessions, dict):
+                sessions = {}
+            for candidate_controller, controller_sessions in sessions.items():
+                if candidate_controller == controller_id or not isinstance(controller_sessions, dict):
+                    continue
+                host_sessions = controller_sessions.get("web")
+                if isinstance(host_sessions, str):
+                    host_sessions = [host_sessions]
+                if isinstance(host_sessions, list) and web_session_id in host_sessions:
+                    raise PermissionError("Web Controller Session is already bound to another Controller")
+            controller_sessions = sessions.get(controller_id)
+            if not isinstance(controller_sessions, dict):
+                controller_sessions = {}
+            web_sessions = controller_sessions.get("web")
+            if isinstance(web_sessions, str):
+                web_sessions = [web_sessions]
+            if not isinstance(web_sessions, list):
+                web_sessions = []
+            normalized = [value for value in web_sessions if isinstance(value, str) and value.strip()]
+            if web_session_id not in normalized:
+                normalized.append(web_session_id)
+            controller_sessions["web"] = normalized
+            sessions[controller_id] = controller_sessions
+            registry["__controller_sessions__"] = sessions
+            _write_json_atomic_file(registry_path, registry)
+            return registry
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def require_web_controller_session(
@@ -118,7 +168,7 @@ def post_tool_event(
     exit_code: int | None = None,
     output: str = "",
     turn_id: str = "web-ai-bridge",
-    controller_session_id: str | None = None,
+    web_session_id: str | None = None,
     execution_host: str = "web",
 ) -> dict[str, Any]:
     response: dict[str, Any] = {"output": output}
@@ -130,7 +180,8 @@ def post_tool_event(
         "execution_host": execution_host,
         "event_source": "web",
         "controller_id": session_id,
-        "controller_session_id": controller_session_id,
+        "controller_session_id": session_id,
+        "web_session_id": web_session_id,
         "session_id": session_id,
         "turn_id": turn_id,
         "cwd": str(repo),
@@ -154,7 +205,7 @@ def extract_command(receipt: dict[str, Any]) -> str:
 
 
 def translate_receipt(
-    receipt: dict[str, Any], *, session_id: str, repo: Path
+    receipt: dict[str, Any], *, session_id: str, repo: Path, web_session_id: str | None = None
 ) -> dict[str, Any] | None:
     if receipt.get("childTool") != "shell_command":
         return None
@@ -177,6 +228,8 @@ def translate_receipt(
         command=command,
         output=output,
         turn_id=f"web-audit:{receipt_id}",
+        web_session_id=web_session_id,
+        execution_host="web",
     )
 
 
@@ -249,7 +302,7 @@ def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, An
     return {
         "product": "Adaptive Agent Runtime",
         "project_root": str(root),
-        "controller_session": controller,
+        "controller_id": controller,
         "restore_order": ["AGENTS.md", ledger_name, "MEMORY.md", "WIKI_INDEX.md", "git_runtime"],
         "documents": documents,
         "authoritative_documents": authoritative_documents,
@@ -394,6 +447,7 @@ def computer_event_from_receipt(
     session_id: str,
     repo: Path,
     lease_path: Path,
+    web_session_id: str | None = None,
     now_unix_ms: int | None = None,
 ) -> dict[str, Any] | None:
     if receipt.get("childTool") != "computer":
@@ -406,6 +460,8 @@ def computer_event_from_receipt(
     if lease.get("session_id") != session_id:
         return None
     if str(lease.get("repo") or "") != str(repo.resolve()):
+        return None
+    if web_session_id is not None and lease.get("web_session_id") != web_session_id:
         return None
     now_ms = int(time.time() * 1000) if now_unix_ms is None else now_unix_ms
     issued_ms = int(lease.get("issued_at_unix_ms", 0) or 0)
@@ -426,7 +482,8 @@ def computer_event_from_receipt(
         "execution_host": "web",
         "event_source": "web",
         "controller_id": session_id,
-        "controller_session_id": lease.get("controller_session_id"),
+        "controller_session_id": session_id,
+        "web_session_id": web_session_id or lease.get("web_session_id"),
         "session_id": session_id,
         "turn_id": f"web-audit:{receipt.get('receiptId') or 'computer'}",
         "cwd": str(repo.resolve()),
@@ -447,11 +504,12 @@ def computer_event_from_receipt(
 
 
 def write_computer_lease(
-    *, lease_path: Path, session_id: str, repo: Path, ttl_seconds: int, uses: int
+    *, lease_path: Path, session_id: str, web_session_id: str, repo: Path, ttl_seconds: int, uses: int
 ) -> dict[str, Any]:
     now_ms = int(time.time() * 1000)
     value = {
         "session_id": session_id,
+        "web_session_id": web_session_id,
         "repo": str(repo.resolve()),
         "issued_at_unix_ms": now_ms,
         "expires_at_unix_ms": now_ms + ttl_seconds * 1000,
@@ -717,7 +775,7 @@ def _wake_receipt(
     receipt: dict[str, Any] = {
         "schema_version": 1,
         "canonical_common_dir": str(common_dir),
-        "controller_session_id": session_id,
+        "controller_id": session_id,
         "event_fingerprint": event_fingerprint,
         "health": health.get("state"),
         "preferred_host": health.get("controller_host"),
@@ -927,7 +985,7 @@ def dispatch_pending_lifecycle_wake(
     if (
         prior.get("event_fingerprint") == fingerprint
         and prior.get("result") == "CONFIRMED"
-        and prior.get("controller_session_id") == session_id
+        and prior.get("controller_id") == session_id
         and current_registered == session_id
         and current_common_dir is not None
         and prior.get("canonical_common_dir") == current_common_dir
@@ -966,9 +1024,11 @@ def wake_receipt_confirmed(receipt: dict[str, Any] | None) -> bool:
     return isinstance(receipt, dict) and receipt.get("result") == "CONFIRMED"
 
 def successful_guard_event_from_receipt(
-    receipt: dict[str, Any], *, session_id: str, repo: Path
+    receipt: dict[str, Any], *, session_id: str, repo: Path, web_session_id: str
 ) -> dict[str, Any] | None:
-    event = translate_receipt(receipt, session_id=session_id, repo=repo)
+    event = translate_receipt(
+        receipt, session_id=session_id, repo=repo, web_session_id=web_session_id
+    )
     if event is None:
         return None
     command = str(event["tool_input"].get("command", ""))
@@ -1225,7 +1285,8 @@ def zshenv_block() -> str:
     python = Path("/Library/Frameworks/Python.framework/Versions/3.11/bin/python3")
     return f'''# >>> adaptive-delivery web lifecycle bridge >>>
 _ad_web_parent=$(/bin/ps -p "$PPID" -o command= 2>/dev/null)
-if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* ]]; then
+_ad_web_session_id="${{ADAPTIVE_DELIVERY_WEB_SESSION_ID:-}}"
+if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* && -n "$_ad_web_session_id" ]]; then
   _ad_web_cwd="$PWD"
   _ad_web_command="$ZSH_EXECUTION_STRING"
   _ad_web_bridge_script="{script}"
@@ -1233,7 +1294,7 @@ if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* ]]; then
   _ad_web_lifecycle_exit() {{
     local _ad_web_exit_code=$?
     trap - EXIT
-    "$_ad_web_bridge_python" "$_ad_web_bridge_script" post-shell --cwd "$_ad_web_cwd" --command "$_ad_web_command" --exit-code "$_ad_web_exit_code"
+    "$_ad_web_bridge_python" "$_ad_web_bridge_script" post-shell --cwd "$_ad_web_cwd" --command "$_ad_web_command" --exit-code "$_ad_web_exit_code" --web-session-id "$_ad_web_session_id"
     local _ad_web_bridge_exit_code=$?
     if [[ "$_ad_web_exit_code" -ne 0 ]]; then
       exit "$_ad_web_exit_code"
@@ -1242,7 +1303,7 @@ if [[ "$_ad_web_parent" == *"{AI_BRIDGE_EXECUTABLE}"* ]]; then
   }}
   trap _ad_web_lifecycle_exit EXIT
 fi
-unset _ad_web_parent
+unset _ad_web_parent _ad_web_session_id
 # <<< adaptive-delivery web lifecycle bridge <<<'''
 
 
@@ -1255,6 +1316,14 @@ def build_parser() -> argparse.ArgumentParser:
     translate = subparsers.add_parser("translate-receipt")
     translate.add_argument("--session-id", required=True)
     translate.add_argument("--repo", required=True)
+    translate.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    translate.add_argument("--web-session-id")
+
+    bind_web = subparsers.add_parser("bind-web-session")
+    bind_web.add_argument("--repo", required=True)
+    bind_web.add_argument("--controller-id", required=True)
+    bind_web.add_argument("--web-session-id", required=True)
+    bind_web.add_argument("--registry", default=str(DEFAULT_REGISTRY))
 
     session_start = subparsers.add_parser("session-start")
     session_start.add_argument("--repo", required=True)
@@ -1277,6 +1346,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit_once.add_argument("--capture-events")
     audit_once.add_argument("--computer-lease")
     audit_once.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    audit_once.add_argument("--web-session-id")
     audit_once.add_argument("--auto-native-stop", action="store_true")
     audit_once.add_argument("--auto-stop-delay-seconds", type=float, default=5.0)
     audit_once.add_argument("--auto-stop-state")
@@ -1287,6 +1357,7 @@ def build_parser() -> argparse.ArgumentParser:
     arm_computer = subparsers.add_parser("arm-computer")
     arm_computer.add_argument("--cwd", required=True)
     arm_computer.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    arm_computer.add_argument("--web-session-id")
     arm_computer.add_argument("--lease")
     arm_computer.add_argument("--ttl-seconds", type=int, default=90)
     arm_computer.add_argument("--uses", type=int, default=1)
@@ -1317,17 +1388,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command_name == "translate-receipt":
         repo = Path(args.repo).expanduser().resolve()
+        registry_path = Path(args.registry).expanduser()
         try:
+            registered = registered_controller_for_repo(repo, registry_path)
+            if registered != args.session_id:
+                raise PermissionError("translate-receipt controller does not match registered Controller")
+            web_session_id = require_web_controller_session(
+                controller_id=registered, web_session_id=args.web_session_id, registry_path=registry_path
+            )
             receipt = json.load(sys.stdin)
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
         except json.JSONDecodeError as exc:
             print(f"invalid receipt JSON: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
             return 2
         if not isinstance(receipt, dict):
             print("receipt must be a JSON object", file=sys.stderr)
             return 2
-        event = translate_receipt(receipt, session_id=args.session_id, repo=repo)
+        event = translate_receipt(
+            receipt, session_id=args.session_id, repo=repo, web_session_id=web_session_id
+        )
         if event is not None:
             print(json.dumps(event, ensure_ascii=False))
+        return 0
+
+    if args.command_name == "bind-web-session":
+        repo = canonical_root(args.repo)
+        registry_path = Path(args.registry).expanduser()
+        try:
+            bind_web_session_to_controller(
+                repo=repo, controller_id=args.controller_id, web_session_id=args.web_session_id, registry_path=registry_path
+            )
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
+        except (OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps({
+            "controller_id": args.controller_id,
+            "controller_session_id": args.controller_id,
+            "web_session_id": args.web_session_id,
+            "event_source": "web",
+        }, ensure_ascii=False))
         return 0
 
     if args.command_name == "session-start":
@@ -1350,7 +1457,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 2
         payload["controller_id"] = controller_id
-        payload["controller_session_id"] = web_session_id
+        payload["controller_session_id"] = controller_id
+        payload["web_session_id"] = web_session_id
         payload["event_source"] = "web"
         print(json.dumps(payload, ensure_ascii=False))
         return 0
@@ -1381,7 +1489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo=repo,
             command=args.command,
             exit_code=args.exit_code,
-            controller_session_id=web_session_id,
+            web_session_id=web_session_id,
             execution_host="web",
         )
         if args.capture_event:
@@ -1407,6 +1515,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command_name == "audit-once":
         repo = Path(args.repo).expanduser().resolve()
+        registry_path = Path(args.registry).expanduser()
+        try:
+            registered = registered_controller_for_repo(repo, registry_path)
+            if registered is None or registered != args.session_id:
+                raise PermissionError("audit-once controller does not match registered Controller")
+            web_session_id = require_web_controller_session(
+                controller_id=registered, web_session_id=args.web_session_id, registry_path=registry_path
+            )
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         cursor_path = Path(args.cursor).expanduser()
         consumer_lock_path = cursor_path.with_suffix(cursor_path.suffix + ".consumer.lock")
         consumer_lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1473,12 +1595,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     continue
 
                 guard_event = successful_guard_event_from_receipt(
-                    receipt, session_id=args.session_id, repo=repo
+                    receipt, session_id=args.session_id, repo=repo, web_session_id=web_session_id
                 )
                 event = guard_event
                 if event is None:
                     event = computer_event_from_receipt(
-                        receipt, session_id=args.session_id, repo=repo, lease_path=lease_path
+                        receipt, session_id=args.session_id, repo=repo, lease_path=lease_path,
+                        web_session_id=web_session_id
                     )
                 if event is None:
                     _advance_audit_cursor(cursor_path, audit_inode, next_offset)
@@ -1566,16 +1689,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command_name == "arm-computer":
         repo = canonical_root(args.cwd)
+        registry_path = Path(args.registry).expanduser()
         try:
-            session_id = registered_controller_for_repo(
-                repo, Path(args.registry).expanduser()
-            )
+            session_id = registered_controller_for_repo(repo, registry_path)
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
         if session_id is None:
             print(f"no registered controller for {repo}", file=sys.stderr)
             return 2
+        try:
+            web_session_id = require_web_controller_session(
+                controller_id=session_id, web_session_id=args.web_session_id, registry_path=registry_path
+            )
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
         if not (5 <= args.ttl_seconds <= 300):
             print("ttl-seconds must be between 5 and 300", file=sys.stderr)
             return 2
@@ -1590,6 +1719,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         value = write_computer_lease(
             lease_path=lease_path,
             session_id=session_id,
+            web_session_id=web_session_id,
             repo=repo,
             ttl_seconds=args.ttl_seconds,
             uses=args.uses,
