@@ -444,6 +444,41 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
                 hook.cycle_score_extremes(repo, controller_session_id="controller-1", model_sha256=hook.scoring_model_sha256(ROOT)),
             )
 
+    def test_unguarded_standalone_formal_label_is_blocked(self):
+        hook = load_module()
+        output, _ = hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "turn_id": "turn-formal-label-unguarded",
+                "cwd": str(ROOT),
+                "last_assistant_message": "正式履职评分：82/100。",
+            },
+            skill_root=ROOT, prior_state={},
+        )
+        self.assertEqual("block", output.get("decision"))
+        self.assertIn("score-guard", output.get("reason", ""))
+
+    def test_guarded_standalone_formal_label_persists_formal_history(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-formal-label", "cwd": str(repo), "prompt": "给总控正式履职评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-formal-label", "cwd": str(repo),
+                 "last_assistant_message": "正式履职评分：82/100。\n评估窗口：最近 24 小时内最多 5 个有效控制事件。"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual({}, output)
+            history = hook.latest_score_history(repo, controller_session_id="controller-1")
+            self.assertIsNotNone(history)
+            self.assertEqual(82.0, history["score"])
+
     def test_cycle_request_blocks_shared_controller_subject_with_second_formal_score(self):
         import subprocess
         hook = load_module()

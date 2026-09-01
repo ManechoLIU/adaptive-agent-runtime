@@ -67,11 +67,12 @@ def is_controller_scoring_request(prompt: str) -> bool:
 
 def looks_like_controller_score_output(message: str) -> bool:
     text = str(message or "")
-    return bool(_OUTPUT_SCORE.search(text) or _CYCLE_OUTPUT_SCORE.search(text))
+    return bool(_OUTPUT_SCORE.search(text) or _FORMAL_SCORE_LABEL.search(text) or _CYCLE_OUTPUT_SCORE.search(text))
 
 
 def _extract_score_value(message: str) -> float | None:
-    match = _OUTPUT_SCORE.search(str(message or ""))
+    text = str(message or "")
+    match = _OUTPUT_SCORE.search(text) or _FORMAL_SCORE_LABEL.search(text)
     if not match:
         return None
     value = re.search(r"(?:100|[1-9]?\d)(?:\.\d+)?", match.group(0))
