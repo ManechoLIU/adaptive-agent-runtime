@@ -756,6 +756,50 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
             self.assertEqual("logical-controller", first["controller_id"])
             self.assertEqual(first["controller_id"], second["controller_id"])
 
+    def test_external_evaluator_session_scores_the_unique_registered_controller(self):
+        import json
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            registry = Path(td) / "controllers.json"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            registry.write_text(json.dumps({
+                "logical-controller": str(repo),
+                "__controller_sessions__": {
+                    "logical-controller": {"desktop_codex": ["controller-session"]}
+                },
+            }), encoding="utf-8")
+            hook.CONTROLLER_REGISTRY_PATH = registry
+            injected, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "evaluator-session",
+                    "turn_id": "evaluation-turn",
+                    "cwd": str(repo),
+                    "prompt": "怎么还不是没法评分啊",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            self.assertIn("hookSpecificOutput", injected)
+            self.assertEqual("logical-controller", state["controller_id"])
+            self.assertEqual("evaluator-session", state["source_session_id"])
+
+            allowed, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "evaluator-session",
+                    "turn_id": "evaluation-turn",
+                    "cwd": str(repo),
+                    "last_assistant_message": formal_message(),
+                },
+                skill_root=ROOT,
+                prior_state=state,
+            )
+            self.assertEqual({}, allowed)
+            self.assertFalse(state["pending_scoring"])
+
     def test_cycle_output_cannot_self_attest_terminal_evidence_into_extremes(self):
         import subprocess
         hook = load_module()

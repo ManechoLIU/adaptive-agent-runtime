@@ -276,29 +276,10 @@ def _logical_controller_id(repo: Path, source_session_id: str) -> str:
         return source
     if len(matches) != 1:
         raise ValueError("controller scoring requires exactly one registered logical Controller")
-    controller_id = matches[0]
-    if source == controller_id:
-        return controller_id
-    aliases: set[str] = set()
-    session_map = registry.get("__controller_sessions__")
-    if isinstance(session_map, dict):
-        controller_sessions = session_map.get(controller_id)
-        if isinstance(controller_sessions, dict):
-            for values in controller_sessions.values():
-                if isinstance(values, str):
-                    aliases.add(values)
-                elif isinstance(values, list):
-                    aliases.update(value for value in values if isinstance(value, str))
-    targets = registry.get("__controller_targets__")
-    if isinstance(targets, dict):
-        controller_targets = targets.get(controller_id)
-        if isinstance(controller_targets, dict):
-            for record in controller_targets.values():
-                if isinstance(record, dict) and record.get("status") == "active" and isinstance(record.get("session_id"), str):
-                    aliases.add(str(record["session_id"]))
-    if source not in aliases:
-        raise ValueError("source session is not bound to the registered logical Controller")
-    return controller_id
+    # The request session is the evaluator, not necessarily the Controller being
+    # evaluated. The Stop event remains bound to this source session, while the
+    # receipt and score history bind to the repository's unique logical Controller.
+    return matches[0]
 
 
 def _state_path(session_id: str) -> Path:
