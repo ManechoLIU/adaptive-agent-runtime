@@ -639,6 +639,11 @@ class WebLifecycleAuditTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(
+                json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8"
+            )
             state = root / "auto-stop.json"
             state.write_text(json.dumps({
                 "receipt_id": "pending-click-1", "session_id": "controller-1",
@@ -654,7 +659,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
             ) as schedule:
                 code = web_bridge.run_auto_native_stop(
                     session_id="controller-1", repo=repo, receipt_id="pending-click-1",
-                    registry=root / "registry.json", codex="/opt/homebrew/bin/codex", delay_seconds=0,
+                    registry=registry, codex="/opt/homebrew/bin/codex", delay_seconds=0,
                     state_path=state, runtime_path="/opt/homebrew/bin:/usr/bin:/bin",
                 )
             self.assertEqual(code, 0)
@@ -1155,6 +1160,48 @@ class WebLifecycleNativeStopTests(unittest.TestCase):
             )
             self.assertNotIn("fork", argv)
 
+    def test_native_stop_dry_run_targets_explicit_current_desktop_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = tmp_path / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-old": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-old": {"desktop_codex": ["desktop-current"]}
+                },
+                "__controller_targets__": {
+                    "controller-old": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-current",
+                            "generation": 4,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+
+            result = self.run_bridge(
+                "native-stop",
+                "--session-id",
+                "controller-old",
+                "--repo",
+                str(repo),
+                "--registry",
+                str(registry),
+                "--codex",
+                "/opt/homebrew/bin/codex",
+                "--dry-run",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            argv = json.loads(result.stdout)
+            self.assertEqual(argv[4], "resume")
+            self.assertEqual(argv[5], "desktop-current")
+            self.assertNotIn("controller-old", argv[4:6])
+
     def test_native_stop_missing_lifecycle_state_does_not_direct_resume(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
@@ -1310,6 +1357,59 @@ class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
             self.assertTrue(saved["pending_control_event"])
             self.assertIn("resume controller-1", marker.read_text())
 
+    def test_resume_uses_target_replaced_during_preflight_not_the_retired_target(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry = self.make_repo_registry(root)
+            marker = root / "resume.txt"
+            codex = root / "codex"
+            codex.write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$*\" > {marker}\nexit 0\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-old", "desktop-new"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-old",
+                            "generation": 1,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+
+            def replace_during_preflight(**_kwargs: object) -> tuple[bool, str, dict[str, str]]:
+                value = json.loads(registry.read_text(encoding="utf-8"))
+                value["__controller_targets__"]["controller-1"]["desktop_codex"] = {
+                    "status": "active",
+                    "session_id": "desktop-new",
+                    "generation": 2,
+                }
+                registry.write_text(json.dumps(value), encoding="utf-8")
+                return True, "", dict(web_bridge.native_runtime_env())
+
+            with patch.object(
+                web_bridge, "preflight_native_resume", side_effect=replace_during_preflight
+            ):
+                attempt = web_bridge.execute_native_resume(
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex=str(codex),
+                )
+
+            self.assertEqual(attempt["result"], "CONFIRMED")
+            self.assertEqual(attempt["execution_target_session_id"], "desktop-new")
+            self.assertEqual(attempt["target_generation"], 2)
+            self.assertIn("resume desktop-new", marker.read_text(encoding="utf-8"))
+
     def test_detached_scheduler_does_not_discard_stderr_to_devnull(self) -> None:
         source = BRIDGE.read_text(encoding="utf-8")
         self.assertNotIn("stderr=subprocess.DEVNULL", source)
@@ -1389,7 +1489,102 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertTrue(receipt["pending_control_event"])
             self.assertEqual(receipt["result"], "CONFIRMED")
             self.assertIn("resume controller-1", marker.read_text(encoding="utf-8"))
-            self.assertEqual(json.loads(receipt_path.read_text(encoding="utf-8"))["decision"], "RESUME_CURRENT_HOST")
+            self.assertEqual(
+                json.loads(receipt_path.read_text(encoding="utf-8"))["decision"],
+                "RESUME_CURRENT_HOST",
+            )
+
+    def test_wake_keeps_logical_controller_but_resumes_explicit_desktop_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, marker = self.make_controller(root)
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {
+                        "web": ["web-session-1"],
+                        "desktop_codex": ["desktop-current"],
+                    }
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-current",
+                            "generation": 2,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+
+            receipt = web_bridge.wake_existing_controller(
+                lifecycle_state={"pending_control_event": True, "triggers": ["READY:F1"]},
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                receipt_path=receipt_path,
+                host_facts={"controller_host": "web", "resume_actionable": True},
+            )
+
+            self.assertEqual(receipt["controller_id"], "controller-1")
+            self.assertEqual(receipt["execution_target_session_id"], "desktop-current")
+            self.assertEqual(receipt["target_generation"], 2)
+            self.assertIn("resume desktop-current", marker.read_text(encoding="utf-8"))
+
+    def test_target_generation_change_invalidates_prior_confirmed_wake_debounce(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, marker = self.make_controller(root)
+            state = {
+                "pending_control_event": True,
+                "triggers": ["READY:F1"],
+                "controller_host": "web",
+                "wake_generation": 1,
+            }
+
+            def write_target(session_id: str, generation: int) -> None:
+                registry.write_text(json.dumps({
+                    "controller-1": str(repo.resolve()),
+                    "__controller_sessions__": {
+                        "controller-1": {"desktop_codex": [session_id]}
+                    },
+                    "__controller_targets__": {
+                        "controller-1": {
+                            "desktop_codex": {
+                                "status": "active",
+                                "session_id": session_id,
+                                "generation": generation,
+                            }
+                        }
+                    },
+                }), encoding="utf-8")
+
+            write_target("desktop-old", 1)
+            first = web_bridge.dispatch_pending_lifecycle_wake(
+                lifecycle_state=state,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                receipt_path=receipt_path,
+                host_facts={"controller_host": "web", "resume_actionable": True},
+            )
+            write_target("desktop-current", 2)
+            second = web_bridge.dispatch_pending_lifecycle_wake(
+                lifecycle_state=state,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                receipt_path=receipt_path,
+                host_facts={"controller_host": "web", "resume_actionable": True},
+            )
+
+            self.assertEqual(first["execution_target_session_id"], "desktop-old")
+            self.assertEqual(second["execution_target_session_id"], "desktop-current")
+            self.assertFalse(second.get("debounced", False))
+            self.assertIn("resume desktop-current", marker.read_text(encoding="utf-8"))
 
     def test_active_controller_is_a_noop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1420,12 +1615,17 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertEqual(receipt["result"], "DEFERRED")
             self.assertFalse(marker.exists())
 
-    def test_eligible_peer_fallback_keeps_the_registered_controller(self) -> None:
+    def test_peer_adapter_without_host_attestation_verifier_defers(self) -> None:
         calls: list[dict] = []
 
         def desktop_resume(**kwargs: object) -> dict:
             calls.append(dict(kwargs))
-            return {"result": "CONFIRMED", "operation": "desktop-resume"}
+            return {
+                "result": "CONFIRMED",
+                "operation": "desktop-resume",
+                "execution_target_session_id": kwargs["execution_target_session_id"],
+                "target_generation": kwargs["target_generation"],
+            }
 
         with tempfile.TemporaryDirectory() as tmp:
             receipt, _, marker = self.wake(
@@ -1447,10 +1647,222 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertEqual(receipt["decision"], "FALLBACK_PEER_HOST")
             self.assertEqual(receipt["selected_host"], "desktop_codex")
             self.assertEqual(receipt["controller_id"], "controller-1")
-            self.assertEqual(receipt["result"], "CONFIRMED")
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0]["session_id"], "controller-1")
+            self.assertEqual(receipt["result"], "DEFERRED")
+            self.assertIn("host-attested verifier", receipt.get("diagnostics", ""))
+            self.assertEqual(calls, [])
             self.assertFalse(marker.exists())
+
+    def test_wake_callers_cannot_inject_a_peer_attestation_verifier(self) -> None:
+        def desktop_resume(**kwargs: object) -> dict:
+            return {
+                "result": "CONFIRMED",
+                "operation": "desktop-resume",
+                "execution_target_session_id": kwargs["execution_target_session_id"],
+                "target_generation": kwargs["target_generation"],
+                "host_execution_receipt": {"host": "desktop_codex", "launch_id": "untrusted"},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, marker = self.make_controller(root)
+            with self.assertRaises(TypeError):
+                web_bridge.wake_existing_controller(
+                    lifecycle_state={"pending_control_event": True, "triggers": ["active_lease_expired:F1"]},
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex=str(codex),
+                    receipt_path=receipt_path,
+                    host_facts={
+                        "controller_host": "web",
+                        "active_writer": False,
+                        "resume_state": "RESUME_FAILED",
+                        "failure_class": "quota_exhausted",
+                        "fallback_eligible": True,
+                        "peer_host_available": True,
+                        "peer_host": "desktop_codex",
+                        "fallback_safe": True,
+                    },
+                    resume_adapters={"desktop_codex": desktop_resume},
+                    peer_attestation_verifiers={"desktop_codex": lambda **_kwargs: True},
+                )
+            self.assertFalse(marker.exists())
+
+    def test_peer_desktop_adapter_receives_and_attests_current_target(self) -> None:
+        calls: list[dict] = []
+        expected_host_receipt = {
+            "host": "desktop_codex",
+            "execution_target_session_id": "desktop-current",
+            "target_generation": 8,
+            "launch_id": "desktop-launch-17",
+        }
+
+        def desktop_resume(**kwargs: object) -> dict:
+            calls.append(dict(kwargs))
+            return {
+                "result": "CONFIRMED",
+                "operation": "desktop-resume",
+                "execution_target_session_id": kwargs["execution_target_session_id"],
+                "target_generation": kwargs["target_generation"],
+                "host_execution_receipt": expected_host_receipt,
+            }
+
+        def verify_desktop_attestation(**kwargs: object) -> bool:
+            return (
+                kwargs["controller_id"] == "controller-1"
+                and kwargs["expected_target_session_id"] == "desktop-current"
+                and kwargs["expected_target_generation"] == 8
+                and kwargs["host_execution_receipt"] == expected_host_receipt
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, marker = self.make_controller(root)
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {
+                        "web": ["web-session-1"],
+                        "desktop_codex": ["desktop-current"],
+                    }
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-current",
+                            "generation": 8,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+
+            from unittest.mock import patch
+            with patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=verify_desktop_attestation,
+                create=True,
+            ):
+                receipt = web_bridge.wake_existing_controller(
+                    lifecycle_state={"pending_control_event": True, "triggers": ["active_lease_expired:F1"]},
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex=str(codex),
+                    receipt_path=receipt_path,
+                    host_facts={
+                        "controller_host": "web",
+                        "active_writer": False,
+                        "resume_state": "RESUME_FAILED",
+                        "failure_class": "quota_exhausted",
+                        "fallback_eligible": True,
+                        "peer_host_available": True,
+                        "peer_host": "desktop_codex",
+                        "fallback_safe": True,
+                    },
+                    resume_adapters={"desktop_codex": desktop_resume},
+                )
+
+            self.assertEqual(receipt["result"], "CONFIRMED")
+            self.assertEqual(calls[0]["controller_id"], "controller-1")
+            self.assertEqual(calls[0]["session_id"], "desktop-current")
+            self.assertEqual(calls[0]["execution_target_session_id"], "desktop-current")
+            self.assertEqual(calls[0]["target_generation"], 8)
+            self.assertEqual(receipt["execution_target_session_id"], "desktop-current")
+            self.assertEqual(receipt["target_generation"], 8)
+            self.assertFalse(marker.exists())
+
+    def test_peer_host_attestation_rejects_stale_actual_execution(self) -> None:
+        def desktop_resume(**kwargs: object) -> dict:
+            return {
+                "result": "CONFIRMED",
+                "operation": "desktop-resume",
+                # A stale host may self-report the target it was asked to use.
+                "execution_target_session_id": kwargs["execution_target_session_id"],
+                "target_generation": kwargs["target_generation"],
+                "host_execution_receipt": {
+                    "host": "desktop_codex",
+                    "execution_target_session_id": "desktop-stale",
+                    "target_generation": 1,
+                    "launch_id": "desktop-launch-stale",
+                },
+            }
+
+        def verify_desktop_attestation(**kwargs: object) -> bool:
+            host_receipt = kwargs["host_execution_receipt"]
+            return (
+                isinstance(host_receipt, dict)
+                and host_receipt.get("execution_target_session_id")
+                == kwargs["expected_target_session_id"]
+                and host_receipt.get("target_generation")
+                == kwargs["expected_target_generation"]
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            from unittest.mock import patch
+            with patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=verify_desktop_attestation,
+                create=True,
+            ):
+                receipt, _, marker = self.wake(
+                    Path(tmp),
+                    lifecycle_state={"pending_control_event": True, "triggers": ["active_lease_expired:F1"]},
+                    host_facts={
+                        "controller_host": "web",
+                        "active_writer": False,
+                        "resume_state": "RESUME_FAILED",
+                        "failure_class": "quota_exhausted",
+                        "fallback_eligible": True,
+                        "peer_host_available": True,
+                        "peer_host": "desktop_codex",
+                        "fallback_safe": True,
+                    },
+                    resume_adapters={"desktop_codex": desktop_resume},
+                )
+
+            self.assertEqual(receipt["result"], "FAILED")
+            self.assertIn("host attestation rejected", receipt.get("diagnostics", ""))
+            self.assertFalse(marker.exists())
+
+    def test_peer_adapter_exception_persists_a_bounded_failed_receipt(self) -> None:
+        from unittest.mock import patch
+
+        for error_type in (TypeError, RuntimeError):
+            with self.subTest(error_type=error_type.__name__), tempfile.TemporaryDirectory() as tmp:
+                def desktop_resume(**_kwargs: object) -> dict:
+                    raise error_type("peer host launch failed: " + "x" * 4096)
+
+                with patch.object(
+                    web_bridge,
+                    "_registered_peer_attestation_verifier",
+                    return_value=lambda **_kwargs: True,
+                    create=True,
+                ):
+                    receipt, receipt_path, marker = self.wake(
+                        Path(tmp),
+                        lifecycle_state={"pending_control_event": True, "triggers": ["active_lease_expired:F1"]},
+                        host_facts={
+                            "controller_host": "web",
+                            "active_writer": False,
+                            "resume_state": "RESUME_FAILED",
+                            "failure_class": "quota_exhausted",
+                            "fallback_eligible": True,
+                            "peer_host_available": True,
+                            "peer_host": "desktop_codex",
+                            "fallback_safe": True,
+                        },
+                        resume_adapters={"desktop_codex": desktop_resume},
+                    )
+
+                self.assertEqual(receipt["result"], "FAILED")
+                self.assertEqual(receipt["error_code"], "PEER_HOST_ADAPTER_FAILED")
+                self.assertTrue(receipt["pending_control_event"])
+                self.assertLessEqual(len(receipt["diagnostics"]), web_bridge.STDERR_TAIL_LIMIT)
+                self.assertEqual(json.loads(receipt_path.read_text(encoding="utf-8")), receipt)
+                self.assertFalse(marker.exists())
 
     def test_ambiguous_or_unsafe_failure_does_not_fall_back(self) -> None:
         calls: list[dict] = []
@@ -1606,24 +2018,39 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 "operation": "peer-operation-" * 1024,
                 "command": ["peer-resume", object(), "unbounded-command-argument" * 1024],
                 "stderr_tail": {"diagnostic": object()},
+                "execution_target_session_id": kwargs["execution_target_session_id"],
+                "target_generation": kwargs["target_generation"],
+                "host_execution_receipt": {"host": "desktop_codex", "launch_id": "metadata-test"},
+            }
+
+        def verify_desktop_attestation(**kwargs: object) -> bool:
+            return kwargs["host_execution_receipt"] == {
+                "host": "desktop_codex", "launch_id": "metadata-test"
             }
 
         with tempfile.TemporaryDirectory() as tmp:
-            receipt, receipt_path, _ = self.wake(
-                Path(tmp),
-                lifecycle_state={"pending_control_event": True, "triggers": ["READY:F1"]},
-                host_facts={
-                    "controller_host": "web",
-                    "active_writer": False,
-                    "resume_state": "RESUME_FAILED",
-                    "failure_class": "quota_exhausted",
-                    "fallback_eligible": True,
-                    "peer_host_available": True,
-                    "peer_host": "desktop_codex",
-                    "fallback_safe": True,
-                },
-                resume_adapters={"desktop_codex": desktop_resume},
-            )
+            from unittest.mock import patch
+            with patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=verify_desktop_attestation,
+                create=True,
+            ):
+                receipt, receipt_path, _ = self.wake(
+                    Path(tmp),
+                    lifecycle_state={"pending_control_event": True, "triggers": ["READY:F1"]},
+                    host_facts={
+                        "controller_host": "web",
+                        "active_writer": False,
+                        "resume_state": "RESUME_FAILED",
+                        "failure_class": "quota_exhausted",
+                        "fallback_eligible": True,
+                        "peer_host_available": True,
+                        "peer_host": "desktop_codex",
+                        "fallback_safe": True,
+                    },
+                    resume_adapters={"desktop_codex": desktop_resume},
+                )
 
             saved = json.loads(receipt_path.read_text(encoding="utf-8"))
             self.assertEqual(receipt, saved)

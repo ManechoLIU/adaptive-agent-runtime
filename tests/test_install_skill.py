@@ -20,7 +20,11 @@ class InstallCapabilityTests(unittest.TestCase):
             codex.chmod(0o755)
             skill_root = root / "adaptive-delivery"
             (skill_root / "scripts").mkdir(parents=True)
-            for name in ("lifecycle_hook.py", "controller_scoring_hook.py"):
+            for name in (
+                "lifecycle_hook.py",
+                "controller_target_guard.py",
+                "controller_scoring_hook.py",
+            ):
                 script = skill_root / "scripts" / name
                 script.write_text(f"#!/usr/bin/env python3\n# {name}\n", encoding="utf-8")
                 script.chmod(0o755)
@@ -28,7 +32,7 @@ class InstallCapabilityTests(unittest.TestCase):
             install_codex_hooks(hooks, skill_root, python_executable="/usr/bin/python3")
             canary = root / "desktop-canary.json"
             receipt = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "status": "passed",
                 "controller_session_id": "controller-1",
                 "run_id": "0123456789abcdef0123456789abcdef",
@@ -37,6 +41,9 @@ class InstallCapabilityTests(unittest.TestCase):
                 "hooks_sha256": hashlib.sha256(hooks.read_bytes()).hexdigest(),
                 "lifecycle_sha256": hashlib.sha256(
                     (skill_root / "scripts" / "lifecycle_hook.py").read_bytes()
+                ).hexdigest(),
+                "controller_target_guard_sha256": hashlib.sha256(
+                    (skill_root / "scripts" / "controller_target_guard.py").read_bytes()
                 ).hexdigest(),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "observations": [
@@ -63,6 +70,24 @@ class InstallCapabilityTests(unittest.TestCase):
 
             self.assertEqual(report["desktop_adapter"]["status"], "enabled")
 
+            (skill_root / "scripts" / "controller_target_guard.py").write_text(
+                "#!/usr/bin/env python3\n# changed target guard\n", encoding="utf-8"
+            )
+            stale_guard = detect_host_capabilities(
+                codex_executable=codex,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=hooks,
+                zshenv_file=root / ".zshenv",
+                skill_root=skill_root,
+                desktop_canary_file=canary,
+            )
+            self.assertEqual(stale_guard["desktop_adapter"]["status"], "degraded")
+
+            receipt["controller_target_guard_sha256"] = hashlib.sha256(
+                (skill_root / "scripts" / "controller_target_guard.py").read_bytes()
+            ).hexdigest()
+            canary.write_text(json.dumps(receipt), encoding="utf-8")
+
             hooks.write_text(hooks.read_text(encoding="utf-8") + "\n", encoding="utf-8")
             stale = detect_host_capabilities(
                 codex_executable=codex,
@@ -88,7 +113,11 @@ class InstallCapabilityTests(unittest.TestCase):
             codex.chmod(0o755)
             skill_root = root / "adaptive-delivery"
             (skill_root / "scripts").mkdir(parents=True)
-            for name in ("lifecycle_hook.py", "controller_scoring_hook.py"):
+            for name in (
+                "lifecycle_hook.py",
+                "controller_target_guard.py",
+                "controller_scoring_hook.py",
+            ):
                 script = skill_root / "scripts" / name
                 script.write_text(f"#!/usr/bin/env python3\n# {name}\n", encoding="utf-8")
                 script.chmod(0o755)
@@ -98,7 +127,7 @@ class InstallCapabilityTests(unittest.TestCase):
             canary.write_text(
                 json.dumps(
                     {
-                        "schema_version": 2,
+                        "schema_version": 3,
                         "status": "passed",
                         "controller_session_id": "controller-1",
                         "run_id": "0123456789abcdef0123456789abcdef",
@@ -107,6 +136,9 @@ class InstallCapabilityTests(unittest.TestCase):
                         "hooks_sha256": hashlib.sha256(hooks.read_bytes()).hexdigest(),
                         "lifecycle_sha256": hashlib.sha256(
                             (skill_root / "scripts" / "lifecycle_hook.py").read_bytes()
+                        ).hexdigest(),
+                        "controller_target_guard_sha256": hashlib.sha256(
+                            (skill_root / "scripts" / "controller_target_guard.py").read_bytes()
                         ).hexdigest(),
                         "completed_at": "2020-01-01T00:00:00+00:00",
                         "observations": [

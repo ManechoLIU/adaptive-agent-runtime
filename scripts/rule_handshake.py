@@ -24,6 +24,7 @@ CRITICAL_WAKE_FILES = {
     "scripts/assignment_runtime.py",
     "scripts/assignment_lease_guard.py",
     "scripts/control_event_guard.py",
+    "scripts/controller_target_guard.py",
     "scripts/lifecycle_hook.py",
     "scripts/rule_handshake.py",
     "scripts/run_external_agent.mjs",

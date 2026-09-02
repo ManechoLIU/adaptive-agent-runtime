@@ -34,6 +34,11 @@ try:
 except ModuleNotFoundError:
     from scripts.controller_self_check import render_controller_self_check
 
+try:
+    import controller_target_guard as target_guard
+except ModuleNotFoundError:
+    from scripts import controller_target_guard as target_guard
+
 
 STATE_ROOT = Path(
     os.environ.get(
@@ -50,6 +55,7 @@ REGISTRY_PATH = Path(
 LEDGER_NAMES = ("TASK_LEDGER.md", "PROJECT_STATUS.md")
 CONTROLLER_SURFACES_KEY = "__controller_surfaces__"
 CONTROLLER_SESSIONS_KEY = "__controller_sessions__"
+CONTROLLER_TARGETS_KEY = "__controller_targets__"
 DESKTOP_SESSION_HOST = "desktop_codex"
 MAX_TOOL_TRACE_ENTRIES = 128
 DESKTOP_CANARY_PATH = Path(
@@ -261,11 +267,13 @@ def _desktop_canary_identity(
 ) -> dict[str, Any]:
     root = (skill_root or Path(__file__).resolve().parents[1]).resolve()
     lifecycle = root / "scripts" / "lifecycle_hook.py"
+    target_guard_path = root / "scripts" / "controller_target_guard.py"
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "skill_root": str(root),
         "hooks_sha256": sha256_bytes(hooks_path.read_bytes()),
         "lifecycle_sha256": sha256_bytes(lifecycle.read_bytes()),
+        "controller_target_guard_sha256": sha256_bytes(target_guard_path.read_bytes()),
     }
 
 
@@ -976,25 +984,11 @@ def registered_controller_id(session_id: str) -> str | None:
     if not session_id:
         return None
     registry = load_json(REGISTRY_PATH)
-    owners: set[str] = set()
-    if isinstance(registry.get(session_id), str):
-        owners.add(session_id)
-    sessions = registry.get(CONTROLLER_SESSIONS_KEY)
-    if isinstance(sessions, dict):
-        for controller_id, controller_sessions in sessions.items():
-            if not isinstance(controller_id, str) or not isinstance(controller_sessions, dict):
-                continue
-            desktop_sessions = controller_sessions.get(DESKTOP_SESSION_HOST)
-            if isinstance(desktop_sessions, str):
-                desktop_sessions = [desktop_sessions]
-            if isinstance(desktop_sessions, list) and session_id in {
-                value for value in desktop_sessions if isinstance(value, str)
-            }:
-                owners.add(controller_id)
-    if len(owners) != 1:
-        return None
-    controller_id = next(iter(owners))
-    return controller_id if isinstance(registry.get(controller_id), str) else None
+    return target_guard.active_source_controller_id(
+        registry,
+        source_session_id=session_id,
+        host=DESKTOP_SESSION_HOST,
+    )
 
 
 def registered_root(session_id: str) -> Path | None:
@@ -1004,6 +998,22 @@ def registered_root(session_id: str) -> Path | None:
     if not isinstance(value, str) or not value.strip():
         return None
     return Path(value).expanduser().resolve()
+
+
+def registry_controller_root_matches(
+    registry: dict[str, Any], *, controller_id: str, expected_root: Path
+) -> bool:
+    value = registry.get(controller_id)
+    if not isinstance(value, str) or not value.strip():
+        return False
+    registered_root = Path(value).expanduser().resolve()
+    expected_root = expected_root.expanduser().resolve()
+    expected_common_dir = git_common_dir(expected_root)
+    return (
+        registered_root == expected_root
+        and expected_common_dir is not None
+        and git_common_dir(registered_root) == expected_common_dir
+    )
 
 
 def registered_controller_surface(session_id: str, expected_root: Path) -> Path | None:
@@ -1032,6 +1042,14 @@ def register_controller(session_id: str, root: Path) -> None:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             registry = load_json(REGISTRY_PATH)
+            existing_root = registry.get(session_id)
+            if existing_root is not None:
+                if not isinstance(existing_root, str) or not existing_root.strip():
+                    raise ValueError("controller session has an invalid registered repository")
+                if git_common_dir(Path(existing_root)) != git_common_dir(canonical_root):
+                    raise ValueError(
+                        "controller session is already registered to a different repository"
+                    )
             sessions = registry.get(CONTROLLER_SESSIONS_KEY)
             if isinstance(sessions, dict):
                 for controller_id, controller_sessions in sessions.items():
@@ -1086,24 +1104,14 @@ def bind_desktop_session(
                 raise PermissionError(
                     "desktop session binding requires the registered Controller for this repository"
                 )
-            direct_owner = registry.get(desktop_session_id)
-            if isinstance(direct_owner, str) and desktop_session_id != controller_id:
-                raise PermissionError(
-                    "Desktop Controller Session is already a registered Controller"
-                )
+            _reject_cross_controller_desktop_owner(
+                registry=registry,
+                controller_id=controller_id,
+                desktop_session_id=desktop_session_id,
+            )
             sessions = registry.get(CONTROLLER_SESSIONS_KEY)
             if not isinstance(sessions, dict):
                 sessions = {}
-            for candidate_controller, controller_sessions in sessions.items():
-                if candidate_controller == controller_id or not isinstance(controller_sessions, dict):
-                    continue
-                desktop_sessions = controller_sessions.get(DESKTOP_SESSION_HOST)
-                if isinstance(desktop_sessions, str):
-                    desktop_sessions = [desktop_sessions]
-                if isinstance(desktop_sessions, list) and desktop_session_id in desktop_sessions:
-                    raise PermissionError(
-                        "Desktop Controller Session is already bound to another Controller"
-                    )
             controller_sessions = sessions.get(controller_id)
             if not isinstance(controller_sessions, dict):
                 controller_sessions = {}
@@ -1123,6 +1131,267 @@ def bind_desktop_session(
             sessions[controller_id] = controller_sessions
             registry[CONTROLLER_SESSIONS_KEY] = sessions
             write_json(REGISTRY_PATH, registry)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _desktop_target_generation(record: object) -> int:
+    if record is None:
+        return 0
+    if not isinstance(record, dict):
+        raise ValueError("desktop Controller target record is invalid")
+    generation = record.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise ValueError("desktop Controller target generation is invalid")
+    return generation
+
+
+def _require_expected_desktop_generation(
+    record: object, *, expected_generation: int
+) -> int:
+    if (
+        isinstance(expected_generation, bool)
+        or not isinstance(expected_generation, int)
+        or expected_generation < 0
+    ):
+        raise ValueError("expected_generation must be a non-negative integer")
+    generation = _desktop_target_generation(record)
+    if expected_generation != generation:
+        raise PermissionError(
+            f"expected_generation {expected_generation} does not match current generation {generation}"
+        )
+    return generation
+
+
+def _validated_controller_registry(
+    *, registry: dict[str, Any], controller_id: str, canonical_root: Path
+) -> None:
+    registered_path = registry.get(controller_id)
+    if (
+        not isinstance(registered_path, str)
+        or Path(registered_path).expanduser().resolve() != canonical_root.resolve()
+    ):
+        raise PermissionError(
+            "desktop session lifecycle change requires the registered Controller for this repository"
+        )
+
+
+def _reject_cross_controller_desktop_owner(
+    *, registry: dict[str, Any], controller_id: str, desktop_session_id: str
+) -> None:
+    direct_owner = registry.get(desktop_session_id)
+    if isinstance(direct_owner, str) and desktop_session_id != controller_id:
+        raise PermissionError(
+            "Desktop Controller Session is already a registered Controller"
+        )
+    sessions = registry.get(CONTROLLER_SESSIONS_KEY)
+    if not isinstance(sessions, dict):
+        sessions = {}
+    for candidate_controller, controller_sessions in sessions.items():
+        if candidate_controller == controller_id or not isinstance(controller_sessions, dict):
+            continue
+        desktop_sessions = controller_sessions.get(DESKTOP_SESSION_HOST)
+        if isinstance(desktop_sessions, str):
+            desktop_sessions = [desktop_sessions]
+        if isinstance(desktop_sessions, list) and desktop_session_id in desktop_sessions:
+            raise PermissionError(
+                "Desktop Controller Session is already bound to another Controller"
+            )
+    targets = registry.get(CONTROLLER_TARGETS_KEY)
+    if not isinstance(targets, dict):
+        return
+    for candidate_controller, controller_targets in targets.items():
+        if candidate_controller == controller_id or not isinstance(controller_targets, dict):
+            continue
+        candidate_target = controller_targets.get(DESKTOP_SESSION_HOST)
+        if (
+            isinstance(candidate_target, dict)
+            and candidate_target.get("status") == "active"
+            and str(candidate_target.get("session_id") or "").strip() == desktop_session_id
+        ):
+            raise PermissionError(
+                "Desktop Controller Session is already active for another Controller"
+            )
+
+
+def replace_desktop_session(
+    *, controller_id: str, desktop_session_id: str, repo: Path, expected_generation: int
+) -> dict[str, Any]:
+    controller_id = controller_id.strip()
+    desktop_session_id = desktop_session_id.strip()
+    if not controller_id or not desktop_session_id:
+        raise ValueError("controller-id and desktop-session-id are required")
+    canonical_root = canonical_main_root(repo)
+    if canonical_root is None:
+        raise ValueError("desktop session replacement requires a canonical Git project")
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            registry = load_json(REGISTRY_PATH)
+            _validated_controller_registry(
+                registry=registry,
+                controller_id=controller_id,
+                canonical_root=canonical_root,
+            )
+            target_guard.require_no_active_outbound_lease(
+                registry, controller_id=controller_id, host=DESKTOP_SESSION_HOST
+            )
+            _reject_cross_controller_desktop_owner(
+                registry=registry,
+                controller_id=controller_id,
+                desktop_session_id=desktop_session_id,
+            )
+
+            sessions = registry.get(CONTROLLER_SESSIONS_KEY)
+            if not isinstance(sessions, dict):
+                sessions = {}
+            controller_sessions = sessions.get(controller_id)
+            if not isinstance(controller_sessions, dict):
+                controller_sessions = {}
+            desktop_sessions = controller_sessions.get(DESKTOP_SESSION_HOST)
+            if isinstance(desktop_sessions, str):
+                desktop_sessions = [desktop_sessions]
+            if not isinstance(desktop_sessions, list):
+                desktop_sessions = []
+            retained_desktop_sessions = list(dict.fromkeys(
+                value.strip()
+                for value in desktop_sessions
+                if isinstance(value, str) and value.strip()
+            ))
+            if (
+                desktop_session_id != controller_id
+                and desktop_session_id not in retained_desktop_sessions
+            ):
+                retained_desktop_sessions.append(desktop_session_id)
+            controller_sessions[DESKTOP_SESSION_HOST] = retained_desktop_sessions
+            sessions[controller_id] = controller_sessions
+            registry[CONTROLLER_SESSIONS_KEY] = sessions
+
+            targets = registry.get(CONTROLLER_TARGETS_KEY)
+            if targets is None:
+                targets = {}
+            elif not isinstance(targets, dict):
+                raise ValueError("controller target registry is invalid")
+            controller_targets = targets.get(controller_id)
+            if controller_targets is None:
+                controller_targets = {}
+            elif not isinstance(controller_targets, dict):
+                raise ValueError("Controller target map is invalid")
+            prior = controller_targets.get(DESKTOP_SESSION_HOST)
+            generation = _require_expected_desktop_generation(
+                prior, expected_generation=expected_generation
+            ) + 1
+            target = {
+                "status": "active",
+                "session_id": desktop_session_id,
+                "generation": generation,
+            }
+            controller_targets[DESKTOP_SESSION_HOST] = target
+            targets[controller_id] = controller_targets
+            registry[CONTROLLER_TARGETS_KEY] = targets
+            write_json(REGISTRY_PATH, registry)
+            return {
+                "controller_id": controller_id,
+                "controller_session_id": controller_id,
+                "execution_target_session_id": desktop_session_id,
+                "host": DESKTOP_SESSION_HOST,
+                "repo": str(canonical_root.resolve()),
+                **target,
+            }
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def unbind_desktop_session(
+    *, controller_id: str, desktop_session_id: str, repo: Path, expected_generation: int
+) -> dict[str, Any]:
+    controller_id = controller_id.strip()
+    desktop_session_id = desktop_session_id.strip()
+    if not controller_id or not desktop_session_id:
+        raise ValueError("controller-id and desktop-session-id are required")
+    canonical_root = canonical_main_root(repo)
+    if canonical_root is None:
+        raise ValueError("desktop session unbind requires a canonical Git project")
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            registry = load_json(REGISTRY_PATH)
+            _validated_controller_registry(
+                registry=registry,
+                controller_id=controller_id,
+                canonical_root=canonical_root,
+            )
+            target_guard.require_no_active_outbound_lease(
+                registry, controller_id=controller_id, host=DESKTOP_SESSION_HOST
+            )
+            _reject_cross_controller_desktop_owner(
+                registry=registry,
+                controller_id=controller_id,
+                desktop_session_id=desktop_session_id,
+            )
+
+            sessions = registry.get(CONTROLLER_SESSIONS_KEY)
+            if not isinstance(sessions, dict):
+                sessions = {}
+            controller_sessions = sessions.get(controller_id)
+            if not isinstance(controller_sessions, dict):
+                controller_sessions = {}
+            desktop_sessions = controller_sessions.get(DESKTOP_SESSION_HOST)
+            if isinstance(desktop_sessions, str):
+                desktop_sessions = [desktop_sessions]
+            if not isinstance(desktop_sessions, list):
+                desktop_sessions = []
+            controller_sessions[DESKTOP_SESSION_HOST] = [
+                value
+                for value in desktop_sessions
+                if isinstance(value, str) and value.strip() and value != desktop_session_id
+            ]
+            sessions[controller_id] = controller_sessions
+            registry[CONTROLLER_SESSIONS_KEY] = sessions
+
+            targets = registry.get(CONTROLLER_TARGETS_KEY)
+            if targets is None:
+                targets = {}
+            elif not isinstance(targets, dict):
+                raise ValueError("controller target registry is invalid")
+            controller_targets = targets.get(controller_id)
+            if controller_targets is None:
+                controller_targets = {}
+            elif not isinstance(controller_targets, dict):
+                raise ValueError("Controller target map is invalid")
+            prior = controller_targets.get(DESKTOP_SESSION_HOST)
+            prior_generation = _require_expected_desktop_generation(
+                prior, expected_generation=expected_generation
+            )
+            current = (
+                str(prior.get("session_id") or "").strip()
+                if isinstance(prior, dict) and prior.get("status") == "active"
+                else ""
+            )
+            if prior is None or current == desktop_session_id:
+                target = {
+                    "status": "unbound",
+                    "session_id": None,
+                    "generation": prior_generation + 1,
+                }
+                controller_targets[DESKTOP_SESSION_HOST] = target
+            else:
+                target = dict(prior)
+            targets[controller_id] = controller_targets
+            registry[CONTROLLER_TARGETS_KEY] = targets
+            write_json(REGISTRY_PATH, registry)
+            return {
+                "controller_id": controller_id,
+                "controller_session_id": controller_id,
+                "execution_target_session_id": target.get("session_id"),
+                "host": DESKTOP_SESSION_HOST,
+                "repo": str(canonical_root.resolve()),
+                **target,
+            }
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -1190,8 +1459,75 @@ def run_hook() -> int:
     normalized_event["controller_session_id"] = controller_id
     normalized_event["session_id"] = controller_id
     normalized_event["controller_host"] = DESKTOP_SESSION_HOST
+    outbound_lease_acquired = False
+    post_outbound_request: tuple[str, str] | None = None
+    if normalized_event.get("hook_event_name") == "PreToolUse":
+        try:
+            outbound_request = target_guard.codex_app_outbound_request(
+                tool_name=normalized_event.get("tool_name"),
+                tool_input=normalized_event.get("tool_input"),
+            )
+            if outbound_request is not None:
+                action, target_session_id = outbound_request
+                target_guard.acquire_outbound_lease(
+                    repo=expected_root,
+                    host=DESKTOP_SESSION_HOST,
+                    action=action,
+                    target_session_id=target_session_id,
+                    tool_use_id=_tool_use_id(normalized_event),
+                    source_session_id=source_session_id,
+                    registry_path=REGISTRY_PATH,
+                )
+                outbound_lease_acquired = True
+        except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
+            print(json.dumps(_pre_tool_denial(
+                f"Controller target guard rejected outbound task action: {exc}"
+            ), ensure_ascii=False))
+            return 0
+    if normalized_event.get("hook_event_name") == "PostToolUse":
+        try:
+            post_outbound_request = target_guard.codex_app_outbound_request(
+                tool_name=normalized_event.get("tool_name"),
+                tool_input=normalized_event.get("tool_input"),
+            )
+        except (OSError, ValueError, PermissionError, subprocess.SubprocessError):
+            post_outbound_request = None
     path = state_path(controller_id)
-    output, next_state = persist_event_state(path, normalized_event, snapshot)
+    with target_guard.locked_registry(REGISTRY_PATH) as registry:
+        if target_guard.active_source_controller_id(
+            registry,
+            source_session_id=source_session_id,
+            host=DESKTOP_SESSION_HOST,
+        ) != controller_id or not registry_controller_root_matches(
+            registry, controller_id=controller_id, expected_root=expected_root
+        ):
+            return 0
+        output, next_state = persist_event_state(path, normalized_event, snapshot)
+    if post_outbound_request is not None and _tool_use_id(normalized_event):
+        action, target_session_id = post_outbound_request
+        try:
+            target_guard.release_outbound_lease(
+                repo=expected_root,
+                host=DESKTOP_SESSION_HOST,
+                tool_use_id=_tool_use_id(normalized_event),
+                expected_action=action,
+                expected_target_session_id=target_session_id,
+                registry_path=REGISTRY_PATH,
+            )
+        except (OSError, ValueError, PermissionError, subprocess.SubprocessError):
+            pass
+    if (
+        outbound_lease_acquired
+        and output.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+    ):
+        target_guard.release_outbound_lease(
+            repo=expected_root,
+            host=DESKTOP_SESSION_HOST,
+            tool_use_id=_tool_use_id(normalized_event),
+            expected_action=action,
+            expected_target_session_id=target_session_id,
+            registry_path=REGISTRY_PATH,
+        )
     try:
         record_desktop_canary_observation(normalized_event, output, next_state)
     except (OSError, ValueError, json.JSONDecodeError):
@@ -1210,6 +1546,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--bind-desktop-session",
         nargs=3,
         metavar=("CONTROLLER_ID", "DESKTOP_SESSION_ID", "REPO"),
+    )
+    parser.add_argument(
+        "--replace-desktop-session",
+        nargs=3,
+        metavar=("CONTROLLER_ID", "DESKTOP_SESSION_ID", "REPO"),
+    )
+    parser.add_argument(
+        "--unbind-desktop-session",
+        nargs=3,
+        metavar=("CONTROLLER_ID", "DESKTOP_SESSION_ID", "REPO"),
+    )
+    parser.add_argument(
+        "--expected-generation",
+        type=int,
+        help="required current desktop target generation for replace or unbind",
     )
     parser.add_argument(
         "--print-machine-trace",
@@ -1274,6 +1625,44 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ensure_ascii=False,
             )
         )
+        return 0
+    if args.replace_desktop_session:
+        controller_id, desktop_session_id, repo = args.replace_desktop_session
+        if args.expected_generation is None:
+            parser.error("--expected-generation is required with --replace-desktop-session")
+        try:
+            receipt = replace_desktop_session(
+                controller_id=controller_id,
+                desktop_session_id=desktop_session_id,
+                repo=Path(repo).expanduser().resolve(),
+                expected_generation=args.expected_generation,
+            )
+        except PermissionError as error:
+            print(str(error), file=sys.stderr)
+            return 78
+        except (OSError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.unbind_desktop_session:
+        controller_id, desktop_session_id, repo = args.unbind_desktop_session
+        if args.expected_generation is None:
+            parser.error("--expected-generation is required with --unbind-desktop-session")
+        try:
+            receipt = unbind_desktop_session(
+                controller_id=controller_id,
+                desktop_session_id=desktop_session_id,
+                repo=Path(repo).expanduser().resolve(),
+                expected_generation=args.expected_generation,
+            )
+        except PermissionError as error:
+            print(str(error), file=sys.stderr)
+            return 78
+        except (OSError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
         return 0
     return run_hook()
 

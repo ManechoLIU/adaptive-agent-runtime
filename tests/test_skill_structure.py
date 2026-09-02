@@ -281,6 +281,7 @@ class SkillStructureTests(unittest.TestCase):
             "scripts/assignment_lease_guard.py",
             "scripts/ledger_consistency_guard.py",
             "scripts/lifecycle_hook.py",
+            "scripts/controller_target_guard.py",
             "不另建评分表",
         ):
             self.assertIn(phrase, long_task)

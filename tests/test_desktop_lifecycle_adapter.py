@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +18,7 @@ sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 
 import lifecycle_hook  # noqa: E402
 import control_event_guard  # noqa: E402
+import controller_target_guard  # noqa: E402
 
 
 class DesktopLifecycleTurnGateTests(unittest.TestCase):
@@ -338,6 +344,7 @@ class DesktopLifecycleTurnGateTests(unittest.TestCase):
         entry = state["tool_trace"][0]
         self.assertEqual(entry["tool_use_id"], "patch-1")
         self.assertEqual(entry["tool_name"], "apply_patch")
+
         self.assertEqual(len(entry["input_sha256"]), 64)
         self.assertNotIn("secret-free", str(entry))
 
@@ -400,6 +407,418 @@ class DesktopLifecycleTurnGateTests(unittest.TestCase):
         self.assertEqual(lifecycle_hook.machine_trace_projection(state), expected)
 
 
+class DesktopOutboundLeaseHookTests(unittest.TestCase):
+    def snapshot(self, root: Path) -> dict[str, object]:
+        return {
+            "root": str(root), "head": "abc123", "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1", "ready_ids": [], "runnable_ids": [],
+            "candidate_revisions": [], "ledger_errors": [], "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+
+    def make_repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        return repo
+
+    def invoke_hook(self, event: dict[str, object]) -> tuple[int, str]:
+        output = StringIO()
+        with patch.object(sys, "stdin", StringIO(json.dumps(event))), redirect_stdout(output):
+            code = lifecycle_hook.run_hook()
+        return code, output.getvalue()
+
+    def test_managed_outbound_pre_tool_holds_lease_until_matching_post_tool_use(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-current"]}},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+            }), encoding="utf-8")
+            old_registry, old_state_root = lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
+            lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = registry, root / "state"
+            try:
+                with patch.object(lifecycle_hook, "registered_controller_id", return_value="controller-1"), patch.object(lifecycle_hook, "registered_root", return_value=repo), patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch.object(lifecycle_hook, "controller_event_is_managed", return_value=True):
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "PreToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "message-1",
+                        "tool_input": {"threadId": "desktop-current", "prompt": "continue"},
+                    })
+                    self.assertEqual(code, 0)
+                    self.assertEqual(output, "")
+                    self.assertTrue(controller_target_guard.has_active_outbound_lease(repo=repo, host="desktop_codex", registry_path=registry))
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "PostToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "message-1",
+                        "tool_input": {"threadId": "desktop-current", "prompt": "continue"}, "tool_response": {"isError": False},
+                    })
+                    self.assertFalse(controller_target_guard.has_active_outbound_lease(repo=repo, host="desktop_codex", registry_path=registry))
+            finally:
+                lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = old_registry, old_state_root
+
+        self.assertEqual(code, 0)
+        self.assertFalse(output)
+
+    def test_post_tool_collision_does_not_release_a_different_outbound_target_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-current"]}},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+            }), encoding="utf-8")
+            old_registry, old_state_root = lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
+            lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = registry, root / "state"
+            try:
+                with patch.object(lifecycle_hook, "registered_controller_id", return_value="controller-1"), patch.object(lifecycle_hook, "registered_root", return_value=repo), patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch.object(lifecycle_hook, "controller_event_is_managed", return_value=True):
+                    self.invoke_hook({
+                        "hook_event_name": "PreToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "message-1",
+                        "tool_input": {"threadId": "desktop-current", "prompt": "continue"},
+                    })
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "PostToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "message-1",
+                        "tool_input": {"threadId": "desktop-other", "prompt": "collision"},
+                        "tool_response": {"isError": False},
+                    })
+                    self.assertTrue(controller_target_guard.has_active_outbound_lease(repo=repo, host="desktop_codex", registry_path=registry))
+            finally:
+                lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = old_registry, old_state_root
+
+        self.assertEqual(code, 0)
+        self.assertFalse(output)
+
+    def test_policy_denied_outbound_pre_tool_releases_its_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-current"]}},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+            }), encoding="utf-8")
+            old_registry, old_state_root = lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
+            lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = registry, root / "state"
+            lifecycle_hook.write_json(lifecycle_hook.state_path("controller-1"), {
+                "active_turn_id": "turn-1", "must_yield": True,
+            })
+            try:
+                with patch.object(lifecycle_hook, "registered_controller_id", return_value="controller-1"), patch.object(lifecycle_hook, "registered_root", return_value=repo), patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch.object(lifecycle_hook, "controller_event_is_managed", return_value=True):
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "PreToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "denied-1",
+                        "tool_input": {"threadId": "desktop-current", "prompt": "late"},
+                    })
+                    self.assertFalse(controller_target_guard.has_active_outbound_lease(repo=repo, host="desktop_codex", registry_path=registry))
+            finally:
+                lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = old_registry, old_state_root
+
+        self.assertEqual(code, 0)
+        self.assertIn('"permissionDecision": "deny"', output)
+
+    def test_outbound_pre_tool_without_tool_use_id_fails_closed_without_a_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-current"]}},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+            }), encoding="utf-8")
+            old_registry, old_state_root = lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
+            lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = registry, root / "state"
+            try:
+                with patch.object(lifecycle_hook, "registered_controller_id", return_value="controller-1"), patch.object(lifecycle_hook, "registered_root", return_value=repo), patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch.object(lifecycle_hook, "controller_event_is_managed", return_value=True):
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "PreToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__navigate_to_codex_page",
+                        "tool_input": {"threadId": "desktop-current"},
+                    })
+                    self.assertFalse(controller_target_guard.has_active_outbound_lease(repo=repo, host="desktop_codex", registry_path=registry))
+            finally:
+                lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = old_registry, old_state_root
+
+        self.assertEqual(code, 0)
+        denial = json.loads(output)
+        self.assertEqual(denial["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("tool_use_id", denial["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_outbound_pre_tool_rechecks_its_source_before_leasing_the_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {
+                    "desktop_codex": ["desktop-old", "desktop-current"]
+                }},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+            }), encoding="utf-8")
+            old_registry, old_state_root = lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
+            lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = registry, root / "state"
+            try:
+                with patch.object(lifecycle_hook, "registered_controller_id", return_value="controller-1"), patch.object(
+                    lifecycle_hook, "registered_root", return_value=repo
+                ), patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch.object(
+                    lifecycle_hook, "controller_event_is_managed", return_value=True
+                ):
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "PreToolUse", "session_id": "desktop-old", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "message-1",
+                        "tool_input": {"threadId": "desktop-current", "prompt": "continue"},
+                    })
+                    self.assertFalse(controller_target_guard.has_active_outbound_lease(
+                        repo=repo, host="desktop_codex", registry_path=registry
+                    ))
+            finally:
+                lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = old_registry, old_state_root
+
+        self.assertEqual(code, 0)
+        denial = json.loads(output)
+        self.assertEqual(denial["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("source session", denial["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_hook_source_rejects_malformed_current_target_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-old": "/tmp/project",
+                "__controller_targets__": {"controller-old": {"desktop_codex": []}},
+            }), encoding="utf-8")
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                with self.assertRaisesRegex(ValueError, "target"):
+                    lifecycle_hook.registered_controller_id("controller-old")
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+    def test_hook_source_rejects_malformed_session_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-old": "/tmp/project",
+                "__controller_sessions__": {"controller-old": {"desktop_codex": {}}},
+            }), encoding="utf-8")
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                with self.assertRaisesRegex(ValueError, "session"):
+                    lifecycle_hook.registered_controller_id("controller-old")
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+    def test_cas_generation_rejects_boolean_metadata(self) -> None:
+        with self.assertRaisesRegex(ValueError, "generation"):
+            lifecycle_hook._desktop_target_generation({"generation": True})
+
+    def test_ordinary_managed_hook_holds_source_fence_through_state_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "controller-1", "generation": 1,
+                }}},
+            }), encoding="utf-8")
+            entered, release, replaced = threading.Event(), threading.Event(), threading.Event()
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                def persist(_path, _event, _snapshot):
+                    entered.set()
+                    self.assertTrue(release.wait(1))
+                    return {}, {}
+
+                with patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch.object(
+                    lifecycle_hook, "controller_event_is_managed", return_value=True
+                ), patch.object(lifecycle_hook, "persist_event_state", side_effect=persist):
+                    hook_thread = threading.Thread(target=self.invoke_hook, args=({
+                        "hook_event_name": "SessionStart", "session_id": "controller-1", "cwd": str(repo),
+                    },))
+                    hook_thread.start()
+                    self.assertTrue(entered.wait(1))
+                    def replace():
+                        lifecycle_hook.replace_desktop_session(
+                            controller_id="controller-1", desktop_session_id="desktop-next",
+                            repo=repo, expected_generation=1,
+                        )
+                        replaced.set()
+                    replace_thread = threading.Thread(target=replace)
+                    replace_thread.start()
+                    time.sleep(0.05)
+                    self.assertFalse(replaced.is_set())
+                    release.set()
+                    hook_thread.join(1)
+                    replace_thread.join(1)
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertTrue(replaced.is_set())
+
+    def test_shared_fence_skips_an_event_after_its_controller_repo_is_rebound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            replacement_root = root / "replacement-root"
+            replacement_root.mkdir()
+            replacement = self.make_repo(replacement_root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "controller-1", "generation": 1,
+                }}},
+            }), encoding="utf-8")
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                def mutate_registered_root(*_args):
+                    saved = lifecycle_hook.load_json(registry)
+                    saved["controller-1"] = str(replacement.resolve())
+                    lifecycle_hook.write_json(registry, saved)
+                    return True
+
+                with patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch.object(
+                    lifecycle_hook, "controller_event_is_managed", side_effect=mutate_registered_root
+                ), patch.object(lifecycle_hook, "persist_event_state", side_effect=AssertionError):
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "SessionStart", "session_id": "controller-1", "cwd": str(repo),
+                    })
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+
+    def test_register_controller_refuses_rebinding_a_session_to_a_different_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            replacement_root = root / "replacement-root"
+            replacement_root.mkdir()
+            replacement = self.make_repo(replacement_root)
+            registry = root / "controllers.json"
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                lifecycle_hook.register_controller("controller-1", repo)
+                with self.assertRaisesRegex(ValueError, "different repository"):
+                    lifecycle_hook.register_controller("controller-1", replacement)
+                saved = lifecycle_hook.load_json(registry)
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertEqual(saved["controller-1"], str(repo.resolve()))
+
+    def test_register_controller_allows_a_same_repository_surface_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "tests@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Tests"], check=True)
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+            surface = root / "controller-surface"
+            subprocess.run(["git", "-C", str(repo), "worktree", "add", "-qb", "controller", str(surface)], check=True)
+            registry = root / "controllers.json"
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                lifecycle_hook.register_controller("controller-1", repo)
+                lifecycle_hook.register_controller("controller-1", surface)
+                saved = lifecycle_hook.load_json(registry)
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertEqual(saved["controller-1"], str(repo.resolve()))
+        self.assertEqual(saved["__controller_surfaces__"]["controller-1"], str(surface.resolve()))
+
+    def test_matching_post_tool_keeps_its_lease_until_lifecycle_state_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-current"]}},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+            }), encoding="utf-8")
+            old_registry, old_state_root = lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
+            lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = registry, root / "state"
+            try:
+                event = {
+                    "session_id": "desktop-current", "turn_id": "turn-1",
+                    "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "message-1",
+                    "tool_input": {"threadId": "desktop-current", "prompt": "continue"},
+                }
+                with patch.object(lifecycle_hook, "registered_controller_id", return_value="controller-1"), patch.object(
+                    lifecycle_hook, "registered_root", return_value=repo
+                ), patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch.object(
+                    lifecycle_hook, "controller_event_is_managed", return_value=True
+                ):
+                    self.invoke_hook({"hook_event_name": "PreToolUse", **event})
+
+                    def persist(_path, _event, _snapshot):
+                        self.assertTrue(controller_target_guard.has_active_outbound_lease(
+                            repo=repo, host="desktop_codex", registry_path=registry
+                        ))
+                        return {}, {}
+
+                    with patch.object(lifecycle_hook, "persist_event_state", side_effect=persist):
+                        code, output = self.invoke_hook({"hook_event_name": "PostToolUse", **event})
+                    self.assertFalse(controller_target_guard.has_active_outbound_lease(
+                        repo=repo, host="desktop_codex", registry_path=registry
+                    ))
+            finally:
+                lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = old_registry, old_state_root
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+
+    def test_unmanaged_hook_silently_skips_without_entering_the_state_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": "/tmp/project"}), encoding="utf-8")
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                with patch.object(lifecycle_hook, "persist_event_state", side_effect=AssertionError):
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "SessionStart", "session_id": "unmanaged-session", "cwd": str(root),
+                    })
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+
+
 class DesktopLifecycleCanaryTests(unittest.TestCase):
     def test_live_observations_are_required_before_canary_passes(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -408,6 +827,9 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             (skill_root / "scripts").mkdir(parents=True)
             lifecycle = skill_root / "scripts" / "lifecycle_hook.py"
             lifecycle.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            (skill_root / "scripts" / "controller_target_guard.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
             hooks = root / "hooks.json"
             hooks.write_text('{"hooks": {"PreToolUse": []}}\n', encoding="utf-8")
             canary = root / "desktop-canary.json"
@@ -492,6 +914,7 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             self.assertEqual(receipt["skill_root"], str(skill_root.resolve()))
             self.assertEqual(len(receipt["hooks_sha256"]), 64)
             self.assertEqual(len(receipt["lifecycle_sha256"]), 64)
+            self.assertEqual(len(receipt["controller_target_guard_sha256"]), 64)
 
     def test_canary_does_not_combine_events_from_other_sessions_or_wrong_order(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -499,6 +922,9 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             skill_root = root / "adaptive-delivery"
             (skill_root / "scripts").mkdir(parents=True)
             (skill_root / "scripts" / "lifecycle_hook.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            (skill_root / "scripts" / "controller_target_guard.py").write_text(
                 "#!/usr/bin/env python3\n", encoding="utf-8"
             )
             hooks = root / "hooks.json"

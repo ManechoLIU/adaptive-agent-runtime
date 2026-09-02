@@ -277,11 +277,10 @@ class GovernanceTests(unittest.TestCase):
                 repo=main,
             )
 
-            self.assertEqual(
-                lifecycle_hook.registered_controller_id("desktop-entry-2"),
-                "controller-1",
+            self.assertIsNone(
+                lifecycle_hook.registered_controller_id("desktop-entry-2")
             )
-            self.assertEqual(lifecycle_hook.registered_root("desktop-entry-2"), main.resolve())
+            self.assertIsNone(lifecycle_hook.registered_root("desktop-entry-2"))
 
         saved = lifecycle_hook.load_json(registry)
         self.assertEqual(saved["__controller_sessions__"]["controller-1"]["web"], ["web-session-1"])
@@ -292,6 +291,152 @@ class GovernanceTests(unittest.TestCase):
         self.assertNotIn("desktop-entry-2", {
             key for key, value in saved.items() if isinstance(value, str)
         })
+
+    def test_desktop_aliases_are_inert_until_one_is_explicitly_replaced_as_current(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+            lifecycle_hook.bind_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-2",
+                repo=main,
+            )
+
+            self.assertIsNone(lifecycle_hook.registered_controller_id("controller-1"))
+            self.assertIsNone(lifecycle_hook.registered_controller_id("desktop-entry-2"))
+
+            receipt = lifecycle_hook.replace_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-2",
+                repo=main,
+                expected_generation=0,
+            )
+
+            self.assertIsNone(lifecycle_hook.registered_controller_id("controller-1"))
+            self.assertEqual(
+                lifecycle_hook.registered_controller_id("desktop-entry-2"),
+                "controller-1",
+            )
+
+        self.assertEqual(receipt["status"], "active")
+        self.assertEqual(receipt["generation"], 1)
+        saved = lifecycle_hook.load_json(registry)
+        self.assertEqual(
+            saved["__controller_sessions__"]["controller-1"]["desktop_codex"],
+            ["desktop-entry-2"],
+        )
+        self.assertEqual(
+            saved["__controller_targets__"]["controller-1"]["desktop_codex"],
+            {
+                "status": "active",
+                "session_id": "desktop-entry-2",
+                "generation": 1,
+            },
+        )
+
+    def test_replacing_desktop_target_deactivates_old_alias_and_advances_generation(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+            lifecycle_hook.replace_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-old",
+                repo=main,
+                expected_generation=0,
+            )
+            lifecycle_hook.bind_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-current",
+                repo=main,
+            )
+            receipt = lifecycle_hook.replace_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-current",
+                repo=main,
+                expected_generation=1,
+            )
+
+            self.assertIsNone(lifecycle_hook.registered_controller_id("controller-1"))
+            self.assertIsNone(lifecycle_hook.registered_controller_id("desktop-entry-old"))
+            self.assertEqual(
+                lifecycle_hook.registered_controller_id("desktop-entry-current"),
+                "controller-1",
+            )
+
+        self.assertEqual(receipt["generation"], 2)
+        saved = lifecycle_hook.load_json(registry)
+        self.assertEqual(
+            saved["__controller_sessions__"]["controller-1"]["desktop_codex"],
+            ["desktop-entry-old", "desktop-entry-current"],
+        )
+
+    def test_replace_and_unbind_fail_closed_when_generation_is_stale(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+            lifecycle_hook.replace_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-current",
+                repo=main,
+                expected_generation=0,
+            )
+
+            with self.assertRaisesRegex(PermissionError, "expected_generation"):
+                lifecycle_hook.replace_desktop_session(
+                    controller_id="controller-1",
+                    desktop_session_id="desktop-next",
+                    repo=main,
+                    expected_generation=0,
+                )
+            with self.assertRaisesRegex(PermissionError, "expected_generation"):
+                lifecycle_hook.unbind_desktop_session(
+                    controller_id="controller-1",
+                    desktop_session_id="desktop-current",
+                    repo=main,
+                    expected_generation=0,
+                )
+
+        saved = lifecycle_hook.load_json(registry)
+        self.assertEqual(
+            saved["__controller_targets__"]["controller-1"]["desktop_codex"],
+            {"status": "active", "session_id": "desktop-current", "generation": 1},
+        )
+
+    def test_unbinding_current_desktop_target_does_not_reactivate_canonical_session(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+            lifecycle_hook.replace_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-current",
+                repo=main,
+                expected_generation=0,
+            )
+            receipt = lifecycle_hook.unbind_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-current",
+                repo=main,
+                expected_generation=1,
+            )
+
+            self.assertIsNone(lifecycle_hook.registered_controller_id("controller-1"))
+            self.assertIsNone(lifecycle_hook.registered_controller_id("desktop-entry-current"))
+
+        self.assertEqual(receipt["status"], "unbound")
+        self.assertEqual(receipt["generation"], 2)
+        saved = lifecycle_hook.load_json(registry)
+        self.assertEqual(
+            saved["__controller_targets__"]["controller-1"]["desktop_codex"],
+            {"status": "unbound", "session_id": None, "generation": 2},
+        )
 
     def test_lifecycle_refuses_desktop_entry_owned_by_another_controller(self) -> None:
         from unittest.mock import patch
@@ -354,6 +499,46 @@ class GovernanceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "already bound"):
                     lifecycle_hook.register_controller("desktop-shared", second)
 
+    def test_replace_refuses_desktop_target_active_for_another_controller_even_if_alias_index_is_missing(self) -> None:
+        from unittest.mock import patch
+
+        first, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            second = Path(directory) / "second"
+            second.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=second, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=second, check=True)
+            subprocess.run(["git", "config", "user.name", "Tests"], cwd=second, check=True)
+            (second / "TASK_LEDGER.md").write_text(
+                "| ID | 状态 | 负责人 | 下一步 |\n|---|---|---|---|\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=second, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=second, check=True, capture_output=True)
+
+            with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+                lifecycle_hook.register_controller("controller-1", first)
+                lifecycle_hook.register_controller("controller-2", second)
+                value = lifecycle_hook.load_json(registry)
+                value["__controller_targets__"] = {
+                    "controller-2": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-shared",
+                            "generation": 1,
+                        }
+                    }
+                }
+                lifecycle_hook.write_json(registry, value)
+
+                with self.assertRaisesRegex(PermissionError, "another Controller"):
+                    lifecycle_hook.replace_desktop_session(
+                        controller_id="controller-1",
+                        desktop_session_id="desktop-shared",
+                        repo=first,
+                        expected_generation=0,
+                    )
+
     def test_lifecycle_desktop_entry_uses_canonical_controller_state(self) -> None:
         from unittest.mock import patch
 
@@ -363,10 +548,11 @@ class GovernanceTests(unittest.TestCase):
             lifecycle_hook, "STATE_ROOT", state_root
         ):
             lifecycle_hook.register_controller("controller-1", main)
-            lifecycle_hook.bind_desktop_session(
+            lifecycle_hook.replace_desktop_session(
                 controller_id="controller-1",
                 desktop_session_id="desktop-entry-2",
                 repo=main,
+                expected_generation=0,
             )
             event = {
                 "hook_event_name": "SessionStart",
@@ -386,6 +572,83 @@ class GovernanceTests(unittest.TestCase):
         self.assertEqual(saved["session_id"], "controller-1")
         self.assertEqual(saved["source_session_id"], "desktop-entry-2")
         self.assertEqual(saved["controller_host"], "desktop_codex")
+
+    def test_lifecycle_pretool_rejects_message_or_navigation_to_retired_task(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        state_root = main.parent / "lifecycle-state"
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry), patch.object(
+            lifecycle_hook, "STATE_ROOT", state_root
+        ):
+            lifecycle_hook.register_controller("controller-old", main)
+            lifecycle_hook.replace_desktop_session(
+                controller_id="controller-old",
+                desktop_session_id="desktop-current",
+                repo=main,
+                expected_generation=0,
+            )
+            for tool_name, target_key in (
+                ("mcp__codex_app__send_message_to_thread", "threadId"),
+                ("mcp__codex_app__navigate_to_codex_page", "threadId"),
+            ):
+                event = {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "desktop-current",
+                    "turn_id": "turn-1",
+                    "tool_use_id": f"tool-{tool_name}",
+                    "tool_name": tool_name,
+                    "tool_input": {target_key: "controller-old"},
+                    "cwd": str(main),
+                }
+                with self.subTest(tool_name=tool_name), patch(
+                    "sys.stdin", io.StringIO(json.dumps(event))
+                ), patch("sys.stdout", new_callable=io.StringIO) as output:
+                    self.assertEqual(lifecycle_hook.run_hook(), 0)
+                    denial = json.loads(output.getvalue())
+                    self.assertEqual(
+                        denial["hookSpecificOutput"]["permissionDecision"], "deny"
+                    )
+                    self.assertIn(
+                        "current desktop_codex target desktop-current",
+                        denial["hookSpecificOutput"]["permissionDecisionReason"],
+                    )
+
+            missing_target = {
+                "hook_event_name": "PreToolUse",
+                "session_id": "desktop-current",
+                "turn_id": "turn-1",
+                "tool_use_id": "tool-missing-target",
+                "tool_name": "mcp__codex_app__send_message_to_thread",
+                "tool_input": {},
+                "cwd": str(main),
+            }
+            with patch("sys.stdin", io.StringIO(json.dumps(missing_target))), patch(
+                "sys.stdout", new_callable=io.StringIO
+            ) as output:
+                self.assertEqual(lifecycle_hook.run_hook(), 0)
+                denial = json.loads(output.getvalue())
+                self.assertIn(
+                    "explicit thread target",
+                    denial["hookSpecificOutput"]["permissionDecisionReason"],
+                )
+
+            current_target = {
+                "hook_event_name": "PreToolUse",
+                "session_id": "desktop-current",
+                "turn_id": "turn-1",
+                "tool_use_id": "tool-current-target",
+                "tool_name": "mcp__codex_app__send_message_to_thread",
+                "tool_input": {"threadId": "desktop-current"},
+                "cwd": str(main),
+            }
+            with patch("sys.stdin", io.StringIO(json.dumps(current_target))), patch(
+                "sys.stdout", new_callable=io.StringIO
+            ) as output:
+                self.assertEqual(lifecycle_hook.run_hook(), 0)
+                self.assertEqual(output.getvalue(), "")
+            saved = lifecycle_hook.load_json(lifecycle_hook.state_path("controller-old"))
+            self.assertIn("tool-current-target", saved["inflight_tool_use_ids"])
 
     def test_lifecycle_bind_desktop_session_cli_reports_canonical_controller(self) -> None:
         from unittest.mock import patch

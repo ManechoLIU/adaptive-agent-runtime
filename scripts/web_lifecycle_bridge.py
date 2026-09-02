@@ -18,9 +18,15 @@ try:
 except ModuleNotFoundError:
     from scripts.controller_health import decide_controller_wake, derive_controller_health
 
+try:
+    import controller_target_guard as target_guard
+except ModuleNotFoundError:
+    from scripts import controller_target_guard as target_guard
+
 
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 DEFAULT_MANUAL_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
+_PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., bool]] = {}
 DEFAULT_MANUAL_WEB_LEASE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_AUDIT_LOG = (
     Path.home()
@@ -665,18 +671,27 @@ def write_auto_stop_state(state_path: Path, value: dict[str, Any]) -> None:
     _write_json_atomic_file(state_path, value)
 
 
+def resolve_native_resume_target(
+    *, session_id: str, repo: Path, registry: Path
+) -> dict[str, Any]:
+    receipt = target_guard.resolve_execution_target(
+        repo=repo,
+        host=target_guard.DESKTOP_SESSION_HOST,
+        registry_path=registry,
+    )
+    if receipt.get("controller_id") != session_id:
+        raise PermissionError(
+            f"session {session_id} is not the registered Controller for {repo}"
+        )
+    return receipt
+
+
 def preflight_native_resume(
     *, session_id: str, repo: Path, registry: Path, codex: str, runtime_path: str | None = None
 ) -> tuple[bool, str, dict[str, str]]:
     env = native_runtime_env(runtime_path)
     if not repo.is_dir():
         return False, f"repository does not exist: {repo}", env
-    try:
-        registered = _registered_controller_for_common_dir(repo, registry)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"cannot resolve registered controller common-dir: {exc}", env
-    if registered != session_id:
-        return False, f"session {session_id} is not the registered controller for {repo}", env
     codex_path = Path(codex).expanduser()
     if not codex_path.is_file() or not os.access(codex_path, os.X_OK):
         return False, f"codex executable unavailable: {codex_path}", env
@@ -737,10 +752,6 @@ def execute_native_resume(
     next_action: str | None = None,
 ) -> dict[str, Any]:
     """Run one bounded, preflighted same-thread native resume attempt."""
-    command = native_resume_command(
-        codex=codex, session_id=session_id, repo=repo, terminal_receipts=terminal_receipts,
-        next_action=next_action,
-    )
     try:
         ok, preflight_error, env = preflight_native_resume(
             session_id=session_id,
@@ -758,7 +769,14 @@ def execute_native_resume(
     if not ok:
         return {
             "operation": "native_resume",
-            "command": command,
+            "controller_id": session_id,
+            "command": native_resume_command(
+                codex=codex,
+                session_id=session_id,
+                repo=repo,
+                terminal_receipts=terminal_receipts,
+                next_action=next_action,
+            ),
             "result": "FAILED",
             "state": "RESUME_FAILED",
             "pending_control_event": True,
@@ -767,13 +785,77 @@ def execute_native_resume(
             "error_code": "WEB_LIFECYCLE_RESUME_FAILED",
         }
 
+    target_receipt: dict[str, Any] | None = None
+    command = native_resume_command(
+        codex=codex,
+        session_id=session_id,
+        repo=repo,
+        terminal_receipts=terminal_receipts,
+        next_action=next_action,
+    )
+    process: subprocess.Popen[str] | None = None
     try:
-        completed = subprocess.run(
-            command, check=False, capture_output=True, text=True, env=env
-        )
+        with target_guard.locked_execution_target(
+            repo=repo,
+            host=target_guard.DESKTOP_SESSION_HOST,
+            registry_path=registry,
+        ) as locked_target:
+            if locked_target.get("controller_id") != session_id:
+                raise PermissionError(
+                    f"session {session_id} is not the registered Controller for {repo}"
+                )
+            target_receipt = locked_target
+            execution_target = str(target_receipt["execution_target_session_id"])
+            command = native_resume_command(
+                codex=codex,
+                session_id=execution_target,
+                repo=repo,
+                terminal_receipts=terminal_receipts,
+                next_action=next_action,
+            )
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+    except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
+        target_rejected = target_receipt is None
+        return {
+            "operation": "native_resume",
+            "controller_id": session_id,
+            **({} if target_receipt is None else {
+                "execution_target_session_id": target_receipt.get("execution_target_session_id"),
+                "target_generation": target_receipt.get("generation"),
+                "target_mode": target_receipt.get("target_mode"),
+            }),
+            "command": command,
+            "result": "FAILED",
+            "state": "RESUME_FAILED",
+            "pending_control_event": True,
+            "returncode": 78,
+            "stderr_tail": bounded_tail(
+                ("Controller target guard rejected resume: " if target_rejected else "native resume execution error: ")
+                + str(exc)
+            ),
+            "error_code": (
+                "CONTROLLER_TARGET_REJECTED"
+                if target_rejected
+                else "WEB_LIFECYCLE_RESUME_FAILED"
+            ),
+        }
+
+    try:
+        stdout, stderr = process.communicate() if process is not None else ("", "")
+        returncode = process.returncode if process is not None else 78
     except (OSError, subprocess.SubprocessError) as exc:
         return {
             "operation": "native_resume",
+            "controller_id": session_id,
+            "execution_target_session_id": target_receipt.get("execution_target_session_id"),
+            "target_generation": target_receipt.get("generation"),
+            "target_mode": target_receipt.get("target_mode"),
             "command": command,
             "result": "FAILED",
             "state": "RESUME_FAILED",
@@ -785,17 +867,21 @@ def execute_native_resume(
 
     attempt: dict[str, Any] = {
         "operation": "native_resume",
+        "controller_id": session_id,
+        "execution_target_session_id": execution_target,
+        "target_generation": target_receipt.get("generation"),
+        "target_mode": target_receipt.get("target_mode"),
         "command": command,
         "pending_control_event": True,
-        "returncode": completed.returncode,
-        "stdout_tail": bounded_tail(completed.stdout),
-        "stderr_tail": bounded_tail(completed.stderr),
+        "returncode": returncode,
+        "stdout_tail": bounded_tail(stdout),
+        "stderr_tail": bounded_tail(stderr),
     }
-    if completed.returncode == 0:
+    if returncode == 0:
         attempt.update({"result": "CONFIRMED", "state": "RESUME_SUCCEEDED"})
         return attempt
     attempt.update(classify_native_resume_failure(
-        completed.returncode, completed.stdout, completed.stderr
+        returncode, stdout, stderr
     ))
     attempt["result"] = "DEFERRED" if attempt["state"] == "RESUME_DEFERRED_ACTIVE_WRITER" else "FAILED"
     return attempt
@@ -877,6 +963,11 @@ def _bounded_adapter_diagnostics(value: Any) -> str | None:
     return bounded_tail(value)
 
 
+def _registered_peer_attestation_verifier(host: str) -> Callable[..., bool] | None:
+    """Return only a verifier registered by this bridge's trusted host boundary."""
+    return _PEER_HOST_ATTESTATION_VERIFIERS.get(host)
+
+
 def _wake_receipt(
     *,
     common_dir: Path,
@@ -890,6 +981,10 @@ def _wake_receipt(
     result: str,
     command: Any = None,
     diagnostics: Any = None,
+    error_code: Any = None,
+    execution_target_session_id: str | None = None,
+    target_generation: int | None = None,
+    target_mode: str | None = None,
 ) -> dict[str, Any]:
     now = int(time.time() * 1000)
     receipt: dict[str, Any] = {
@@ -910,12 +1005,20 @@ def _wake_receipt(
         # remains the control-event guard's responsibility.
         "pending_control_event": True,
     }
+    if isinstance(execution_target_session_id, str) and execution_target_session_id.strip():
+        receipt["execution_target_session_id"] = execution_target_session_id.strip()
+    if isinstance(target_generation, int) and target_generation >= 0:
+        receipt["target_generation"] = target_generation
+    if isinstance(target_mode, str) and target_mode.strip():
+        receipt["target_mode"] = target_mode.strip()
     normalized_command = _bounded_adapter_command(command)
     if normalized_command is not None:
         receipt["command"] = normalized_command
     normalized_diagnostics = _bounded_adapter_diagnostics(diagnostics)
     if normalized_diagnostics:
         receipt["diagnostics"] = normalized_diagnostics
+    if isinstance(error_code, str) and error_code.strip():
+        receipt["error_code"] = _bounded_text(error_code.strip(), 128)[0]
     return receipt
 
 
@@ -1014,6 +1117,7 @@ def wake_existing_controller(
                 )
             else:
                 adapter = (resume_adapters or {}).get(str(selected_host))
+                verifier = _registered_peer_attestation_verifier(str(selected_host))
                 if adapter is None:
                     attempt = {
                         "operation": None,
@@ -1021,21 +1125,119 @@ def wake_existing_controller(
                         "state": "RESUME_DEFERRED",
                         "stderr_tail": f"no authorized adapter for peer host {selected_host}",
                     }
+                elif not callable(verifier):
+                    attempt = {
+                        "operation": None,
+                        "result": "DEFERRED",
+                        "state": "RESUME_DEFERRED",
+                        "stderr_tail": (
+                            "no registered host-attested verifier for peer host "
+                            f"{selected_host}"
+                        ),
+                        "error_code": "PEER_HOST_ATTESTATION_VERIFIER_UNAVAILABLE",
+                    }
                 else:
                     try:
-                        attempt = adapter(
-                            session_id=session_id,
+                        with target_guard.locked_execution_target(
                             repo=repo,
-                            registry=registry,
-                            codex=codex,
-                            runtime_path=runtime_path,
-                        )
-                    except (OSError, subprocess.SubprocessError) as exc:
+                            host=str(selected_host),
+                            registry_path=registry,
+                        ) as peer_target:
+                            if peer_target.get("controller_id") != session_id:
+                                raise PermissionError(
+                                    "peer target does not belong to the registered Controller"
+                                )
+                            expected_target = str(peer_target["execution_target_session_id"])
+                            expected_generation = peer_target.get("generation")
+                            try:
+                                attempt = adapter(
+                                    controller_id=session_id,
+                                    session_id=expected_target,
+                                    execution_target_session_id=expected_target,
+                                    target_generation=expected_generation,
+                                    target_mode=peer_target.get("target_mode"),
+                                    repo=repo,
+                                    registry=registry,
+                                    codex=codex,
+                                    runtime_path=runtime_path,
+                                )
+                            except Exception as exc:
+                                attempt = {
+                                    "operation": f"{selected_host}_resume",
+                                    "result": "FAILED",
+                                    "state": "RESUME_FAILED",
+                                    "execution_target_session_id": expected_target,
+                                    "target_generation": expected_generation,
+                                    "target_mode": peer_target.get("target_mode"),
+                                    "stderr_tail": f"peer host adapter failed: {exc}",
+                                    "error_code": "PEER_HOST_ADAPTER_FAILED",
+                                }
+                            if not isinstance(attempt, dict):
+                                attempt = {
+                                    "operation": f"{selected_host}_resume",
+                                    "result": "FAILED",
+                                    "state": "RESUME_FAILED",
+                                    "execution_target_session_id": expected_target,
+                                    "target_generation": expected_generation,
+                                    "target_mode": peer_target.get("target_mode"),
+                                    "stderr_tail": "peer host returned a non-object execution receipt",
+                                    "error_code": "PEER_HOST_ATTESTATION_INVALID",
+                                }
+                            elif (
+                                attempt.get("execution_target_session_id") != expected_target
+                                or attempt.get("target_generation") != expected_generation
+                            ):
+                                attempt = {
+                                    "operation": f"{selected_host}_resume",
+                                    "result": "FAILED",
+                                    "state": "RESUME_FAILED",
+                                    "execution_target_session_id": expected_target,
+                                    "target_generation": expected_generation,
+                                    "target_mode": peer_target.get("target_mode"),
+                                    "stderr_tail": "peer host target receipt mismatch; outbound result rejected",
+                                    "error_code": "CONTROLLER_TARGET_RECEIPT_MISMATCH",
+                                }
+                            else:
+                                try:
+                                    attested = verifier(
+                                        controller_id=session_id,
+                                        host=str(selected_host),
+                                        expected_target_session_id=expected_target,
+                                        expected_target_generation=expected_generation,
+                                        expected_target_mode=peer_target.get("target_mode"),
+                                        host_execution_receipt=attempt.get("host_execution_receipt"),
+                                        adapter_attempt=attempt,
+                                    )
+                                except Exception as exc:
+                                    attempt = {
+                                        "operation": f"{selected_host}_resume",
+                                        "result": "FAILED",
+                                        "state": "RESUME_FAILED",
+                                        "execution_target_session_id": expected_target,
+                                        "target_generation": expected_generation,
+                                        "target_mode": peer_target.get("target_mode"),
+                                        "stderr_tail": f"peer host attestation verifier failed: {exc}",
+                                        "error_code": "PEER_HOST_ATTESTATION_INVALID",
+                                    }
+                                else:
+                                    if attested is not True:
+                                        attempt = {
+                                            "operation": f"{selected_host}_resume",
+                                            "result": "FAILED",
+                                            "state": "RESUME_FAILED",
+                                            "execution_target_session_id": expected_target,
+                                            "target_generation": expected_generation,
+                                            "target_mode": peer_target.get("target_mode"),
+                                            "stderr_tail": "peer host attestation rejected; outbound result rejected",
+                                            "error_code": "PEER_HOST_ATTESTATION_REJECTED",
+                                        }
+                    except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
                         attempt = {
                             "operation": f"{selected_host}_resume",
                             "result": "FAILED",
                             "state": "RESUME_FAILED",
-                            "stderr_tail": f"host adapter error: {exc}",
+                            "stderr_tail": f"host adapter target guard error: {exc}",
+                            "error_code": "CONTROLLER_TARGET_REJECTED",
                         }
             result = str(attempt.get("result", "FAILED"))
             receipt = _wake_receipt(
@@ -1043,6 +1245,10 @@ def wake_existing_controller(
                 health=health, decision=decision, selected_host=str(selected_host), reason=reason,
                 operation=attempt.get("operation"), result=result,
                 command=attempt.get("command"), diagnostics=attempt.get("stderr_tail"),
+                error_code=attempt.get("error_code"),
+                execution_target_session_id=attempt.get("execution_target_session_id"),
+                target_generation=attempt.get("target_generation"),
+                target_mode=attempt.get("target_mode"),
             )
         _write_json_atomic_file(receipt_path, receipt)
         return receipt
@@ -1104,6 +1310,28 @@ def dispatch_pending_lifecycle_wake(
     except (OSError, subprocess.SubprocessError):
         current_common_dir = None
         current_registered = None
+    try:
+        current_target = resolve_native_resume_target(
+            session_id=session_id,
+            repo=repo,
+            registry=registry,
+        )
+    except (OSError, ValueError, PermissionError, subprocess.SubprocessError):
+        current_target = None
+    target_matches_prior = False
+    if current_target is not None:
+        current_target_id = current_target.get("execution_target_session_id")
+        current_generation = current_target.get("generation")
+        prior_target_id = prior.get("execution_target_session_id")
+        prior_generation = prior.get("target_generation")
+        if prior_target_id is None and current_target.get("target_mode") == "legacy_canonical":
+            prior_target_id = session_id
+        if prior_generation is None and current_target.get("target_mode") == "legacy_canonical":
+            prior_generation = 0
+        target_matches_prior = (
+            prior_target_id == current_target_id
+            and prior_generation == current_generation
+        )
     if (
         prior.get("event_fingerprint") == fingerprint
         and prior.get("result") == "CONFIRMED"
@@ -1111,6 +1339,7 @@ def dispatch_pending_lifecycle_wake(
         and current_registered == session_id
         and current_common_dir is not None
         and prior.get("canonical_common_dir") == current_common_dir
+        and target_matches_prior
     ):
         debounced = dict(prior)
         debounced["debounced"] = True
@@ -1362,15 +1591,21 @@ def run_auto_native_stop(
     state = load_json(state_path)
     if state.get("receipt_id") != receipt_id:
         return 0
-    command = native_resume_command(codex=codex, session_id=session_id, repo=repo)
     latest = dict(state)
     latest.update({
         "state": "RESUME_PENDING",
         "pending_control_event": True,
         "started_at_unix_ms": int(time.time() * 1000),
-        "command": command,
+        "controller_id": session_id,
         "runtime_path": runtime_path or DEFAULT_RUNTIME_PATH,
     })
+    for stale_key in (
+        "command",
+        "execution_target_session_id",
+        "target_generation",
+        "target_mode",
+    ):
+        latest.pop(stale_key, None)
     write_auto_stop_state(state_path, latest)
     lifecycle_state = _load_lifecycle_state(session_id)
     attempt = execute_native_resume(
@@ -1381,6 +1616,14 @@ def run_auto_native_stop(
     )
     latest = load_json(state_path)
     if latest.get("receipt_id") == receipt_id:
+        for evidence_key in (
+            "command",
+            "execution_target_session_id",
+            "target_generation",
+            "target_mode",
+        ):
+            if evidence_key in attempt:
+                latest[evidence_key] = attempt[evidence_key]
         if attempt["result"] == "CONFIRMED":
             latest.update({
                 "state": "RESUME_CONFIRMED",
@@ -1961,8 +2204,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        try:
+            target_receipt = resolve_native_resume_target(
+                session_id=args.session_id,
+                repo=repo,
+                registry=Path(args.registry).expanduser(),
+            )
+        except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
+            print(f"Controller target guard rejected native-stop: {exc}", file=sys.stderr)
+            return 78
         command = native_resume_command(
-            codex=args.codex, session_id=args.session_id, repo=repo
+            codex=args.codex,
+            session_id=str(target_receipt["execution_target_session_id"]),
+            repo=repo,
         )
         if args.dry_run:
             print(json.dumps(command, ensure_ascii=False))

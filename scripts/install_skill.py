@@ -146,10 +146,12 @@ def _valid_desktop_canary(
     if skill_root is None:
         return False
     lifecycle = skill_root / "scripts" / "lifecycle_hook.py"
+    target_guard = skill_root / "scripts" / "controller_target_guard.py"
     try:
         receipt = json.loads(path.read_text(encoding="utf-8"))
         hooks_sha256 = hashlib.sha256(hooks_path.read_bytes()).hexdigest()
         lifecycle_sha256 = hashlib.sha256(lifecycle.read_bytes()).hexdigest()
+        target_guard_sha256 = hashlib.sha256(target_guard.read_bytes()).hexdigest()
     except (OSError, json.JSONDecodeError):
         return False
     if not isinstance(receipt, dict):
@@ -165,7 +167,7 @@ def _valid_desktop_canary(
         return False
     observations = receipt.get("observations")
     return (
-        receipt.get("schema_version") == 2
+        receipt.get("schema_version") == 3
         and receipt.get("status") == "passed"
         and isinstance(receipt.get("controller_session_id"), str)
         and bool(receipt.get("controller_session_id"))
@@ -175,6 +177,7 @@ def _valid_desktop_canary(
         and receipt.get("skill_root") == str(skill_root.resolve())
         and receipt.get("hooks_sha256") == hooks_sha256
         and receipt.get("lifecycle_sha256") == lifecycle_sha256
+        and receipt.get("controller_target_guard_sha256") == target_guard_sha256
         and observations == list(DESKTOP_CANARY_SEQUENCE)
     )
 
