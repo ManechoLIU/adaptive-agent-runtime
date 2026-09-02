@@ -422,13 +422,13 @@ python3 scripts/install_skill.py \
 ### Codex
 
 ```text
-请使用 skill-installer 从 https://github.com/ManechoLIU/adaptive-delivery 安装 adaptive-agent-runtime
+请使用 skill-installer 从 https://github.com/ManechoLIU/adaptive-agent-runtime 安装 adaptive-agent-runtime
 ```
 
 或手动安装：
 
 ```bash
-git clone https://github.com/ManechoLIU/adaptive-delivery ~/.agents/skills/adaptive-agent-runtime
+git clone https://github.com/ManechoLIU/adaptive-agent-runtime ~/.agents/skills/adaptive-agent-runtime
 ```
 
 Codex 可以按描述自动选择，也可以显式写 `$adaptive-agent-runtime`。
@@ -436,13 +436,13 @@ Codex 可以按描述自动选择，也可以显式写 `$adaptive-agent-runtime`
 ### Claude Code
 
 ```bash
-git clone https://github.com/ManechoLIU/adaptive-delivery ~/.claude/skills/adaptive-agent-runtime
+git clone https://github.com/ManechoLIU/adaptive-agent-runtime ~/.claude/skills/adaptive-agent-runtime
 ```
 
 ### Gemini CLI
 
 ```bash
-gemini skills install https://github.com/ManechoLIU/adaptive-delivery
+gemini skills install https://github.com/ManechoLIU/adaptive-agent-runtime
 ```
 
 ### Cursor
@@ -450,7 +450,7 @@ gemini skills install https://github.com/ManechoLIU/adaptive-delivery
 可在 **Customize → Rules → Add Rule → Remote Rule (Github)** 输入：
 
 ```text
-https://github.com/ManechoLIU/adaptive-delivery
+https://github.com/ManechoLIU/adaptive-agent-runtime
 ```
 
 各宿主的发现路径和调用语法不同，但 Skill 的项目事实源、授权和完成规则保持一致。

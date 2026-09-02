@@ -380,7 +380,7 @@ Expected: all PASS on main.
 
 - [ ] **Step 4: Install exact merged revision in place**
 
-Use existing `scripts/install_skill.py` transactional path targeting `/Users/echoman/.agents/skills/adaptive-delivery`. Do not create `/Users/echoman/.agents/skills/adaptive-agent-runtime` or `.git/adaptive-agent-runtime`.
+Use existing `scripts/install_skill.py` transactional path targeting `~/.agents/skills/adaptive-delivery`. Do not create `~/.agents/skills/adaptive-agent-runtime` or `.git/adaptive-agent-runtime`.
 
 - [ ] **Step 5: Verify installed hashes/manifest/host adapters and rule handshake semantics**
 

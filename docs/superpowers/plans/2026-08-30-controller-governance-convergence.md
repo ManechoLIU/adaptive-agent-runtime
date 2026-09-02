@@ -638,7 +638,7 @@ Use `scripts/install_skill.py` with the final source revision and qualification 
 
 - [ ] **Step 4: Verify SelfAlone remains fail-closed until its registered controller loads the new revision**
 
-Run the installed `rule_handshake.py status` and launch guard against `/Users/echoman/Documents/SelfAlone`. Expected before controller ACK: pending exact revision and launch blocked if effective live impact exists.
+Run the installed `rule_handshake.py status` and launch guard against `/path/to/SelfAlone`. Expected before controller ACK: pending exact revision and launch blocked if effective live impact exists.
 
 - [ ] **Step 5: Do not ACK on behalf of the controller**
 
@@ -651,4 +651,3 @@ Observe, without taking over the controller, that the same controller produces a
 - [ ] **Step 7: Record release evidence**
 
 Capture exact governance revision, test counts, E2E qualification result, handshake state, and first real control-cycle outcome in the governance release evidence. Do not represent governance installation itself as SelfAlone product Delivery.
-
