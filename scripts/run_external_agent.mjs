@@ -788,7 +788,12 @@ async function executeExternalAgent({ cwd, engine, model, reasoningEffort, authM
       ...process.env,
       KIMI_MODEL_NAME: model,
       KIMI_MODEL_API_KEY: apiKey,
-      KIMI_MODEL_PROVIDER_TYPE: "kimi",
+      // Kimi K3's Platform API uses the standard Chat Completions
+      // `reasoning_effort` field. Kimi Code's `kimi` provider emits the
+      // legacy `thinking` object, which the K3 route rejects behind a
+      // Kimi-Api-Version compatibility gate. The `openai` provider keeps the
+      // same official Moonshot endpoint while encoding K3's wire contract.
+      KIMI_MODEL_PROVIDER_TYPE: "openai",
       KIMI_MODEL_BASE_URL: kimiApiBaseUrl(),
       KIMI_MODEL_MAX_CONTEXT_SIZE: "1048576",
       KIMI_MODEL_CAPABILITIES: "image_in,video_in,thinking,always_thinking,tool_use",

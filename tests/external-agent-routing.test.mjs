@@ -72,6 +72,7 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
     cwd: process.cwd(),
     hasKimiApiKey: Boolean(process.env.KIMI_MODEL_API_KEY),
     kimiModelName: process.env.KIMI_MODEL_NAME || null,
+    kimiModelProviderType: process.env.KIMI_MODEL_PROVIDER_TYPE || null,
     kimiModelBaseUrl: process.env.KIMI_MODEL_BASE_URL || null,
     kimiThinkingEffort: process.env.KIMI_MODEL_THINKING_EFFORT || null,
     hasXaiApiKey: Boolean(process.env.XAI_API_KEY),
@@ -395,6 +396,7 @@ test("OAuth and API execution stay on distinct Kimi and Grok credential paths", 
   assert.deepEqual(kimiApiCall.args, ["-p", "bounded contract", "--output-format", "stream-json"]);
   assert.equal(kimiApiCall.hasKimiApiKey, true);
   assert.equal(kimiApiCall.kimiModelName, "kimi-k3");
+  assert.equal(kimiApiCall.kimiModelProviderType, "openai");
   assert.equal(kimiApiCall.kimiModelBaseUrl, "https://api.moonshot.cn/v1");
   assert.equal(kimiApiCall.kimiThinkingEffort, "max");
 
