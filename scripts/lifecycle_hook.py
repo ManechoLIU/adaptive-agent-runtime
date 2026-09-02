@@ -103,6 +103,59 @@ def _event_turn_id(event: dict[str, Any]) -> str:
     return str(event.get("turn_id", "")).strip()
 
 
+def _desktop_turn_start(event: dict[str, Any]) -> dict[str, str] | None:
+    """Attest a delegated turn against host-owned rollout records, not tool input.
+
+    Codex task-to-task input need not emit UserPromptSubmit. The rollout format
+    is not a stable API: unknown/missing/bounded-out evidence fails closed.
+    This never synthesizes a SessionStart or a completed tool result.
+    """
+    if event.get("controller_host") != DESKTOP_SESSION_HOST:
+        return None
+    if event.get("hook_event_name") not in {"PreToolUse", "Stop"}:
+        return None
+    source_id = str(event.get("source_session_id") or "").strip()
+    transcript = str(event.get("transcript_path") or "").strip()
+    if not source_id or not transcript:
+        return None
+    sessions = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
+    try:
+        path = Path(transcript).resolve(strict=True)
+        if not path.is_relative_to(sessions.resolve()):
+            return None
+        with path.open("rb") as stream:
+            header = json.loads(stream.readline(65536))
+            if header.get("type") != "session_meta" or header.get("payload", {}).get("id") != source_id:
+                return None
+            size = stream.seek(0, os.SEEK_END)
+            offset = max(0, size - 8 * 1024 * 1024)
+            stream.seek(offset)
+            if offset:
+                stream.readline()  # Drop the partial first record.
+            raw = stream.read()
+        for line in reversed(raw.splitlines()):
+            row = json.loads(line)
+            if row.get("type") != "event_msg":
+                continue
+            payload = row.get("payload", {})
+            kind = payload.get("type")
+            if kind in {"turn_aborted", "task_complete"}:
+                return None
+            if kind == "task_started":
+                if payload.get("turn_id") != _event_turn_id(event):
+                    return None
+                return {
+                    "source": "codex_rollout_task_started",
+                    "source_session_id": source_id,
+                    "turn_id": _event_turn_id(event),
+                    "transcript_path": str(path),
+                    "record_sha256": sha256_bytes(line),
+                }
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    return None
+
+
 def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> None:
     turn_id = _event_turn_id(event)
     if not turn_id:
@@ -110,11 +163,11 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> None:
     current_turn_id = str(state.get("active_turn_id", ""))
     if current_turn_id == turn_id:
         return
-    if current_turn_id and event.get("hook_event_name") not in {
-        "SessionStart",
-        "UserPromptSubmit",
-    }:
-        return
+    proof = None
+    if current_turn_id and event.get("hook_event_name") not in {"SessionStart", "UserPromptSubmit"}:
+        proof = _desktop_turn_start(event)
+        if proof is None:
+            return
     state["active_turn_id"] = turn_id
     state["must_yield"] = False
     state["tool_trace"] = []
@@ -125,6 +178,37 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> None:
     state.pop("goal_block_authorization", None)
     state.pop("goal_block_inflight", None)
     state.pop("receipt_turn_id", None)
+    state.pop("adapter_fault", None)
+    state["turn_start_evidence"] = proof or {
+        "source": str(event.get("hook_event_name", "")), "turn_id": turn_id,
+    }
+
+
+def _turn_fault(state: dict[str, Any], event: dict[str, Any]) -> str | None:
+    current = str(state.get("active_turn_id", ""))
+    incoming = _event_turn_id(event)
+    if current and incoming != current:
+        return "unverified_turn_boundary"
+    if state.get("tool_trace_overflow"):
+        return "tool_trace_overflow"
+    if event.get("hook_event_name") == "Stop" and state.get("inflight_tool_use_ids"):
+        return "inflight_tools_at_stop"
+    return None
+
+
+def _adapter_fault_output(state: dict[str, Any], event: dict[str, Any], code: str) -> dict[str, Any]:
+    state["adapter_fault"] = {
+        "code": code, "turn_id": _event_turn_id(event),
+        "active_turn_id": str(state.get("active_turn_id", "")),
+    }
+    reason = (
+        f"Adaptive Agent Runtime adapter degraded: {code}. "
+        "本回合机器证据无法闭合；保留 pending、工具轨迹与未返回工具，停止异常续作。"
+        "不得重试收据、清空状态或把项目 Goal 标为 blocked；从可信新回合恢复并先对账检查点。"
+    )
+    if event.get("hook_event_name") == "PreToolUse":
+        return _pre_tool_denial(reason)
+    return {"continue": False, "stopReason": reason, "systemMessage": reason}
 
 
 def _is_control_guard_command(
@@ -777,6 +861,17 @@ def evaluate_event(
         state["must_yield"] = False
     if "tool_trace" not in state:
         state["tool_trace"] = []
+    if event_name in {"PreToolUse", "Stop"}:
+        fault = _turn_fault(state, event)
+        if fault:
+            return _adapter_fault_output(state, event, fault), state
+    if event_name == "PostToolUse" and _event_turn_id(event) and _event_turn_id(event) != str(state.get("active_turn_id", "")):
+        # A delayed result cannot unlock a newer turn or contaminate its trace.
+        state["adapter_fault"] = {
+            "code": "unmatched_tool_result", "turn_id": _event_turn_id(event),
+            "active_turn_id": str(state.get("active_turn_id", "")),
+        }
+        return {"systemMessage": "Adaptive Agent Runtime: unmatched tool result; current turn evidence was not changed."}, state
     if event_name == "PreToolUse":
         if _goal_block_request(event):
             turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
@@ -1522,11 +1617,29 @@ def persist_event_state(
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
+            previous = load_json(path)
             output, next_state = evaluate_event(
                 event,
                 snapshot=snapshot,
-                prior_state=load_json(path),
+                prior_state=previous,
             )
+            if previous.get("active_turn_id") and previous.get("active_turn_id") != next_state.get("active_turn_id"):
+                # Preserve unresolved old evidence before rotating the current-turn
+                # projection. An archive failure must not silently discard it.
+                archived = {key: previous[key] for key in (
+                    "active_turn_id", "source_session_id", "tool_trace", "tool_trace_overflow",
+                    "inflight_tool_use_ids", "control_receipt_inflight", "must_yield",
+                    "receipt_turn_id", "adapter_fault",
+                ) if key in previous}
+                archived["replaced_by"] = next_state.get("turn_start_evidence")
+                try:
+                    with path.with_suffix(".turns.jsonl").open("a", encoding="utf-8") as archive:
+                        archive.write(json.dumps(archived, ensure_ascii=False) + "\n")
+                        archive.flush()
+                        os.fsync(archive.fileno())
+                except OSError:
+                    output = _adapter_fault_output(previous, event, "turn_archive_unavailable")
+                    return output, previous
             write_json(path, next_state)
             return output, next_state
         finally:
