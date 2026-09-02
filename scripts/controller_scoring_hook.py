@@ -64,6 +64,10 @@ _SCORE_TERMS = re.compile(
     r"(?:评分|打分|分数|多少分|履职评估|履职评分|performance\s+(?:score|scoring|evaluation)|score\s+(?:the\s+)?(?:controller|orchestrator)|rate\s+(?:the\s+)?(?:controller|orchestrator))",
     re.IGNORECASE,
 )
+_SCORING_MODEL_REQUEST = re.compile(
+    r"(?:调用|使用|让|call|use).{0,8}(?:评分模型|scoring\s+model).{0,12}(?:评分|打分|评估|score|rate)",
+    re.IGNORECASE,
+)
 _PERFORMANCE_WORKFLOW = re.compile(
     r"(?:审计.{0,16}(?:项目总控|总控).{0,16}(?:履职|表现)|(?:项目总控|总控).{0,16}(?:履职|表现).{0,16}审计|(?:比较|评估|评价).{0,16}(?:项目总控|总控).{0,16}(?:履职|表现)|(?:项目总控|总控).{0,16}(?:履职|表现).{0,16}(?:比较|评估|评价)|(?:检查|核对).{0,16}(?:项目总控|总控).{0,16}假繁荣|(?:audit|evaluate|assess|review|compare).{0,30}(?:controller|orchestrator).{0,30}(?:performance|duty|execution)|(?:controller|orchestrator).{0,30}(?:performance|duty|execution).{0,30}(?:audit|evaluate|assess|review|compare))",
     re.IGNORECASE,
@@ -88,6 +92,7 @@ def is_controller_scoring_request(prompt: str) -> bool:
         (_CONTROLLER_TERMS.search(text) and _SCORE_TERMS.search(text))
         or (_CONTROLLER_TERMS.search(text) and _CYCLE_REQUEST.search(text))
         or _PERFORMANCE_WORKFLOW.search(text)
+        or _SCORING_MODEL_REQUEST.search(text)
     )
 
 
@@ -344,11 +349,14 @@ def evaluate_event(
             repo = _repo_root(str(event.get("cwd", "") or Path.cwd()))
             source_session_id = str(event.get("session_id", "")).strip()
             controller_id = _logical_controller_id(repo, source_session_id)
+            prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            receipt_id = ":".join((source_session_id, str(event.get("turn_id", "")), prompt_sha256))
             model = scoring_model_path(skill_root)
             content, receipt = read_and_record_model(
                 repo,
                 skill_root=skill_root,
                 controller_session_id=controller_id,
+                receipt_id=receipt_id,
             )
             digest = str(receipt["model_sha256"])
             context = (
@@ -378,13 +386,15 @@ def evaluate_event(
                 "pending_scoring": True,
                 "model_path": str(model),
                 "model_sha256": digest,
-                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "prompt_sha256": prompt_sha256,
                 "repo_root": str(repo),
                 "controller_id": controller_id,
                 "source_session_id": source_session_id,
-                "receipt_path": str(receipt_path(repo)),
+                "receipt_id": receipt_id,
+                "receipt_path": str(receipt_path(repo, receipt_id=receipt_id)),
                 "receipt_sha256": str(receipt.get("model_sha256", "")),
                 "reinject_required": False,
+                "retry_after_block": False,
                 "turn_id": str(event.get("turn_id", "")),
                 "scoring_mode": _scoring_mode(prompt),
             }
@@ -400,7 +410,10 @@ def evaluate_event(
         message = str(event.get("last_assistant_message", ""))
         current_turn = str(event.get("turn_id", ""))
         if state.get("pending_scoring") and str(state.get("turn_id", "")) != current_turn:
-            state.update({"pending_scoring": False, "reinject_required": False, "turn_id": current_turn})
+            if state.get("retry_after_block") and str(event.get("session_id", "")).strip() == str(state.get("source_session_id", "")).strip():
+                state.update({"turn_id": current_turn, "retry_after_block": False})
+            else:
+                state.update({"pending_scoring": False, "reinject_required": False, "retry_after_block": False, "turn_id": current_turn})
         if looks_like_controller_score_output(message) and not state.get("pending_scoring"):
             return {
                 "decision": "block",
@@ -439,17 +452,20 @@ def evaluate_event(
                 ),
             }, state
         scoring_mode = str(state.get("scoring_mode", "formal"))
+        receipt_id = str(state.get("receipt_id", "")).strip() or None
         cycle_score = _extract_cycle_score_value(message)
         formal_score = _extract_score_value(message)
         if scoring_mode == "cycle" and (
             (cycle_score is None and formal_score is not None)
             or _has_distinct_formal_score_output(message)
         ):
+            state["retry_after_block"] = True
             return {
                 "decision": "block",
                 "reason": "controller scoring blocked: score output mode mismatch; cycle diagnostic requested",
             }, state
         if scoring_mode == "formal" and cycle_score is not None:
+            state["retry_after_block"] = True
             return {
                 "decision": "block",
                 "reason": "controller scoring blocked: score output mode mismatch; formal scoring requested",
@@ -464,7 +480,7 @@ def evaluate_event(
                         model_sha256=installed_digest,
                     )
                     _validate_cycle_extrema_claim(message, expected=expected_extremes)
-                    errors = consume_score_guard(Path(repo_text), skill_root=skill_root)
+                    errors = consume_score_guard(Path(repo_text), skill_root=skill_root, receipt_id=receipt_id)
                     if errors:
                         raise ValueError("score-guard failed: " + "; ".join(errors))
                 elif cycle_score is not None:
@@ -483,12 +499,13 @@ def evaluate_event(
                         "score": cycle_score,
                         "evidence_summary": evidence_summary,
                         "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                        "receipt_id": receipt_id,
                     }
                     if evidence_id:
                         finalizer_kwargs["evidence_id"] = evidence_id
                     finalizer(**finalizer_kwargs)
                 else:
-                    errors = consume_score_guard(Path(repo_text), skill_root=skill_root)
+                    errors = consume_score_guard(Path(repo_text), skill_root=skill_root, receipt_id=receipt_id)
                     if errors:
                         raise ValueError("score-guard failed: " + "; ".join(errors))
             else:
@@ -518,12 +535,14 @@ def evaluate_event(
                         governance_risk_status=risk_status, risk_summary=risk_summary,
                         window_summary=_extract_window_summary(message),
                         message_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                        receipt_id=receipt_id,
                     )
                 else:
-                    errors = consume_score_guard(Path(repo_text), skill_root=skill_root)
+                    errors = consume_score_guard(Path(repo_text), skill_root=skill_root, receipt_id=receipt_id)
                     if errors:
                         raise ValueError("score-guard failed: " + "; ".join(errors))
         except ValueError as error:
+            state["retry_after_block"] = True
             return {
                 "decision": "block",
                 "reason": f"controller scoring blocked: score-guard validation failed safely: {error}",
@@ -536,6 +555,7 @@ def evaluate_event(
                 "reason": f"controller scoring blocked: score finalization could not persist a valid history record; resubmit the scoring request. {error}",
             }, state
         state["pending_scoring"] = False
+        state["retry_after_block"] = False
         return {}, state
 
     return {}, state

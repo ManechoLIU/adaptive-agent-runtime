@@ -15,6 +15,7 @@ from typing import Any
 MODEL_RELATIVE_PATH = Path("references/controller-performance-scoring.md")
 RECEIPT_DIRECTORY = "adaptive-delivery"
 RECEIPT_FILE = "controller-scoring-model-read.json"
+RECEIPT_ACTION_DIRECTORY = "controller-scoring-model-reads"
 RECEIPT_MAX_AGE_SECONDS = 1800
 SCORE_HISTORY_FILE = "controller-score-history.jsonl"
 CYCLE_EVIDENCE_DIRECTORY = "controller-cycle-evidence"
@@ -72,8 +73,13 @@ def stable_logical_controller_id(repo: str | Path, declared_controller_id: str) 
     return owners[0]
 
 
-def receipt_path(repo: str | Path) -> Path:
-    return _git_common_dir(Path(repo).resolve()) / RECEIPT_DIRECTORY / RECEIPT_FILE
+def receipt_path(repo: str | Path, *, receipt_id: str | None = None) -> Path:
+    root = _git_common_dir(Path(repo).resolve()) / RECEIPT_DIRECTORY
+    identifier = str(receipt_id or "").strip()
+    if not identifier:
+        return root / RECEIPT_FILE
+    digest = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
+    return root / RECEIPT_ACTION_DIRECTORY / f"{digest}.json"
 
 
 def score_history_path(repo: str | Path) -> Path:
@@ -383,6 +389,7 @@ def _write_receipt(
     model: Path,
     content: bytes,
     controller_session_id: str | None = None,
+    receipt_id: str | None = None,
 ) -> dict[str, Any]:
     receipt = {
         "schema_version": 1,
@@ -401,7 +408,9 @@ def _write_receipt(
         receipt["governance_risk_projection"] = governance_risk_projection(
             repo, controller_session_id=controller
         )
-    target = receipt_path(repo)
+    if receipt_id:
+        receipt["receipt_id"] = str(receipt_id)
+    target = receipt_path(repo, receipt_id=receipt_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return receipt
@@ -412,6 +421,7 @@ def read_and_record_model(
     *,
     skill_root: str | Path,
     controller_session_id: str | None = None,
+    receipt_id: str | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     model = scoring_model_path(skill_root)
     content = model.read_bytes()
@@ -420,6 +430,7 @@ def read_and_record_model(
         model=model,
         content=content,
         controller_session_id=controller_session_id,
+        receipt_id=receipt_id,
     )
 
 
@@ -428,17 +439,19 @@ def record_model_read(
     *,
     skill_root: str | Path,
     controller_session_id: str | None = None,
+    receipt_id: str | None = None,
 ) -> dict[str, Any]:
     _, receipt = read_and_record_model(
         repo,
         skill_root=skill_root,
         controller_session_id=controller_session_id,
+        receipt_id=receipt_id,
     )
     return receipt
 
 
-def _load_receipt(repo: str | Path) -> dict[str, Any] | None:
-    target = receipt_path(repo)
+def _load_receipt(repo: str | Path, *, receipt_id: str | None = None) -> dict[str, Any] | None:
+    target = receipt_path(repo, receipt_id=receipt_id)
     if not target.is_file():
         return None
     try:
@@ -458,8 +471,13 @@ def _receipt_age_seconds(receipt: dict[str, Any]) -> float | None:
     return max(0.0, (datetime.now(timezone.utc) - read_at.astimezone(timezone.utc)).total_seconds())
 
 
-def score_guard_errors(repo: str | Path, *, skill_root: str | Path) -> list[str]:
-    receipt = _load_receipt(repo)
+def score_guard_errors(
+    repo: str | Path,
+    *,
+    skill_root: str | Path,
+    receipt_id: str | None = None,
+) -> list[str]:
+    receipt = _load_receipt(repo, receipt_id=receipt_id)
     if receipt is None:
         return ["controller scoring blocked: scoring model read receipt is missing or unreadable"]
     age = _receipt_age_seconds(receipt)
@@ -485,6 +503,7 @@ def finalize_score(
     risk_summary: str,
     window_summary: str | None,
     message_sha256: str | None,
+    receipt_id: str | None = None,
 ) -> dict[str, Any]:
     controller = stable_logical_controller_id(repo, controller_session_id)
     performance = float(performance_score)
@@ -503,7 +522,7 @@ def finalize_score(
         raise ValueError("governance risk status must be GREEN, AMBER, or RED")
     if not risk_basis:
         raise ValueError("formal score requires a non-empty governance risk summary")
-    receipt = _load_receipt(repo)
+    receipt = _load_receipt(repo, receipt_id=receipt_id)
     if receipt is None or str(receipt.get("controller_session_id", "")).strip() != controller:
         raise ValueError(
             "score-guard failed: machine governance risk projection is missing or bound to another Controller"
@@ -526,7 +545,7 @@ def finalize_score(
         controller_session_id=controller,
         model_sha256=model_sha256,
     )
-    errors = consume_score_guard(repo, skill_root=skill_root)
+    errors = consume_score_guard(repo, skill_root=skill_root, receipt_id=receipt_id)
     if errors:
         raise ValueError("score-guard failed: " + "; ".join(errors))
     record = {
@@ -561,6 +580,7 @@ def finalize_cycle_candidate(
     score: float,
     evidence_summary: str | None,
     message_sha256: str | None,
+    receipt_id: str | None = None,
 ) -> dict[str, Any]:
     controller = stable_logical_controller_id(repo, controller_session_id)
     status = str(terminal_status).upper().strip()
@@ -579,7 +599,7 @@ def finalize_cycle_candidate(
         raise ValueError("cycle score requires a valid message sha256 reference")
     if not 0 <= float(score) <= 100:
         raise ValueError("cycle score must be within 0..100")
-    errors = consume_score_guard(repo, skill_root=skill_root)
+    errors = consume_score_guard(repo, skill_root=skill_root, receipt_id=receipt_id)
     if errors:
         raise ValueError("score-guard failed: " + "; ".join(errors))
     record = {
@@ -610,6 +630,7 @@ def finalize_attested_cycle_score(
     evidence_summary: str | None,
     evidence_id: str,
     message_sha256: str | None,
+    receipt_id: str | None = None,
 ) -> dict[str, Any]:
     controller = stable_logical_controller_id(repo, controller_session_id)
     cycle = str(cycle_id).strip()
@@ -633,7 +654,7 @@ def finalize_attested_cycle_score(
         raise ValueError("cycle evidence receipt is not terminal")
     if claimed_status != receipt_status or claimed_evidence != receipt_evidence:
         raise ValueError("cycle terminal status or evidence summary does not match the machine receipt")
-    model_read_receipt = _load_receipt(repo)
+    model_read_receipt = _load_receipt(repo, receipt_id=receipt_id)
     current_projection = governance_risk_projection(repo, controller_session_id=controller)
     if (
         not isinstance(model_read_receipt, dict)
@@ -648,7 +669,7 @@ def finalize_attested_cycle_score(
         raise ValueError(
             f"machine governance risk projection enforces the active {active_cap} cap on cycle scores"
         )
-    errors = consume_score_guard(repo, skill_root=skill_root)
+    errors = consume_score_guard(repo, skill_root=skill_root, receipt_id=receipt_id)
     if errors:
         raise ValueError("score-guard failed: " + "; ".join(errors))
     record = {
@@ -670,11 +691,16 @@ def finalize_attested_cycle_score(
     return append_score_history(repo, record)
 
 
-def consume_score_guard(repo: str | Path, *, skill_root: str | Path) -> list[str]:
-    errors = score_guard_errors(repo, skill_root=skill_root)
+def consume_score_guard(
+    repo: str | Path,
+    *,
+    skill_root: str | Path,
+    receipt_id: str | None = None,
+) -> list[str]:
+    errors = score_guard_errors(repo, skill_root=skill_root, receipt_id=receipt_id)
     if errors:
         return errors
-    receipt_path(repo).unlink()
+    receipt_path(repo, receipt_id=receipt_id).unlink()
     return []
 
 

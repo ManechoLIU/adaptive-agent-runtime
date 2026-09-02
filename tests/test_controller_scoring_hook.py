@@ -127,6 +127,10 @@ class ControllerScoringHookTests(unittest.TestCase):
             with self.subTest(prompt=prompt):
                 self.assertTrue(hook.is_controller_scoring_request(prompt))
 
+    def test_contextual_request_to_call_the_scoring_model_activates_gate(self):
+        hook = load_module()
+        self.assertTrue(hook.is_controller_scoring_request("你调用评分模型去评分啊"))
+
     def test_unrelated_controller_audits_do_not_activate_scoring_gate(self):
         hook = load_module()
         prompts = [
@@ -233,6 +237,105 @@ class ControllerScoringHookTests(unittest.TestCase):
         self.assertEqual("block", output["decision"])
         self.assertIn("score-guard", output["reason"])
         self.assertTrue(state["pending_scoring"])
+
+    def test_blocked_stop_retry_in_next_turn_preserves_scoring_state(self):
+        hook = load_module()
+        _, state = hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "s1",
+                "turn_id": "score-turn",
+                "cwd": str(ROOT),
+                "prompt": "给总控正式评分",
+            },
+            skill_root=ROOT,
+            prior_state={},
+        )
+        blocked, state = hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "s1",
+                "turn_id": "score-turn",
+                "cwd": str(ROOT),
+                "last_assistant_message": "正式履职评分：82/100。",
+            },
+            skill_root=ROOT,
+            prior_state=state,
+        )
+        self.assertEqual("block", blocked.get("decision"))
+        self.assertTrue(state.get("pending_scoring"))
+        self.assertTrue(state.get("retry_after_block"))
+
+        allowed, state = hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "s1",
+                "turn_id": "score-turn-retry",
+                "cwd": str(ROOT),
+                "last_assistant_message": formal_message(),
+            },
+            skill_root=ROOT,
+            prior_state=state,
+        )
+        self.assertEqual({}, allowed)
+        self.assertFalse(state.get("pending_scoring"))
+
+    def test_concurrent_scoring_turns_use_isolated_model_read_receipts(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, first = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-a",
+                    "turn_id": "turn-a",
+                    "cwd": str(repo),
+                    "prompt": "给总控正式评分",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            _, second = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-b",
+                    "turn_id": "turn-b",
+                    "cwd": str(repo),
+                    "prompt": "给总控正式评分",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            self.assertNotEqual(first["receipt_path"], second["receipt_path"])
+
+            first_output, first = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "session-a",
+                    "turn_id": "turn-a",
+                    "cwd": str(repo),
+                    "last_assistant_message": formal_message(),
+                },
+                skill_root=ROOT,
+                prior_state=first,
+            )
+            second_output, second = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "session-b",
+                    "turn_id": "turn-b",
+                    "cwd": str(repo),
+                    "last_assistant_message": formal_message(),
+                },
+                skill_root=ROOT,
+                prior_state=second,
+            )
+            self.assertEqual({}, first_output)
+            self.assertEqual({}, second_output)
+            self.assertFalse(first.get("pending_scoring"))
+            self.assertFalse(second.get("pending_scoring"))
 
     def test_run_hook_blocks_when_scoring_state_cannot_be_persisted(self):
         import json

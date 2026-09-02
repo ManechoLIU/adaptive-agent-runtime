@@ -158,6 +158,49 @@ class ControllerScoringGuardTests(unittest.TestCase):
             self.assertFalse(target.exists())
             self.assertTrue(guard.score_guard_errors(repo, skill_root=ROOT))
 
+    def test_scoring_model_read_receipts_are_isolated_by_action_id(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            guard.record_model_read(
+                repo,
+                skill_root=ROOT,
+                controller_session_id="controller-1",
+                receipt_id="session-a:turn-a",
+            )
+            guard.record_model_read(
+                repo,
+                skill_root=ROOT,
+                controller_session_id="controller-1",
+                receipt_id="session-b:turn-b",
+            )
+            first = guard.receipt_path(repo, receipt_id="session-a:turn-a")
+            second = guard.receipt_path(repo, receipt_id="session-b:turn-b")
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.is_file())
+            self.assertTrue(second.is_file())
+
+            self.assertEqual(
+                [],
+                guard.consume_score_guard(
+                    repo,
+                    skill_root=ROOT,
+                    receipt_id="session-a:turn-a",
+                ),
+            )
+            self.assertFalse(first.exists())
+            self.assertTrue(second.exists())
+            self.assertEqual(
+                [],
+                guard.score_guard_errors(
+                    repo,
+                    skill_root=ROOT,
+                    receipt_id="session-b:turn-b",
+                ),
+            )
+
     def test_read_and_record_uses_the_same_model_bytes_for_output_and_receipt(self):
         guard = load_module()
         import subprocess
