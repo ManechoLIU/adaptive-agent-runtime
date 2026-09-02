@@ -239,46 +239,50 @@ class ControllerScoringHookTests(unittest.TestCase):
         self.assertTrue(state["pending_scoring"])
 
     def test_blocked_stop_retry_in_next_turn_preserves_scoring_state(self):
+        import subprocess
         hook = load_module()
-        _, state = hook.evaluate_event(
-            {
-                "hook_event_name": "UserPromptSubmit",
-                "session_id": "s1",
-                "turn_id": "score-turn",
-                "cwd": str(ROOT),
-                "prompt": "给总控正式评分",
-            },
-            skill_root=ROOT,
-            prior_state={},
-        )
-        blocked, state = hook.evaluate_event(
-            {
-                "hook_event_name": "Stop",
-                "session_id": "s1",
-                "turn_id": "score-turn",
-                "cwd": str(ROOT),
-                "last_assistant_message": "正式履职评分：82/100。",
-            },
-            skill_root=ROOT,
-            prior_state=state,
-        )
-        self.assertEqual("block", blocked.get("decision"))
-        self.assertTrue(state.get("pending_scoring"))
-        self.assertTrue(state.get("retry_after_block"))
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "s1",
+                    "turn_id": "score-turn",
+                    "cwd": str(repo),
+                    "prompt": "给总控正式评分",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            blocked, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "s1",
+                    "turn_id": "score-turn",
+                    "cwd": str(repo),
+                    "last_assistant_message": "正式履职评分：82/100。",
+                },
+                skill_root=ROOT,
+                prior_state=state,
+            )
+            self.assertEqual("block", blocked.get("decision"))
+            self.assertTrue(state.get("pending_scoring"))
+            self.assertTrue(state.get("retry_after_block"))
 
-        allowed, state = hook.evaluate_event(
-            {
-                "hook_event_name": "Stop",
-                "session_id": "s1",
-                "turn_id": "score-turn-retry",
-                "cwd": str(ROOT),
-                "last_assistant_message": formal_message(),
-            },
-            skill_root=ROOT,
-            prior_state=state,
-        )
-        self.assertEqual({}, allowed)
-        self.assertFalse(state.get("pending_scoring"))
+            allowed, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "s1",
+                    "turn_id": "score-turn-retry",
+                    "cwd": str(repo),
+                    "last_assistant_message": formal_message(),
+                },
+                skill_root=ROOT,
+                prior_state=state,
+            )
+            self.assertEqual({}, allowed)
+            self.assertFalse(state.get("pending_scoring"))
 
     def test_concurrent_scoring_turns_use_isolated_model_read_receipts(self):
         import subprocess
