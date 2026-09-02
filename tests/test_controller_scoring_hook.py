@@ -131,6 +131,10 @@ class ControllerScoringHookTests(unittest.TestCase):
         hook = load_module()
         self.assertTrue(hook.is_controller_scoring_request("你调用评分模型去评分啊"))
 
+    def test_elliptical_scoring_failure_retry_activates_gate(self):
+        hook = load_module()
+        self.assertTrue(hook.is_controller_scoring_request("怎么还不是没法评分啊"))
+
     def test_unrelated_controller_audits_do_not_activate_scoring_gate(self):
         hook = load_module()
         prompts = [

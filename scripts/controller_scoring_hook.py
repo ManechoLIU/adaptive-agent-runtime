@@ -68,6 +68,10 @@ _SCORING_MODEL_REQUEST = re.compile(
     r"(?:调用|使用|让|call|use).{0,8}(?:评分模型|scoring\s+model).{0,12}(?:评分|打分|评估|score|rate)",
     re.IGNORECASE,
 )
+_SCORING_FAILURE_RETRY = re.compile(
+    r"(?:(?:怎么|为什么|为何|还是|又|仍然|依然|还).{0,16}(?:不能|不行|没法|无法|失败|unknown|阻断|拦截).{0,12}(?:评分|打分)|(?:评分|打分).{0,12}(?:不能|不行|没法|无法|失败|unknown|阻断|拦截))",
+    re.IGNORECASE,
+)
 _PERFORMANCE_WORKFLOW = re.compile(
     r"(?:审计.{0,16}(?:项目总控|总控).{0,16}(?:履职|表现)|(?:项目总控|总控).{0,16}(?:履职|表现).{0,16}审计|(?:比较|评估|评价).{0,16}(?:项目总控|总控).{0,16}(?:履职|表现)|(?:项目总控|总控).{0,16}(?:履职|表现).{0,16}(?:比较|评估|评价)|(?:检查|核对).{0,16}(?:项目总控|总控).{0,16}假繁荣|(?:audit|evaluate|assess|review|compare).{0,30}(?:controller|orchestrator).{0,30}(?:performance|duty|execution)|(?:controller|orchestrator).{0,30}(?:performance|duty|execution).{0,30}(?:audit|evaluate|assess|review|compare))",
     re.IGNORECASE,
@@ -93,6 +97,7 @@ def is_controller_scoring_request(prompt: str) -> bool:
         or (_CONTROLLER_TERMS.search(text) and _CYCLE_REQUEST.search(text))
         or _PERFORMANCE_WORKFLOW.search(text)
         or _SCORING_MODEL_REQUEST.search(text)
+        or _SCORING_FAILURE_RETRY.search(text)
     )
 
 
