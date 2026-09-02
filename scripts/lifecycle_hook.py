@@ -6,8 +6,12 @@ import fcntl
 import hashlib
 import json
 import os
+import secrets
+import shlex
+import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -47,6 +51,27 @@ LEDGER_NAMES = ("TASK_LEDGER.md", "PROJECT_STATUS.md")
 CONTROLLER_SURFACES_KEY = "__controller_surfaces__"
 CONTROLLER_SESSIONS_KEY = "__controller_sessions__"
 DESKTOP_SESSION_HOST = "desktop_codex"
+MAX_TOOL_TRACE_ENTRIES = 128
+DESKTOP_CANARY_PATH = Path(
+    os.environ.get(
+        "AD_DESKTOP_CANARY_PATH",
+        str(Path.home() / ".codex" / "state" / "adaptive-delivery-desktop-canary.json"),
+    )
+).expanduser()
+CODEX_HOOKS_PATH = Path(
+    os.environ.get("AD_CODEX_HOOKS_PATH", str(Path.home() / ".codex" / "hooks.json"))
+).expanduser()
+DESKTOP_CANARY_SEQUENCE = (
+    "session_started",
+    "pre_tool_allowed",
+    "post_tool_observed",
+    "receipt_latched",
+    "same_turn_denied",
+    "stop_observed",
+    "next_turn_allowed",
+    "subagent_stop_observed",
+)
+DESKTOP_CANARY_OBSERVATIONS = set(DESKTOP_CANARY_SEQUENCE)
 
 
 
@@ -59,6 +84,311 @@ def controller_self_check_context() -> str:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return sha256_bytes(encoded)
+
+
+def _event_turn_id(event: dict[str, Any]) -> str:
+    return str(event.get("turn_id", "")).strip()
+
+
+def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> None:
+    turn_id = _event_turn_id(event)
+    if not turn_id:
+        return
+    current_turn_id = str(state.get("active_turn_id", ""))
+    if current_turn_id == turn_id:
+        return
+    if current_turn_id and event.get("hook_event_name") not in {
+        "SessionStart",
+        "UserPromptSubmit",
+    }:
+        return
+    state["active_turn_id"] = turn_id
+    state["must_yield"] = False
+    state["tool_trace"] = []
+    state["tool_trace_overflow"] = False
+    state["inflight_tool_use_ids"] = []
+    state.pop("control_receipt_inflight", None)
+    state.pop("receipt_turn_id", None)
+
+
+def _is_control_guard_command(
+    command: str,
+    *,
+    controller_session_id: str = "",
+    cwd: str | Path | None = None,
+) -> bool:
+    if any(character in command for character in "\n\r;&|><#$`()"):
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if len(tokens) < 4:
+        return False
+    declared_python = Path(tokens[0]).expanduser()
+    if declared_python.is_absolute():
+        resolved_python = declared_python.resolve()
+    else:
+        discovered_python = shutil.which(tokens[0])
+        if not discovered_python:
+            return False
+        resolved_python = Path(discovered_python).resolve()
+    if resolved_python != Path(sys.executable).resolve():
+        return False
+    expected_guard = Path(__file__).resolve().with_name("control_event_guard.py")
+    declared_guard = Path(tokens[1]).expanduser()
+    candidates: set[Path] = set()
+    if declared_guard.is_absolute():
+        candidates.add(declared_guard.resolve())
+    else:
+        skill_root = Path(__file__).resolve().parents[1]
+        candidates.add((skill_root / declared_guard).resolve())
+        candidates.add((expected_guard.parent / declared_guard).resolve())
+        if cwd is not None:
+            candidates.add((Path(cwd).expanduser().resolve() / declared_guard).resolve())
+    if expected_guard not in candidates:
+        return False
+    if any(token in {";", "&&", "||", "|", "&", ">", "<", "#"} for token in tokens):
+        return False
+    if "--ledger" not in tokens:
+        return False
+    session_id = controller_session_id.strip()
+    if session_id:
+        try:
+            index = tokens.index("--controller-session")
+        except ValueError:
+            return False
+        if index + 1 >= len(tokens) or tokens[index + 1] != session_id:
+            return False
+    return True
+
+
+def _tool_use_id(event: dict[str, Any]) -> str:
+    return str(event.get("tool_use_id", "")).strip()
+
+
+def _record_tool_trace(state: dict[str, Any], event: dict[str, Any]) -> None:
+    if event.get("hook_event_name") != "PostToolUse":
+        return
+    tool_name = str(event.get("tool_name", "")).strip()
+    tool_input = event.get("tool_input")
+    if not tool_name and not isinstance(tool_input, dict):
+        return
+    if isinstance(tool_input, dict):
+        command = str(tool_input.get("command", ""))
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = []
+        script_indexes = [
+            index
+            for index, token in enumerate(tokens)
+            if token.endswith("lifecycle_hook.py")
+        ]
+        if len(script_indexes) == 1:
+            script_index = script_indexes[0]
+            if (
+                script_index == 1
+                and len(tokens) == 4
+                and tokens[script_index + 1] == "--print-machine-trace"
+                and tokens[script_index + 2].strip()
+            ):
+                return
+    turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
+    input_sha256 = _json_sha256(tool_input)
+    tool_use_id = str(event.get("tool_use_id", "")).strip()
+    if not tool_use_id:
+        tool_use_id = f"derived:{turn_id}:{tool_name}:{input_sha256[:12]}"
+    response = event.get("tool_response")
+    response_status: Any = None
+    if isinstance(response, dict):
+        response_status = response.get("exit_code", response.get("isError", response.get("state")))
+    entry = {
+        "turn_id": turn_id,
+        "tool_use_id": tool_use_id,
+        "tool_name": tool_name or "unknown",
+        "input_sha256": input_sha256,
+        "response_status": response_status,
+    }
+    trace = [item for item in state.get("tool_trace", []) if isinstance(item, dict)]
+    trace.append(entry)
+    if len(trace) > MAX_TOOL_TRACE_ENTRIES:
+        state["tool_trace_overflow"] = True
+    state["tool_trace"] = trace[-MAX_TOOL_TRACE_ENTRIES:]
+
+
+def machine_trace_projection(state: dict[str, Any]) -> dict[str, Any]:
+    turn_id = str(state.get("active_turn_id", "")).strip()
+    trace: list[dict[str, Any]] = []
+    for item in state.get("tool_trace", []):
+        if not isinstance(item, dict) or str(item.get("turn_id", "")) != turn_id:
+            continue
+        trace.append(
+            {
+                "turn_id": turn_id,
+                "tool_use_id": str(item.get("tool_use_id", "")),
+                "tool_name": str(item.get("tool_name", "")),
+                "input_sha256": str(item.get("input_sha256", "")),
+                "response_status": item.get("response_status"),
+            }
+        )
+    return {
+        "turn_id": turn_id,
+        "tool_use_ids": [item["tool_use_id"] for item in trace],
+        "trace_sha256": _json_sha256(trace),
+    }
+
+
+def _pre_tool_denial(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def _desktop_canary_identity(
+    *, hooks_path: Path, skill_root: Path | None
+) -> dict[str, Any]:
+    root = (skill_root or Path(__file__).resolve().parents[1]).resolve()
+    lifecycle = root / "scripts" / "lifecycle_hook.py"
+    return {
+        "schema_version": 2,
+        "skill_root": str(root),
+        "hooks_sha256": sha256_bytes(hooks_path.read_bytes()),
+        "lifecycle_sha256": sha256_bytes(lifecycle.read_bytes()),
+    }
+
+
+def arm_desktop_canary(
+    controller_session_id: str,
+    *,
+    canary_path: Path = DESKTOP_CANARY_PATH,
+    hooks_path: Path = CODEX_HOOKS_PATH,
+    skill_root: Path | None = None,
+) -> dict[str, Any]:
+    session_id = controller_session_id.strip()
+    if not session_id:
+        raise ValueError("controller session is required to arm desktop canary")
+    identity = _desktop_canary_identity(
+        hooks_path=hooks_path, skill_root=skill_root
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    receipt = {
+        **identity,
+        "status": "armed",
+        "controller_session_id": session_id,
+        "run_id": secrets.token_hex(16),
+        "sequence_index": 0,
+        "observations": [],
+        "armed_at": now,
+        "updated_at": now,
+    }
+    canary_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = canary_path.with_suffix(canary_path.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            write_json(canary_path, receipt)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return receipt
+
+
+def record_desktop_canary_observation(
+    event: dict[str, Any],
+    output: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    canary_path: Path = DESKTOP_CANARY_PATH,
+    hooks_path: Path = CODEX_HOOKS_PATH,
+    skill_root: Path | None = None,
+) -> dict[str, Any]:
+    identity = _desktop_canary_identity(
+        hooks_path=hooks_path, skill_root=skill_root
+    )
+    canary_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = canary_path.with_suffix(canary_path.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            current = load_json(canary_path)
+            if any(current.get(key) != value for key, value in identity.items()):
+                return current
+            if current.get("status") not in {"armed", "pending"}:
+                return current
+            session_id = str(event.get("session_id", "")).strip()
+            if session_id != str(current.get("controller_session_id", "")):
+                return current
+            observations = [
+                str(item) for item in current.get("observations", []) if str(item).strip()
+            ]
+            event_name = str(event.get("hook_event_name", ""))
+            turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
+            decision = output.get("hookSpecificOutput")
+            denied = (
+                isinstance(decision, dict)
+                and decision.get("permissionDecision") == "deny"
+            )
+            index = int(current.get("sequence_index", 0) or 0)
+            observation = ""
+            if index == 0 and event_name == "SessionStart" and turn_id:
+                observation = "session_started"
+                current["first_turn_id"] = turn_id
+            elif index == 1 and event_name == "PreToolUse" and not denied:
+                observation = "pre_tool_allowed"
+            elif index == 2 and event_name == "PostToolUse" and state.get("must_yield") is not True:
+                observation = "post_tool_observed"
+            elif (
+                index == 3
+                and event_name == "PostToolUse"
+                and state.get("must_yield") is True
+                and str(state.get("receipt_turn_id", "")) == turn_id
+            ):
+                observation = "receipt_latched"
+                current["denied_turn_id"] = turn_id
+            elif (
+                index == 4
+                and event_name == "PreToolUse"
+                and denied
+                and turn_id == str(current.get("denied_turn_id", ""))
+            ):
+                observation = "same_turn_denied"
+            elif index == 5 and event_name == "Stop":
+                observation = "stop_observed"
+            elif (
+                index == 6
+                and event_name == "PreToolUse"
+                and not denied
+                and turn_id
+                and turn_id != str(current.get("denied_turn_id", ""))
+            ):
+                observation = "next_turn_allowed"
+            elif index == 7 and event_name == "SubagentStop":
+                observation = "subagent_stop_observed"
+            if observation:
+                observations.append(observation)
+                current["sequence_index"] = index + 1
+                current["status"] = "pending"
+            current["observations"] = observations
+            if int(current.get("sequence_index", 0) or 0) == len(DESKTOP_CANARY_SEQUENCE):
+                current["status"] = "passed"
+                current["completed_at"] = datetime.now(timezone.utc).isoformat()
+            current["last_turn_id"] = turn_id
+            current["updated_at"] = datetime.now(timezone.utc).isoformat()
+            write_json(canary_path, current)
+            return current
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def run_git(root: Path, *args: str) -> str:
@@ -190,7 +520,12 @@ def successful_control_receipt(
     if not isinstance(tool_input, dict):
         return False
     command = str(tool_input.get("command", ""))
-    if "control_event_guard.py" not in command:
+    controller_session_id = str(event.get("controller_session_id", "")).strip()
+    if not _is_control_guard_command(
+        command,
+        controller_session_id=controller_session_id,
+        cwd=event.get("cwd"),
+    ):
         return False
     if snapshot and snapshot.get("candidate_revisions") and "--repo" not in command:
         return False
@@ -374,6 +709,52 @@ def evaluate_event(
     event_host = str(event.get("controller_host", "")).strip()
     state["controller_host"] = event_host if event_host in {"web", "desktop_codex"} else "desktop_codex"
     event_name = event.get("hook_event_name")
+    _begin_turn(state, event)
+    if "must_yield" not in state:
+        state["must_yield"] = False
+    if "tool_trace" not in state:
+        state["tool_trace"] = []
+    if event_name == "PreToolUse":
+        if state.get("must_yield") is True:
+            return _pre_tool_denial(
+                "当前控制事件已经签发成功收据；同一回合必须立即结束，禁止继续调用工具。"
+            ), state
+        inflight = [
+            str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)
+        ]
+        tool_use_id = _tool_use_id(event)
+        tool_input = event.get("tool_input")
+        command = str(tool_input.get("command", "")) if isinstance(tool_input, dict) else ""
+        controller_session_id = str(event.get("controller_session_id", "")).strip()
+        is_guard = _is_control_guard_command(
+            command,
+            controller_session_id=controller_session_id,
+            cwd=event.get("cwd"),
+        )
+        if is_guard and inflight:
+            return _pre_tool_denial(
+                "控制收据必须串行执行；当前仍有已放行工具尚未返回。"
+            ), state
+        if not is_guard and state.get("control_receipt_inflight"):
+            return _pre_tool_denial(
+                "控制收据正在执行；在其 PostToolUse 闭合前禁止并发放行其他工具。"
+            ), state
+        if tool_use_id and tool_use_id not in inflight:
+            inflight.append(tool_use_id)
+        state["inflight_tool_use_ids"] = inflight
+        if is_guard:
+            state["control_receipt_inflight"] = tool_use_id or "unknown"
+        return {}, state
+    if event_name == "PostToolUse":
+        tool_use_id = _tool_use_id(event)
+        state["inflight_tool_use_ids"] = [
+            str(item)
+            for item in state.get("inflight_tool_use_ids", [])
+            if str(item) and str(item) != tool_use_id
+        ]
+        if str(state.get("control_receipt_inflight", "")) == tool_use_id:
+            state.pop("control_receipt_inflight", None)
+    _record_tool_trace(state, event)
     event_next_action = str(event.get("next_action") or "").strip()
     event_requires_user = event.get("requires_user")
     if event_name == "PostToolUse" and event_next_action and isinstance(event_requires_user, bool):
@@ -470,7 +851,10 @@ def evaluate_event(
             state["wake_generation"] = prior_generation + 1
         return {}, state
 
-    if successful_control_receipt(event, snapshot) and not snapshot.get("runnable_ids", snapshot.get("ready_ids")):
+    if successful_control_receipt(event, snapshot):
+        receipt_turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
+        state["must_yield"] = True
+        state["receipt_turn_id"] = receipt_turn_id
         if wake_policy == "after_event" and str(handshake.get("state", "")) == "pending_ack":
             rule_triggers = [item for item in lifecycle_triggers(snapshot, None) if item.startswith("rule_update_pending:")]
             state.update({
@@ -807,7 +1191,11 @@ def run_hook() -> int:
     normalized_event["session_id"] = controller_id
     normalized_event["controller_host"] = DESKTOP_SESSION_HOST
     path = state_path(controller_id)
-    output, _next_state = persist_event_state(path, normalized_event, snapshot)
+    output, next_state = persist_event_state(path, normalized_event, snapshot)
+    try:
+        record_desktop_canary_observation(normalized_event, output, next_state)
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
     if output:
         print(json.dumps(output, ensure_ascii=False))
     return 0
@@ -823,7 +1211,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         nargs=3,
         metavar=("CONTROLLER_ID", "DESKTOP_SESSION_ID", "REPO"),
     )
+    parser.add_argument(
+        "--print-machine-trace",
+        metavar="CONTROLLER_SESSION_ID",
+        help="print the current turn machine trace projection for a control receipt",
+    )
+    parser.add_argument(
+        "--arm-desktop-canary",
+        metavar="CONTROLLER_SESSION_ID",
+        help="arm one ordered live desktop hook canary for the registered controller",
+    )
     args = parser.parse_args(argv)
+    if args.arm_desktop_canary:
+        receipt = arm_desktop_canary(args.arm_desktop_canary)
+        print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.print_machine_trace:
+        state = load_json(state_path(args.print_machine_trace))
+        if state.get("tool_trace_overflow") is True:
+            print(
+                "registered controller machine trace overflowed in the current turn",
+                file=sys.stderr,
+            )
+            return 2
+        projection = machine_trace_projection(state)
+        if not projection.get("turn_id"):
+            print("registered controller has no active turn machine trace", file=sys.stderr)
+            return 2
+        print(json.dumps(projection, ensure_ascii=False, sort_keys=True))
+        return 0
     if args.register_controller:
         session_id, repo = args.register_controller
         root = Path(repo).expanduser().resolve()

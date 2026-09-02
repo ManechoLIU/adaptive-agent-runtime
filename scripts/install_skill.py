@@ -25,6 +25,9 @@ LEGACY_SKILL_IDS = ("adaptive-delivery",)
 DEFAULT_AI_BRIDGE_EXECUTABLE = Path("/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge")
 DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
 DEFAULT_ZSHENV = Path.home() / ".zshenv"
+DEFAULT_DESKTOP_CANARY = (
+    Path.home() / ".codex" / "state" / "adaptive-delivery-desktop-canary.json"
+)
 WEB_BLOCK_START = "# >>> adaptive-delivery web lifecycle bridge >>>"
 WEB_BLOCK_END = "# <<< adaptive-delivery web lifecycle bridge <<<"
 MANIFEST_NAME = ".adaptive-delivery-install.json"
@@ -92,6 +95,90 @@ def _hooks_contain(path: Path, needle: str, *, skill_root: Path | None = None) -
     return False
 
 
+def _hook_event_contains(
+    path: Path, event_name: str, needle: str, *, skill_root: Path | None = None
+) -> bool:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    entries = hooks.get(event_name) if isinstance(hooks, dict) else None
+    if not isinstance(entries, list):
+        return False
+    expected = (skill_root / "scripts" / needle).resolve() if skill_root is not None else None
+    if expected is not None and not expected.is_file():
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            continue
+        for handler in entry["hooks"]:
+            command = handler.get("command") if isinstance(handler, dict) else None
+            if not isinstance(command, str) or needle not in command:
+                continue
+            if expected is None:
+                return True
+            try:
+                tokens = shlex.split(command)
+            except ValueError:
+                continue
+            if len(tokens) >= 2 and Path(tokens[1]).expanduser().resolve() == expected:
+                return True
+    return False
+
+
+DESKTOP_CANARY_SEQUENCE = (
+    "session_started",
+    "pre_tool_allowed",
+    "post_tool_observed",
+    "receipt_latched",
+    "same_turn_denied",
+    "stop_observed",
+    "next_turn_allowed",
+    "subagent_stop_observed",
+)
+DESKTOP_CANARY_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def _valid_desktop_canary(
+    path: Path, *, hooks_path: Path, skill_root: Path | None
+) -> bool:
+    if skill_root is None:
+        return False
+    lifecycle = skill_root / "scripts" / "lifecycle_hook.py"
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        hooks_sha256 = hashlib.sha256(hooks_path.read_bytes()).hexdigest()
+        lifecycle_sha256 = hashlib.sha256(lifecycle.read_bytes()).hexdigest()
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(receipt, dict):
+        return False
+    try:
+        completed_at = datetime.fromisoformat(str(receipt.get("completed_at", "")))
+        if completed_at.tzinfo is None:
+            return False
+        age_seconds = (datetime.now(UTC) - completed_at.astimezone(UTC)).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    if age_seconds < 0 or age_seconds > DESKTOP_CANARY_MAX_AGE_SECONDS:
+        return False
+    observations = receipt.get("observations")
+    return (
+        receipt.get("schema_version") == 2
+        and receipt.get("status") == "passed"
+        and isinstance(receipt.get("controller_session_id"), str)
+        and bool(receipt.get("controller_session_id"))
+        and isinstance(receipt.get("run_id"), str)
+        and len(receipt.get("run_id")) >= 16
+        and receipt.get("sequence_index") == len(DESKTOP_CANARY_SEQUENCE)
+        and receipt.get("skill_root") == str(skill_root.resolve())
+        and receipt.get("hooks_sha256") == hooks_sha256
+        and receipt.get("lifecycle_sha256") == lifecycle_sha256
+        and observations == list(DESKTOP_CANARY_SEQUENCE)
+    )
+
+
 def _zshenv_has_web_bridge(
     path: Path, *, skill_root: Path | None = None, ai_bridge_executable: Path | None = None
 ) -> bool:
@@ -136,6 +223,7 @@ def detect_host_capabilities(
     hooks_file: str | Path = DEFAULT_CODEX_HOOKS,
     zshenv_file: str | Path = DEFAULT_ZSHENV,
     skill_root: str | Path | None = None,
+    desktop_canary_file: str | Path = DEFAULT_DESKTOP_CANARY,
 ) -> dict[str, dict[str, Any]]:
     codex_path = Path(codex_executable).expanduser() if codex_executable else None
     if codex_path is None:
@@ -144,20 +232,47 @@ def detect_host_capabilities(
     bridge_path = Path(ai_bridge_executable).expanduser()
     hooks_path = Path(hooks_file).expanduser()
     zshenv_path = Path(zshenv_file).expanduser()
+    desktop_canary_path = Path(desktop_canary_file).expanduser()
     skill_root_path = Path(skill_root).expanduser().resolve() if skill_root is not None else None
 
     codex_available = bool(codex_path and codex_path.is_file() and os.access(codex_path, os.X_OK))
-    lifecycle_configured = _hooks_contain(hooks_path, "lifecycle_hook.py", skill_root=skill_root_path)
-    scoring_configured = _hooks_contain(hooks_path, "controller_scoring_hook.py", skill_root=skill_root_path)
+    lifecycle_events = {
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "SubagentStop",
+        "Stop",
+    }
+    lifecycle_configured = all(
+        _hook_event_contains(
+            hooks_path, event_name, "lifecycle_hook.py", skill_root=skill_root_path
+        )
+        for event_name in lifecycle_events
+    )
+    scoring_configured = all(
+        _hook_event_contains(
+            hooks_path, event_name, "controller_scoring_hook.py", skill_root=skill_root_path
+        )
+        for event_name in {"UserPromptSubmit", "Stop"}
+    )
+    canary_valid = _valid_desktop_canary(
+        desktop_canary_path, hooks_path=hooks_path, skill_root=skill_root_path
+    )
     if not codex_available:
         desktop = {
             "status": "blocked", "adapter": "codex-native", "configured": False,
             "reason": "codex executable not detected",
         }
+    elif lifecycle_configured and scoring_configured and canary_valid:
+        desktop = {
+            "status": "enabled", "adapter": "codex-native", "configured": True,
+            "reason": "hooks configured and exact live canary receipt verified",
+        }
     elif lifecycle_configured and scoring_configured:
         desktop = {
             "status": "degraded", "adapter": "codex-native", "configured": True,
-            "reason": "hooks configured; host trust/activation still requires verification",
+            "reason": "hooks configured; exact live canary receipt is missing or stale",
         }
     else:
         desktop = {
@@ -251,6 +366,8 @@ def install_codex_hooks(
 
     lifecycle_specs = {
         "SessionStart": ("startup|resume|clear|compact", "Loading Adaptive Agent Runtime controller state", True),
+        "UserPromptSubmit": (None, "Opening Adaptive Agent Runtime control turn", False),
+        "PreToolUse": ("*", "Enforcing Adaptive Agent Runtime turn boundary", False),
         "PostToolUse": ("*", "Checking Adaptive Agent Runtime lifecycle", True),
         "SubagentStop": (None, "Recording Adaptive Agent Runtime candidate", False),
         "Stop": (None, "Closing Adaptive Agent Runtime control event", False),

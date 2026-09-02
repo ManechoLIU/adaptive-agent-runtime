@@ -12,6 +12,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "scripts" / "web_lifecycle_bridge.py"
+GUARD_COMMAND = (
+    f"{sys.executable} scripts/control_event_guard.py event.json "
+    "--ledger TASK_LEDGER.md --repo . --controller-session controller-1"
+)
 _SPEC = importlib.util.spec_from_file_location("web_lifecycle_bridge_under_test", BRIDGE)
 assert _SPEC and _SPEC.loader
 web_bridge = importlib.util.module_from_spec(_SPEC)
@@ -505,7 +509,7 @@ if __name__ == "__main__":
 class WebLifecycleAuditTests(unittest.TestCase):
     def run_bridge(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["/usr/bin/python3", str(BRIDGE), *args],
+            [sys.executable, str(BRIDGE), *args],
             text=True,
             capture_output=True,
             check=False,
@@ -527,9 +531,9 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 "childTool": "shell_command",
                 "state": "succeeded",
                 "rootLabel": str(repo),
-                "targetLabel": "python3 scripts/control_event_guard.py event.json",
+                "targetLabel": GUARD_COMMAND,
                 "detail": (
-                    "命令：python3 scripts/control_event_guard.py event.json"
+                    f"命令：{GUARD_COMMAND}"
                     f" · 工作目录：{repo}\n\n命令输出：\n"
                     "control-event: allowed; declared READY decisions are complete\n"
                 ),
@@ -574,8 +578,8 @@ class WebLifecycleAuditTests(unittest.TestCase):
             audit = root / "audit.jsonl"; cursor = root / "cursor.json"
             receipt = {
                 "receiptId":"guard-lock-1", "childTool":"shell_command", "state":"succeeded",
-                "rootLabel":str(repo), "targetLabel":"python3 scripts/control_event_guard.py event.json",
-                "detail":f"命令：python3 scripts/control_event_guard.py event.json · 工作目录：{repo}\n\n命令输出：\ncontrol-event: allowed; done\n",
+                "rootLabel":str(repo), "targetLabel":GUARD_COMMAND,
+                "detail":f"命令：{GUARD_COMMAND} · 工作目录：{repo}\n\n命令输出：\ncontrol-event: allowed; done\n",
             }
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             lock_path = cursor.with_suffix(cursor.suffix + ".consumer.lock")
@@ -612,8 +616,8 @@ class WebLifecycleAuditTests(unittest.TestCase):
             audit = root / "audit.jsonl"; cursor = root / "cursor.json"
             receipt = {
                 "receiptId":"guard-fail-1", "childTool":"shell_command", "state":"succeeded",
-                "rootLabel":str(repo), "targetLabel":"python3 scripts/control_event_guard.py event.json",
-                "detail":f"命令：python3 scripts/control_event_guard.py event.json · 工作目录：{repo}\n\n命令输出：\ncontrol-event: allowed; done\n",
+                "rootLabel":str(repo), "targetLabel":GUARD_COMMAND,
+                "detail":f"命令：{GUARD_COMMAND} · 工作目录：{repo}\n\n命令输出：\ncontrol-event: allowed; done\n",
             }
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             args = ["audit-once", "--session-id", "controller-1", "--repo", str(repo),
@@ -747,9 +751,9 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 "childTool": "shell_command",
                 "state": "succeeded",
                 "rootLabel": str(repo),
-                "targetLabel": "python3 scripts/control_event_guard.py event.json --repo .",
+                "targetLabel": GUARD_COMMAND,
                 "detail": (
-                    "命令：python3 scripts/control_event_guard.py event.json --repo ."
+                    f"命令：{GUARD_COMMAND}"
                     f" · 工作目录：{repo}\n\n命令输出：\n"
                     "control-event: allowed; declared decisions are complete\n"
                 ),
@@ -2142,8 +2146,8 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-capture-retry-1", "childTool": "shell_command", "state": "succeeded",
-                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
-                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+                "rootLabel": str(repo), "targetLabel": GUARD_COMMAND,
+                "detail": f"命令：{GUARD_COMMAND}\n\n命令输出：\ncontrol-event: allowed\n",
             }
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             cursor = root / "cursor.json"
@@ -2184,8 +2188,8 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-only-capture-1", "childTool": "shell_command", "state": "succeeded",
-                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
-                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+                "rootLabel": str(repo), "targetLabel": GUARD_COMMAND,
+                "detail": f"命令：{GUARD_COMMAND}\n\n命令输出：\ncontrol-event: allowed\n",
             }
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             cursor = root / "cursor.json"
@@ -2239,8 +2243,8 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-generation-1", "childTool": "shell_command", "state": "succeeded",
-                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
-                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+                "rootLabel": str(repo), "targetLabel": GUARD_COMMAND,
+                "detail": f"命令：{GUARD_COMMAND}\n\n命令输出：\ncontrol-event: allowed\n",
             }
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             cursor = root / "cursor.json"
@@ -2376,8 +2380,8 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-retry-1", "childTool": "shell_command", "state": "succeeded",
-                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
-                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+                "rootLabel": str(repo), "targetLabel": GUARD_COMMAND,
+                "detail": f"命令：{GUARD_COMMAND}\n\n命令输出：\ncontrol-event: allowed\n",
             }
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             cursor = root / "cursor.json"
@@ -2414,8 +2418,8 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-none-1", "childTool": "shell_command", "state": "succeeded",
-                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
-                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+                "rootLabel": str(repo), "targetLabel": GUARD_COMMAND,
+                "detail": f"命令：{GUARD_COMMAND}\n\n命令输出：\ncontrol-event: allowed\n",
             }
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             cursor = root / "cursor.json"
@@ -2441,8 +2445,8 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-fail-1", "childTool": "shell_command", "state": "succeeded",
-                "rootLabel": str(repo), "targetLabel": "python3 scripts/control_event_guard.py receipt.json --repo .",
-                "detail": "命令：python3 scripts/control_event_guard.py receipt.json --repo .\n\n命令输出：\ncontrol-event: allowed\n",
+                "rootLabel": str(repo), "targetLabel": GUARD_COMMAND,
+                "detail": f"命令：{GUARD_COMMAND}\n\n命令输出：\ncontrol-event: allowed\n",
             }
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             cursor = root / "cursor.json"

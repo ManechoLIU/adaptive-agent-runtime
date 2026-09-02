@@ -1153,11 +1153,11 @@ def successful_guard_event_from_receipt(
     )
     if event is None:
         return None
-    command = str(event["tool_input"].get("command", ""))
-    output = str(event["tool_response"].get("output", ""))
-    if "control_event_guard.py" not in command:
-        return None
-    if "control-event: allowed" not in output:
+    try:
+        from lifecycle_hook import successful_control_receipt
+    except ModuleNotFoundError:
+        from scripts.lifecycle_hook import successful_control_receipt
+    if not successful_control_receipt(event):
         return None
     return event
 

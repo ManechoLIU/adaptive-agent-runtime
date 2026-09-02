@@ -285,18 +285,21 @@ python3 scripts/lint_governance.py --strict /path/to/project
 python3 scripts/control_event_guard.py \
   --ledger /path/to/project/TASK_LEDGER.md \
   --repo /path/to/project \
+  --controller-session <registered-controller-session> \
   --require-review UX-EARLY \
   --rule-revision abc123 --affected-task writer-1 \
   control-event.json
 ```
 
-该 JSON 只在当前事件中使用，不进入项目台账。除当前台账 SHA-256、全部 `READY` 决定和显式声明的 Reviewer / 规则 ACK 外，还要带宿主容量投影 `capacity_projection`、本轮 `event_contract`、`event_actions`、`terminal_receipt_issued=true`、全部未合入 worktree 的 `candidate_packages` 决定与本轮 `new_assignments`。脚本会从总容量与 `ACTIVE / RECOVERING` 占用重算 `available_slots`，复核整条动作链是否仍属于同一主任务和候选 revision，并直接用 Git 对账候选是否遗漏；每个新 Assignment 必须冻结执行模式、文件所有权和绑定真实项目规则 SHA 的路由，root 自写和 fallback 都需要结构化例外证据。延后 `READY` 必须使用结构化 `reason_code`，不能用“下一事件”或“稍后处理”留下空槽。门禁通过后删除临时输入，不新增治理文档。
+该 JSON 只在当前事件中使用，不进入项目台账。除当前台账 SHA-256、全部 `READY` 决定和显式声明的 Reviewer / 规则 ACK 外，还要带宿主容量投影 `capacity_projection`、本轮 `event_contract`、`event_actions`、`terminal_receipt_issued=true`、全部未合入 worktree 的 `candidate_packages` 决定与本轮 `new_assignments`。registered controller 先运行 `python3 scripts/lifecycle_hook.py --print-machine-trace <controller-session>` 取得当前投影，再把原样结果放入 `machine_trace`；其 `turn_id / tool_use_ids / trace_sha256` 必须与 lifecycle state 的真实工具轨迹一致，省略 `--controller-session` 或遗漏调用均直接拒绝。实际调用 `control_event_guard.py` 时必须使用 Hook 配置中的同一 Python 解释器和安装副本内的精确 Guard 路径，不接受同名脚本、替代解释器或 shell 拼接。脚本会从总容量与 `ACTIVE / RECOVERING` 占用重算 `available_slots`，复核整条动作链是否仍属于同一主任务和候选 revision，并直接用 Git 对账候选是否遗漏；每个新 Assignment 必须冻结执行模式、文件所有权和绑定真实项目规则 SHA 的路由，root 自写和 fallback 都需要结构化例外证据。延后 `READY` 必须使用结构化 `reason_code`，不能用“下一事件”或“稍后处理”留下空槽。门禁通过后删除临时输入，不新增治理文档。
 
 ### 让控制事件自动触发，而不是等总控想起来
 
 `scripts/lifecycle_hook.py` 把持续总控的控制事件接到 Codex 生命周期：
 
 - `SessionStart`：读取 canonical `main` 与唯一台账基线，并立即暴露台账一致性错误；
+- `UserPromptSubmit`：建立新的 `turn_id`，解除上一回合的 yield 锁；
+- `PreToolUse`：成功控制收据后，同一回合的下一次工具调用在执行前被拒绝；
 - `PostToolUse`：主线、工作区、台账、`READY` 或任一 worktree 未合入候选改变后立即给总控追加控制上下文；
 - `SubagentStop`：把子 Agent 完成登记为待审候选事件；
 - `Stop`：仍有待处理事件且没有通过的控制收据时，每一次原生 `Stop` 都返回 block；重复 Stop 不能成为逃生口，只有既有闭合收据、真正用户依赖或可验证阻塞才能释放 pending。
@@ -308,7 +311,7 @@ python3 ~/.agents/skills/adaptive-agent-runtime/scripts/lifecycle_hook.py \
   --register-controller <controller-session-id> /path/to/canonical/main
 ```
 
-然后在 `~/.codex/hooks.json` 合并四个 command handler，命令都指向安装副本的 `scripts/lifecycle_hook.py`：`SessionStart`、`PostToolUse`（matcher `*`）、`SubagentStop` 和 `Stop`。Codex 的非托管 Hook 还必须在 CLI 的 `/hooks` 中审核并信任精确定义；未显示 Active 就不能声称自动门禁已生效。
+然后在 `~/.codex/hooks.json` 合并六个 command handler，命令都指向安装副本的 `scripts/lifecycle_hook.py`：`SessionStart`、`UserPromptSubmit`、`PreToolUse`（matcher `*`）、`PostToolUse`（matcher `*`）、`SubagentStop` 和 `Stop`。Codex 的非托管 Hook 还必须在 CLI 的 `/hooks` 中审核并信任精确定义。信任后先运行 `python3 ~/.agents/skills/adaptive-agent-runtime/scripts/lifecycle_hook.py --arm-desktop-canary <controller-session-id>`，再从新会话按顺序完成会话启动、普通工具前后事件、成功收据锁、同回合拒绝、Stop、新回合放行和 SubagentStop。Canary 绑定当前 Hook / lifecycle 哈希、单一 Controller、随机 run ID 和严格事件顺序；不能跨会话拼接。安装器只有在该 8 步收据 24 小时内完整通过时才报告 `desktop_adapter=enabled`，其余情况保持 `degraded`。
 
 总控履职评分另有独立的机器门。安装副本就绪后执行：
 
@@ -414,7 +417,7 @@ python3 scripts/install_skill.py \
   --stop-condition "installation verified"
 ```
 
-安装器把主 Skill ID 记录为 `adaptive-agent-runtime`，但机器状态路径继续使用 `adaptive-delivery`。全新安装默认进入 `~/.agents/skills/adaptive-agent-runtime`；检测到既有 `~/.agents/skills/adaptive-delivery` 安装时原地升级，避免重复发现和双运行时。安装目录属于机器管理内容：安装时先冻结精确 HEAD revision，再只从该 commit 的 Git objects 重建同目录 staging，校验 hash 后整体替换，因此旧版/缺失 manifest 也不会把已删除的陈旧脚本带进新安装；后续即使源工作树或 HEAD 并发变化，也不会让 manifest revision 与实际安装文件错配。检测到 Codex 时会幂等合并 lifecycle + scoring hooks；检测到 AI-Bridge 时会幂等安装 Web shell bridge；已有 Hook 和 `.zshenv` 其他内容不会被覆盖。默认的一键安装把目标 Skill、hooks 与 `.zshenv` 视为同一安装事务：从安装前快照、精确 revision staging、Host Adapter 配置到 commit/rollback 全程按确定顺序同时锁住目标 Skill、hooks 与 `.zshenv` 三类共享资源，`--no-configure-host-adapters` 也不能绕过；即使两个安装使用不同 target，只要共享 Host Adapter 配置文件也会互斥，并发安装会直接 fail closed，不会互相覆盖或用陈旧快照回滚成功安装。任一 Host Adapter 配置失败会恢复三者的安装前快照并以非零状态阻塞，不会把部分激活配置当作 degraded success。Codex 非托管 Hook 的 **Active / trusted** 仍必须由宿主自身确认，因此即使配置已写入，能力报告在无法机器验证 trust 时仍为 `degraded`，不会虚报完全启用。没有 AI-Bridge 时安装本身仍成功，Web 本地能力明确降级为 `pure_web_file`。副作用恢复同样 fail closed：同一 attempt 的首个 terminal receipt 一旦持久化，后续 heartbeat/progress/第二个 terminal 都不能改写；成功完成且 delivery PASS 的 Assignment 不能再次打开 recovery attempt。任何副作用终态（包括 PASS）若要把 `result_unknown` 清为 false，都必须附带结构化 provider/resource `reconciliation_evidence`：每条证据分别声明与 runtime 完全一致的 `provider`、非空具体 `resource`、可追溯 `receipt:`/`artifact:` `locator`，以及与 Assignment 完全相等的 `idempotency_key`（没有 key 时不得凭空引入）；前缀/子串匹配、普通 file/git 证据或执行方自报都不能解除安全锁。如只需要复制 Core、明确不希望安装器修改宿主配置，可加 `--no-configure-host-adapters`。
+安装器把主 Skill ID 记录为 `adaptive-agent-runtime`，但机器状态路径继续使用 `adaptive-delivery`。全新安装默认进入 `~/.agents/skills/adaptive-agent-runtime`；检测到既有 `~/.agents/skills/adaptive-delivery` 安装时原地升级，避免重复发现和双运行时。安装目录属于机器管理内容：安装时先冻结精确 HEAD revision，再只从该 commit 的 Git objects 重建同目录 staging，校验 hash 后整体替换，因此旧版/缺失 manifest 也不会把已删除的陈旧脚本带进新安装；后续即使源工作树或 HEAD 并发变化，也不会让 manifest revision 与实际安装文件错配。检测到 Codex 时会幂等合并 lifecycle + scoring hooks；检测到 AI-Bridge 时会幂等安装 Web shell bridge；已有 Hook 和 `.zshenv` 其他内容不会被覆盖。默认的一键安装把目标 Skill、hooks 与 `.zshenv` 视为同一安装事务：从安装前快照、精确 revision staging、Host Adapter 配置到 commit/rollback 全程按确定顺序同时锁住目标 Skill、hooks 与 `.zshenv` 三类共享资源，`--no-configure-host-adapters` 也不能绕过；即使两个安装使用不同 target，只要共享 Host Adapter 配置文件也会互斥，并发安装会直接 fail closed，不会互相覆盖或用陈旧快照回滚成功安装。任一 Host Adapter 配置失败会恢复三者的安装前快照并以非零状态阻塞，不会把部分激活配置当作 degraded success。Codex 非托管 Hook 的 **Active / trusted** 与当前安装的实机生效验证都必须成立；配置已写入但任一证明缺失时，能力报告保持 `degraded`，不会虚报完全启用。没有 AI-Bridge 时安装本身仍成功，Web 本地能力明确降级为 `pure_web_file`。副作用恢复同样 fail closed：同一 attempt 的首个 terminal receipt 一旦持久化，后续 heartbeat/progress/第二个 terminal 都不能改写；成功完成且 delivery PASS 的 Assignment 不能再次打开 recovery attempt。任何副作用终态（包括 PASS）若要把 `result_unknown` 清为 false，都必须附带结构化 provider/resource `reconciliation_evidence`：每条证据分别声明与 runtime 完全一致的 `provider`、非空具体 `resource`、可追溯 `receipt:`/`artifact:` `locator`，以及与 Assignment 完全相等的 `idempotency_key`（没有 key 时不得凭空引入）；前缀/子串匹配、普通 file/git 证据或执行方自报都不能解除安全锁。如只需要复制 Core、明确不希望安装器修改宿主配置，可加 `--no-configure-host-adapters`。
 
 ### Codex
 

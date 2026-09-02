@@ -700,6 +700,7 @@ def validate_snapshot(
     ledger_goal_ids: set[str] | None = None,
     ledger_work_in_flight: dict[str, str] | None = None,
     derived_runnable_ids: set[str] | None = None,
+    expected_machine_trace: dict[str, Any] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     contract = snapshot.get("event_contract")
@@ -722,6 +723,16 @@ def validate_snapshot(
                 )
     if snapshot.get("terminal_receipt_issued") is not True:
         errors.append("terminal_receipt_issued=true is required")
+    if expected_machine_trace is not None:
+        declared_trace = snapshot.get("machine_trace")
+        if not isinstance(declared_trace, dict):
+            errors.append("machine_trace is required for a registered controller receipt")
+        else:
+            for field in ("turn_id", "tool_use_ids", "trace_sha256"):
+                if declared_trace.get(field) != expected_machine_trace.get(field):
+                    errors.append(
+                        f"machine_trace.{field} does not match the observed controller tool trace"
+                    )
 
     liveness = snapshot.get("assignment_liveness", {})
     if liveness is not None and not isinstance(liveness, dict):
@@ -936,24 +947,31 @@ def validate_snapshot(
 
 
 def canonical_rule_handshake_errors(
-    repo: Path, ledger: Path, *, snapshot: dict[str, Any] | None = None
+    repo: Path,
+    ledger: Path,
+    *,
+    snapshot: dict[str, Any] | None = None,
+    handshake_evaluator: Any | None = None,
+    wake_policy_resolver: Any | None = None,
 ) -> list[str]:
     try:
-        try:
-            from rule_handshake import evaluate_rule_handshake
-        except ModuleNotFoundError:
-            from scripts.rule_handshake import evaluate_rule_handshake
-        status = evaluate_rule_handshake(repo, ledger=ledger)
+        if handshake_evaluator is None:
+            try:
+                from rule_handshake import evaluate_rule_handshake as handshake_evaluator
+            except ModuleNotFoundError:
+                from scripts.rule_handshake import evaluate_rule_handshake as handshake_evaluator
+        status = handshake_evaluator(repo, ledger=ledger)
     except (OSError, ValueError) as error:
         return [f"rule handshake integrity check failed: {error}"]
     if status.get("blocking") is True:
         try:
-            try:
-                from rule_handshake import derive_rule_wake_policy
-            except ModuleNotFoundError:
-                from scripts.rule_handshake import derive_rule_wake_policy
+            if wake_policy_resolver is None:
+                try:
+                    from rule_handshake import derive_rule_wake_policy as wake_policy_resolver
+                except ModuleNotFoundError:
+                    from scripts.rule_handshake import derive_rule_wake_policy as wake_policy_resolver
             event_snapshot = snapshot if isinstance(snapshot, dict) else {}
-            wake_policy = derive_rule_wake_policy(
+            wake_policy = wake_policy_resolver(
                 status, assignment_liveness=event_snapshot.get("assignment_liveness", {})
             )
             new_assignments = event_snapshot.get("new_assignments", [])
@@ -977,6 +995,77 @@ def load_snapshot(path: str) -> dict[str, Any]:
     return data
 
 
+def observed_machine_trace_from_state(state: dict[str, Any]) -> dict[str, Any]:
+    if state.get("tool_trace_overflow") is True:
+        raise ValueError("registered controller machine trace overflowed in the current turn")
+    try:
+        from lifecycle_hook import machine_trace_projection
+    except ModuleNotFoundError:
+        from scripts.lifecycle_hook import machine_trace_projection
+    projection = machine_trace_projection(state)
+    if not projection.get("turn_id"):
+        raise ValueError("registered controller has no active turn machine trace")
+    return projection
+
+
+def observed_machine_trace(
+    controller_session: str,
+    *,
+    state_root: Path | None = None,
+) -> dict[str, Any]:
+    try:
+        from lifecycle_hook import load_json, state_path
+    except ModuleNotFoundError:
+        from scripts.lifecycle_hook import load_json, state_path
+
+    session_id = controller_session.strip()
+    if not session_id:
+        raise ValueError("controller session is required for machine trace validation")
+    path = state_path(session_id)
+    if state_root is not None:
+        path = state_root / path.name
+    state = load_json(path)
+    return observed_machine_trace_from_state(state)
+
+
+def resolve_controller_trace_session(
+    repo: Path,
+    declared_session: str | None,
+    *,
+    registry_path: Path | None = None,
+) -> str | None:
+    try:
+        from lifecycle_hook import REGISTRY_PATH, load_json
+    except ModuleNotFoundError:
+        from scripts.lifecycle_hook import REGISTRY_PATH, load_json
+
+    root = repo.expanduser().resolve()
+    registry = load_json(registry_path or REGISTRY_PATH)
+    owners = sorted(
+        session_id
+        for session_id, registered_path in registry.items()
+        if isinstance(session_id, str)
+        and not session_id.startswith("__")
+        and isinstance(registered_path, str)
+        and Path(registered_path).expanduser().resolve() == root
+    )
+    declared = str(declared_session or "").strip()
+    if len(owners) > 1:
+        raise ValueError("canonical repository has ambiguous registered controllers")
+    if not owners:
+        if declared:
+            raise ValueError("--controller-session is not registered for this repository")
+        return None
+    owner = owners[0]
+    if not declared:
+        raise ValueError(
+            f"registered controller receipt requires --controller-session {owner}"
+        )
+    if declared != owner:
+        raise ValueError("--controller-session does not own this canonical repository")
+    return owner
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -995,6 +1084,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--repo",
         help="canonical repository; when set, every unmerged worktree candidate must receive a decision",
+    )
+    parser.add_argument(
+        "--controller-session",
+        help="registered controller session whose observed tool trace must match this receipt",
     )
     parser.add_argument(
         "--affected-task",
@@ -1024,6 +1117,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             if repo_root and main_revision
             else None
         )
+        trace_session = (
+            resolve_controller_trace_session(repo_root, args.controller_session)
+            if repo_root is not None
+            else str(args.controller_session or "").strip() or None
+        )
+        expected_machine_trace = (
+            observed_machine_trace(trace_session) if trace_session else None
+        )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"control-event: invalid snapshot: {error}")
         return 2
@@ -1042,6 +1143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ledger_goal_ids=goal_ids,
         ledger_work_in_flight=work_in_flight,
         derived_runnable_ids=derived_runnable_ids,
+        expected_machine_trace=expected_machine_trace,
     )
     if repo_root is not None:
         errors.extend(canonical_rule_handshake_errors(repo_root, ledger, snapshot=snapshot))

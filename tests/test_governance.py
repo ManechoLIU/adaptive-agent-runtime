@@ -613,32 +613,32 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertEqual(policy, "next_turn")
 
     def test_after_event_rule_update_allows_current_control_receipt_without_new_assignment(self) -> None:
-        from unittest.mock import patch
-        with patch("scripts.rule_handshake.evaluate_rule_handshake", return_value={
+        status = {
             "state": "pending_ack", "blocking": True, "impact": "live_assignments",
             "installed_revision": "rev-new", "changed_files": ["references/context-governance.md"],
-        }):
-            self.assertEqual(
-                control_event_guard.canonical_rule_handshake_errors(
-                    Path("."), Path("TASK_LEDGER.md"),
-                    snapshot={"assignment_liveness": {}, "new_assignments": []},
-                ),
-                [],
-            )
+        }
+        self.assertEqual(
+            control_event_guard.canonical_rule_handshake_errors(
+                Path("."), Path("TASK_LEDGER.md"),
+                snapshot={"assignment_liveness": {}, "new_assignments": []},
+                handshake_evaluator=lambda *_args, **_kwargs: status,
+            ),
+            [],
+        )
 
     def test_immediate_rule_update_still_blocks_current_control_receipt(self) -> None:
-        from unittest.mock import patch
-        with patch("scripts.rule_handshake.evaluate_rule_handshake", return_value={
+        status = {
             "state": "pending_ack", "blocking": True, "impact": "live_assignments",
             "installed_revision": "rev-new", "changed_files": ["scripts/run_external_agent.mjs"],
-        }):
-            errors = control_event_guard.canonical_rule_handshake_errors(
-                Path("."), Path("TASK_LEDGER.md"),
-                snapshot={
-                    "assignment_liveness": {"T1": {"ledger_state": "ACTIVE", "state": "healthy"}},
-                    "new_assignments": [],
-                },
-            )
+        }
+        errors = control_event_guard.canonical_rule_handshake_errors(
+            Path("."), Path("TASK_LEDGER.md"),
+            snapshot={
+                "assignment_liveness": {"T1": {"ledger_state": "ACTIVE", "state": "healthy"}},
+                "new_assignments": [],
+            },
+            handshake_evaluator=lambda *_args, **_kwargs: status,
+        )
         self.assertIn("rule handshake pending_ack for installed revision rev-new", errors)
 
     def test_next_turn_rule_update_does_not_interrupt_existing_post_tool_event(self) -> None:
@@ -724,7 +724,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             {
                 "hook_event_name": "PostToolUse",
                 "session_id": "controller-1",
-                "tool_input": {"command": "python3 scripts/control_event_guard.py receipt.json --repo ."},
+                "tool_input": {"command": "python3 scripts/control_event_guard.py receipt.json --ledger TASK_LEDGER.md --repo ."},
                 "tool_response": {"output": "control-event: allowed", "exit_code": 0},
             },
             snapshot=snapshot,
@@ -775,7 +775,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         _, closed = lifecycle_hook.evaluate_event(
             {
                 "hook_event_name": "PostToolUse", "session_id": "controller-1",
-                "tool_input": {"command": "python3 scripts/control_event_guard.py receipt.json --repo ."},
+                "tool_input": {"command": "python3 scripts/control_event_guard.py receipt.json --ledger TASK_LEDGER.md --repo ."},
                 "tool_response": {"output": "control-event: allowed", "exit_code": 0},
             }, snapshot=snapshot, prior_state=pending,
         )
@@ -812,11 +812,13 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertTrue(state["pending_control_event"]); self.assertIn("active_lease_expired:F1", state["triggers"]); self.assertIn("active_lease_expired:F1", str(output))
 
     def test_control_event_guard_blocks_canonical_pending_rule_handshake(self) -> None:
-        from unittest.mock import patch
-        with patch("scripts.rule_handshake.evaluate_rule_handshake", return_value={
+        status = {
             "state": "pending_ack", "blocking": True, "installed_revision": "rev-new"
-        }):
-            errors = control_event_guard.canonical_rule_handshake_errors(Path("."), Path("TASK_LEDGER.md"))
+        }
+        errors = control_event_guard.canonical_rule_handshake_errors(
+            Path("."), Path("TASK_LEDGER.md"),
+            handshake_evaluator=lambda *_args, **_kwargs: status,
+        )
         self.assertIn("rule handshake pending_ack for installed revision rev-new", errors)
 
     def test_control_event_guard_blocks_stale_active_runtime(self) -> None:
@@ -2620,14 +2622,14 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         )
         self.assertEqual(errors, [])
 
-    def test_successful_control_receipt_does_not_clear_derived_runnable(self) -> None:
+    def test_successful_control_receipt_closes_the_event_and_latches_yield(self) -> None:
         snapshot = {
             "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
             "ready_ids": [], "runnable_ids": ["PENDING-RUNNABLE"], "candidate_revisions": [],
             "rule_handshake": {"state": "current", "blocking": False},
         }
         event = {
-            "hook_event_name": "PostToolUse", "session_id": "s",
+            "hook_event_name": "PostToolUse", "session_id": "s", "turn_id": "turn-1",
             "tool_input": {"command": "python3 control_event_guard.py receipt --ledger TASK_LEDGER.md"},
             "tool_response": {"exit_code": 0, "stdout": "control-event: allowed"},
         }
@@ -2635,8 +2637,10 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             event, snapshot=snapshot,
             prior_state={"pending_control_event": True, "triggers": ["RUNNABLE:PENDING-RUNNABLE"], "snapshot": snapshot},
         )
-        self.assertTrue(state["pending_control_event"])
-        self.assertIn("RUNNABLE:PENDING-RUNNABLE", state["triggers"])
+        self.assertFalse(state["pending_control_event"])
+        self.assertEqual(state["triggers"], [])
+        self.assertTrue(state["must_yield"])
+        self.assertEqual(state["receipt_turn_id"], "turn-1")
 
     def test_preblock_guard_rejects_derived_runnable_pending_package(self) -> None:
         snapshot = {

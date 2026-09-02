@@ -6,6 +6,135 @@ from scripts.install_skill import detect_host_capabilities
 
 
 class InstallCapabilityTests(unittest.TestCase):
+    def test_desktop_adapter_is_enabled_only_by_an_exact_live_canary_receipt(self):
+        import hashlib
+        import json
+        from datetime import datetime, timezone
+
+        from scripts.install_skill import install_codex_hooks
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            codex = root / "codex"
+            codex.write_text("#!/bin/sh\n", encoding="utf-8")
+            codex.chmod(0o755)
+            skill_root = root / "adaptive-delivery"
+            (skill_root / "scripts").mkdir(parents=True)
+            for name in ("lifecycle_hook.py", "controller_scoring_hook.py"):
+                script = skill_root / "scripts" / name
+                script.write_text(f"#!/usr/bin/env python3\n# {name}\n", encoding="utf-8")
+                script.chmod(0o755)
+            hooks = root / "hooks.json"
+            install_codex_hooks(hooks, skill_root, python_executable="/usr/bin/python3")
+            canary = root / "desktop-canary.json"
+            receipt = {
+                "schema_version": 2,
+                "status": "passed",
+                "controller_session_id": "controller-1",
+                "run_id": "0123456789abcdef0123456789abcdef",
+                "sequence_index": 8,
+                "skill_root": str(skill_root.resolve()),
+                "hooks_sha256": hashlib.sha256(hooks.read_bytes()).hexdigest(),
+                "lifecycle_sha256": hashlib.sha256(
+                    (skill_root / "scripts" / "lifecycle_hook.py").read_bytes()
+                ).hexdigest(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "observations": [
+                    "session_started",
+                    "pre_tool_allowed",
+                    "post_tool_observed",
+                    "receipt_latched",
+                    "same_turn_denied",
+                    "stop_observed",
+                    "next_turn_allowed",
+                    "subagent_stop_observed",
+                ],
+            }
+            canary.write_text(json.dumps(receipt), encoding="utf-8")
+
+            report = detect_host_capabilities(
+                codex_executable=codex,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=hooks,
+                zshenv_file=root / ".zshenv",
+                skill_root=skill_root,
+                desktop_canary_file=canary,
+            )
+
+            self.assertEqual(report["desktop_adapter"]["status"], "enabled")
+
+            hooks.write_text(hooks.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            stale = detect_host_capabilities(
+                codex_executable=codex,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=hooks,
+                zshenv_file=root / ".zshenv",
+                skill_root=skill_root,
+                desktop_canary_file=canary,
+            )
+            self.assertEqual(stale["desktop_adapter"]["status"], "degraded")
+            self.assertIn("canary", stale["desktop_adapter"]["reason"].lower())
+
+    def test_desktop_adapter_rejects_an_expired_canary_receipt(self):
+        import hashlib
+        import json
+
+        from scripts.install_skill import install_codex_hooks
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            codex = root / "codex"
+            codex.write_text("#!/bin/sh\n", encoding="utf-8")
+            codex.chmod(0o755)
+            skill_root = root / "adaptive-delivery"
+            (skill_root / "scripts").mkdir(parents=True)
+            for name in ("lifecycle_hook.py", "controller_scoring_hook.py"):
+                script = skill_root / "scripts" / name
+                script.write_text(f"#!/usr/bin/env python3\n# {name}\n", encoding="utf-8")
+                script.chmod(0o755)
+            hooks = root / "hooks.json"
+            install_codex_hooks(hooks, skill_root, python_executable="/usr/bin/python3")
+            canary = root / "desktop-canary.json"
+            canary.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "status": "passed",
+                        "controller_session_id": "controller-1",
+                        "run_id": "0123456789abcdef0123456789abcdef",
+                        "sequence_index": 8,
+                        "skill_root": str(skill_root.resolve()),
+                        "hooks_sha256": hashlib.sha256(hooks.read_bytes()).hexdigest(),
+                        "lifecycle_sha256": hashlib.sha256(
+                            (skill_root / "scripts" / "lifecycle_hook.py").read_bytes()
+                        ).hexdigest(),
+                        "completed_at": "2020-01-01T00:00:00+00:00",
+                        "observations": [
+                                "session_started",
+                                "pre_tool_allowed",
+                                "post_tool_observed",
+                                "receipt_latched",
+                                "same_turn_denied",
+                                "stop_observed",
+                                "next_turn_allowed",
+                                "subagent_stop_observed",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = detect_host_capabilities(
+                codex_executable=codex,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=hooks,
+                zshenv_file=root / ".zshenv",
+                skill_root=skill_root,
+                desktop_canary_file=canary,
+            )
+
+        self.assertEqual(report["desktop_adapter"]["status"], "degraded")
+
     def test_capability_report_degrades_cleanly_without_ai_bridge(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -352,8 +481,13 @@ class HostAdapterInstallationTests(unittest.TestCase):
             self.assertEqual(len([x for x in config["hooks"]["Stop"] if "echo keep" in str(x)]), 1)
             self.assertEqual(len([x for x in config["hooks"]["Stop"] if "lifecycle_hook.py" in str(x)]), 1)
             self.assertEqual(len([x for x in config["hooks"]["Stop"] if "controller_scoring_hook.py" in str(x)]), 1)
-            for event in ("SessionStart", "PostToolUse", "SubagentStop", "UserPromptSubmit"):
+            for event in ("SessionStart", "PreToolUse", "PostToolUse", "SubagentStop", "UserPromptSubmit"):
                 self.assertIn(event, config["hooks"])
+            self.assertEqual(
+                sum("lifecycle_hook.py" in str(entry) for entry in config["hooks"]["UserPromptSubmit"]),
+                1,
+            )
+            self.assertIn('"matcher": "*"', json.dumps(config["hooks"]["PreToolUse"]))
             self.assertIn('"matcher": "*"', json.dumps(config["hooks"]["PostToolUse"]))
 
     def test_codex_hook_install_preserves_other_handlers_inside_same_group(self):
@@ -446,7 +580,7 @@ class HostAdapterInstallationTests(unittest.TestCase):
             )
 
             self.assertEqual(report["desktop_adapter"]["status"], "degraded")
-            self.assertIn("trust", report["desktop_adapter"]["reason"])
+            self.assertIn("canary", report["desktop_adapter"]["reason"].lower())
             self.assertEqual(report["web_local_adapter"]["status"], "enabled")
             self.assertTrue(hooks.is_file())
             self.assertTrue(zshenv.is_file())
