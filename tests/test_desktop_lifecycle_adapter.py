@@ -89,6 +89,103 @@ class DesktopLifecycleTurnGateTests(unittest.TestCase):
         self.assertIn("同一回合", decision["permissionDecisionReason"])
         self.assertTrue(next_state["must_yield"])
 
+    def test_update_goal_blocked_is_denied_without_project_block_receipt(self) -> None:
+        output, _state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "controller-1",
+                "turn_id": "turn-1",
+                "tool_name": "update_goal",
+                "tool_use_id": "goal-block",
+                "tool_input": {"status": "blocked"},
+            },
+            snapshot=self.snapshot(),
+            prior_state={"active_turn_id": "turn-1"},
+        )
+
+        decision = output["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("project_blocked", decision["permissionDecisionReason"])
+
+    def test_project_block_receipt_authorizes_one_goal_block_in_the_same_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            receipt_path = Path(directory) / "receipt.json"
+            receipt_path.write_text(
+                json.dumps({"goal_rollover": {"status": "project_blocked"}}),
+                encoding="utf-8",
+            )
+            command = (
+                f"{sys.executable} scripts/control_event_guard.py {receipt_path} "
+                "--ledger TASK_LEDGER.md --repo . "
+                "--controller-session controller-1"
+            )
+            pre_output, pre_state = lifecycle_hook.evaluate_event(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "controller-1",
+                    "controller_session_id": "controller-1",
+                    "turn_id": "turn-1",
+                    "tool_name": "exec_command",
+                    "tool_use_id": "receipt-call",
+                    "tool_input": {"command": command},
+                },
+                snapshot=self.snapshot(),
+                prior_state={
+                    "pending_control_event": True,
+                    "triggers": ["project_block_requested"],
+                    "active_turn_id": "turn-1",
+                },
+            )
+            self.assertEqual(pre_output, {})
+
+            _post_output, receipt_state = lifecycle_hook.evaluate_event(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "session_id": "controller-1",
+                    "controller_session_id": "controller-1",
+                    "turn_id": "turn-1",
+                    "tool_name": "exec_command",
+                    "tool_use_id": "receipt-call",
+                    "tool_input": {"command": command},
+                    "tool_response": {
+                        "output": "control-event: allowed",
+                        "exit_code": 0,
+                    },
+                },
+                snapshot=self.snapshot(),
+                prior_state=pre_state,
+            )
+
+            allowed, allowed_state = lifecycle_hook.evaluate_event(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "controller-1",
+                    "turn_id": "turn-1",
+                    "tool_name": "functions.update_goal",
+                    "tool_use_id": "goal-block",
+                    "tool_input": {"status": "blocked"},
+                },
+                snapshot=self.snapshot(),
+                prior_state=receipt_state,
+            )
+            self.assertEqual(allowed, {})
+
+            denied, _denied_state = lifecycle_hook.evaluate_event(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "controller-1",
+                    "turn_id": "turn-1",
+                    "tool_name": "update_goal",
+                    "tool_use_id": "goal-block-again",
+                    "tool_input": {"status": "blocked"},
+                },
+                snapshot=self.snapshot(),
+                prior_state=allowed_state,
+            )
+            self.assertEqual(
+                denied["hookSpecificOutput"]["permissionDecision"], "deny"
+            )
+
     def test_plain_shell_output_cannot_spoof_a_successful_receipt(self) -> None:
         _output, state = lifecycle_hook.evaluate_event(
             {

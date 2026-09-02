@@ -121,6 +121,9 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> None:
     state["tool_trace_overflow"] = False
     state["inflight_tool_use_ids"] = []
     state.pop("control_receipt_inflight", None)
+    state.pop("control_receipt_proposal", None)
+    state.pop("goal_block_authorization", None)
+    state.pop("goal_block_inflight", None)
     state.pop("receipt_turn_id", None)
 
 
@@ -174,6 +177,58 @@ def _is_control_guard_command(
         if index + 1 >= len(tokens) or tokens[index + 1] != session_id:
             return False
     return True
+
+
+def _goal_block_request(event: dict[str, Any]) -> bool:
+    tool_name = str(event.get("tool_name", "")).strip().rsplit(".", 1)[-1]
+    tool_input = event.get("tool_input")
+    return (
+        tool_name == "update_goal"
+        and isinstance(tool_input, dict)
+        and str(tool_input.get("status", "")).strip().lower() == "blocked"
+    )
+
+
+def _control_guard_proposal(command: str, *, cwd: str | Path | None) -> dict[str, str] | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if len(tokens) < 3 or tokens[2].startswith("-"):
+        return None
+    snapshot_path = Path(tokens[2]).expanduser()
+    if not snapshot_path.is_absolute():
+        snapshot_path = (Path(cwd or ".").expanduser().resolve() / snapshot_path).resolve()
+    try:
+        raw = snapshot_path.read_bytes()
+        snapshot = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    rollover = snapshot.get("goal_rollover") if isinstance(snapshot, dict) else None
+    if not isinstance(rollover, dict):
+        return None
+    return {
+        "snapshot_path": str(snapshot_path),
+        "snapshot_sha256": sha256_bytes(raw),
+        "goal_rollover_status": str(rollover.get("status", "")).strip().lower(),
+    }
+
+
+def _verified_project_block_proposal(
+    proposal: object, *, tool_use_id: str
+) -> bool:
+    if not isinstance(proposal, dict):
+        return False
+    if str(proposal.get("tool_use_id", "")) != tool_use_id:
+        return False
+    if proposal.get("goal_rollover_status") != "project_blocked":
+        return False
+    path = Path(str(proposal.get("snapshot_path", ""))).expanduser()
+    expected_sha256 = str(proposal.get("snapshot_sha256", ""))
+    try:
+        return bool(expected_sha256) and sha256_bytes(path.read_bytes()) == expected_sha256
+    except OSError:
+        return False
 
 
 def _tool_use_id(event: dict[str, Any]) -> str:
@@ -723,6 +778,27 @@ def evaluate_event(
     if "tool_trace" not in state:
         state["tool_trace"] = []
     if event_name == "PreToolUse":
+        if _goal_block_request(event):
+            turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
+            authorization = state.get("goal_block_authorization")
+            authorized = (
+                isinstance(authorization, dict)
+                and str(authorization.get("turn_id", "")) == turn_id
+            )
+            tool_use_id = _tool_use_id(event)
+            if not authorized or not tool_use_id:
+                return _pre_tool_denial(
+                    "系统 Goal blocked 必须在同一回合先取得通过 project_blocked 全项目扫描的控制收据。"
+                ), state
+            state.pop("goal_block_authorization", None)
+            state["goal_block_inflight"] = tool_use_id
+            inflight = [
+                str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)
+            ]
+            if tool_use_id not in inflight:
+                inflight.append(tool_use_id)
+            state["inflight_tool_use_ids"] = inflight
+            return {}, state
         if state.get("must_yield") is True:
             return _pre_tool_denial(
                 "当前控制事件已经签发成功收据；同一回合必须立即结束，禁止继续调用工具。"
@@ -752,6 +828,14 @@ def evaluate_event(
         state["inflight_tool_use_ids"] = inflight
         if is_guard:
             state["control_receipt_inflight"] = tool_use_id or "unknown"
+            proposal = _control_guard_proposal(command, cwd=event.get("cwd"))
+            if proposal is not None and tool_use_id:
+                state["control_receipt_proposal"] = {
+                    **proposal,
+                    "tool_use_id": tool_use_id,
+                }
+            else:
+                state.pop("control_receipt_proposal", None)
         return {}, state
     if event_name == "PostToolUse":
         tool_use_id = _tool_use_id(event)
@@ -861,8 +945,19 @@ def evaluate_event(
 
     if successful_control_receipt(event, snapshot):
         receipt_turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
+        project_block_authorized = _verified_project_block_proposal(
+            state.get("control_receipt_proposal"), tool_use_id=_tool_use_id(event)
+        )
+        state.pop("control_receipt_proposal", None)
         state["must_yield"] = True
         state["receipt_turn_id"] = receipt_turn_id
+        if project_block_authorized:
+            state["goal_block_authorization"] = {
+                "turn_id": receipt_turn_id,
+                "receipt_tool_use_id": _tool_use_id(event),
+            }
+        else:
+            state.pop("goal_block_authorization", None)
         if wake_policy == "after_event" and str(handshake.get("state", "")) == "pending_ack":
             rule_triggers = [item for item in lifecycle_triggers(snapshot, None) if item.startswith("rule_update_pending:")]
             state.update({
