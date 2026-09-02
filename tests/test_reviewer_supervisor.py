@@ -1,0 +1,660 @@
+import json
+import signal
+import subprocess
+import time
+import tempfile
+import unittest
+from pathlib import Path
+
+from scripts.reviewer_supervisor import ReviewContract, AttemptResult, build_review_instructions, run_attempt, run_review, git_common_state_root, validate_verdict
+
+
+class ReviewerSupervisorCoreTests(unittest.TestCase):
+    def test_state_root_uses_git_common_dir(self):
+        repo = Path.cwd()
+        common = subprocess.check_output(["git", "rev-parse", "--git-common-dir"], cwd=repo, text=True).strip()
+        common_path = Path(common)
+        if not common_path.is_absolute():
+            common_path = (repo / common_path).resolve()
+        self.assertEqual(git_common_state_root(repo), common_path / "adaptive-delivery" / "reviewer-runs")
+
+
+    def test_review_instructions_define_full_schema_and_exact_head(self):
+        head = "c" * 40
+        instructions = build_review_instructions("focus on runtime safety", head, "b" * 40)
+        self.assertIn(head, instructions)
+        self.assertIn("b" * 40, instructions)
+        self.assertIn('"reviewed_head"', instructions)
+        self.assertIn('"verdict"', instructions)
+        self.assertIn('"critical"', instructions)
+        self.assertIn('"important"', instructions)
+        self.assertIn('"minor"', instructions)
+        self.assertIn("PASS", instructions)
+        self.assertIn("FINDINGS", instructions)
+        self.assertIn("focus on runtime safety", instructions)
+
+    def test_pass_requires_all_finding_lists_empty(self):
+        head = "a" * 40
+        payload = {
+            "reviewed_head": head,
+            "verdict": "PASS",
+            "critical": [],
+            "important": [],
+            "minor": ["small note"],
+        }
+        with self.assertRaisesRegex(ValueError, "PASS"):
+            validate_verdict(payload, head)
+
+    def test_findings_requires_at_least_one_finding(self):
+        head = "a" * 40
+        payload = {
+            "reviewed_head": head,
+            "verdict": "FINDINGS",
+            "critical": [],
+            "important": [],
+            "minor": [],
+        }
+        with self.assertRaisesRegex(ValueError, "FINDINGS"):
+            validate_verdict(payload, head)
+
+    def test_revision_mismatch_fails_closed(self):
+        payload = {
+            "reviewed_head": "b" * 40,
+            "verdict": "PASS",
+            "critical": [],
+            "important": [],
+            "minor": [],
+        }
+        with self.assertRaisesRegex(ValueError, "reviewed_head"):
+            validate_verdict(payload, "a" * 40)
+
+    def test_severity_fields_must_be_lists(self):
+        payload = {
+            "reviewed_head": "a" * 40,
+            "verdict": "FINDINGS",
+            "critical": "bad",
+            "important": [],
+            "minor": [],
+        }
+        with self.assertRaisesRegex(ValueError, "critical"):
+            validate_verdict(payload, "a" * 40)
+
+    def test_verdict_rejects_additional_keys_independently_of_codex_schema(self):
+        head = "a" * 40
+        payload = {
+            "reviewed_head": head,
+            "verdict": "PASS",
+            "critical": [],
+            "important": [],
+            "minor": [],
+            "unexpected": "must fail closed",
+        }
+        with self.assertRaisesRegex(ValueError, "exact keys"):
+            validate_verdict(payload, head)
+
+
+class _FakeStdin:
+    def __init__(self):
+        self.value = ""
+        self.closed = False
+
+    def write(self, text):
+        self.value += text
+
+    def flush(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeProcess:
+    def __init__(self, lines, returncode=0):
+        self.stdout = iter(lines)
+        self.stdin = _FakeStdin()
+        self.pid = 4242
+        self._returncode = returncode
+
+    def wait(self, timeout=None):
+        return self._returncode
+
+
+class ReviewerSupervisorLaunchTests(unittest.TestCase):
+    def test_direct_child_requires_valid_codex_event_before_running(self):
+        calls = []
+
+        proc_holder = []
+        def factory(argv, **kwargs):
+            calls.append((argv, kwargs))
+            proc = _FakeProcess(["not-json\n"], returncode=1)
+            proc_holder.append(proc)
+            return proc
+
+        contract = ReviewContract(
+            repo=Path.cwd(), base="main", head="a" * 40, instructions="review exact head",
+            event_path=Path(tempfile.mkdtemp()) / "events.jsonl",
+            final_path=Path(tempfile.mkdtemp()) / "final.json",
+        )
+        result = run_attempt(contract, 0, popen_factory=factory, codex_executable="/usr/bin/codex")
+        argv, kwargs = calls[0]
+        self.assertEqual(argv[0:2], ["/usr/bin/codex", "exec"])
+        self.assertEqual(argv[-1], "-")
+        self.assertNotIn("review", argv)
+        self.assertNotIn("--base", argv)
+        self.assertIn("--output-schema", argv)
+        schema_path = Path(argv[argv.index("--output-schema") + 1])
+        schema = json.loads(schema_path.read_text())
+        self.assertEqual(schema["required"], ["reviewed_head", "verdict", "critical", "important", "minor"])
+        self.assertNotIn(contract.instructions, argv)
+        self.assertNotIn("nohup", argv)
+        self.assertNotIn("sh", argv)
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertIs(kwargs["stdin"], subprocess.PIPE)
+        self.assertNotIn("input", kwargs)
+        self.assertEqual(proc_holder[0].stdin.value, contract.instructions)
+        self.assertTrue(proc_holder[0].stdin.closed)
+        self.assertFalse(result.running_observed)
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+
+    def test_valid_json_event_proves_running(self):
+        def factory(argv, **kwargs):
+            return _FakeProcess([json.dumps({"type": "thread.started", "thread_id": "thread-1"}) + "\n"], returncode=1)
+
+        contract = ReviewContract(
+            repo=Path.cwd(), base="main", head="a" * 40, instructions="review exact head",
+            event_path=Path(tempfile.mkdtemp()) / "events.jsonl",
+            final_path=Path(tempfile.mkdtemp()) / "final.json",
+        )
+        result = run_attempt(contract, 0, popen_factory=factory, codex_executable="/usr/bin/codex")
+        self.assertTrue(result.running_observed)
+        self.assertEqual(result.session_id, "thread-1")
+        self.assertEqual(result.pid, 4242)
+
+
+class _BrokenPipeStdin(_FakeStdin):
+    def write(self, text):
+        raise BrokenPipeError("child exited before stdin delivery")
+
+
+class _BrokenPipeProcess(_FakeProcess):
+    def __init__(self):
+        super().__init__([], returncode=1)
+        self.stdin = _BrokenPipeStdin()
+
+
+class ReviewerSupervisorInfrastructureFailureTests(unittest.TestCase):
+    def _contract(self):
+        root = Path(tempfile.mkdtemp())
+        return ReviewContract(Path.cwd(), "b" * 40, "a" * 40, "review", root / "events", root / "final")
+
+    def test_missing_codex_binary_becomes_infra_result_instead_of_exception(self):
+        def factory(argv, **kwargs):
+            raise FileNotFoundError("codex missing")
+        result = run_attempt(self._contract(), 0, popen_factory=factory, codex_executable="/missing/codex")
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertFalse(result.running_observed)
+        self.assertIn("launch", result.diagnostic.lower())
+
+    def test_broken_pipe_while_delivering_instructions_becomes_infra_result(self):
+        def factory(argv, **kwargs):
+            return _BrokenPipeProcess()
+        result = run_attempt(self._contract(), 0, popen_factory=factory, codex_executable="codex")
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertIn("stdin", result.diagnostic.lower())
+
+    def test_signal_failure_is_fail_closed_and_not_retry_safe(self):
+        holder = []
+        def factory(argv, **kwargs):
+            proc = _TimeoutProcess(stdout=iter([])); holder.append(proc); return proc
+        def signaler(pid, sig):
+            raise PermissionError("cannot signal process group")
+        result = run_attempt(
+            self._contract(), 0, popen_factory=factory, codex_executable="codex",
+            timeout_seconds=0.01, process_group_killer=signaler,
+        )
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertFalse(result.retry_safe)
+        self.assertIn("signal", result.diagnostic.lower())
+
+
+class _BlockingStdin(_FakeStdin):
+    def write(self, text):
+        time.sleep(0.3)
+        self.value += text
+
+
+class _BlockingStdinProcess(_TimeoutProcess if False else _FakeProcess):
+    def __init__(self):
+        super().__init__([], returncode=-signal.SIGTERM)
+        self.stdin = _BlockingStdin()
+        self.killed = False
+
+    def wait(self, timeout=None):
+        if not self.killed:
+            raise subprocess.TimeoutExpired("codex", timeout or 0)
+        return self._returncode
+
+
+class _WaitErrorProcess(_FakeProcess):
+    def __init__(self):
+        super().__init__([], returncode=-signal.SIGTERM)
+        self.killed = False
+
+    def wait(self, timeout=None):
+        if not self.killed:
+            raise OSError("wait backend failed")
+        return self._returncode
+
+
+class ReviewerSupervisorDeadlineCoverageTests(unittest.TestCase):
+    def _contract(self):
+        root = Path(tempfile.mkdtemp())
+        return ReviewContract(Path.cwd(), "b" * 40, "a" * 40, "review", root / "events", root / "final")
+
+    def test_stdin_delivery_is_bounded_by_attempt_deadline(self):
+        holder = []
+        sent = []
+        def factory(argv, **kwargs):
+            proc = _BlockingStdinProcess(); holder.append(proc); return proc
+        def signaler(pid, sig):
+            sent.append((pid, sig)); holder[0].killed = True
+        started = time.monotonic()
+        result = run_attempt(
+            self._contract(), 0, popen_factory=factory, codex_executable="codex",
+            timeout_seconds=0.03, process_group_killer=signaler, termination_grace_seconds=0.01,
+        )
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertIn("stdin", result.diagnostic.lower())
+        self.assertTrue(sent)
+
+    def test_non_timeout_wait_error_triggers_cleanup_before_retry_can_be_safe(self):
+        holder = []
+        sent = []
+        def factory(argv, **kwargs):
+            proc = _WaitErrorProcess(); holder.append(proc); return proc
+        def signaler(pid, sig):
+            sent.append((pid, sig)); holder[0].killed = True
+        result = run_attempt(
+            self._contract(), 0, popen_factory=factory, codex_executable="codex",
+            timeout_seconds=0.03, process_group_killer=signaler, termination_grace_seconds=0.01,
+        )
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertTrue(sent)
+        self.assertTrue(result.retry_safe)
+        self.assertIn("wait", result.diagnostic.lower())
+
+class _SlowStdout:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        time.sleep(5)
+        return json.dumps({"type": "thread.started", "thread_id": "late"}) + "\n"
+
+
+class _TimeoutProcess(_FakeProcess):
+    def __init__(self, *, stdout=None):
+        super().__init__([], returncode=-15)
+        self.stdout = stdout if stdout is not None else _SlowStdout()
+        self.killed = False
+
+    def wait(self, timeout=None):
+        if not self.killed:
+            raise subprocess.TimeoutExpired("codex", timeout or 0)
+        return self._returncode
+
+
+class ReviewerSupervisorTimeoutTests(unittest.TestCase):
+    def test_timeout_kills_process_group_and_fails_closed(self):
+        holder = []
+        killed = []
+        def factory(argv, **kwargs):
+            proc = _TimeoutProcess(); holder.append(proc); return proc
+        def killer(pid, sig):
+            killed.append((pid, sig)); holder[0].killed = True
+
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "main", "d" * 40, "schema", root / "events", root / "final")
+        started = time.monotonic()
+        result = run_attempt(contract, 0, popen_factory=factory, codex_executable="codex", timeout_seconds=0.05, process_group_killer=killer)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(killed, [(4242, signal.SIGTERM)])
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertIn("timeout", result.diagnostic.lower())
+
+    def test_timeout_tracks_child_even_when_stdout_closes_early(self):
+        holder = []
+        killed = []
+        def factory(argv, **kwargs):
+            proc = _TimeoutProcess(stdout=iter([])); holder.append(proc); return proc
+        def killer(pid, sig):
+            killed.append((pid, sig)); holder[0].killed = True
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "main", "e" * 40, "schema", root / "events", root / "final")
+        started = time.monotonic()
+        result = run_attempt(contract, 0, popen_factory=factory, codex_executable="codex", timeout_seconds=0.05, process_group_killer=killer)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(killed, [(4242, signal.SIGTERM)])
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertIn("timeout", result.diagnostic.lower())
+
+
+class _TermIgnoringProcess(_FakeProcess):
+    def __init__(self):
+        super().__init__([], returncode=-signal.SIGKILL)
+        self.signals = []
+
+    def wait(self, timeout=None):
+        if signal.SIGKILL not in self.signals:
+            raise subprocess.TimeoutExpired("codex", timeout or 0)
+        return self._returncode
+
+
+class ReviewerSupervisorForcedCleanupTests(unittest.TestCase):
+    def test_timeout_escalates_term_to_kill_and_reaps_before_return(self):
+        holder = []
+        sent = []
+        def factory(argv, **kwargs):
+            proc = _TermIgnoringProcess(); holder.append(proc); return proc
+        def signaler(pid, sig):
+            sent.append((pid, sig)); holder[0].signals.append(sig)
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "a" * 40, "b" * 40, "schema", root / "events", root / "final")
+        result = run_attempt(contract, 0, popen_factory=factory, codex_executable="codex", timeout_seconds=0.01, process_group_killer=signaler, termination_grace_seconds=0.01)
+        self.assertEqual(sent, [(4242, signal.SIGTERM), (4242, signal.SIGKILL)])
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertEqual(result.exit_code, -signal.SIGKILL)
+        self.assertIn("SIGKILL", result.diagnostic)
+
+
+
+class _LeaderExitsDescendantSurvivesProcess(_FakeProcess):
+    def __init__(self):
+        super().__init__([], returncode=0)
+        self.term_sent = False
+
+    def wait(self, timeout=None):
+        if self.term_sent:
+            return 0
+        raise subprocess.TimeoutExpired("codex", timeout or 0)
+
+
+class ReviewerSupervisorProcessGroupCleanupTests(unittest.TestCase):
+    def test_process_group_capture_failure_still_cleans_started_child_using_session_leader_pid(self):
+        sent = []
+        group_alive = {4242: True}
+        proc = _FakeProcess([], returncode=0)
+
+        def factory(argv, **kwargs):
+            return proc
+
+        def getter(pid):
+            raise PermissionError("pgid lookup failed")
+
+        def signaler(pgid, sig):
+            sent.append((pgid, sig))
+            group_alive[pgid] = False
+
+        def group_exists(pgid):
+            return group_alive.get(pgid, False)
+
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "a" * 40, "b" * 40, "schema", root / "events", root / "final")
+        result = run_attempt(
+            contract, 0, popen_factory=factory, codex_executable="codex",
+            process_group_getter=getter, process_group_killer=signaler,
+            process_group_exists=group_exists, termination_grace_seconds=0.01,
+        )
+
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertEqual(sent, [(4242, signal.SIGTERM)])
+        self.assertTrue(result.retry_safe)
+        self.assertIn("capture", result.diagnostic.lower())
+        self.assertIn("cleanup", result.diagnostic.lower())
+
+    def test_reader_still_alive_after_leader_exit_triggers_group_cleanup(self):
+        sent = []
+        group_alive = {4242: True}
+        proc = _FakeProcess([], returncode=0)
+        proc.stdout = _SlowStdout()
+
+        def factory(argv, **kwargs):
+            return proc
+
+        def signaler(pgid, sig):
+            sent.append((pgid, sig))
+            group_alive[pgid] = False
+
+        def group_exists(pgid):
+            return group_alive.get(pgid, False)
+
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "a" * 40, "b" * 40, "schema", root / "events", root / "final")
+        result = run_attempt(
+            contract, 0, popen_factory=factory, codex_executable="codex",
+            process_group_getter=lambda pid: 4242, process_group_killer=signaler,
+            process_group_exists=group_exists, termination_grace_seconds=0.01,
+        )
+
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertEqual(sent, [(4242, signal.SIGTERM)])
+        self.assertTrue(result.retry_safe)
+        self.assertIn("event stream", result.diagnostic.lower())
+        self.assertIn("cleanup", result.diagnostic.lower())
+
+    def test_successful_leader_exit_with_detached_descendant_is_cleaned_and_fails_closed(self):
+        sent = []
+        group_alive = {4242: True}
+        proc = _FakeProcess([json.dumps({"type": "thread.started", "thread_id": "thread-ok"}) + "\n"], returncode=0)
+
+        def factory(argv, **kwargs):
+            return proc
+
+        def signaler(pgid, sig):
+            sent.append((pgid, sig))
+            group_alive[pgid] = False
+
+        def group_exists(pgid):
+            return group_alive.get(pgid, False)
+
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "a" * 40, "b" * 40, "schema", root / "events", root / "final")
+        result = run_attempt(
+            contract, 0, popen_factory=factory, codex_executable="codex",
+            process_group_getter=lambda pid: 4242, process_group_killer=signaler,
+            process_group_exists=group_exists, termination_grace_seconds=0.01,
+        )
+
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertEqual(sent, [(4242, signal.SIGTERM)])
+        self.assertTrue(result.retry_safe)
+        self.assertIn("process group", result.diagnostic.lower())
+
+    def test_leader_exit_after_term_does_not_make_retry_safe_while_descendant_survives(self):
+        holder = []
+        sent = []
+        group_alive = {4242: True}
+
+        def factory(argv, **kwargs):
+            proc = _LeaderExitsDescendantSurvivesProcess()
+            holder.append(proc)
+            return proc
+
+        def signaler(pgid, sig):
+            sent.append((pgid, sig))
+            if sig == signal.SIGTERM:
+                holder[0].term_sent = True
+            elif sig == signal.SIGKILL:
+                group_alive[pgid] = False
+
+        def group_exists(pgid):
+            return group_alive.get(pgid, False)
+
+        root = Path(tempfile.mkdtemp())
+        contract = ReviewContract(Path.cwd(), "a" * 40, "b" * 40, "schema", root / "events", root / "final")
+        result = run_attempt(
+            contract,
+            0,
+            popen_factory=factory,
+            codex_executable="codex",
+            timeout_seconds=0.01,
+            process_group_killer=signaler,
+            process_group_getter=lambda pid: 4242,
+            process_group_exists=group_exists,
+            termination_grace_seconds=0.01,
+        )
+
+        self.assertEqual(sent, [(4242, signal.SIGTERM), (4242, signal.SIGKILL)])
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertTrue(result.retry_safe)
+        self.assertIn("SIGKILL", result.diagnostic)
+
+
+class ReviewerSupervisorRunTests(unittest.TestCase):
+    def setUp(self):
+        self._repo_tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._repo_tmp.name)
+        subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo, check=True)
+        (self.repo / "base.txt").write_text("base")
+        subprocess.run(["git", "add", "base.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=self.repo, check=True)
+
+    def tearDown(self):
+        self._repo_tmp.cleanup()
+
+    def _write_final(self, contract, verdict="PASS", head=None):
+        contract.final_path.write_text(json.dumps({
+            "reviewed_head": head or contract.head,
+            "verdict": verdict,
+            "critical": [], "important": [], "minor": [],
+        }))
+
+    def test_second_supervisor_for_same_repo_is_rejected_while_first_lock_is_held(self):
+        import fcntl
+        root = git_common_state_root(self.repo)
+        root.mkdir(parents=True, exist_ok=True)
+        lock_path = root / "active-review.lock"
+        calls = []
+        with lock_path.open("a+") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            def attempt(contract, number):
+                calls.append(number)
+                self._write_final(contract)
+                return AttemptResult("RUNNING", 1, 0, True, "s")
+            result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertEqual(calls, [])
+        state = json.loads(result.state_path.read_text())
+        self.assertIn("active reviewer", state["diagnostic"].lower())
+
+    def test_findings_are_terminal_and_not_retried(self):
+        calls = []
+        def attempt(contract, number):
+            calls.append(number)
+            contract.final_path.write_text(json.dumps({
+                "reviewed_head": contract.head, "verdict": "FINDINGS",
+                "critical": [], "important": ["issue"], "minor": [],
+            }))
+            return AttemptResult("RUNNING", 1, 0, True, "s")
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt)
+        self.assertEqual(result.state, "FINDINGS")
+        self.assertEqual(calls, [0])
+
+    def test_infra_failure_retries_once_with_same_contract(self):
+        seen = []
+        def attempt(contract, number):
+            seen.append((contract.repo, contract.base, contract.head, contract.instructions))
+            if number == 0:
+                return AttemptResult("REVIEW_INFRA_FAILED", 1, 1, False, None, "start failed")
+            self._write_final(contract)
+            return AttemptResult("RUNNING", 2, 0, True, "s")
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt)
+        self.assertEqual(result.state, "PASS")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0], seen[1])
+
+    def test_exit_zero_without_output_fails_closed_twice(self):
+        calls = []
+        def attempt(contract, number):
+            calls.append(number)
+            return AttemptResult("RUNNING", number + 1, 0, True, "s")
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt)
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        self.assertEqual(calls, [0, 1])
+
+    def test_revision_mismatch_is_infrastructure_failure(self):
+        def attempt(contract, number):
+            self._write_final(contract, head="f" * 40)
+            return AttemptResult("RUNNING", 1, 0, True, "s")
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+
+    def test_attempt_exception_updates_durable_state_instead_of_leaving_starting(self):
+        def attempt(contract, number):
+            raise OSError("spawn infrastructure exploded")
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
+        self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+        state = json.loads(result.state_path.read_text())
+        self.assertEqual(state["state"], "REVIEW_INFRA_FAILED")
+        self.assertIn("spawn infrastructure exploded", state["diagnostic"])
+
+    def test_base_ref_is_resolved_once_to_immutable_commit(self):
+        base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        seen = []
+        def attempt(contract, number):
+            seen.append(contract.base)
+            self._write_final(contract)
+            return AttemptResult("RUNNING", 1, 0, True, "s")
+        result = run_review(self.repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
+        self.assertEqual(result.state, "PASS")
+        self.assertEqual(seen, [base_sha])
+        state = json.loads(result.state_path.read_text())
+        self.assertEqual(state["base_ref"], "HEAD")
+        self.assertEqual(state["base_revision"], base_sha)
+
+    def test_dirty_worktree_is_rejected_before_attempt(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            (repo / "x.txt").write_text("one")
+            subprocess.run(["git", "add", "x.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+            (repo / "x.txt").write_text("dirty")
+            calls = []
+            def attempt(contract, number):
+                calls.append(number)
+                return AttemptResult("RUNNING", 1, 0, True, "s")
+            result = run_review(repo, "HEAD~0", "review", attempt_runner=attempt, max_infra_retries=0)
+            self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+            self.assertEqual(calls, [])
+            state = json.loads(result.state_path.read_text())
+            self.assertIn("dirty", state["diagnostic"].lower())
+
+    def test_head_change_during_review_invalidates_pass(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            (repo / "x.txt").write_text("one")
+            subprocess.run(["git", "add", "x.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+            def attempt(contract, number):
+                self._write_final(contract)
+                (repo / "y.txt").write_text("two")
+                subprocess.run(["git", "add", "y.txt"], cwd=repo, check=True)
+                subprocess.run(["git", "commit", "-qm", "move head"], cwd=repo, check=True)
+                return AttemptResult("RUNNING", 1, 0, True, "s")
+            result = run_review(repo, "HEAD", "review", attempt_runner=attempt, max_infra_retries=0)
+            self.assertEqual(result.state, "REVIEW_INFRA_FAILED")
+            state = json.loads(result.state_path.read_text())
+            self.assertIn("head changed", state["diagnostic"].lower())
+
+
+if __name__ == "__main__":
+    unittest.main()

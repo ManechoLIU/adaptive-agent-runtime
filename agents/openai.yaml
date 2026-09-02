@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adaptive Agent Runtime"
+  short_description: "跨会话长期项目的自适应 Agent 治理、恢复与可验证交付"
+  default_prompt: "Use $adaptive-agent-runtime to govern and continue this project from its current verified state."
