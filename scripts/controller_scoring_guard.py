@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -16,7 +17,15 @@ RECEIPT_DIRECTORY = "adaptive-delivery"
 RECEIPT_FILE = "controller-scoring-model-read.json"
 RECEIPT_MAX_AGE_SECONDS = 1800
 SCORE_HISTORY_FILE = "controller-score-history.jsonl"
+CYCLE_EVIDENCE_DIRECTORY = "controller-cycle-evidence"
 TERMINAL_CYCLE_STATUSES = {"CLOSED", "FAILED", "BLOCKED", "CANCELLED", "ABSORBED", "PARKED"}
+GOVERNANCE_RISK_STATUSES = {"GREEN", "AMBER", "RED"}
+CONTROLLER_REGISTRY_PATH = Path(
+    os.environ.get(
+        "AD_CONTROLLER_REGISTRY",
+        str(Path.home() / ".codex" / "adaptive-delivery-controllers.json"),
+    )
+).expanduser()
 
 
 def _git_common_dir(repo: Path) -> Path:
@@ -30,12 +39,71 @@ def _git_common_dir(repo: Path) -> Path:
     return (repo / path).resolve() if not path.is_absolute() else path.resolve()
 
 
+def stable_logical_controller_id(repo: str | Path, declared_controller_id: str) -> str:
+    declared = str(declared_controller_id or "").strip()
+    if not declared:
+        raise ValueError("stable logical controller id is required")
+    try:
+        registry = json.loads(CONTROLLER_REGISTRY_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return declared
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"controller registry is unreadable: {error}") from error
+    if not isinstance(registry, dict):
+        raise ValueError("controller registry root must be an object")
+    requested_common = _git_common_dir(Path(repo).resolve())
+    owners: list[str] = []
+    for controller_id, registered_repo in registry.items():
+        if (
+            not isinstance(controller_id, str)
+            or controller_id.startswith("__")
+            or not isinstance(registered_repo, str)
+        ):
+            continue
+        try:
+            if _git_common_dir(Path(registered_repo).expanduser().resolve()) == requested_common:
+                owners.append(controller_id)
+        except (OSError, subprocess.CalledProcessError):
+            continue
+    if not owners:
+        return declared
+    if len(owners) != 1 or declared != owners[0]:
+        raise ValueError("registered repository scoring requires its stable logical controller id")
+    return owners[0]
+
+
 def receipt_path(repo: str | Path) -> Path:
     return _git_common_dir(Path(repo).resolve()) / RECEIPT_DIRECTORY / RECEIPT_FILE
 
 
 def score_history_path(repo: str | Path) -> Path:
     return _git_common_dir(Path(repo).resolve()) / RECEIPT_DIRECTORY / SCORE_HISTORY_FILE
+
+
+def cycle_evidence_directory(repo: str | Path) -> Path:
+    return _git_common_dir(Path(repo).resolve()) / RECEIPT_DIRECTORY / CYCLE_EVIDENCE_DIRECTORY
+
+
+def _cycle_evidence_path(repo: str | Path, evidence_id: str) -> Path:
+    identifier = str(evidence_id or "").strip()
+    if not identifier or len(identifier) > 256:
+        raise ValueError("cycle evidence id is missing or too long")
+    digest = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
+    return cycle_evidence_directory(repo) / f"{digest}.json"
+
+
+def load_cycle_evidence(repo: str | Path, evidence_id: str) -> tuple[dict[str, Any], str]:
+    target = _cycle_evidence_path(repo, evidence_id)
+    try:
+        content = target.read_bytes()
+        value = json.loads(content)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cycle evidence receipt is missing or unreadable: {error}") from error
+    if not isinstance(value, dict) or value.get("record_kind") != "controller_cycle_evidence":
+        raise ValueError("cycle evidence receipt has an invalid schema")
+    if str(value.get("evidence_id", "")).strip() != str(evidence_id).strip():
+        raise ValueError("cycle evidence receipt id mismatch")
+    return value, hashlib.sha256(content).hexdigest()
 
 
 def append_score_history(repo: str | Path, record: dict[str, Any]) -> dict[str, Any]:
@@ -84,7 +152,11 @@ def latest_score_history(repo: str | Path, *, controller_session_id: str) -> dic
 
 
 def _valid_cycle_history_record(
-    value: dict[str, Any], *, controller_session_id: str, model_sha256: str
+    repo: str | Path,
+    value: dict[str, Any],
+    *,
+    controller_session_id: str,
+    model_sha256: str,
 ) -> bool:
     controller = str(controller_session_id).strip()
     if not controller or str(value.get("controller_session_id", "")).strip() != controller:
@@ -106,7 +178,23 @@ def _valid_cycle_history_record(
         score = float(value["score"])
     except (KeyError, TypeError, ValueError):
         return False
-    return 0 <= score <= 100
+    if not 0 <= score <= 100:
+        return False
+    evidence_id = str(value.get("evidence_id", "")).strip()
+    evidence_sha256 = str(value.get("evidence_sha256", "")).strip()
+    try:
+        receipt, actual_sha256 = load_cycle_evidence(repo, evidence_id)
+    except ValueError:
+        return False
+    return bool(
+        evidence_sha256 == actual_sha256
+        and str(receipt.get("controller_id", "")).strip() == controller
+        and str(receipt.get("cycle_id", "")).strip() == str(value.get("cycle_id", "")).strip()
+        and str(receipt.get("terminal_status", "")).upper().strip()
+        == str(value.get("terminal_status", "")).upper().strip()
+        and str(receipt.get("evidence_summary", "")).strip()
+        == str(value.get("evidence_summary", "")).strip()
+    )
 
 
 def cycle_score_extremes(
@@ -115,7 +203,7 @@ def cycle_score_extremes(
     eligible = [
         value for value in _score_history_records(repo)
         if _valid_cycle_history_record(
-            value, controller_session_id=controller_session_id, model_sha256=model_sha256
+            repo, value, controller_session_id=controller_session_id, model_sha256=model_sha256
         )
     ]
     if not eligible:
@@ -126,6 +214,124 @@ def cycle_score_extremes(
     }
 
 
+def _recorded_at(value: dict[str, Any]) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value.get("recorded_at", "")))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _cycle_evidence_receipts(repo: str | Path, *, controller_session_id: str) -> list[dict[str, Any]]:
+    directory = cycle_evidence_directory(repo)
+    if not directory.is_dir():
+        return []
+    receipts: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict) or value.get("record_kind") != "controller_cycle_evidence":
+            continue
+        if str(value.get("controller_id", "")).strip() != str(controller_session_id).strip():
+            continue
+        receipts.append(value)
+    return receipts
+
+
+def governance_risk_projection(
+    repo: str | Path, *, controller_session_id: str
+) -> dict[str, Any]:
+    controller = str(controller_session_id).strip()
+    receipts = _cycle_evidence_receipts(repo, controller_session_id=controller)
+    incidents_by_id: dict[str, dict[str, Any]] = {}
+    for receipt in receipts:
+        if str(receipt.get("terminal_status", "")).upper().strip() != "FAILED":
+            continue
+        if str(receipt.get("governance_incident_severity", "")).lower().strip() != "major":
+            continue
+        incident_id = str(receipt.get("cycle_id", "")).strip()
+        if incident_id:
+            incidents_by_id[incident_id] = receipt
+    for value in _score_history_records(repo):
+        if str(value.get("controller_session_id", "")).strip() != controller:
+            continue
+        if value.get("record_kind") != "cycle":
+            continue
+        if str(value.get("terminal_status", "")).upper().strip() != "FAILED":
+            continue
+        try:
+            score = float(value["score"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        cycle_id = str(value.get("cycle_id", "")).strip()
+        if score <= 49 and cycle_id:
+            existing = incidents_by_id.get(cycle_id)
+            if existing is None or _recorded_at(value) < _recorded_at(existing):
+                incidents_by_id[cycle_id] = value
+    incidents = sorted(incidents_by_id.values(), key=_recorded_at)
+    incident_states: list[dict[str, Any]] = []
+    for incident in incidents:
+        incident_id = str(incident["cycle_id"]).strip()
+        incident_time = _recorded_at(incident)
+        corrections = [
+            receipt for receipt in receipts
+            if str(receipt.get("corrects_incident", "")).strip() == incident_id
+            and str(receipt.get("terminal_status", "")).upper().strip() == "CLOSED"
+            and _recorded_at(receipt) > incident_time
+        ]
+        if not corrections:
+            incident_states.append({"incident_cycle_id": incident_id, "status": "RED"})
+            continue
+        correction = min(corrections, key=_recorded_at)
+        correction_time = _recorded_at(correction)
+        alignments = [
+            receipt for receipt in receipts
+            if str(receipt.get("alignment_for_incident", "")).strip() == incident_id
+            and str(receipt.get("terminal_status", "")).upper().strip() == "CLOSED"
+            and _recorded_at(receipt) >= correction_time
+        ]
+        closures = [
+            receipt for receipt in receipts
+            if str(receipt.get("post_incident_closure_for", "")).strip() == incident_id
+            and str(receipt.get("terminal_status", "")).upper().strip() == "CLOSED"
+            and str(receipt.get("outcome_level", "")).upper().strip() in {"L3", "L4"}
+            and _recorded_at(receipt) > correction_time
+        ]
+        status = "GREEN" if alignments and closures else "AMBER"
+        state = {
+            "incident_cycle_id": incident_id,
+            "status": status,
+            "correction_evidence_id": correction.get("evidence_id"),
+        }
+        if alignments:
+            state["alignment_evidence_id"] = min(alignments, key=_recorded_at).get("evidence_id")
+        if closures:
+            state["post_incident_closure_evidence_id"] = min(closures, key=_recorded_at).get("evidence_id")
+        incident_states.append(state)
+    status_rank = {"GREEN": 0, "AMBER": 1, "RED": 2}
+    status = max((item["status"] for item in incident_states), key=status_rank.get, default="GREEN")
+    basis = {
+        "controller_id": controller,
+        "status": status,
+        "active_cap": 49 if status in {"AMBER", "RED"} else None,
+        "incident_states": incident_states,
+        "observed_cycle_records": sum(
+            1 for value in _score_history_records(repo)
+            if str(value.get("controller_session_id", "")).strip() == controller
+            and value.get("record_kind") == "cycle"
+        ),
+        "observed_machine_receipts": len(receipts),
+    }
+    basis["projection_sha256"] = hashlib.sha256(
+        json.dumps(basis, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return basis
+
+
 def scoring_model_path(skill_root: str | Path) -> Path:
     return Path(skill_root).resolve() / MODEL_RELATIVE_PATH
 
@@ -134,27 +340,63 @@ def scoring_model_sha256(skill_root: str | Path) -> str:
     return hashlib.sha256(scoring_model_path(skill_root).read_bytes()).hexdigest()
 
 
-def _write_receipt(repo: str | Path, *, model: Path, content: bytes) -> dict[str, Any]:
+def _write_receipt(
+    repo: str | Path,
+    *,
+    model: Path,
+    content: bytes,
+    controller_session_id: str | None = None,
+) -> dict[str, Any]:
     receipt = {
         "schema_version": 1,
         "model_path": str(model.resolve()),
         "model_sha256": hashlib.sha256(content).hexdigest(),
         "read_at": datetime.now(timezone.utc).isoformat(),
     }
+    declared_controller = str(controller_session_id or "").strip()
+    controller = (
+        stable_logical_controller_id(repo, declared_controller)
+        if declared_controller
+        else ""
+    )
+    if controller:
+        receipt["controller_session_id"] = controller
+        receipt["governance_risk_projection"] = governance_risk_projection(
+            repo, controller_session_id=controller
+        )
     target = receipt_path(repo)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return receipt
 
 
-def read_and_record_model(repo: str | Path, *, skill_root: str | Path) -> tuple[bytes, dict[str, Any]]:
+def read_and_record_model(
+    repo: str | Path,
+    *,
+    skill_root: str | Path,
+    controller_session_id: str | None = None,
+) -> tuple[bytes, dict[str, Any]]:
     model = scoring_model_path(skill_root)
     content = model.read_bytes()
-    return content, _write_receipt(repo, model=model, content=content)
+    return content, _write_receipt(
+        repo,
+        model=model,
+        content=content,
+        controller_session_id=controller_session_id,
+    )
 
 
-def record_model_read(repo: str | Path, *, skill_root: str | Path) -> dict[str, Any]:
-    _, receipt = read_and_record_model(repo, skill_root=skill_root)
+def record_model_read(
+    repo: str | Path,
+    *,
+    skill_root: str | Path,
+    controller_session_id: str | None = None,
+) -> dict[str, Any]:
+    _, receipt = read_and_record_model(
+        repo,
+        skill_root=skill_root,
+        controller_session_id=controller_session_id,
+    )
     return receipt
 
 
@@ -201,27 +443,77 @@ def finalize_score(
     controller_session_id: str,
     turn_id: str,
     score: float,
+    performance_score: float,
+    governance_risk_status: str,
+    risk_summary: str,
     window_summary: str | None,
     message_sha256: str | None,
 ) -> dict[str, Any]:
+    controller = stable_logical_controller_id(repo, controller_session_id)
+    performance = float(performance_score)
+    constrained = float(score)
+    risk_status = str(governance_risk_status).upper().strip()
+    risk_basis = str(risk_summary or "").strip()
+    if not controller:
+        raise ValueError("formal score requires a non-empty controller session identity")
+    if not 0 <= performance <= 100:
+        raise ValueError("performance score must be within 0..100")
+    if not 0 <= constrained <= 100:
+        raise ValueError("risk-constrained score must be within 0..100")
+    if constrained > performance:
+        raise ValueError("risk-constrained score cannot exceed performance score")
+    if risk_status not in GOVERNANCE_RISK_STATUSES:
+        raise ValueError("governance risk status must be GREEN, AMBER, or RED")
+    if not risk_basis:
+        raise ValueError("formal score requires a non-empty governance risk summary")
+    receipt = _load_receipt(repo)
+    if receipt is None or str(receipt.get("controller_session_id", "")).strip() != controller:
+        raise ValueError(
+            "score-guard failed: machine governance risk projection is missing or bound to another Controller"
+        )
+    stored_projection = receipt.get("governance_risk_projection")
+    current_projection = governance_risk_projection(repo, controller_session_id=controller)
+    if not isinstance(stored_projection, dict) or stored_projection != current_projection:
+        raise ValueError("machine governance risk projection changed or is unreadable; reload the scoring model")
+    expected_status = str(current_projection.get("status", "")).upper().strip()
+    if risk_status != expected_status:
+        raise ValueError(
+            f"machine governance risk projection requires {expected_status}, not {risk_status}"
+        )
+    active_cap = current_projection.get("active_cap")
+    if active_cap is not None and constrained > float(active_cap):
+        raise ValueError(f"machine governance risk projection enforces the active {active_cap} cap")
+    model_sha256 = scoring_model_sha256(skill_root)
+    extremes = cycle_score_extremes(
+        repo,
+        controller_session_id=controller,
+        model_sha256=model_sha256,
+    )
     errors = consume_score_guard(repo, skill_root=skill_root)
     if errors:
         raise ValueError("score-guard failed: " + "; ".join(errors))
     record = {
         "schema_version": 1,
         "record_kind": "formal",
-        "controller_session_id": str(controller_session_id),
+        "controller_session_id": controller,
         "turn_id": str(turn_id),
         "recorded_at": datetime.now(timezone.utc).isoformat(),
-        "score": float(score),
+        # Keep score as a compatibility alias for existing latest-score readers.
+        "score": constrained,
+        "performance_score": performance,
+        "risk_constrained_score": constrained,
+        "governance_risk_status": risk_status,
+        "risk_summary": risk_basis,
+        "governance_risk_projection": current_projection,
+        "cycle_extremes": extremes,
         "window_summary": window_summary,
-        "model_sha256": scoring_model_sha256(skill_root),
+        "model_sha256": model_sha256,
         "message_sha256": message_sha256,
     }
     return append_score_history(repo, record)
 
 
-def finalize_cycle_score(
+def finalize_cycle_candidate(
     repo: str | Path,
     *,
     skill_root: str | Path,
@@ -233,7 +525,7 @@ def finalize_cycle_score(
     evidence_summary: str | None,
     message_sha256: str | None,
 ) -> dict[str, Any]:
-    controller = str(controller_session_id).strip()
+    controller = stable_logical_controller_id(repo, controller_session_id)
     status = str(terminal_status).upper().strip()
     cycle = str(cycle_id).strip()
     evidence = str(evidence_summary or "").strip()
@@ -255,14 +547,71 @@ def finalize_cycle_score(
         raise ValueError("score-guard failed: " + "; ".join(errors))
     record = {
         "schema_version": 1,
+        "record_kind": "cycle_candidate",
+        "controller_session_id": controller,
+        "turn_id": str(turn_id),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "cycle_id": cycle,
+        "claimed_terminal_status": status,
+        "score": float(score),
+        "claimed_evidence_summary": evidence,
+        "model_sha256": scoring_model_sha256(skill_root),
+        "message_sha256": message_ref.lower(),
+    }
+    return append_score_history(repo, record)
+
+
+def finalize_attested_cycle_score(
+    repo: str | Path,
+    *,
+    skill_root: str | Path,
+    controller_session_id: str,
+    turn_id: str,
+    cycle_id: str,
+    terminal_status: str,
+    score: float,
+    evidence_summary: str | None,
+    evidence_id: str,
+    message_sha256: str | None,
+) -> dict[str, Any]:
+    controller = stable_logical_controller_id(repo, controller_session_id)
+    cycle = str(cycle_id).strip()
+    claimed_status = str(terminal_status).upper().strip()
+    claimed_evidence = str(evidence_summary or "").strip()
+    message_ref = str(message_sha256 or "").strip()
+    if not controller or not cycle:
+        raise ValueError("attested cycle score requires controller and cycle identities")
+    if not 0 <= float(score) <= 100:
+        raise ValueError("cycle score must be within 0..100")
+    if len(message_ref) != 64 or any(char not in "0123456789abcdefABCDEF" for char in message_ref):
+        raise ValueError("cycle score requires a valid message sha256 reference")
+    receipt, evidence_sha256 = load_cycle_evidence(repo, evidence_id)
+    receipt_controller = str(receipt.get("controller_id", "")).strip()
+    receipt_cycle = str(receipt.get("cycle_id", "")).strip()
+    receipt_status = str(receipt.get("terminal_status", "")).upper().strip()
+    receipt_evidence = str(receipt.get("evidence_summary", "")).strip()
+    if receipt_controller != controller or receipt_cycle != cycle:
+        raise ValueError("cycle evidence receipt is bound to another Controller or cycle")
+    if receipt_status not in TERMINAL_CYCLE_STATUSES:
+        raise ValueError("cycle evidence receipt is not terminal")
+    if claimed_status != receipt_status or claimed_evidence != receipt_evidence:
+        raise ValueError("cycle terminal status or evidence summary does not match the machine receipt")
+    errors = consume_score_guard(repo, skill_root=skill_root)
+    if errors:
+        raise ValueError("score-guard failed: " + "; ".join(errors))
+    record = {
+        "schema_version": 2,
         "record_kind": "cycle",
         "controller_session_id": controller,
         "turn_id": str(turn_id),
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "cycle_id": cycle,
-        "terminal_status": status,
+        "terminal_status": receipt_status,
         "score": float(score),
-        "evidence_summary": evidence,
+        "evidence_summary": receipt_evidence,
+        "evidence_id": str(evidence_id).strip(),
+        "evidence_sha256": evidence_sha256,
+        "outcome_level": receipt.get("outcome_level"),
         "model_sha256": scoring_model_sha256(skill_root),
         "message_sha256": message_ref.lower(),
     }
@@ -280,9 +629,11 @@ def consume_score_guard(repo: str | Path, *, skill_root: str | Path) -> list[str
 def main() -> int:
     parser = argparse.ArgumentParser(description="Record and verify the mandatory controller scoring model read.")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("record-read", "score-guard"):
-        cmd = sub.add_parser(name)
-        cmd.add_argument("--repo", required=True)
+    record_read = sub.add_parser("record-read")
+    record_read.add_argument("--repo", required=True)
+    record_read.add_argument("--controller-session")
+    score_guard = sub.add_parser("score-guard")
+    score_guard.add_argument("--repo", required=True)
     latest = sub.add_parser("latest-score")
     latest.add_argument("--repo", required=True)
     latest.add_argument("--controller-session", required=True)
@@ -294,12 +645,19 @@ def main() -> int:
     finalize.add_argument("--controller-session", required=True)
     finalize.add_argument("--turn-id", default="")
     finalize.add_argument("--score", required=True, type=float)
+    finalize.add_argument("--performance-score", required=True, type=float)
+    finalize.add_argument("--governance-risk-status", required=True, choices=sorted(GOVERNANCE_RISK_STATUSES))
+    finalize.add_argument("--risk-summary", required=True)
     finalize.add_argument("--window-summary")
     finalize.add_argument("--message-sha256")
     args = parser.parse_args()
     installed_skill_root = Path(__file__).resolve().parents[1]
     if args.command == "record-read":
-        content, receipt = read_and_record_model(args.repo, skill_root=installed_skill_root)
+        content, receipt = read_and_record_model(
+            args.repo,
+            skill_root=installed_skill_root,
+            controller_session_id=args.controller_session,
+        )
         text = content.decode("utf-8")
         print(text, end="" if text.endswith("\n") else "\n")
         print("--- controller-scoring-model-read-receipt ---")
@@ -325,7 +683,9 @@ def main() -> int:
         try:
             record = finalize_score(
                 args.repo, skill_root=installed_skill_root, controller_session_id=args.controller_session,
-                turn_id=args.turn_id, score=args.score, window_summary=args.window_summary,
+                turn_id=args.turn_id, score=args.score, performance_score=args.performance_score,
+                governance_risk_status=args.governance_risk_status, risk_summary=args.risk_summary,
+                window_summary=args.window_summary,
                 message_sha256=args.message_sha256,
             )
         except ValueError as error:

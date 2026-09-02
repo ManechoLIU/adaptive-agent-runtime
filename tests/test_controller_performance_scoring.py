@@ -62,6 +62,24 @@ class ControllerPerformanceScoringContractTests(unittest.TestCase):
     def test_standard_output_requires_attribution_conclusion(self) -> None:
         self.assertIn("责任归因结论", self.text)
 
+    def test_formal_score_separates_performance_risk_and_constraint(self) -> None:
+        self.assertIn("近期履职能力", self.text)
+        self.assertIn("治理风险状态", self.text)
+        self.assertIn("风险约束分", self.text)
+        self.assertIn("单回合最高分", self.text)
+        self.assertIn("单回合最低分", self.text)
+
+    def test_major_incident_cap_clears_only_after_evidence_not_time(self) -> None:
+        self.assertIn("时间经过本身不能解除", self.text)
+        self.assertIn("控制面对齐", self.text)
+        self.assertIn("后续高价值闭环", self.text)
+        self.assertIn("历史最差闭环回合仍保留", self.text)
+
+    def test_cycle_extremes_and_risk_status_are_machine_attested(self) -> None:
+        self.assertIn("机器证据收据", self.text)
+        self.assertIn("cycle_candidate", self.text)
+        self.assertIn("机器风险投影", self.text)
+
 
 if __name__ == "__main__":
     unittest.main()

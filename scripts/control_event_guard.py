@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -50,6 +51,7 @@ ROUTE_CLASS_MARKERS = {
     "backend": ("backend", "后端", "server"),
     "frontend": ("frontend", "前端", "web", "小程序", "miniapp"),
 }
+CONTROLLER_CYCLE_EVIDENCE_DIRECTORY = "controller-cycle-evidence"
 
 
 def ready_ledger_package_ids(ledger: Path) -> set[str]:
@@ -187,6 +189,240 @@ def run_git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedP
         capture_output=True,
         text=True,
     )
+
+
+def git_common_dir(root: Path) -> Path:
+    common = Path(run_git(root, "rev-parse", "--git-common-dir").stdout.strip())
+    return (root / common).resolve() if not common.is_absolute() else common.resolve()
+
+
+def controller_cycle_evidence_path(root: Path, evidence_id: str) -> Path:
+    identifier = str(evidence_id or "").strip()
+    if not identifier or len(identifier) > 256:
+        raise ValueError("controller cycle evidence id is missing or too long")
+    digest = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
+    return (
+        git_common_dir(Path(root).expanduser().resolve())
+        / "adaptive-delivery"
+        / CONTROLLER_CYCLE_EVIDENCE_DIRECTORY
+        / f"{digest}.json"
+    )
+
+
+def _known_controller_incident_ids(root: Path, controller_id: str) -> set[str]:
+    common = git_common_dir(Path(root).expanduser().resolve()) / "adaptive-delivery"
+    incident_ids: set[str] = set()
+    evidence_dir = common / CONTROLLER_CYCLE_EVIDENCE_DIRECTORY
+    for path in sorted(evidence_dir.glob("*.json")) if evidence_dir.is_dir() else []:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        if str(value.get("controller_id", "")).strip() != controller_id:
+            continue
+        if str(value.get("terminal_status", "")).upper().strip() != "FAILED":
+            continue
+        cycle_id = str(value.get("cycle_id", "")).strip()
+        if cycle_id:
+            incident_ids.add(cycle_id)
+    history = common / "controller-score-history.jsonl"
+    try:
+        lines = history.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        if str(value.get("controller_session_id", "")).strip() != controller_id:
+            continue
+        if value.get("record_kind") != "cycle":
+            continue
+        if str(value.get("terminal_status", "")).upper().strip() != "FAILED":
+            continue
+        try:
+            score = float(value.get("score"))
+        except (TypeError, ValueError):
+            continue
+        cycle_id = str(value.get("cycle_id", "")).strip()
+        if score <= 49 and cycle_id:
+            incident_ids.add(cycle_id)
+    return incident_ids
+
+
+def _cycle_outcome_level(
+    snapshot: dict[str, Any],
+    *,
+    terminal_status: str,
+    integrated_revisions: set[str] | None,
+) -> str:
+    if terminal_status != "CLOSED":
+        return "L0"
+    if event_closes_goal(snapshot):
+        return "L4"
+    if integrated_revisions:
+        return "L3"
+    return "L2"
+
+
+def _governance_incident_severity(
+    snapshot: dict[str, Any],
+    *,
+    terminal_status: str,
+    validation_errors: Sequence[str],
+    integrated_revisions: set[str] | None,
+) -> str:
+    """Only post-integration gate failures create automatic 49-point debt."""
+    if terminal_status != "FAILED" or not integrated_revisions:
+        return "none"
+    combined = " ".join(str(error).lower() for error in validation_errors)
+    major_markers = (
+        "required review",
+        "review pass",
+        "regression_evidence",
+        "main_revision does not match",
+    )
+    return "major" if any(marker in combined for marker in major_markers) else "none"
+
+
+def persist_controller_cycle_evidence(
+    root: Path,
+    snapshot: dict[str, Any],
+    *,
+    controller_id: str,
+    ledger_sha256: str,
+    main_revision: str,
+    terminal_status: str,
+    validation_errors: Sequence[str],
+    integrated_revisions: set[str] | None = None,
+) -> tuple[dict[str, Any], Path]:
+    """Persist one immutable machine-attested controller event outcome."""
+    contract = snapshot.get("event_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("controller cycle evidence requires event_contract")
+    evidence_id = str(contract.get("event_id", "")).strip()
+    controller = str(controller_id or "").strip()
+    status = str(terminal_status or "").upper().strip()
+    if not controller:
+        raise ValueError("controller cycle evidence requires a controller id")
+    if status not in {"CLOSED", "FAILED"}:
+        raise ValueError("controller cycle evidence status must be CLOSED or FAILED")
+    errors = [str(error).strip() for error in validation_errors if str(error).strip()]
+    if status == "FAILED" and not errors:
+        raise ValueError("failed controller cycle evidence requires validation errors")
+    if status == "CLOSED" and errors:
+        raise ValueError("closed controller cycle evidence cannot contain validation errors")
+    terminal_receipt = str(contract.get("terminal_receipt", "")).strip()
+    evidence_summary = (
+        terminal_receipt if status == "CLOSED" else "; ".join(errors)
+    )[:500].strip()
+    if not evidence_summary:
+        raise ValueError("controller cycle evidence requires a machine outcome summary")
+    snapshot_bytes = json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    outcome_level = _cycle_outcome_level(
+        snapshot,
+        terminal_status=status,
+        integrated_revisions=integrated_revisions,
+    )
+    clearance_markers = {
+        field: str(contract.get(field, "")).strip()
+        for field in (
+            "corrects_incident",
+            "alignment_for_incident",
+            "post_incident_closure_for",
+        )
+        if str(contract.get(field, "")).strip()
+    }
+    if clearance_markers:
+        if status != "CLOSED":
+            raise ValueError("risk clearance markers require a CLOSED controller event")
+        known_incidents = _known_controller_incident_ids(root, controller)
+        unknown = sorted(set(clearance_markers.values()) - known_incidents)
+        if unknown:
+            raise ValueError("risk clearance marker references an unknown incident: " + ", ".join(unknown))
+    if "alignment_for_incident" in clearance_markers:
+        rule_update = snapshot.get("rule_update")
+        if not isinstance(rule_update, dict):
+            raise ValueError("alignment clearance requires a complete rule ACK receipt")
+        revision = str(rule_update.get("revision", "")).strip()
+        affected = rule_update.get("affected_tasks")
+        acknowledged = rule_update.get("acknowledged_tasks")
+        if (
+            not revision
+            or not isinstance(affected, list)
+            or not affected
+            or not isinstance(acknowledged, list)
+            or {str(item).strip() for item in affected}
+            != {str(item).strip() for item in acknowledged}
+        ):
+            raise ValueError("alignment clearance requires a complete rule ACK receipt")
+    if (
+        "post_incident_closure_for" in clearance_markers
+        and outcome_level not in {"L3", "L4"}
+    ):
+        raise ValueError("post-incident closure clearance requires machine-derived L3 or L4 outcome")
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "record_kind": "controller_cycle_evidence",
+        "evidence_id": evidence_id,
+        "controller_id": controller,
+        "cycle_id": evidence_id,
+        "event_type": str(contract.get("event_type", "")).strip(),
+        "primary_task": str(contract.get("primary_task", "")).strip(),
+        "terminal_status": status,
+        "evidence_summary": evidence_summary,
+        "outcome_level": outcome_level,
+        "governance_incident_severity": _governance_incident_severity(
+            snapshot,
+            terminal_status=status,
+            validation_errors=errors,
+            integrated_revisions=integrated_revisions,
+        ),
+        "main_revision": str(main_revision or "").strip(),
+        "ledger_sha256": str(ledger_sha256 or "").strip(),
+        "snapshot_sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
+        "validation_errors": errors,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    payload.update(clearance_markers)
+    target = controller_cycle_evidence_path(root, evidence_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        try:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"immutable controller cycle evidence is unreadable: {error}") from error
+        comparable_existing = dict(existing) if isinstance(existing, dict) else {}
+        comparable_payload = dict(payload)
+        comparable_existing.pop("recorded_at", None)
+        comparable_payload.pop("recorded_at", None)
+        if comparable_existing != comparable_payload:
+            raise ValueError("immutable controller cycle evidence cannot be rewritten")
+        return existing, target
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    try:
+        with target.open("x", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+    except FileExistsError:
+        return persist_controller_cycle_evidence(
+            root,
+            snapshot,
+            controller_id=controller,
+            ledger_sha256=ledger_sha256,
+            main_revision=main_revision,
+            terminal_status=status,
+            validation_errors=errors,
+            integrated_revisions=integrated_revisions,
+        )
+    return payload, target
 
 
 CANDIDATE_STATE_ROOT = Path(
@@ -1156,6 +1392,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     for error in errors:
         print(f"control-event: blocked: {error}")
     if errors:
+        if repo_root is not None and trace_session and main_revision:
+            try:
+                persist_controller_cycle_evidence(
+                    repo_root,
+                    snapshot,
+                    controller_id=trace_session,
+                    ledger_sha256=current_ledger_sha256,
+                    main_revision=main_revision,
+                    terminal_status="FAILED",
+                    validation_errors=errors,
+                    integrated_revisions=integrated_revisions,
+                )
+            except (OSError, ValueError) as error:
+                print(f"control-event: blocked: failed to persist machine cycle evidence: {error}")
         return 1
     if args.repo:
         raw_candidates = snapshot.get("candidate_packages", [])
@@ -1165,8 +1415,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             except OSError as error:
                 print(f"control-event: blocked: failed to persist candidate lifecycle: {error}")
                 return 1
+    if repo_root is not None and trace_session and main_revision:
+        try:
+            evidence, _ = persist_controller_cycle_evidence(
+                repo_root,
+                snapshot,
+                controller_id=trace_session,
+                ledger_sha256=current_ledger_sha256,
+                main_revision=main_revision,
+                terminal_status="CLOSED",
+                validation_errors=[],
+                integrated_revisions=integrated_revisions,
+            )
+        except (OSError, ValueError) as error:
+            print(f"control-event: blocked: failed to persist machine cycle evidence: {error}")
+            return 1
     print(
         "control-event: allowed; declared READY, candidate, review and rule ACK decisions are complete"
+        + (
+            f"; cycle evidence receipt={evidence['evidence_id']}"
+            if repo_root is not None and trace_session and main_revision
+            else ""
+        )
     )
     return 0
 

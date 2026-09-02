@@ -2209,6 +2209,221 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             [],
         )
 
+    def test_control_event_guard_persists_immutable_machine_cycle_evidence(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "TASK_LEDGER.md").write_text("# ledger\n", encoding="utf-8")
+            subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            snapshot = self.complete_event_receipt()
+            receipt, receipt_path = control_event_guard.persist_controller_cycle_evidence(
+                root,
+                snapshot,
+                controller_id="controller-1",
+                ledger_sha256="ledger-sha",
+                main_revision=revision,
+                terminal_status="CLOSED",
+                validation_errors=[],
+            )
+
+            self.assertEqual("controller_cycle_evidence", receipt["record_kind"])
+            self.assertEqual("control-event-1", receipt["evidence_id"])
+            self.assertEqual("control-event-1", receipt["cycle_id"])
+            self.assertEqual("controller-1", receipt["controller_id"])
+            self.assertEqual("CLOSED", receipt["terminal_status"])
+            self.assertEqual("control event synchronized", receipt["evidence_summary"])
+            self.assertEqual(receipt, json.loads(receipt_path.read_text(encoding="utf-8")))
+
+            repeated, repeated_path = control_event_guard.persist_controller_cycle_evidence(
+                root,
+                snapshot,
+                controller_id="controller-1",
+                ledger_sha256="ledger-sha",
+                main_revision=revision,
+                terminal_status="CLOSED",
+                validation_errors=[],
+            )
+            self.assertEqual(receipt, repeated)
+            self.assertEqual(receipt_path, repeated_path)
+
+    def test_control_event_guard_refuses_conflicting_cycle_evidence_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            snapshot = self.complete_event_receipt()
+            control_event_guard.persist_controller_cycle_evidence(
+                root,
+                snapshot,
+                controller_id="controller-1",
+                ledger_sha256="ledger-sha",
+                main_revision="main-1",
+                terminal_status="FAILED",
+                validation_errors=["candidate review missing"],
+            )
+            changed = self.complete_event_receipt()
+            changed["event_contract"]["terminal_receipt"] = "rewritten receipt"
+
+            with self.assertRaisesRegex(ValueError, "immutable"):
+                control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    changed,
+                    controller_id="controller-1",
+                    ledger_sha256="ledger-sha",
+                    main_revision="main-1",
+                    terminal_status="CLOSED",
+                    validation_errors=[],
+                )
+
+    def test_control_event_guard_rejects_unproven_risk_clearance_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            incident = self.complete_event_receipt()
+            incident["event_contract"]["event_id"] = "incident-1"
+            control_event_guard.persist_controller_cycle_evidence(
+                root,
+                incident,
+                controller_id="controller-1",
+                ledger_sha256="ledger-sha",
+                main_revision="main-1",
+                terminal_status="FAILED",
+                validation_errors=["candidate review missing"],
+            )
+
+            alignment = self.complete_event_receipt()
+            alignment["event_contract"].update({
+                "event_id": "alignment-1",
+                "alignment_for_incident": "incident-1",
+            })
+            with self.assertRaisesRegex(ValueError, "alignment.*rule ACK"):
+                control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    alignment,
+                    controller_id="controller-1",
+                    ledger_sha256="ledger-sha",
+                    main_revision="main-1",
+                    terminal_status="CLOSED",
+                    validation_errors=[],
+                )
+            alignment["rule_update"] = {
+                "revision": "rule-2",
+                "affected_tasks": ["writer-1"],
+                "acknowledged_tasks": ["writer-1"],
+            }
+            alignment_receipt, _ = control_event_guard.persist_controller_cycle_evidence(
+                root,
+                alignment,
+                controller_id="controller-1",
+                ledger_sha256="ledger-sha",
+                main_revision="main-1",
+                terminal_status="CLOSED",
+                validation_errors=[],
+            )
+            self.assertEqual("incident-1", alignment_receipt["alignment_for_incident"])
+
+            closure = self.complete_event_receipt()
+            closure["event_contract"].update({
+                "event_id": "closure-1",
+                "post_incident_closure_for": "incident-1",
+            })
+            with self.assertRaisesRegex(ValueError, "post-incident closure.*L3 or L4"):
+                control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    closure,
+                    controller_id="controller-1",
+                    ledger_sha256="ledger-sha",
+                    main_revision="main-1",
+                    terminal_status="CLOSED",
+                    validation_errors=[],
+                )
+            closure_receipt, _ = control_event_guard.persist_controller_cycle_evidence(
+                root,
+                closure,
+                controller_id="controller-1",
+                ledger_sha256="ledger-sha",
+                main_revision="main-2",
+                terminal_status="CLOSED",
+                validation_errors=[],
+                integrated_revisions={"candidate-1"},
+            )
+            self.assertEqual("L3", closure_receipt["outcome_level"])
+
+    def test_registered_control_event_main_writes_machine_cycle_evidence(self) -> None:
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            ledger = root / "TASK_LEDGER.md"
+            ledger.write_text(
+                (SKILL_ROOT / "assets" / "templates" / "TASK_LEDGER.md").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            snapshot = {
+                **self.complete_event_receipt(),
+                "ledger_sha256": control_event_guard.ledger_sha256(ledger),
+                "available_slots": 1,
+                "capacity_projection": {
+                    "source": "host_runtime",
+                    "evidence": "receipt:host-runtime/capacity-main",
+                    "total_slots": 1,
+                    "occupied_task_ids": [],
+                },
+                "ready_packages": [{
+                    "id": "INIT-01",
+                    "decision": "active",
+                    "task_id": "INIT-01-WRITER",
+                    "delivered_ack": True,
+                }],
+                "required_reviews": [],
+                "candidate_packages": [],
+                "new_assignments": [],
+                "machine_trace": {
+                    "turn_id": "turn-1",
+                    "tool_use_ids": ["tool-1"],
+                    "trace_sha256": "trace-1",
+                },
+            }
+            receipt_file = root / "control-receipt.json"
+            receipt_file.write_text(json.dumps(snapshot), encoding="utf-8")
+            with patch.object(
+                control_event_guard,
+                "resolve_controller_trace_session",
+                return_value="controller-1",
+            ), patch.object(
+                control_event_guard,
+                "observed_machine_trace",
+                return_value=snapshot["machine_trace"],
+            ):
+                result = control_event_guard.main([
+                    str(receipt_file),
+                    "--ledger", str(ledger),
+                    "--repo", str(root),
+                    "--controller-session", "controller-1",
+                ])
+
+            self.assertEqual(0, result)
+            evidence_path = control_event_guard.controller_cycle_evidence_path(
+                root, "control-event-1"
+            )
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            self.assertEqual("controller-1", evidence["controller_id"])
+            self.assertEqual("CLOSED", evidence["terminal_status"])
+
     def test_control_event_guard_rejects_fabricated_available_slots(self) -> None:
         snapshot = {
             **self.complete_event_receipt(),

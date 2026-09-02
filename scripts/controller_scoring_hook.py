@@ -13,11 +13,17 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from controller_scoring_guard import consume_score_guard, cycle_score_extremes, finalize_cycle_score, finalize_score, latest_score_history, read_and_record_model, receipt_path
+    from controller_scoring_guard import consume_score_guard, cycle_score_extremes, finalize_attested_cycle_score, finalize_cycle_candidate, finalize_score, latest_score_history, read_and_record_model, receipt_path
 except ModuleNotFoundError:
-    from scripts.controller_scoring_guard import consume_score_guard, cycle_score_extremes, finalize_cycle_score, finalize_score, latest_score_history, read_and_record_model, receipt_path
+    from scripts.controller_scoring_guard import consume_score_guard, cycle_score_extremes, finalize_attested_cycle_score, finalize_cycle_candidate, finalize_score, latest_score_history, read_and_record_model, receipt_path
 
 MODEL_RELATIVE_PATH = Path("references/controller-performance-scoring.md")
+CONTROLLER_REGISTRY_PATH = Path(
+    os.environ.get(
+        "AD_CONTROLLER_REGISTRY",
+        str(Path.home() / ".codex" / "adaptive-delivery-controllers.json"),
+    )
+).expanduser()
 STATE_ROOT = Path(
     os.environ.get(
         "AD_SCORING_STATE_DIR",
@@ -41,6 +47,18 @@ _FORMAL_SCORE_LABEL = re.compile(
     rf"(?:正式(?:总控)?(?:履职)?评分|履职评分|formal(?: controller)? score|controller performance score).{{0,20}}?{_SCORE_VALUE}",
     re.IGNORECASE | re.DOTALL,
 )
+_PERFORMANCE_SCORE_LABEL = re.compile(
+    rf"(?:近期履职能力|recent performance score).{{0,20}}?{_SCORE_VALUE}",
+    re.IGNORECASE | re.DOTALL,
+)
+_RISK_CONSTRAINED_SCORE_LABEL = re.compile(
+    rf"(?:风险约束分|risk-constrained score).{{0,20}}?{_SCORE_VALUE}",
+    re.IGNORECASE | re.DOTALL,
+)
+_ANY_SCORE_SHAPE = re.compile(
+    r"(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)",
+    re.IGNORECASE,
+)
 
 _SCORE_TERMS = re.compile(
     r"(?:评分|打分|分数|多少分|履职评估|履职评分|performance\s+(?:score|scoring|evaluation)|score\s+(?:the\s+)?(?:controller|orchestrator)|rate\s+(?:the\s+)?(?:controller|orchestrator))",
@@ -48,6 +66,10 @@ _SCORE_TERMS = re.compile(
 )
 _PERFORMANCE_WORKFLOW = re.compile(
     r"(?:审计.{0,16}(?:项目总控|总控).{0,16}(?:履职|表现)|(?:项目总控|总控).{0,16}(?:履职|表现).{0,16}审计|(?:比较|评估|评价).{0,16}(?:项目总控|总控).{0,16}(?:履职|表现)|(?:项目总控|总控).{0,16}(?:履职|表现).{0,16}(?:比较|评估|评价)|(?:检查|核对).{0,16}(?:项目总控|总控).{0,16}假繁荣|(?:audit|evaluate|assess|review|compare).{0,30}(?:controller|orchestrator).{0,30}(?:performance|duty|execution)|(?:controller|orchestrator).{0,30}(?:performance|duty|execution).{0,30}(?:audit|evaluate|assess|review|compare))",
+    re.IGNORECASE,
+)
+_FORMAL_REQUEST_CONTEXT = re.compile(
+    r"(?:正式|履职评分|总控(?:履职)?评分|项目总控(?:履职)?评分|近期(?:履职|表现)|最近(?:履职|表现)|综合评分|formal(?: controller)? score|controller performance score)",
     re.IGNORECASE,
 )
 
@@ -69,6 +91,13 @@ def is_controller_scoring_request(prompt: str) -> bool:
     )
 
 
+def _scoring_mode(prompt: str) -> str:
+    text = str(prompt or "")
+    if _CYCLE_REQUEST.search(text) and not _FORMAL_REQUEST_CONTEXT.search(text):
+        return "cycle"
+    return "formal"
+
+
 def looks_like_controller_score_output(message: str) -> bool:
     text = str(message or "")
     return bool(
@@ -76,12 +105,14 @@ def looks_like_controller_score_output(message: str) -> bool:
         or _FORMAL_SCORE_LABEL.search(text)
         or _CYCLE_OUTPUT_SCORE.search(text)
         or _CYCLE_EXTREMA_OUTPUT.search(text)
+        or _PERFORMANCE_SCORE_LABEL.search(text)
+        or _RISK_CONSTRAINED_SCORE_LABEL.search(text)
     )
 
 
 def _extract_score_value(message: str) -> float | None:
     text = str(message or "")
-    match = _OUTPUT_SCORE.search(text) or _FORMAL_SCORE_LABEL.search(text)
+    match = _RISK_CONSTRAINED_SCORE_LABEL.search(text) or _OUTPUT_SCORE.search(text) or _FORMAL_SCORE_LABEL.search(text)
     if not match:
         return None
     value = re.search(r"(?:100|[1-9]?\d)(?:\.\d+)?", match.group(0))
@@ -99,7 +130,12 @@ def _extract_cycle_score_value(message: str) -> float | None:
 def _has_distinct_formal_score_output(message: str) -> bool:
     text = str(message or "")
     cycle_spans = [match.span() for match in _CYCLE_OUTPUT_SCORE.finditer(text)]
-    formal_matches = list(_OUTPUT_SCORE.finditer(text)) + list(_FORMAL_SCORE_LABEL.finditer(text))
+    formal_matches = (
+        list(_OUTPUT_SCORE.finditer(text))
+        + list(_FORMAL_SCORE_LABEL.finditer(text))
+        + list(_PERFORMANCE_SCORE_LABEL.finditer(text))
+        + list(_RISK_CONSTRAINED_SCORE_LABEL.finditer(text))
+    )
     for formal in formal_matches:
         formal_start, formal_end = formal.span()
         if not any(max(formal_start, cycle_start) < min(formal_end, cycle_end) for cycle_start, cycle_end in cycle_spans):
@@ -111,10 +147,68 @@ def _extract_labeled_value(message: str, labels: tuple[str, ...]) -> str | None:
     for raw_line in str(message or "").splitlines():
         line = raw_line.strip()
         for label in labels:
-            match = re.match(rf"{label}\s*[：:]\s*(.+)$", line, re.IGNORECASE)
+            match = re.match(
+                rf"(?:(?:[-*+] |\d+[.)] )|(?:#{{1,6}} ))?(?:\*\*|__)?{label}(?:\*\*|__)?\s*[：:]\s*(.+)$",
+                line,
+                re.IGNORECASE,
+            )
             if match:
                 return match.group(1).strip()[:500] or None
     return None
+
+
+def _parse_score_text(value: str | None) -> float | None:
+    match = re.search(r"(?:100|[1-9]?\d)(?:\.\d+)?", str(value or ""))
+    return float(match.group(0)) if match else None
+
+
+def _extract_labeled_score(message: str, labels: tuple[str, ...]) -> float | None:
+    return _parse_score_text(_extract_labeled_value(message, labels))
+
+
+def _is_unknown(value: str | None) -> bool:
+    return str(value or "").strip().upper() == "UNKNOWN"
+
+
+def _validate_cycle_extrema_claim(
+    message: str,
+    *,
+    expected: dict[str, dict[str, Any] | None],
+) -> None:
+    fields = {
+        "best_score": _extract_labeled_value(message, (r"单回合最高分", r"single-cycle best score")),
+        "best_id": _extract_labeled_value(message, (r"最高回合", r"best cycle")),
+        "worst_score": _extract_labeled_value(message, (r"单回合最低分", r"single-cycle worst score")),
+        "worst_id": _extract_labeled_value(message, (r"最低回合", r"worst cycle")),
+    }
+    if any(value is None for value in fields.values()):
+        raise ValueError("cycle extrema require best/worst scores and cycle ids, or explicit UNKNOWN for all four fields")
+    for side in ("best", "worst"):
+        score_text = fields[f"{side}_score"]
+        cycle_text = fields[f"{side}_id"]
+        expected_record = expected[side]
+        if expected_record is None:
+            if not (_is_unknown(score_text) and _is_unknown(cycle_text)):
+                raise ValueError("cycle extrema do not match eligible same-controller, same-model history; expected UNKNOWN")
+            continue
+        claimed_score = _parse_score_text(score_text)
+        claimed_cycle = str(cycle_text or "").strip().strip("`")
+        expected_score = float(expected_record["score"])
+        expected_cycle = str(expected_record["cycle_id"]).strip()
+        if claimed_score is None or abs(claimed_score - expected_score) > 1e-9 or claimed_cycle != expected_cycle:
+            raise ValueError("cycle extrema do not match eligible same-controller, same-model history")
+
+
+def _extract_three_layer_report(message: str) -> tuple[float, str, str, float]:
+    performance = _extract_labeled_score(message, (r"近期履职能力", r"recent performance score"))
+    risk_status = _extract_labeled_value(message, (r"治理风险状态", r"governance risk status"))
+    risk_summary = _extract_labeled_value(message, (r"治理风险依据", r"governance risk basis"))
+    constrained = _extract_labeled_score(message, (r"风险约束分", r"risk-constrained score"))
+    if performance is None or risk_status is None or risk_summary is None or constrained is None:
+        raise ValueError(
+            "three-layer formal report requires performance score, governance risk status/basis, and risk-constrained score"
+        )
+    return performance, risk_status.upper().strip(), risk_summary, constrained
 
 
 def _extract_window_summary(message: str) -> str | None:
@@ -132,6 +226,69 @@ def _extract_window_summary(message: str) -> str | None:
 def _repo_root(cwd: str | Path) -> Path:
     completed = subprocess.run(["git", "-C", str(Path(cwd).resolve()), "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True)
     return Path(completed.stdout.strip()).resolve()
+
+
+def _git_common_dir(repo: str | Path) -> Path:
+    root = Path(repo).resolve()
+    completed = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    common = Path(completed.stdout.strip())
+    return (root / common).resolve() if not common.is_absolute() else common.resolve()
+
+
+def _logical_controller_id(repo: Path, source_session_id: str) -> str:
+    source = str(source_session_id or "").strip()
+    if not source:
+        raise ValueError("controller scoring requires a non-empty source session identity")
+    try:
+        registry = json.loads(CONTROLLER_REGISTRY_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return source
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"controller registry is unreadable: {error}") from error
+    if not isinstance(registry, dict):
+        raise ValueError("controller registry root must be an object")
+    requested_common = _git_common_dir(repo)
+    matches: list[str] = []
+    for controller_id, registered_repo in registry.items():
+        if not isinstance(controller_id, str) or controller_id.startswith("__") or not isinstance(registered_repo, str):
+            continue
+        try:
+            if _git_common_dir(Path(registered_repo).expanduser()) == requested_common:
+                matches.append(controller_id)
+        except (OSError, subprocess.CalledProcessError):
+            continue
+    if not matches:
+        return source
+    if len(matches) != 1:
+        raise ValueError("controller scoring requires exactly one registered logical Controller")
+    controller_id = matches[0]
+    if source == controller_id:
+        return controller_id
+    aliases: set[str] = set()
+    session_map = registry.get("__controller_sessions__")
+    if isinstance(session_map, dict):
+        controller_sessions = session_map.get(controller_id)
+        if isinstance(controller_sessions, dict):
+            for values in controller_sessions.values():
+                if isinstance(values, str):
+                    aliases.add(values)
+                elif isinstance(values, list):
+                    aliases.update(value for value in values if isinstance(value, str))
+    targets = registry.get("__controller_targets__")
+    if isinstance(targets, dict):
+        controller_targets = targets.get(controller_id)
+        if isinstance(controller_targets, dict):
+            for record in controller_targets.values():
+                if isinstance(record, dict) and record.get("status") == "active" and isinstance(record.get("session_id"), str):
+                    aliases.add(str(record["session_id"]))
+    if source not in aliases:
+        raise ValueError("source session is not bound to the registered logical Controller")
+    return controller_id
 
 
 def _state_path(session_id: str) -> Path:
@@ -185,8 +342,14 @@ def evaluate_event(
             return {}, state
         try:
             repo = _repo_root(str(event.get("cwd", "") or Path.cwd()))
+            source_session_id = str(event.get("session_id", "")).strip()
+            controller_id = _logical_controller_id(repo, source_session_id)
             model = scoring_model_path(skill_root)
-            content, receipt = read_and_record_model(repo, skill_root=skill_root)
+            content, receipt = read_and_record_model(
+                repo,
+                skill_root=skill_root,
+                controller_session_id=controller_id,
+            )
             digest = str(receipt["model_sha256"])
             context = (
                 "Adaptive Agent Runtime controller-scoring machine gate is active. "
@@ -194,6 +357,15 @@ def evaluate_event(
                 "Do not substitute another rubric. The Stop gate will fail closed if this exact model changes before the response completes.\n"
                 f"installed_scoring_model_sha256={digest}\n"
                 f"installed_scoring_model_path={model}\n\n"
+                f"stable_logical_controller_id={controller_id}\n"
+                "machine_governance_risk_projection="
+                + json.dumps(
+                    receipt.get("governance_risk_projection", {}),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n\n"
                 + content.decode("utf-8")
             )
         except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as error:
@@ -208,11 +380,13 @@ def evaluate_event(
                 "model_sha256": digest,
                 "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
                 "repo_root": str(repo),
+                "controller_id": controller_id,
+                "source_session_id": source_session_id,
                 "receipt_path": str(receipt_path(repo)),
                 "receipt_sha256": str(receipt.get("model_sha256", "")),
                 "reinject_required": False,
                 "turn_id": str(event.get("turn_id", "")),
-                "scoring_mode": "cycle" if _CYCLE_REQUEST.search(prompt) else "formal",
+                "scoring_mode": _scoring_mode(prompt),
             }
         )
         return {
@@ -245,6 +419,11 @@ def evaluate_event(
         repo_text = str(state.get("repo_root", "")).strip()
         if not repo_text:
             return {"decision": "block", "reason": "controller scoring blocked: score-guard repo binding is missing."}, state
+        if str(event.get("session_id", "")).strip() != str(state.get("source_session_id", "")).strip():
+            return {"decision": "block", "reason": "controller scoring blocked: scoring turn source session changed."}, state
+        controller_id = str(state.get("controller_id", "")).strip()
+        if not controller_id:
+            return {"decision": "block", "reason": "controller scoring blocked: stable logical Controller binding is missing."}, state
         if state.get("model_sha256") != installed_digest or Path(str(state.get("model_path", ""))).resolve() != installed_path:
             # Stop continuation text is size-limited by Codex. Do not pretend the new
             # rubric was fully injected here and do not advance the recorded digest.
@@ -270,38 +449,80 @@ def evaluate_event(
                 "decision": "block",
                 "reason": "controller scoring blocked: score output mode mismatch; cycle diagnostic requested",
             }, state
-        if scoring_mode == "formal" and (cycle_score is not None or _CYCLE_EXTREMA_OUTPUT.search(message)):
+        if scoring_mode == "formal" and cycle_score is not None:
             return {
                 "decision": "block",
                 "reason": "controller scoring blocked: score output mode mismatch; formal scoring requested",
             }, state
-        score = cycle_score if scoring_mode == "cycle" else formal_score
         try:
-            if score is None:
-                errors = consume_score_guard(Path(repo_text), skill_root=skill_root)
-                if errors:
-                    return {
-                        "decision": "block",
-                        "reason": "controller scoring blocked: score-guard failed: " + "; ".join(errors),
-                    }, state
-            elif scoring_mode == "cycle":
-                cycle_id = _extract_labeled_value(message, (r"控制回合", r"cycle(?: id)?"))
-                terminal_status = _extract_labeled_value(message, (r"回合终态", r"terminal status"))
-                evidence_summary = _extract_labeled_value(message, (r"证据摘要", r"evidence summary"))
-                finalize_cycle_score(
-                    Path(repo_text), skill_root=skill_root,
-                    controller_session_id=str(event.get("session_id", "")).strip(),
-                    turn_id=current_turn, cycle_id=cycle_id or "", terminal_status=terminal_status or "",
-                    score=score, evidence_summary=evidence_summary,
-                    message_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
-                )
+            if scoring_mode == "cycle":
+                controller_session_id = controller_id
+                if cycle_score is None and (_CYCLE_EXTREMA_OUTPUT.search(message) or "单回合最高分" in message or "单回合最低分" in message):
+                    expected_extremes = cycle_score_extremes(
+                        Path(repo_text),
+                        controller_session_id=controller_session_id,
+                        model_sha256=installed_digest,
+                    )
+                    _validate_cycle_extrema_claim(message, expected=expected_extremes)
+                    errors = consume_score_guard(Path(repo_text), skill_root=skill_root)
+                    if errors:
+                        raise ValueError("score-guard failed: " + "; ".join(errors))
+                elif cycle_score is not None:
+                    cycle_id = _extract_labeled_value(message, (r"控制回合", r"cycle(?: id)?"))
+                    terminal_status = _extract_labeled_value(message, (r"回合终态", r"terminal status"))
+                    evidence_summary = _extract_labeled_value(message, (r"证据摘要", r"evidence summary"))
+                    evidence_id = _extract_labeled_value(message, (r"证据收据", r"evidence receipt"))
+                    finalizer = finalize_attested_cycle_score if evidence_id else finalize_cycle_candidate
+                    finalizer_kwargs = {
+                        "repo": Path(repo_text),
+                        "skill_root": skill_root,
+                        "controller_session_id": controller_session_id,
+                        "turn_id": current_turn,
+                        "cycle_id": cycle_id or "",
+                        "terminal_status": terminal_status or "",
+                        "score": cycle_score,
+                        "evidence_summary": evidence_summary,
+                        "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                    }
+                    if evidence_id:
+                        finalizer_kwargs["evidence_id"] = evidence_id
+                    finalizer(**finalizer_kwargs)
+                else:
+                    errors = consume_score_guard(Path(repo_text), skill_root=skill_root)
+                    if errors:
+                        raise ValueError("score-guard failed: " + "; ".join(errors))
             else:
-                finalize_score(
-                    Path(repo_text), skill_root=skill_root,
-                    controller_session_id=str(event.get("session_id", "")).strip(),
-                    turn_id=current_turn, score=score, window_summary=_extract_window_summary(message),
-                    message_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                formal_claim_present = bool(
+                    formal_score is not None
+                    or _ANY_SCORE_SHAPE.search(message)
+                    or _PERFORMANCE_SCORE_LABEL.search(message)
+                    or _RISK_CONSTRAINED_SCORE_LABEL.search(message)
+                    or _CYCLE_EXTREMA_OUTPUT.search(message)
+                    or "治理风险状态" in message
+                    or "治理风险依据" in message
+                    or "单回合最高分" in message
+                    or "单回合最低分" in message
                 )
+                if formal_claim_present:
+                    performance_score, risk_status, risk_summary, constrained_score = _extract_three_layer_report(message)
+                    expected_extremes = cycle_score_extremes(
+                        Path(repo_text),
+                        controller_session_id=controller_id,
+                        model_sha256=installed_digest,
+                    )
+                    _validate_cycle_extrema_claim(message, expected=expected_extremes)
+                    finalize_score(
+                        Path(repo_text), skill_root=skill_root,
+                        controller_session_id=controller_id,
+                        turn_id=current_turn, score=constrained_score, performance_score=performance_score,
+                        governance_risk_status=risk_status, risk_summary=risk_summary,
+                        window_summary=_extract_window_summary(message),
+                        message_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                    )
+                else:
+                    errors = consume_score_guard(Path(repo_text), skill_root=skill_root)
+                    if errors:
+                        raise ValueError("score-guard failed: " + "; ".join(errors))
         except ValueError as error:
             return {
                 "decision": "block",

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "controller_scoring_hook.py"
+GUARD_SCRIPT = ROOT / "scripts" / "controller_scoring_guard.py"
 
 
 def load_module():
@@ -15,6 +18,63 @@ def load_module():
     assert spec and spec.loader
     spec.loader.exec_module(module)
     return module
+
+
+def load_guard_module():
+    spec = importlib.util.spec_from_file_location("controller_scoring_guard_for_hook_tests", GUARD_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def append_attested_cycle(guard, repo: Path, record: dict):
+    evidence_id = f"evidence-{record['cycle_id']}"
+    receipt = {
+        "schema_version": 1,
+        "record_kind": "controller_cycle_evidence",
+        "evidence_id": evidence_id,
+        "controller_id": record["controller_session_id"],
+        "cycle_id": record["cycle_id"],
+        "terminal_status": record["terminal_status"],
+        "evidence_summary": record["evidence_summary"],
+        "outcome_level": "L3",
+        "recorded_at": "2026-09-02T00:00:00+00:00",
+    }
+    target = guard._cycle_evidence_path(repo, evidence_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    content = (json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    target.write_bytes(content)
+    guard.append_score_history(repo, {
+        **record,
+        "evidence_id": evidence_id,
+        "evidence_sha256": hashlib.sha256(content).hexdigest(),
+    })
+
+
+def formal_message(
+    performance: float = 82.0,
+    constrained: float | None = None,
+    *,
+    risk_status: str = "GREEN",
+    risk_summary: str = "无未闭环治理事故。",
+    best_score: str = "UNKNOWN",
+    best_cycle: str = "UNKNOWN",
+    worst_score: str = "UNKNOWN",
+    worst_cycle: str = "UNKNOWN",
+) -> str:
+    constrained = performance if constrained is None else constrained
+    return (
+        f"近期履职能力：{performance}/100\n"
+        f"治理风险状态：{risk_status}\n"
+        f"治理风险依据：{risk_summary}\n"
+        f"风险约束分：{constrained}/100\n"
+        f"单回合最高分：{best_score}\n"
+        f"最高回合：{best_cycle}\n"
+        f"单回合最低分：{worst_score}\n"
+        f"最低回合：{worst_cycle}\n"
+        "评估窗口：最近 24 小时内最多 5 个有效控制事件。"
+    )
 
 
 class ControllerScoringHookTests(unittest.TestCase):
@@ -34,6 +94,7 @@ class ControllerScoringHookTests(unittest.TestCase):
         self.assertIn("# Controller Performance Scoring", context)
         self.assertIn("七维评分模型", context)
         self.assertIn(hook.scoring_model_sha256(ROOT), context)
+        self.assertIn("machine_governance_risk_projection=", context)
         self.assertTrue(state["pending_scoring"])
         self.assertEqual(hook.scoring_model_sha256(ROOT), state["model_sha256"])
 
@@ -84,7 +145,7 @@ class ControllerScoringHookTests(unittest.TestCase):
             skill_root=ROOT, prior_state={},
         )
         output, state = hook.evaluate_event(
-            {"hook_event_name": "Stop", "session_id": "s1", "cwd": str(ROOT), "last_assistant_message": "总控评分：82/100。"},
+            {"hook_event_name": "Stop", "session_id": "s1", "cwd": str(ROOT), "last_assistant_message": formal_message()},
             skill_root=ROOT, prior_state=state,
         )
         self.assertEqual({}, output)
@@ -130,7 +191,7 @@ class ControllerScoringHookTests(unittest.TestCase):
             self.assertFalse(refreshed.get("reinject_required", False))
             self.assertEqual(hook.scoring_model_sha256(skill), refreshed["model_sha256"])
             allowed, refreshed = hook.evaluate_event(
-                {"hook_event_name": "Stop", "session_id": "s1", "cwd": str(repo), "last_assistant_message": "总控评分：80/100"},
+                {"hook_event_name": "Stop", "session_id": "s1", "cwd": str(repo), "last_assistant_message": formal_message(80.0)},
                 skill_root=skill, prior_state=refreshed,
             )
             self.assertEqual({}, allowed)
@@ -235,7 +296,7 @@ class ControllerScoringHookTests(unittest.TestCase):
             )
             output, state = hook.evaluate_event(
                 {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-1", "cwd": str(repo),
-                 "last_assistant_message": "当前总控履职评分：86/100。\n评估窗口：最近 24 小时内最多 5 个有效控制事件 + 当前重大未闭环异常单独检查。"},
+                 "last_assistant_message": formal_message(86.0)},
                 skill_root=ROOT, prior_state=state,
             )
             self.assertEqual({}, output)
@@ -260,7 +321,7 @@ class ControllerScoringHookTests(unittest.TestCase):
             Path(state["receipt_path"]).unlink()
             output, _ = hook.evaluate_event(
                 {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-1", "cwd": str(repo),
-                 "last_assistant_message": "当前总控履职评分：86/100。"},
+                 "last_assistant_message": formal_message(86.0)},
                 skill_root=ROOT, prior_state=state,
             )
             self.assertEqual("block", output["decision"])
@@ -282,7 +343,7 @@ class ControllerScoringHookTests(unittest.TestCase):
             handler = value["hooks"]["UserPromptSubmit"][0]["hooks"][0]
             self.assertEqual(0, handler["additionalContextLimit"])
 
-    def test_single_cycle_score_is_persisted_as_cycle_not_formal_history(self):
+    def test_single_cycle_score_is_persisted_as_unattested_candidate_not_formal_history(self):
         import subprocess
         hook = load_module()
         with tempfile.TemporaryDirectory() as td:
@@ -300,8 +361,7 @@ class ControllerScoringHookTests(unittest.TestCase):
             self.assertEqual({}, output)
             self.assertIsNone(hook.latest_score_history(repo, controller_session_id="controller-1"))
             extremes = hook.cycle_score_extremes(repo, controller_session_id="controller-1", model_sha256=hook.scoring_model_sha256(ROOT))
-            self.assertEqual(91.0, extremes["best"]["score"])
-            self.assertEqual("M1-F4-C-SERVER-GATE", extremes["best"]["cycle_id"])
+            self.assertEqual({"best": None, "worst": None}, extremes)
 
 
 class ControllerScoringOutputGateTests(unittest.TestCase):
@@ -433,7 +493,7 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
                 self.assertEqual("block", output.get("decision"))
                 self.assertIn("score-guard", output.get("reason", ""))
 
-    def test_formal_request_blocks_cycle_extrema_summary(self):
+    def test_formal_request_blocks_incomplete_extrema_only_summary(self):
         import subprocess
         hook = load_module()
         with tempfile.TemporaryDirectory() as td:
@@ -449,9 +509,210 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
                 skill_root=ROOT, prior_state=state,
             )
             self.assertEqual("block", output.get("decision"))
-            self.assertIn("mode", output.get("reason", ""))
+            self.assertIn("three-layer", output.get("reason", ""))
 
-    def test_cycle_request_allows_guarded_extrema_summary_without_new_cycle_record(self):
+    def test_formal_request_requires_three_layer_report(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-formal-required", "cwd": str(repo), "prompt": "给总控正式履职评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-formal-required", "cwd": str(repo),
+                 "last_assistant_message": "正式履职评分：82/100。\n评估窗口：最近24小时。"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual("block", output.get("decision"))
+            self.assertIn("three-layer", output.get("reason", ""))
+
+    def test_formal_request_allows_three_layer_report_with_verified_cycle_extremes(self):
+        import subprocess
+        hook = load_module()
+        guard = load_guard_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            model = hook.scoring_model_sha256(ROOT)
+            append_attested_cycle(guard, repo, {
+                "controller_session_id": "controller-1", "record_kind": "cycle",
+                "cycle_id": "best-cycle", "terminal_status": "CLOSED", "score": 90.0,
+                "model_sha256": model, "evidence_summary": "closed", "message_sha256": "a" * 64,
+            })
+            append_attested_cycle(guard, repo, {
+                "controller_session_id": "controller-1", "record_kind": "cycle",
+                "cycle_id": "worst-cycle", "terminal_status": "FAILED", "score": 49.0,
+                "model_sha256": model, "evidence_summary": "failed", "message_sha256": "b" * 64,
+            })
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-formal-layered", "cwd": str(repo), "prompt": "给总控正式履职评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            message = (
+                "近期履职能力：77.4/100\n"
+                "治理风险状态：RED\n"
+                "治理风险依据：重大事故尚未形成机器纠偏收据。\n"
+                "风险约束分：49/100\n"
+                "单回合最高分：90/100\n最高回合：best-cycle\n"
+                "单回合最低分：49/100\n最低回合：worst-cycle\n"
+                "评估窗口：最近24小时内最多5个有效控制事件。"
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-formal-layered", "cwd": str(repo),
+                 "last_assistant_message": message},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual({}, output)
+            history = hook.latest_score_history(repo, controller_session_id="controller-1")
+            self.assertEqual(77.4, history["performance_score"])
+            self.assertEqual(49.0, history["risk_constrained_score"])
+            self.assertEqual("best-cycle", history["cycle_extremes"]["best"]["cycle_id"])
+
+    def test_formal_scoring_request_with_extrema_requirement_stays_formal(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "controller-1",
+                    "turn_id": "turn-formal-with-extrema",
+                    "cwd": str(repo),
+                    "prompt": "再给总控履职评分一下，记得要有单回合最高分和最低分",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            self.assertEqual("formal", state["scoring_mode"])
+            output, _ = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "controller-1",
+                    "turn_id": "turn-formal-with-extrema",
+                    "cwd": str(repo),
+                    "last_assistant_message": formal_message(),
+                },
+                skill_root=ROOT,
+                prior_state=state,
+            )
+            self.assertEqual({}, output)
+
+    def test_formal_request_blocks_generic_score_shape_that_omits_required_report(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "session-a", "turn_id": "t1", "cwd": str(repo), "prompt": "给总控履职评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "session-a", "turn_id": "t1", "cwd": str(repo), "last_assistant_message": "结论：82/100"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual("block", output.get("decision"))
+            self.assertIn("three-layer", output.get("reason", ""))
+
+    def test_registered_handoff_sessions_share_stable_logical_controller_id(self):
+        import json
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            registry = Path(td) / "controllers.json"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            registry.write_text(json.dumps({
+                "logical-controller": str(repo),
+                "__controller_sessions__": {
+                    "logical-controller": {"desktop_codex": ["session-a", "session-b"]}
+                },
+            }), encoding="utf-8")
+            hook.CONTROLLER_REGISTRY_PATH = registry
+            _, first = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "session-a", "turn_id": "t1", "cwd": str(repo), "prompt": "给总控履职评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            _, second = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "session-b", "turn_id": "t2", "cwd": str(repo), "prompt": "给总控履职评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            self.assertEqual("logical-controller", first["controller_id"])
+            self.assertEqual(first["controller_id"], second["controller_id"])
+
+    def test_cycle_output_cannot_self_attest_terminal_evidence_into_extremes(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "t1", "cwd": str(repo), "prompt": "给总控做单回合诊断评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "t1", "cwd": str(repo),
+                 "last_assistant_message": "单回合诊断评分：99/100。\n控制回合：invented\n回合终态：CLOSED\n证据摘要：invented evidence"},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual({}, output)
+            self.assertEqual(
+                {"best": None, "worst": None},
+                hook.cycle_score_extremes(repo, controller_session_id="controller-1", model_sha256=hook.scoring_model_sha256(ROOT)),
+            )
+
+    def test_markdown_bold_list_three_layer_report_is_accepted(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "t1", "cwd": str(repo), "prompt": "给总控履职评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            message = "\n".join((
+                "- **近期履职能力**：82/100", "- **治理风险状态**：GREEN",
+                "- **治理风险依据**：机器投影未发现事故", "- **风险约束分**：82/100",
+                "- **单回合最高分**：UNKNOWN", "- **最高回合**：UNKNOWN",
+                "- **单回合最低分**：UNKNOWN", "- **最低回合**：UNKNOWN",
+                "- **评估窗口**：最近24小时",
+            ))
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "t1", "cwd": str(repo), "last_assistant_message": message},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual({}, output)
+
+    def test_formal_request_rejects_unverified_cycle_extremes(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "controller-1", "turn_id": "turn-formal-fake-extrema", "cwd": str(repo), "prompt": "给总控正式履职评分"},
+                skill_root=ROOT, prior_state={},
+            )
+            message = (
+                "近期履职能力：77.4/100\n治理风险状态：GREEN\n治理风险依据：无未闭环事故。\n"
+                "风险约束分：77.4/100\n单回合最高分：90/100\n最高回合：invented\n"
+                "单回合最低分：49/100\n最低回合：invented-worst\n评估窗口：最近24小时。"
+            )
+            output, _ = hook.evaluate_event(
+                {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-formal-fake-extrema", "cwd": str(repo),
+                 "last_assistant_message": message},
+                skill_root=ROOT, prior_state=state,
+            )
+            self.assertEqual("block", output.get("decision"))
+            self.assertIn("cycle extrema", output.get("reason", ""))
+
+    def test_cycle_request_allows_explicit_unknown_extrema_without_new_cycle_record(self):
         import subprocess
         hook = load_module()
         with tempfile.TemporaryDirectory() as td:
@@ -463,7 +724,10 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
             )
             output, _ = hook.evaluate_event(
                 {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-cycle-extrema", "cwd": str(repo),
-                 "last_assistant_message": "能力上限：91分；能力下限：42分。"},
+                 "last_assistant_message": (
+                     "单回合最高分：UNKNOWN\n最高回合：UNKNOWN\n"
+                     "单回合最低分：UNKNOWN\n最低回合：UNKNOWN"
+                 )},
                 skill_root=ROOT, prior_state=state,
             )
             self.assertEqual({}, output)
@@ -528,7 +792,7 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
         self.assertEqual("block", output.get("decision"))
         self.assertIn("score-guard", output.get("reason", ""))
 
-    def test_guarded_standalone_formal_label_persists_formal_history(self):
+    def test_guarded_three_layer_report_persists_formal_history(self):
         import subprocess
         hook = load_module()
         with tempfile.TemporaryDirectory() as td:
@@ -540,7 +804,7 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
             )
             output, _ = hook.evaluate_event(
                 {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-formal-label", "cwd": str(repo),
-                 "last_assistant_message": "正式履职评分：82/100。\n评估窗口：最近 24 小时内最多 5 个有效控制事件。"},
+                 "last_assistant_message": formal_message()},
                 skill_root=ROOT, prior_state=state,
             )
             self.assertEqual({}, output)
