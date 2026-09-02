@@ -2345,17 +2345,328 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                     terminal_status="CLOSED",
                     validation_errors=[],
                 )
-            closure_receipt, _ = control_event_guard.persist_controller_cycle_evidence(
+    def test_control_event_guard_classifies_integrated_review_fail_as_major_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            snapshot = self.complete_event_receipt()
+            receipt, _ = control_event_guard.persist_controller_cycle_evidence(
                 root,
-                closure,
+                snapshot,
                 controller_id="controller-1",
                 ledger_sha256="ledger-sha",
+                main_revision="main-1",
+                terminal_status="FAILED",
+                validation_errors=["review FAIL for candidate-1 requires rework disposition"],
+                integrated_revisions={"candidate-1"},
+            )
+            self.assertEqual("major", receipt["governance_incident_severity"])
+
+    def test_control_event_guard_rejects_empty_correction_and_unbound_post_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            incident = self.complete_event_receipt()
+            incident["event_contract"]["event_id"] = "incident-1"
+            control_event_guard.persist_controller_cycle_evidence(
+                root,
+                incident,
+                controller_id="controller-1",
+                ledger_sha256="ledger-sha",
+                main_revision="main-1",
+                terminal_status="FAILED",
+                validation_errors=["review FAIL for candidate-1 requires rework disposition"],
+                integrated_revisions={"candidate-1"},
+            )
+
+            correction = self.complete_event_receipt()
+            correction["event_contract"].update({
+                "event_id": "correction-1",
+                "corrects_incident": "incident-1",
+            })
+            with self.assertRaisesRegex(ValueError, "correction clearance.*integrated correction"):
+                control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    correction,
+                    controller_id="controller-1",
+                    ledger_sha256="ledger-sha",
+                    main_revision="main-2",
+                    terminal_status="CLOSED",
+                    validation_errors=[],
+                )
+
+            post_closure = self.complete_event_receipt()
+            post_closure["event_contract"].update({
+                "event_id": "post-1",
+                "post_incident_closure_for": "incident-1",
+            })
+            with self.assertRaisesRegex(ValueError, "post-incident closure.*correction evidence"):
+                control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    post_closure,
+                    controller_id="controller-1",
+                    ledger_sha256="ledger-sha",
+                    main_revision="main-3",
+                    terminal_status="CLOSED",
+                    validation_errors=[],
+                    integrated_revisions={"unrelated-candidate"},
+                )
+
+    def test_control_event_guard_accepts_evidence_bound_correction_and_post_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            incident = self.complete_event_receipt()
+            incident["event_contract"]["event_id"] = "incident-1"
+            control_event_guard.persist_controller_cycle_evidence(
+                root,
+                incident,
+                controller_id="controller-1",
+                ledger_sha256="ledger-1",
+                main_revision="main-1",
+                terminal_status="FAILED",
+                validation_errors=["review FAIL for bad-revision requires rework disposition"],
+                integrated_revisions={"bad-revision"},
+            )
+
+            correction = self.complete_event_receipt()
+            correction["event_contract"].update({
+                "event_id": "correction-1",
+                "corrects_incident": "incident-1",
+                "correction_revision": "fixed-revision",
+            })
+            correction["candidate_packages"] = [{
+                "revision": "fixed-revision",
+                "task_id": "FIX-1",
+                "review_task_id": "REVIEW-1",
+                "decision": "integrate",
+                "integrated_this_event": True,
+                "main_revision": "main-2",
+                "regression_evidence": "current-main regression PASS",
+                "acceptance_evidence": "real environment acceptance PASS",
+                "author_task_id": "FIX-1",
+            }]
+            correction["required_reviews"] = [{
+                "id": "review-1",
+                "task_id": "REVIEW-1",
+                "delivered_ack": True,
+                "candidate_revision": "fixed-revision",
+                "verdict": "PASS",
+            }]
+            correction_receipt, _ = control_event_guard.persist_controller_cycle_evidence(
+                root,
+                correction,
+                controller_id="controller-1",
+                ledger_sha256="ledger-2",
                 main_revision="main-2",
                 terminal_status="CLOSED",
                 validation_errors=[],
-                integrated_revisions={"candidate-1"},
+                integrated_revisions={"fixed-revision"},
+                ledger_open_ids=set(),
+                ledger_task_states={"FIX-1": "DONE", "REVIEW-1": "DONE"},
             )
-            self.assertEqual("L3", closure_receipt["outcome_level"])
+            self.assertEqual("fixed-revision", correction_receipt["correction_revision"])
+
+            post = self.complete_event_receipt()
+            post["event_contract"].update({
+                "event_id": "post-1",
+                "post_incident_closure_for": "incident-1",
+                "depends_on_correction_evidence_id": "correction-1",
+            })
+            post_receipt, _ = control_event_guard.persist_controller_cycle_evidence(
+                root,
+                post,
+                controller_id="controller-1",
+                ledger_sha256="ledger-3",
+                main_revision="main-3",
+                terminal_status="CLOSED",
+                validation_errors=[],
+                integrated_revisions={"post-revision"},
+            )
+            self.assertEqual("L3", post_receipt["outcome_level"])
+            self.assertEqual(
+                "correction-1", post_receipt["depends_on_correction_evidence_id"]
+            )
+
+    def test_control_event_guard_rejects_correction_with_unregistered_task_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            incident = self.complete_event_receipt()
+            incident["event_contract"]["event_id"] = "incident-1"
+            control_event_guard.persist_controller_cycle_evidence(
+                root,
+                incident,
+                controller_id="controller-1",
+                ledger_sha256="ledger-1",
+                main_revision="main-1",
+                terminal_status="FAILED",
+                validation_errors=["review FAIL for bad-revision requires rework disposition"],
+                integrated_revisions={"bad-revision"},
+            )
+
+            correction = self.complete_event_receipt()
+            correction["event_contract"].update({
+                "event_id": "correction-1",
+                "corrects_incident": "incident-1",
+                "correction_revision": "fixed-revision",
+            })
+            correction["candidate_packages"] = [{
+                "revision": "fixed-revision",
+                "task_id": "NONEXISTENT-LEDGER-TASK",
+                "review_task_id": "NONEXISTENT-REVIEW-TASK",
+                "decision": "integrate",
+                "integrated_this_event": True,
+                "main_revision": "main-2",
+                "regression_evidence": "PASS",
+                "acceptance_evidence": "PASS",
+                "author_task_id": "NONEXISTENT-LEDGER-TASK",
+            }]
+            correction["required_reviews"] = [{
+                "id": "review-1",
+                "task_id": "NONEXISTENT-REVIEW-TASK",
+                "delivered_ack": True,
+                "candidate_revision": "fixed-revision",
+                "verdict": "PASS",
+            }]
+
+            correction["candidate_packages"][0]["author_task_id"] = "FAKE-AUTHOR"
+            with self.assertRaisesRegex(ValueError, "author task bound"):
+                control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    correction,
+                    controller_id="controller-1",
+                    ledger_sha256="ledger-2",
+                    main_revision="main-2",
+                    terminal_status="CLOSED",
+                    validation_errors=[],
+                    integrated_revisions={"fixed-revision"},
+                    ledger_open_ids=set(),
+                    ledger_task_states={"FIX-1": "DONE", "REVIEW-1": "DONE"},
+                )
+            correction["candidate_packages"][0]["author_task_id"] = (
+                "NONEXISTENT-LEDGER-TASK"
+            )
+            with self.assertRaisesRegex(ValueError, "current ledger"):
+                control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    correction,
+                    controller_id="controller-1",
+                    ledger_sha256="ledger-2",
+                    main_revision="main-2",
+                    terminal_status="CLOSED",
+                    validation_errors=[],
+                    integrated_revisions={"fixed-revision"},
+                    ledger_open_ids=set(),
+                    ledger_task_states={"FIX-1": "DONE", "REVIEW-1": "DONE"},
+                )
+
+    def test_control_event_guard_fails_closed_when_configured_upstream_is_unresolvable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "branch.main.remote", "origin"], cwd=root, check=True)
+            subprocess.run(["git", "config", "branch.main.merge", "refs/heads/main"], cwd=root, check=True)
+            incident = self.complete_event_receipt()
+            incident["event_contract"]["event_id"] = "incident-1"
+            control_event_guard.persist_controller_cycle_evidence(
+                root,
+                incident,
+                controller_id="controller-1",
+                ledger_sha256="ledger-1",
+                main_revision="main-1",
+                terminal_status="FAILED",
+                validation_errors=["review FAIL for bad-revision requires rework disposition"],
+                integrated_revisions={"bad-revision"},
+            )
+            correction = self.complete_event_receipt()
+            correction["event_contract"].update({
+                "event_id": "correction-1",
+                "corrects_incident": "incident-1",
+                "correction_revision": "fixed-revision",
+            })
+            correction["candidate_packages"] = [{
+                "revision": "fixed-revision",
+                "task_id": "FIX-1",
+                "review_task_id": "REVIEW-1",
+                "decision": "integrate",
+                "integrated_this_event": True,
+                "main_revision": "main-2",
+                "regression_evidence": "PASS",
+                "acceptance_evidence": "PASS",
+                "author_task_id": "FIX-1",
+            }]
+            correction["required_reviews"] = [{
+                "id": "review-1",
+                "task_id": "REVIEW-1",
+                "delivered_ack": True,
+                "candidate_revision": "fixed-revision",
+                "verdict": "PASS",
+            }]
+
+            with self.assertRaisesRegex(ValueError, "tracked remote.*unavailable"):
+                control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    correction,
+                    controller_id="controller-1",
+                    ledger_sha256="ledger-2",
+                    main_revision="main-2",
+                    terminal_status="CLOSED",
+                    validation_errors=[],
+                    integrated_revisions={"fixed-revision"},
+                    ledger_open_ids=set(),
+                    ledger_task_states={"FIX-1": "DONE", "REVIEW-1": "DONE"},
+                )
+
+    def test_control_event_guard_rejects_post_closure_bound_to_legacy_weak_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            incident = self.complete_event_receipt()
+            incident["event_contract"]["event_id"] = "incident-1"
+            control_event_guard.persist_controller_cycle_evidence(
+                root,
+                incident,
+                controller_id="controller-1",
+                ledger_sha256="ledger-1",
+                main_revision="main-1",
+                terminal_status="FAILED",
+                validation_errors=["review FAIL for bad-revision requires rework disposition"],
+                integrated_revisions={"bad-revision"},
+            )
+            legacy_path = control_event_guard.controller_cycle_evidence_path(
+                root, "legacy-correction"
+            )
+            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_path.write_text(json.dumps({
+                "schema_version": 1,
+                "record_kind": "controller_cycle_evidence",
+                "evidence_id": "legacy-correction",
+                "controller_id": "controller-1",
+                "cycle_id": "legacy-correction",
+                "terminal_status": "CLOSED",
+                "corrects_incident": "incident-1",
+                "outcome_level": "L3",
+                "recorded_at": "2026-09-02T00:01:00+00:00",
+            }), encoding="utf-8")
+            post = self.complete_event_receipt()
+            post["event_contract"].update({
+                "event_id": "post-1",
+                "post_incident_closure_for": "incident-1",
+                "depends_on_correction_evidence_id": "legacy-correction",
+            })
+
+            with self.assertRaisesRegex(ValueError, "strong correction"):
+                control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    post,
+                    controller_id="controller-1",
+                    ledger_sha256="ledger-2",
+                    main_revision="main-2",
+                    terminal_status="CLOSED",
+                    validation_errors=[],
+                    integrated_revisions={"post-revision"},
+                )
 
     def test_registered_control_event_main_writes_machine_cycle_evidence(self) -> None:
         import json

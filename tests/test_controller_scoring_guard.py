@@ -378,6 +378,7 @@ class ControllerScoringGuardTests(unittest.TestCase):
             write_receipt(
                 "correction-1", "2026-09-02T00:01:00+00:00",
                 corrects_incident="incident-1",
+                risk_clearance_contract_version=2,
             )
             self.assertEqual("AMBER", guard.governance_risk_projection(
                 repo, controller_session_id="controller-1"
@@ -393,13 +394,122 @@ class ControllerScoringGuardTests(unittest.TestCase):
 
             write_receipt(
                 "closure-1", "2026-09-02T00:03:00+00:00",
-                post_incident_closure_for="incident-1", outcome_level="L3",
+                post_incident_closure_for="incident-1",
+                depends_on_correction_evidence_id="correction-1",
+                outcome_level="L3",
             )
             projection = guard.governance_risk_projection(
                 repo, controller_session_id="controller-1"
             )
             self.assertEqual("GREEN", projection["status"])
             self.assertIsNone(projection["active_cap"])
+
+    def test_risk_projection_uses_a_newer_complete_correction_chain(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+
+            def write_receipt(evidence_id: str, recorded_at: str, **values):
+                target = guard._cycle_evidence_path(repo, evidence_id)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps({
+                    "schema_version": 1,
+                    "record_kind": "controller_cycle_evidence",
+                    "evidence_id": evidence_id,
+                    "controller_id": "controller-1",
+                    "cycle_id": evidence_id,
+                    "terminal_status": values.pop("terminal_status", "CLOSED"),
+                    "evidence_summary": evidence_id,
+                    "outcome_level": values.pop("outcome_level", "L2"),
+                    "recorded_at": recorded_at,
+                    **values,
+                }, sort_keys=True), encoding="utf-8")
+
+            write_receipt(
+                "incident-1", "2026-09-02T00:00:00+00:00",
+                terminal_status="FAILED", outcome_level="L0",
+                governance_incident_severity="major",
+            )
+            write_receipt(
+                "correction-old", "2026-09-02T00:01:00+00:00",
+                corrects_incident="incident-1",
+                risk_clearance_contract_version=2,
+            )
+            write_receipt(
+                "correction-new", "2026-09-02T00:02:00+00:00",
+                corrects_incident="incident-1",
+                risk_clearance_contract_version=2,
+            )
+            write_receipt(
+                "alignment-new", "2026-09-02T00:03:00+00:00",
+                alignment_for_incident="incident-1",
+            )
+            write_receipt(
+                "closure-new", "2026-09-02T00:04:00+00:00",
+                post_incident_closure_for="incident-1",
+                depends_on_correction_evidence_id="correction-new",
+                outcome_level="L3",
+            )
+
+            projection = guard.governance_risk_projection(
+                repo, controller_session_id="controller-1"
+            )
+            self.assertEqual("GREEN", projection["status"])
+            self.assertEqual(
+                "correction-new",
+                projection["incident_states"][0]["correction_evidence_id"],
+            )
+
+    def test_risk_projection_does_not_clear_from_legacy_weak_correction_receipt(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+
+            def write_receipt(evidence_id: str, recorded_at: str, **values):
+                target = guard._cycle_evidence_path(repo, evidence_id)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps({
+                    "schema_version": 1,
+                    "record_kind": "controller_cycle_evidence",
+                    "evidence_id": evidence_id,
+                    "controller_id": "controller-1",
+                    "cycle_id": evidence_id,
+                    "terminal_status": values.pop("terminal_status", "CLOSED"),
+                    "evidence_summary": evidence_id,
+                    "outcome_level": values.pop("outcome_level", "L2"),
+                    "recorded_at": recorded_at,
+                    **values,
+                }, sort_keys=True), encoding="utf-8")
+
+            write_receipt(
+                "incident-1", "2026-09-02T00:00:00+00:00",
+                terminal_status="FAILED", outcome_level="L0",
+                governance_incident_severity="major",
+            )
+            write_receipt(
+                "legacy-correction", "2026-09-02T00:01:00+00:00",
+                corrects_incident="incident-1",
+            )
+            write_receipt(
+                "alignment-1", "2026-09-02T00:02:00+00:00",
+                alignment_for_incident="incident-1",
+            )
+            write_receipt(
+                "closure-1", "2026-09-02T00:03:00+00:00",
+                post_incident_closure_for="incident-1",
+                depends_on_correction_evidence_id="legacy-correction",
+                outcome_level="L3",
+            )
+
+            projection = guard.governance_risk_projection(
+                repo, controller_session_id="controller-1"
+            )
+            self.assertEqual("AMBER", projection["status"])
+            self.assertEqual(49, projection["active_cap"])
 
     def test_finalize_score_fails_closed_without_valid_guard_and_writes_no_history(self):
         guard = load_module()
@@ -558,6 +668,50 @@ class ControllerScoringGuardTests(unittest.TestCase):
                     evidence_id="event-1",
                     message_sha256="b" * 64,
                 )
+
+    def test_major_failed_attested_cycle_cannot_score_above_49(self):
+        guard = load_module()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            receipt = {
+                "schema_version": 1,
+                "record_kind": "controller_cycle_evidence",
+                "evidence_id": "major-event",
+                "controller_id": "c1",
+                "cycle_id": "major-event",
+                "terminal_status": "FAILED",
+                "evidence_summary": "review FAIL entered main",
+                "outcome_level": "L0",
+                "governance_incident_severity": "major",
+                "recorded_at": "2026-09-02T00:00:00+00:00",
+            }
+            target = guard._cycle_evidence_path(repo, "major-event")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(receipt), encoding="utf-8")
+            guard.record_model_read(repo, skill_root=ROOT, controller_session_id="c1")
+            with self.assertRaisesRegex(ValueError, "49"):
+                guard.finalize_attested_cycle_score(
+                    repo,
+                    skill_root=ROOT,
+                    controller_session_id="c1",
+                    turn_id="t1",
+                    cycle_id="major-event",
+                    terminal_status="FAILED",
+                    score=95.0,
+                    evidence_summary="review FAIL entered main",
+                    evidence_id="major-event",
+                    message_sha256="a" * 64,
+                )
+            self.assertEqual(
+                {"best": None, "worst": None},
+                guard.cycle_score_extremes(
+                    repo,
+                    controller_session_id="c1",
+                    model_sha256=guard.scoring_model_sha256(ROOT),
+                ),
+            )
 
     def test_cycle_extremes_cli_reports_best_and_worst_for_current_model(self):
         guard = load_module()

@@ -52,6 +52,7 @@ ROUTE_CLASS_MARKERS = {
     "frontend": ("frontend", "前端", "web", "小程序", "miniapp"),
 }
 CONTROLLER_CYCLE_EVIDENCE_DIRECTORY = "controller-cycle-evidence"
+LEDGER_SUCCESS_STATES = {"DONE"}
 
 
 def ready_ledger_package_ids(ledger: Path) -> set[str]:
@@ -284,6 +285,7 @@ def _governance_incident_severity(
     major_markers = (
         "required review",
         "review pass",
+        "review fail",
         "regression_evidence",
         "main_revision does not match",
     )
@@ -300,6 +302,8 @@ def persist_controller_cycle_evidence(
     terminal_status: str,
     validation_errors: Sequence[str],
     integrated_revisions: set[str] | None = None,
+    ledger_open_ids: set[str] | None = None,
+    ledger_task_states: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], Path]:
     """Persist one immutable machine-attested controller event outcome."""
     contract = snapshot.get("event_contract")
@@ -347,6 +351,121 @@ def persist_controller_cycle_evidence(
         unknown = sorted(set(clearance_markers.values()) - known_incidents)
         if unknown:
             raise ValueError("risk clearance marker references an unknown incident: " + ", ".join(unknown))
+    if "corrects_incident" in clearance_markers:
+        correction_revision = str(contract.get("correction_revision", "")).strip()
+        if not correction_revision or correction_revision not in set(integrated_revisions or set()):
+            raise ValueError(
+                "correction clearance requires an integrated correction revision on current main"
+            )
+        candidates = snapshot.get("candidate_packages")
+        candidate = next((
+            item for item in candidates
+            if isinstance(item, dict)
+            and str(item.get("revision", "")).strip() == correction_revision
+        ), None) if isinstance(candidates, list) else None
+        if not isinstance(candidate, dict):
+            raise ValueError("correction clearance requires the integrated correction candidate")
+        if (
+            str(candidate.get("decision", "")).lower().strip() != "integrate"
+            or candidate.get("integrated_this_event") is not True
+            or str(candidate.get("main_revision", "")).strip() != str(main_revision).strip()
+            or not str(candidate.get("regression_evidence", "")).strip()
+            or not str(candidate.get("acceptance_evidence", "")).strip()
+        ):
+            raise ValueError(
+                "correction clearance requires current-main integration, regression, and acceptance evidence"
+            )
+        author_task_id = str(candidate.get("author_task_id", "")).strip()
+        correction_task_id = str(candidate.get("task_id", "")).strip()
+        candidate_review_task_id = str(candidate.get("review_task_id", "")).strip()
+        reviews = snapshot.get("required_reviews")
+        pass_reviews = [
+            review for review in reviews
+            if isinstance(review, dict)
+            and str(review.get("candidate_revision", "")).strip() == correction_revision
+            and str(review.get("verdict", "")).upper().strip() == "PASS"
+            and review.get("delivered_ack") is True
+        ] if isinstance(reviews, list) else []
+        matching_pass_reviews = [
+            review for review in pass_reviews
+            if str(review.get("task_id", "")).strip() == candidate_review_task_id
+        ]
+        if not author_task_id or author_task_id != correction_task_id:
+            raise ValueError(
+                "correction clearance requires the author task bound to the correction task"
+            )
+        if (
+            not candidate_review_task_id
+            or not matching_pass_reviews
+            or candidate_review_task_id == author_task_id
+        ):
+            raise ValueError("correction clearance requires a non-author PASS review")
+        if ledger_task_states is None:
+            raise ValueError(
+                "correction clearance requires machine-derived current ledger task states"
+            )
+        identity_states = {
+            correction_task_id: str(ledger_task_states.get(correction_task_id, "")).upper(),
+            candidate_review_task_id: str(
+                ledger_task_states.get(candidate_review_task_id, "")
+            ).upper(),
+        }
+        invalid_identities = sorted(
+            task_id
+            for task_id, task_status in identity_states.items()
+            if task_status not in LEDGER_SUCCESS_STATES
+        )
+        if invalid_identities:
+            raise ValueError(
+                "correction clearance requires successful current ledger task records for: "
+                + ", ".join(invalid_identities)
+            )
+        if ledger_open_ids is None or any(
+            task_id in ledger_open_ids for task_id in identity_states
+        ):
+            raise ValueError(
+                "correction clearance requires correction and review tasks closed in the current ledger"
+            )
+        branch_remote = run_git(
+            Path(root).expanduser().resolve(),
+            "config",
+            "--get",
+            "branch.main.remote",
+            check=False,
+        )
+        branch_merge = run_git(
+            Path(root).expanduser().resolve(),
+            "config",
+            "--get",
+            "branch.main.merge",
+            check=False,
+        )
+        tracking_configured = bool(
+            branch_remote.stdout.strip() or branch_merge.stdout.strip()
+        )
+        upstream = run_git(
+            Path(root).expanduser().resolve(),
+            "rev-parse",
+            "--verify",
+            "main@{upstream}",
+            check=False,
+        )
+        if tracking_configured:
+            if (
+                not branch_remote.stdout.strip()
+                or not branch_merge.stdout.strip()
+                or upstream.returncode != 0
+                or not upstream.stdout.strip()
+            ):
+                raise ValueError(
+                    "correction clearance tracked remote is configured but unavailable"
+                )
+            if upstream.stdout.strip() != str(main_revision).strip():
+                raise ValueError(
+                    "correction clearance requires current main aligned with its tracked remote"
+                )
+        clearance_markers["correction_revision"] = correction_revision
+        clearance_markers["risk_clearance_contract_version"] = 2
     if "alignment_for_incident" in clearance_markers:
         rule_update = snapshot.get("rule_update")
         if not isinstance(rule_update, dict):
@@ -368,6 +487,37 @@ def persist_controller_cycle_evidence(
         and outcome_level not in {"L3", "L4"}
     ):
         raise ValueError("post-incident closure clearance requires machine-derived L3 or L4 outcome")
+    if "post_incident_closure_for" in clearance_markers:
+        correction_evidence_id = str(
+            contract.get("depends_on_correction_evidence_id", "")
+        ).strip()
+        if not correction_evidence_id:
+            raise ValueError(
+                "post-incident closure requires the exact correction evidence dependency"
+            )
+        correction_path = controller_cycle_evidence_path(root, correction_evidence_id)
+        try:
+            correction_receipt = json.loads(correction_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"post-incident closure correction evidence is missing: {error}"
+            ) from error
+        if (
+            not isinstance(correction_receipt, dict)
+            or correction_receipt.get("record_kind") != "controller_cycle_evidence"
+            or str(correction_receipt.get("controller_id", "")).strip() != controller
+            or str(correction_receipt.get("terminal_status", "")).upper().strip() != "CLOSED"
+            or str(correction_receipt.get("corrects_incident", "")).strip()
+            != clearance_markers["post_incident_closure_for"]
+        ):
+            raise ValueError(
+                "post-incident closure correction evidence does not match this incident"
+            )
+        if correction_receipt.get("risk_clearance_contract_version") != 2:
+            raise ValueError(
+                "post-incident closure requires a strong correction evidence receipt"
+            )
+        clearance_markers["depends_on_correction_evidence_id"] = correction_evidence_id
     payload: dict[str, Any] = {
         "schema_version": 1,
         "record_kind": "controller_cycle_evidence",
@@ -421,6 +571,8 @@ def persist_controller_cycle_evidence(
             terminal_status=status,
             validation_errors=errors,
             integrated_revisions=integrated_revisions,
+            ledger_open_ids=ledger_open_ids,
+            ledger_task_states=ledger_task_states,
         )
     return payload, target
 
@@ -1337,8 +1489,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ledger = Path(args.ledger).resolve()
         if not ledger.is_file():
             raise ValueError("ledger path must be an existing file")
+        ledger_text = ledger.read_text(encoding="utf-8")
+        ledger_records = task_records(ledger_text)
+        ledger_task_states = {
+            record["id"]: record["status"] for record in ledger_records
+        }
         ready_ids = ready_ledger_package_ids(ledger)
-        derived_runnable_ids = set(derive_runnable_tasks(task_records(ledger.read_text(encoding="utf-8")))["runnable_task_ids"])
+        derived_runnable_ids = set(derive_runnable_tasks(ledger_records)["runnable_task_ids"])
         open_ids = open_ledger_package_ids(ledger)
         goal_ids = current_goal_ledger_ids(ledger, open_ids)
         work_in_flight = work_in_flight_ledger_packages(ledger)
@@ -1403,6 +1560,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     terminal_status="FAILED",
                     validation_errors=errors,
                     integrated_revisions=integrated_revisions,
+                    ledger_open_ids=open_ids,
+                    ledger_task_states=ledger_task_states,
                 )
             except (OSError, ValueError) as error:
                 print(f"control-event: blocked: failed to persist machine cycle evidence: {error}")
@@ -1426,6 +1585,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 terminal_status="CLOSED",
                 validation_errors=[],
                 integrated_revisions=integrated_revisions,
+                ledger_open_ids=open_ids,
+                ledger_task_states=ledger_task_states,
             )
         except (OSError, ValueError) as error:
             print(f"control-event: blocked: failed to persist machine cycle evidence: {error}")

@@ -286,22 +286,59 @@ def governance_risk_projection(
         if not corrections:
             incident_states.append({"incident_cycle_id": incident_id, "status": "RED"})
             continue
-        correction = min(corrections, key=_recorded_at)
-        correction_time = _recorded_at(correction)
-        alignments = [
-            receipt for receipt in receipts
-            if str(receipt.get("alignment_for_incident", "")).strip() == incident_id
-            and str(receipt.get("terminal_status", "")).upper().strip() == "CLOSED"
-            and _recorded_at(receipt) >= correction_time
+        strong_corrections = [
+            receipt for receipt in corrections
+            if receipt.get("risk_clearance_contract_version") == 2
         ]
-        closures = [
-            receipt for receipt in receipts
-            if str(receipt.get("post_incident_closure_for", "")).strip() == incident_id
-            and str(receipt.get("terminal_status", "")).upper().strip() == "CLOSED"
-            and str(receipt.get("outcome_level", "")).upper().strip() in {"L3", "L4"}
-            and _recorded_at(receipt) > correction_time
-        ]
-        status = "GREEN" if alignments and closures else "AMBER"
+        if not strong_corrections:
+            incident_states.append({
+                "incident_cycle_id": incident_id,
+                "status": "AMBER",
+                "legacy_correction_evidence_ids": [
+                    receipt.get("evidence_id")
+                    for receipt in sorted(corrections, key=_recorded_at)
+                ],
+            })
+            continue
+        complete_chain: tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]] | None = None
+        for candidate_correction in sorted(strong_corrections, key=_recorded_at):
+            candidate_time = _recorded_at(candidate_correction)
+            candidate_alignments = [
+                receipt for receipt in receipts
+                if str(receipt.get("alignment_for_incident", "")).strip() == incident_id
+                and str(receipt.get("terminal_status", "")).upper().strip() == "CLOSED"
+                and _recorded_at(receipt) >= candidate_time
+            ]
+            candidate_closures = [
+                receipt for receipt in receipts
+                if str(receipt.get("post_incident_closure_for", "")).strip() == incident_id
+                and str(receipt.get("depends_on_correction_evidence_id", "")).strip()
+                == str(candidate_correction.get("evidence_id", "")).strip()
+                and str(receipt.get("terminal_status", "")).upper().strip() == "CLOSED"
+                and str(receipt.get("outcome_level", "")).upper().strip() in {"L3", "L4"}
+                and _recorded_at(receipt) > candidate_time
+            ]
+            if candidate_alignments and candidate_closures:
+                complete_chain = (
+                    candidate_correction,
+                    candidate_alignments,
+                    candidate_closures,
+                )
+                break
+        if complete_chain is None:
+            correction = max(strong_corrections, key=_recorded_at)
+            correction_time = _recorded_at(correction)
+            alignments = [
+                receipt for receipt in receipts
+                if str(receipt.get("alignment_for_incident", "")).strip() == incident_id
+                and str(receipt.get("terminal_status", "")).upper().strip() == "CLOSED"
+                and _recorded_at(receipt) >= correction_time
+            ]
+            closures: list[dict[str, Any]] = []
+            status = "AMBER"
+        else:
+            correction, alignments, closures = complete_chain
+            status = "GREEN"
         state = {
             "incident_cycle_id": incident_id,
             "status": status,
@@ -596,6 +633,21 @@ def finalize_attested_cycle_score(
         raise ValueError("cycle evidence receipt is not terminal")
     if claimed_status != receipt_status or claimed_evidence != receipt_evidence:
         raise ValueError("cycle terminal status or evidence summary does not match the machine receipt")
+    model_read_receipt = _load_receipt(repo)
+    current_projection = governance_risk_projection(repo, controller_session_id=controller)
+    if (
+        not isinstance(model_read_receipt, dict)
+        or str(model_read_receipt.get("controller_session_id", "")).strip() != controller
+        or model_read_receipt.get("governance_risk_projection") != current_projection
+    ):
+        raise ValueError(
+            "score-guard failed: cycle score requires the current bound machine governance risk projection"
+        )
+    active_cap = current_projection.get("active_cap")
+    if active_cap is not None and float(score) > float(active_cap):
+        raise ValueError(
+            f"machine governance risk projection enforces the active {active_cap} cap on cycle scores"
+        )
     errors = consume_score_guard(repo, skill_root=skill_root)
     if errors:
         raise ValueError("score-guard failed: " + "; ".join(errors))
