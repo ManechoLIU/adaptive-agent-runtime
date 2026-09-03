@@ -111,6 +111,7 @@ def derive_controller_health(facts: dict[str, Any]) -> dict[str, Any]:
         and facts.get("fallback_eligible") is True
         and facts.get("peer_host_available") is True
         and facts.get("fallback_safe") is True
+        and facts.get("peer_wake_authorized") is True
         and facts.get("unknown_side_effect") is not True
         and facts.get("partial_write") is not True
         and peer_host is not None

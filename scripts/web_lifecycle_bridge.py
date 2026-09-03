@@ -1305,12 +1305,61 @@ def wake_existing_controller(
             )
         else:
             if selected_host == health.get("controller_host"):
-                attempt = execute_native_resume(
-                    session_id=session_id, repo=repo, registry=registry, codex=codex,
-                    runtime_path=runtime_path,
-                    terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []),
-                    next_action=str(lifecycle_state.get("next_action") or "").strip() or None,
-                )
+                if selected_host == "desktop_codex":
+                    attempt = execute_native_resume(
+                        session_id=session_id, repo=repo, registry=registry, codex=codex,
+                        runtime_path=runtime_path,
+                        terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []),
+                        next_action=str(lifecycle_state.get("next_action") or "").strip() or None,
+                    )
+                elif selected_host == "web":
+                    adapter = (resume_adapters or {}).get("web")
+                    if adapter is None:
+                        attempt = {
+                            "operation": None,
+                            "result": "DEFERRED",
+                            "state": "WEB_HOST_REENTRY_PENDING",
+                            "returncode": 0,
+                            "stderr_tail": "web controller re-entry requires a host-native Web adapter",
+                            "error_code": "WEB_HOST_REENTRY_ADAPTER_UNAVAILABLE",
+                        }
+                    else:
+                        try:
+                            attempt = adapter(
+                                controller_id=session_id,
+                                session_id=session_id,
+                                repo=repo,
+                                registry=registry,
+                                lifecycle_state=lifecycle_state,
+                                runtime_path=runtime_path,
+                            )
+                        except Exception as exc:
+                            attempt = {
+                                "operation": "web_resume",
+                                "result": "FAILED",
+                                "state": "RESUME_FAILED",
+                                "returncode": 1,
+                                "stderr_tail": f"web host adapter failed: {exc}",
+                                "error_code": "WEB_HOST_REENTRY_ADAPTER_FAILED",
+                            }
+                        if not isinstance(attempt, dict):
+                            attempt = {
+                                "operation": "web_resume",
+                                "result": "FAILED",
+                                "state": "RESUME_FAILED",
+                                "returncode": 1,
+                                "stderr_tail": "web host adapter returned a non-object execution receipt",
+                                "error_code": "WEB_HOST_REENTRY_ADAPTER_INVALID",
+                            }
+                else:
+                    attempt = {
+                        "operation": None,
+                        "result": "FAILED",
+                        "state": "RESUME_FAILED",
+                        "returncode": 1,
+                        "stderr_tail": f"unsupported controller host {selected_host}",
+                        "error_code": "CONTROLLER_HOST_UNSUPPORTED",
+                    }
             else:
                 adapter = (resume_adapters or {}).get(str(selected_host))
                 verifier = _registered_peer_attestation_verifier(str(selected_host))
@@ -1542,9 +1591,9 @@ def dispatch_pending_lifecycle_wake(
         return debounced
 
     facts = dict(host_facts) if isinstance(host_facts, dict) else {}
-    controller_host = str(lifecycle_state.get("controller_host") or facts.get("controller_host") or "web").strip()
-    if controller_host not in {"web", "desktop_codex"}:
-        controller_host = "web"
+    controller_host = resolve_controller_host(
+        lifecycle_state, facts, load_json(registry), session_id
+    )
     facts.setdefault("controller_host", controller_host)
     if (
         "resume_actionable" not in facts
@@ -1565,6 +1614,27 @@ def dispatch_pending_lifecycle_wake(
         runtime_path=runtime_path,
     )
 
+
+
+def resolve_controller_host(
+    lifecycle_state: dict[str, Any],
+    host_facts: dict[str, Any],
+    registry_data: dict[str, Any],
+    session_id: str,
+) -> str:
+    for value in (lifecycle_state.get("controller_host"), host_facts.get("controller_host")):
+        host = str(value or "").strip()
+        if host in {"web", "desktop_codex"}:
+            return host
+    sessions = registry_data.get("__controller_sessions__", {}) if isinstance(registry_data, dict) else {}
+    controller_sessions = sessions.get(session_id, {}) if isinstance(sessions, dict) else {}
+    if not isinstance(controller_sessions, dict):
+        controller_sessions = {}
+    web_bound = isinstance(controller_sessions.get("web"), list) and any(str(x).strip() for x in controller_sessions.get("web", []))
+    desktop_bound = isinstance(controller_sessions.get("desktop_codex"), list) and any(str(x).strip() for x in controller_sessions.get("desktop_codex", []))
+    if desktop_bound and not web_bound:
+        return "desktop_codex"
+    return "web"
 
 
 def wake_receipt_confirmed(receipt: dict[str, Any] | None) -> bool:
@@ -1851,6 +1921,24 @@ def run_auto_native_stop(
         latest.pop(stale_key, None)
     write_auto_stop_state(state_path, latest)
     lifecycle_state = _load_lifecycle_state(session_id)
+    lifecycle_state = lifecycle_state if isinstance(lifecycle_state, dict) else {}
+    controller_host = resolve_controller_host(
+        lifecycle_state, {}, load_json(registry), session_id
+    )
+    if controller_host == "web":
+        current = load_json(state_path)
+        if current.get("receipt_id") == receipt_id:
+            current.update({
+                "state": "WEB_HOST_REENTRY_PENDING",
+                "pending_control_event": True,
+                "completed_at_unix_ms": int(time.time() * 1000),
+                "returncode": 0,
+                "error_code": "WEB_HOST_REENTRY_ADAPTER_UNAVAILABLE",
+                "failure_class": "web_host_reentry_required",
+                "stderr_tail": "web controller continuation requires a host-native Web re-entry adapter; desktop Codex resume is forbidden",
+            })
+            write_auto_stop_state(state_path, current)
+        return 0
     attempt = execute_native_resume(
         session_id=session_id, repo=repo, registry=registry, codex=codex,
         runtime_path=runtime_path,

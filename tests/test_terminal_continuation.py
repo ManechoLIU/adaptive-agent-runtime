@@ -26,7 +26,7 @@ class TerminalContinuationTests(unittest.TestCase):
             repo.mkdir()
             subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
             registry = root / "controllers.json"
-            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve()), "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}}}), encoding="utf-8")
             receipt = root / "terminal.json"
             receipt.write_text(json.dumps({
                 "schema_version": 1,
@@ -146,3 +146,26 @@ class TerminalContinuationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TerminalContinuationHostResolutionTests(unittest.TestCase):
+    def load_module(self):
+        spec = importlib.util.spec_from_file_location("terminal_continuation_host_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(module)
+        return module
+
+    def test_missing_prior_host_prefers_unique_web_binding_not_desktop_default(self) -> None:
+        module = self.load_module()
+        registry = {
+            "__controller_sessions__": {"controller-1": {"web": ["web-session-1"], "desktop_codex": []}}
+        }
+        self.assertEqual(module.resolve_controller_host({}, registry, "controller-1"), "web")
+
+    def test_ambiguous_missing_prior_host_fails_closed(self) -> None:
+        module = self.load_module()
+        registry = {
+            "__controller_sessions__": {"controller-1": {"web": ["web-session-1"], "desktop_codex": ["desktop-1"]}}
+        }
+        with self.assertRaisesRegex(PermissionError, "controller host is ambiguous"):
+            module.resolve_controller_host({}, registry, "controller-1")

@@ -36,6 +36,26 @@ def _load_terminal_receipt(path: Path) -> dict[str, Any]:
     return value
 
 
+
+
+def resolve_controller_host(prior_state: dict[str, Any], registry: dict[str, Any], controller_id: str) -> str:
+    prior_host = str(prior_state.get("controller_host") or "").strip()
+    if prior_host in {"web", "desktop_codex"}:
+        return prior_host
+    sessions = registry.get("__controller_sessions__", {}) if isinstance(registry, dict) else {}
+    controller_sessions = sessions.get(controller_id, {}) if isinstance(sessions, dict) else {}
+    if not isinstance(controller_sessions, dict):
+        controller_sessions = {}
+    web_bound = isinstance(controller_sessions.get("web"), list) and any(str(x).strip() for x in controller_sessions.get("web", []))
+    desktop_bound = isinstance(controller_sessions.get("desktop_codex"), list) and any(str(x).strip() for x in controller_sessions.get("desktop_codex", []))
+    if web_bound and not desktop_bound:
+        return "web"
+    if desktop_bound and not web_bound:
+        return "desktop_codex"
+    if web_bound and desktop_bound:
+        raise PermissionError("controller host is ambiguous across web and desktop_codex bindings")
+    raise PermissionError("controller host is unavailable; refusing implicit desktop fallback")
+
 def consume_terminal_receipt(
     *,
     repo: Path,
@@ -75,9 +95,7 @@ def consume_terminal_receipt(
         raise RuntimeError("cannot snapshot registered Controller repository")
     state_path = lifecycle.state_path(controller_id)
     prior_state = lifecycle.load_json(state_path)
-    controller_host = str(prior_state.get("controller_host") or "desktop_codex").strip()
-    if controller_host not in {"web", "desktop_codex"}:
-        controller_host = "desktop_codex"
+    controller_host = resolve_controller_host(prior_state, registry, controller_id)
     agent_id = str(receipt.get("agent_id") or "").strip() or f"external:{receipt_path.stem}"
     event = {
         "hook_event_name": "SubagentStop",

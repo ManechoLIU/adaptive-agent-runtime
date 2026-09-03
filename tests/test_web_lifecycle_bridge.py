@@ -704,9 +704,9 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 "pending_control_event": True, "returncode": 1, "stdout_tail": "",
                 "stderr_tail": "thread already has an active writer", "failure_class": "active_writer_present",
             }
-            with patch.object(web_bridge, "execute_native_resume", return_value=deferred), patch.object(
-                web_bridge, "schedule_auto_native_stop"
-            ) as schedule:
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value={"pending_control_event": True, "controller_host": "desktop_codex"}), patch.object(
+                web_bridge, "execute_native_resume", return_value=deferred
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
                 code = web_bridge.run_auto_native_stop(
                     session_id="controller-1", repo=repo, receipt_id="pending-click-1",
                     registry=registry, codex="/opt/homebrew/bin/codex", delay_seconds=0,
@@ -1349,7 +1349,13 @@ class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
         repo.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
         registry = root / "controllers.json"
-        registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+        registry.write_text(json.dumps({
+            "controller-1": str(repo.resolve()),
+            "__controller_sessions__": {"controller-1": {"desktop_codex": ["controller-1"]}},
+            "__controller_targets__": {"controller-1": {"desktop_codex": {
+                "status": "active", "session_id": "controller-1", "generation": 1,
+            }}},
+        }), encoding="utf-8")
         return repo, registry
 
     def test_auto_native_stop_preflight_names_missing_node_in_launchagent_like_path(self) -> None:
@@ -1477,8 +1483,8 @@ class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
                 "repo": str(repo.resolve()), "state": "RESUME_PENDING",
                 "pending_control_event": True,
             }), encoding="utf-8")
-            initial = {"pending_control_event": True, "requires_user": False, "wake_generation": 1}
-            closed = {"pending_control_event": False, "requires_user": False, "wake_generation": 1}
+            initial = {"pending_control_event": True, "requires_user": False, "controller_host": "desktop_codex", "wake_generation": 1}
+            closed = {"pending_control_event": False, "requires_user": False, "controller_host": "desktop_codex", "wake_generation": 1}
             confirmed = {
                 "operation": "native_resume", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
                 "pending_control_event": True, "returncode": 0, "stdout_tail": "done",
@@ -1507,8 +1513,8 @@ class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
                 "repo": str(repo.resolve()), "state": "RESUME_PENDING",
                 "pending_control_event": True,
             }), encoding="utf-8")
-            initial = {"pending_control_event": True, "requires_user": False, "wake_generation": 3}
-            waiting = {"pending_control_event": True, "requires_user": True, "wake_generation": 3}
+            initial = {"pending_control_event": True, "requires_user": False, "controller_host": "desktop_codex", "wake_generation": 3}
+            waiting = {"pending_control_event": True, "requires_user": True, "controller_host": "desktop_codex", "wake_generation": 3}
             confirmed = {
                 "operation": "native_resume", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
                 "pending_control_event": True, "returncode": 0, "stdout_tail": "need decision",
@@ -1691,12 +1697,12 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                     "pending_control_event": True,
                     "triggers": ["active_lease_expired:F1"],
                 },
-                host_facts={"controller_host": "web", "resume_actionable": True},
+                host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
             )
 
             self.assertEqual(receipt["decision"], "RESUME_CURRENT_HOST")
             self.assertEqual(receipt["controller_id"], "controller-1")
-            self.assertEqual(receipt["selected_host"], "web")
+            self.assertEqual(receipt["selected_host"], "desktop_codex")
             self.assertTrue(receipt["pending_control_event"])
             self.assertEqual(receipt["result"], "CONFIRMED")
             self.assertIn("resume controller-1", marker.read_text(encoding="utf-8"))
@@ -1735,7 +1741,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 registry=registry,
                 codex=str(codex),
                 receipt_path=receipt_path,
-                host_facts={"controller_host": "web", "resume_actionable": True},
+                host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
             )
 
             self.assertEqual(receipt["controller_id"], "controller-1")
@@ -1750,7 +1756,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             state = {
                 "pending_control_event": True,
                 "triggers": ["READY:F1"],
-                "controller_host": "web",
+                "controller_host": "desktop_codex",
                 "wake_generation": 1,
             }
 
@@ -1779,7 +1785,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 registry=registry,
                 codex=str(codex),
                 receipt_path=receipt_path,
-                host_facts={"controller_host": "web", "resume_actionable": True},
+                host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
             )
             write_target("desktop-current", 2)
             second = web_bridge.dispatch_pending_lifecycle_wake(
@@ -1789,7 +1795,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 registry=registry,
                 codex=str(codex),
                 receipt_path=receipt_path,
-                host_facts={"controller_host": "web", "resume_actionable": True},
+                host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
             )
 
             self.assertEqual(first["execution_target_session_id"], "desktop-old")
@@ -1851,6 +1857,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                     "peer_host_available": True,
                     "peer_host": "desktop_codex",
                     "fallback_safe": True,
+                    "peer_wake_authorized": True,
                 },
                 resume_adapters={"desktop_codex": desktop_resume},
             )
@@ -1893,6 +1900,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                         "peer_host_available": True,
                         "peer_host": "desktop_codex",
                         "fallback_safe": True,
+                    "peer_wake_authorized": True,
                     },
                     resume_adapters={"desktop_codex": desktop_resume},
                     peer_attestation_verifiers={"desktop_codex": lambda **_kwargs: True},
@@ -1971,6 +1979,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                         "peer_host_available": True,
                         "peer_host": "desktop_codex",
                         "fallback_safe": True,
+                    "peer_wake_authorized": True,
                     },
                     resume_adapters={"desktop_codex": desktop_resume},
                 )
@@ -2030,6 +2039,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                         "peer_host_available": True,
                         "peer_host": "desktop_codex",
                         "fallback_safe": True,
+                    "peer_wake_authorized": True,
                     },
                     resume_adapters={"desktop_codex": desktop_resume},
                 )
@@ -2064,6 +2074,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                             "peer_host_available": True,
                             "peer_host": "desktop_codex",
                             "fallback_safe": True,
+                    "peer_wake_authorized": True,
                         },
                         resume_adapters={"desktop_codex": desktop_resume},
                     )
@@ -2191,7 +2202,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertLessEqual(len(saved["reason"]), 512)
             self.assertFalse(list(root.glob(f".{receipt_path.name}.*")))
 
-    def test_current_host_adapter_is_ignored_for_native_preflighted_resume(self) -> None:
+    def test_current_web_host_adapter_is_used_instead_of_native_preflighted_resume(self) -> None:
         from unittest.mock import patch
 
         adapter_calls: list[dict] = []
@@ -2214,10 +2225,10 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 )
 
             self.assertEqual(receipt["decision"], "RESUME_CURRENT_HOST")
-            self.assertEqual(receipt["operation"], "native_resume")
-            self.assertEqual(adapter_calls, [])
-            self.assertEqual(native_resume.call_count, 1)
-            self.assertIn("resume controller-1", marker.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["operation"], "untrusted-current-host-adapter")
+            self.assertEqual(len(adapter_calls), 1)
+            self.assertEqual(native_resume.call_count, 0)
+            self.assertFalse(marker.exists())
 
     def test_peer_adapter_metadata_is_json_safe_bounded_and_persisted(self) -> None:
         calls: list[dict] = []
@@ -2259,6 +2270,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                         "peer_host_available": True,
                         "peer_host": "desktop_codex",
                         "fallback_safe": True,
+                    "peer_wake_authorized": True,
                     },
                     resume_adapters={"desktop_codex": desktop_resume},
                 )
@@ -2292,7 +2304,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                     registry=registry,
                     codex=str(codex),
                     receipt_path=receipt_path,
-                    host_facts={"controller_host": "web", "resume_actionable": True},
+                    host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
                 )
             finally:
                 subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)], check=True)
@@ -2324,7 +2336,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                     },
                     session_id="controller-1", repo=repo, registry=registry, codex=str(codex),
                     receipt_path=receipt_path,
-                    host_facts={"controller_host": "web", "resume_actionable": True},
+                    host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
                 )
             self.assertEqual(receipt["result"], "CONFIRMED")
             self.assertEqual(resume.call_args.kwargs["terminal_receipts"], [terminal])
@@ -2334,7 +2346,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             receipt, receipt_path, _ = self.wake(
                 Path(tmp),
                 lifecycle_state={"pending_control_event": True, "triggers": ["READY:F1"]},
-                host_facts={"controller_host": "web", "resume_actionable": True},
+                host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
             )
 
             self.assertEqual(receipt["result"], "CONFIRMED")
@@ -2359,13 +2371,13 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             ) as native_resume:
                 for triggers in trigger_sets:
                     receipt = web_bridge.dispatch_pending_lifecycle_wake(
-                        lifecycle_state={"pending_control_event": True, "triggers": triggers, "controller_host": "web"},
+                        lifecycle_state={"pending_control_event": True, "triggers": triggers, "controller_host": "desktop_codex"},
                         session_id="controller-1",
                         repo=repo,
                         registry=registry,
                         codex=str(codex),
                         receipt_path=receipt_path,
-                        host_facts={"controller_host": "web", "resume_actionable": True},
+                        host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
                     )
                     self.assertEqual(receipt["decision"], "RESUME_CURRENT_HOST")
                     self.assertEqual(receipt["controller_id"], "controller-1")
@@ -2380,7 +2392,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             state = {
                 "pending_control_event": True,
                 "triggers": ["active_lease_expired:F1"],
-                "controller_host": "web",
+                "controller_host": "desktop_codex",
             }
             first = web_bridge.dispatch_pending_lifecycle_wake(
                 lifecycle_state=state,
@@ -2389,7 +2401,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 registry=registry,
                 codex=str(codex),
                 receipt_path=receipt_path,
-                host_facts={"controller_host": "web", "resume_actionable": True},
+                host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
             )
             second = web_bridge.dispatch_pending_lifecycle_wake(
                 lifecycle_state=state,
@@ -2398,7 +2410,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 registry=registry,
                 codex=str(codex),
                 receipt_path=receipt_path,
-                host_facts={"controller_host": "web", "resume_actionable": True},
+                host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
             )
             self.assertEqual(first["result"], "CONFIRMED")
             self.assertEqual(second["event_fingerprint"], first["event_fingerprint"])
@@ -2436,7 +2448,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             base = {
                 "pending_control_event": True,
                 "triggers": ["READY:F1"],
-                "controller_host": "web",
+                "controller_host": "desktop_codex",
                 "snapshot": {
                     "head": "h1", "ledger_sha256": "l1", "worktree_status_sha256": "s1",
                     "ready_ids": ["F1"], "runnable_ids": ["F1"], "candidate_revisions": [],
@@ -2449,12 +2461,12 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 first = web_bridge.dispatch_pending_lifecycle_wake(
                     lifecycle_state=first_state, session_id="controller-1", repo=repo, registry=registry,
                     codex=str(codex), receipt_path=receipt_path,
-                    host_facts={"controller_host": "web", "resume_actionable": True},
+                    host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
                 )
                 second = web_bridge.dispatch_pending_lifecycle_wake(
                     lifecycle_state=second_state, session_id="controller-1", repo=repo, registry=registry,
                     codex=str(codex), receipt_path=receipt_path,
-                    host_facts={"controller_host": "web", "resume_actionable": True},
+                    host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
                 )
             self.assertEqual(first["result"], "CONFIRMED")
             self.assertEqual(second["result"], "CONFIRMED")
@@ -2468,7 +2480,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             repo, registry, codex, receipt_path, _ = self.make_controller(root)
             state = {
                 "pending_control_event": True, "triggers": ["READY:F1"], "wake_generation": 4,
-                "controller_host": "web", "snapshot": {"head": "h", "ledger_sha256": "l", "worktree_status_sha256": "s"},
+                "controller_host": "desktop_codex", "snapshot": {"head": "h", "ledger_sha256": "l", "worktree_status_sha256": "s"},
             }
             fingerprint = web_bridge._wake_event_fingerprint(state)
             receipt_path.write_text(json.dumps({
@@ -2481,7 +2493,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 result = web_bridge.dispatch_pending_lifecycle_wake(
                     lifecycle_state=state, session_id="controller-1", repo=repo, registry=registry,
                     codex=str(codex), receipt_path=receipt_path,
-                    host_facts={"controller_host": "web", "resume_actionable": True},
+                    host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
                 )
             self.assertEqual(result["result"], "CONFIRMED")
             self.assertFalse(result.get("debounced", False))
@@ -2496,7 +2508,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             state = {
                 "pending_control_event": True,
                 "triggers": ["READY:F1"],
-                "controller_host": "web",
+                "controller_host": "desktop_codex",
                 "wake_generation": 7,
                 "snapshot": {
                     "head": "h1", "ledger_sha256": "l1", "worktree_status_sha256": "s1",
@@ -2524,7 +2536,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                         receipt = web_bridge.dispatch_pending_lifecycle_wake(
                             lifecycle_state=state, session_id="controller-1", repo=repo, registry=registry,
                             codex=str(codex), receipt_path=receipt_path,
-                            host_facts={"controller_host": "web", "resume_actionable": True},
+                            host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
                         )
                     self.assertEqual(receipt["result"], "CONFIRMED")
                     self.assertFalse(receipt.get("debounced", False))
@@ -2563,7 +2575,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             first_state = {
                 "pending_control_event": True,
                 "triggers": ["main_worktree_changed"],
-                "controller_host": "web",
+                "controller_host": "desktop_codex",
                 "snapshot": {
                     "head": "head-1",
                     "ledger_sha256": "ledger-1",
@@ -2585,12 +2597,12 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 first = web_bridge.dispatch_pending_lifecycle_wake(
                     lifecycle_state=first_state, session_id="controller-1", repo=repo, registry=registry,
                     codex=str(codex), receipt_path=receipt_path,
-                    host_facts={"controller_host": "web", "resume_actionable": True},
+                    host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
                 )
                 second = web_bridge.dispatch_pending_lifecycle_wake(
                     lifecycle_state=second_state, session_id="controller-1", repo=repo, registry=registry,
                     codex=str(codex), receipt_path=receipt_path,
-                    host_facts={"controller_host": "web", "resume_actionable": True},
+                    host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
                 )
             self.assertEqual(first["result"], "CONFIRMED")
             self.assertEqual(second["result"], "CONFIRMED")
@@ -2606,7 +2618,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             state = {
                 "pending_control_event": True,
                 "triggers": ["active_lease_expired:F1"],
-                "controller_host": "web",
+                "controller_host": "desktop_codex",
             }
             first = web_bridge.dispatch_pending_lifecycle_wake(
                 lifecycle_state=state,
@@ -2615,7 +2627,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 registry=registry,
                 codex=str(codex),
                 receipt_path=receipt_path,
-                host_facts={"controller_host": "web", "active_writer": True},
+                host_facts={"controller_host": "desktop_codex", "active_writer": True},
             )
             second = web_bridge.dispatch_pending_lifecycle_wake(
                 lifecycle_state=state,
@@ -2624,7 +2636,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 registry=registry,
                 codex=str(codex),
                 receipt_path=receipt_path,
-                host_facts={"controller_host": "web", "resume_actionable": True},
+                host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
             )
             self.assertEqual(first["result"], "DEFERRED")
             self.assertEqual(second["result"], "CONFIRMED")
@@ -2687,7 +2699,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             receipt, receipt_path, _ = self.wake(
                 Path(tmp),
                 lifecycle_state={"pending_control_event": True, "triggers": ["active_lease_expired:F1"]},
-                host_facts={"controller_host": "web", "resume_actionable": True},
+                host_facts={"controller_host": "desktop_codex", "resume_actionable": True},
             )
             self.assertEqual(receipt["result"], "CONFIRMED")
             self.assertTrue(receipt["pending_control_event"])
@@ -3340,6 +3352,7 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
             registry = root / "registry.json"
             registry.write_text(json.dumps({
                 "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-bad"]}},
                 "__controller_targets__": {
                     "controller-1": {"desktop_codex": {
                         "status": "active", "session_id": "desktop-bad", "generation": 1,
@@ -3564,3 +3577,84 @@ class DesktopWebLifecycleParityTests(unittest.TestCase):
         self.assertIn("same current-snapshot", routing)
         self.assertNotIn("WEB_READY", source)
         self.assertNotIn("web_runnable", source)
+
+class WebHostNativeWakeIsolationTests(unittest.TestCase):
+    def test_web_current_host_wake_never_calls_desktop_native_resume_without_web_adapter(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            receipt_path = root / "wake.json"
+            state = {"pending_control_event": True, "controller_host": "web", "wake_generation": 1}
+            with patch.object(web_bridge, "execute_native_resume", side_effect=AssertionError("web wake must not invoke desktop codex")):
+                receipt = web_bridge.wake_existing_controller(
+                    lifecycle_state=state,
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex="/opt/homebrew/bin/codex",
+                    receipt_path=receipt_path,
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                )
+            self.assertEqual(receipt["selected_host"], "web")
+            self.assertEqual(receipt["result"], "DEFERRED")
+            self.assertEqual(receipt["error_code"], "WEB_HOST_REENTRY_ADAPTER_UNAVAILABLE")
+
+    def test_web_current_host_wake_uses_web_adapter_when_supplied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            receipt_path = root / "wake.json"
+            calls = []
+            def web_resume(**kwargs):
+                calls.append(kwargs)
+                return {"operation":"web_resume","result":"CONFIRMED","state":"RESUME_CONFIRMED","returncode":0}
+            receipt = web_bridge.wake_existing_controller(
+                lifecycle_state={"pending_control_event": True, "controller_host": "web", "wake_generation": 1},
+                session_id="controller-1", repo=repo, registry=registry, codex="codex",
+                receipt_path=receipt_path,
+                host_facts={"controller_host": "web", "resume_actionable": True},
+                resume_adapters={"web": web_resume},
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(receipt["operation"], "web_resume")
+            self.assertEqual(receipt["result"], "CONFIRMED")
+
+    def test_auto_stop_for_web_host_never_calls_desktop_native_resume(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            state_path = root / "auto.json"
+            state_path.write_text(json.dumps({"receipt_id":"r1","session_id":"controller-1","repo":str(repo.resolve()),"state":"RESUME_PENDING"}), encoding="utf-8")
+            lifecycle = {"pending_control_event": True, "controller_host":"web", "requires_user":False, "wake_generation":1}
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+                web_bridge, "execute_native_resume", side_effect=AssertionError("auto-stop web host must not invoke desktop codex")
+            ):
+                rc = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state_path,
+                )
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(rc, 0)
+            self.assertEqual(saved["state"], "WEB_HOST_REENTRY_PENDING")
+            self.assertEqual(saved["error_code"], "WEB_HOST_REENTRY_ADAPTER_UNAVAILABLE")
+
+class ControllerHostResolutionIsolationTests(unittest.TestCase):
+    def test_missing_lifecycle_host_resolves_unique_desktop_binding(self) -> None:
+        registry = {
+            "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-1"], "web": []}}
+        }
+        self.assertEqual(web_bridge.resolve_controller_host({}, {}, registry, "controller-1"), "desktop_codex")
+
+    def test_missing_lifecycle_host_with_both_bindings_does_not_assume_desktop(self) -> None:
+        registry = {
+            "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-1"], "web": ["web-1"]}}
+        }
+        self.assertEqual(web_bridge.resolve_controller_host({}, {}, registry, "controller-1"), "web")

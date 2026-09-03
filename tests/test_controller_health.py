@@ -31,6 +31,7 @@ class ControllerHealthTests(unittest.TestCase):
             "peer_host_available": True,
             "peer_host": "desktop_codex",
             "fallback_safe": True,
+            "peer_wake_authorized": True,
         })
         self.assertEqual(health["state"], "FALLBACK_NEEDED")
         decision = decide_controller_wake(health)
@@ -171,6 +172,7 @@ class ControllerHealthTests(unittest.TestCase):
             "peer_host_available": True,
             "peer_host": "web",
             "fallback_safe": True,
+            "peer_wake_authorized": True,
         })
         decision = decide_controller_wake(health)
         self.assertEqual(health["state"], "FALLBACK_NEEDED")
@@ -179,3 +181,40 @@ class ControllerHealthTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ControllerWakePeerAuthorizationTests(unittest.TestCase):
+    def test_web_controller_does_not_cross_host_without_explicit_wake_authorization(self):
+        health = derive_controller_health({
+            "registered_controller": "controller-1",
+            "canonical_common_dir": "/repo/.git",
+            "controller_host": "web",
+            "pending_control_event": True,
+            "resume_state": "RESUME_FAILED",
+            "active_writer": False,
+            "failure_class": "usage_limit_exceeded",
+            "fallback_eligible": True,
+            "peer_host_available": True,
+            "fallback_safe": True,
+            "peer_host": "desktop_codex",
+        })
+        decision = decide_controller_wake(health)
+        self.assertNotEqual(decision["decision"], "FALLBACK_PEER_HOST")
+        self.assertIsNone(decision["selected_host"])
+
+    def test_web_controller_can_cross_host_only_with_explicit_wake_authorization(self):
+        health = derive_controller_health({
+            "registered_controller": "controller-1",
+            "canonical_common_dir": "/repo/.git",
+            "controller_host": "web",
+            "pending_control_event": True,
+            "resume_state": "RESUME_FAILED",
+            "active_writer": False,
+            "failure_class": "usage_limit_exceeded",
+            "fallback_eligible": True,
+            "peer_host_available": True,
+            "fallback_safe": True,
+            "peer_host": "desktop_codex",
+            "peer_wake_authorized": True,
+        })
+        decision = decide_controller_wake(health)
+        self.assertEqual(decision, {"decision": "FALLBACK_PEER_HOST", "selected_host": "desktop_codex"})
