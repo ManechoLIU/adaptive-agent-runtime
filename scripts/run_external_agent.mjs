@@ -580,6 +580,8 @@ function persistExternalTerminalReceipt(options, { exitCode, summary, deliveryOu
     task_id: options.taskId || null,
     agent_id: options.agentId || null,
     session_id: options.sessionId || null,
+    attempt: options.assignmentId ? options.attempt : null,
+    lease_id: options.assignmentId ? options.leaseId : null,
     completed_at: new Date().toISOString(),
   });
   const helper = process.env.AD_TERMINAL_CONTINUATION_HELPER || fileURLToPath(new URL("./terminal_continuation.py", import.meta.url));

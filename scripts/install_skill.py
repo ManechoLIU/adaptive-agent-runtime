@@ -309,8 +309,10 @@ def detect_host_capabilities(
         "web_agent_execution": {
             "status": "host_limited",
             "adapter": "web-agent-execution",
-            "configured": False,
-            "reason": "runtime adapter is installed, but no trusted Host verifier provides authenticated, fresh, replay-safe ChatGPT generation lifecycle events",
+            "configured": True,
+            "recovery_mode": "runtime_progress_watchdog",
+            "host_terminal": "unavailable",
+            "reason": "runtime-owned canonical lease/progress watchdog is installed; trusted ChatGPT Host terminal events remain unavailable and are not required for stale-execution recovery",
         },
     }
 

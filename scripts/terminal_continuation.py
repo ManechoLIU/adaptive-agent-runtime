@@ -18,6 +18,7 @@ if str(SKILL_ROOT) not in sys.path:
 try:
     from scripts import lifecycle_hook as lifecycle
     from scripts import web_lifecycle_bridge as web_bridge
+    from scripts.assignment_runtime import load_runtime_state
 finally:
     if _added_skill_root:
         try:
@@ -34,6 +35,37 @@ def _load_terminal_receipt(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("event_type") != "external_agent_terminal":
         raise ValueError("terminal receipt must be an external_agent_terminal object")
     return value
+
+
+def _verify_assignment_bound_receipt(repo: Path, receipt: dict[str, Any]) -> None:
+    assignment_id = str(receipt.get("assignment_id") or "").strip()
+    if not assignment_id:
+        return
+    required = ("task_id", "agent_id", "session_id", "attempt", "lease_id")
+    missing = [field for field in required if receipt.get(field) in (None, "")]
+    if missing:
+        raise PermissionError("assignment-bound terminal receipt is missing current canonical runtime lease identity")
+    lease = load_runtime_state(repo).get("leases", {}).get(assignment_id)
+    if not isinstance(lease, dict):
+        raise PermissionError("assignment-bound terminal receipt does not match current canonical runtime lease")
+    expected = {
+        "task_id": str(lease.get("task_id") or ""),
+        "agent_id": str(lease.get("agent_id") or ""),
+        "session_id": str(lease.get("session_id") or ""),
+        "attempt": int(lease.get("attempt", 0)),
+        "lease_id": str(lease.get("lease_id") or ""),
+    }
+    actual = {
+        "task_id": str(receipt.get("task_id") or ""),
+        "agent_id": str(receipt.get("agent_id") or ""),
+        "session_id": str(receipt.get("session_id") or ""),
+        "attempt": int(receipt.get("attempt", 0)),
+        "lease_id": str(receipt.get("lease_id") or ""),
+    }
+    if actual != expected:
+        raise PermissionError("assignment-bound terminal receipt does not match current canonical runtime lease")
+    if not str(lease.get("terminal_state") or "").strip():
+        raise PermissionError("assignment-bound terminal receipt requires a canonical runtime terminal state")
 
 
 def consume_terminal_receipt(
@@ -60,6 +92,8 @@ def consume_terminal_receipt(
         if isinstance(exc, PermissionError):
             raise
         raise ValueError(f"cannot verify terminal receipt repository: {exc}") from exc
+
+    _verify_assignment_bound_receipt(repo, receipt)
 
     controller_id = web_bridge._registered_controller_for_common_dir(repo, registry_path)
     if not controller_id:

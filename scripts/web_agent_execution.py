@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""Transport adapter from Web-agent host lifecycle evidence to canonical Assignment runtime."""
+"""Runtime-owned Web Agent execution health and recovery adapter."""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import os
 import re
 import subprocess
-import tempfile
 import sys
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 try:
-    from scripts.assignment_runtime import apply_runtime_receipt, evaluate_lease, load_runtime_state
+    from scripts.assignment_runtime import apply_runtime_receipt, apply_observed_progress, evaluate_lease, load_runtime_state
     from scripts import terminal_continuation
     from scripts import web_lifecycle_bridge
     from scripts.reviewer_supervisor import validate_verdict
     from scripts.project_state import adaptive_delivery_state_dir
 except ModuleNotFoundError:
-    from assignment_runtime import apply_runtime_receipt, evaluate_lease, load_runtime_state
+    from assignment_runtime import apply_runtime_receipt, apply_observed_progress, evaluate_lease, load_runtime_state
     import terminal_continuation
     import web_lifecycle_bridge
     from reviewer_supervisor import validate_verdict
@@ -35,19 +35,6 @@ TERMINAL_STATES = {"completed", "interrupted", "missing", "failed"}
 
 def _iso(now: datetime) -> str:
     return (now if now.tzinfo else now.replace(tzinfo=UTC)).astimezone(UTC).isoformat()
-
-
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
-            handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
-        os.replace(name, path)
-    finally:
-        if os.path.exists(name):
-            os.unlink(name)
 
 
 def _registered_controller(repo: Path, registry_path: Path, controller_id: str) -> None:
@@ -110,11 +97,6 @@ def _immutable_git_commit(repo: Path, candidate: str) -> str:
     if resolved != value:
         raise ValueError("Web reviewer candidate_revision must be the exact immutable Git commit")
     return resolved
-
-
-def _terminal_receipt_path(repo: Path, assignment_id: str, attempt: int) -> Path:
-    digest = hashlib.sha256(f"{assignment_id}:{attempt}".encode()).hexdigest()
-    return adaptive_delivery_state_dir(repo) / "web-agent-terminal" / f"{digest}.json"
 
 
 def _start_receipt(repo: Path, event: dict[str, Any], now: datetime) -> dict[str, Any]:
@@ -186,13 +168,288 @@ def _review_delivery(lease: dict[str, Any], event: dict[str, Any]) -> str:
     return claimed
 
 
+def _git_progress_snapshot(worktree: str | Path) -> dict[str, str]:
+    root = Path(worktree).expanduser().resolve()
+    try:
+        head = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        status = subprocess.check_output(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("Web runtime watchdog cannot verify the Assignment worktree") from exc
+    return {
+        "last_observed_head": head,
+        "last_observed_status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
+    }
+
+
+def _watchdog_log_path(repo: Path, assignment_id: str, attempt: int) -> Path:
+    digest = hashlib.sha256(f"{assignment_id}:{attempt}".encode("utf-8")).hexdigest()
+    return adaptive_delivery_state_dir(repo) / "web-agent-watchdog" / f"{digest}.log"
+
+
+def _default_watchdog_launcher(
+    *, repo: Path, registry_path: Path, assignment_id: str, attempt: int, lease_id: str,
+) -> dict[str, Any]:
+    log_path = _watchdog_log_path(repo, assignment_id, attempt)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = log_path.open("ab")
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable, str(Path(__file__).resolve()), "watch",
+                "--repo", str(repo), "--registry", str(registry_path),
+                "--assignment-id", assignment_id, "--attempt", str(attempt),
+                "--lease-id", lease_id,
+            ],
+            stdin=subprocess.DEVNULL, stdout=handle, stderr=handle,
+            start_new_session=True, close_fds=True,
+        )
+    finally:
+        handle.close()
+    return {"launched": True, "pid": process.pid, "log_path": str(log_path)}
+
+
+def _dispatch_start_receipt(
+    *, repo: Path, controller_id: str, conversation_id: str, assignment: dict[str, Any],
+    now: datetime, attempt: int, lease_id: str,
+) -> dict[str, Any]:
+    required = (
+        "assignment_id", "task_id", "agent_id", "provider", "worktree", "primary_goal",
+        "success_criteria", "owned_scope", "strategy",
+    )
+    missing = [key for key in required if assignment.get(key) in (None, "", [])]
+    if missing:
+        raise ValueError("Web execution Assignment missing contract: " + ", ".join(missing))
+    if not conversation_id or conversation_id == controller_id:
+        raise ValueError("Web conversation execution identity must be distinct from Controller identity")
+    role = str(assignment.get("role") or "writer").strip().lower()
+    candidate = str(assignment.get("candidate_revision") or "").strip() or None
+    if role == "reviewer":
+        if not candidate:
+            raise ValueError("Web reviewer requires immutable candidate_revision")
+        candidate = _immutable_git_commit(repo, candidate)
+    snapshot = _git_progress_snapshot(assignment["worktree"])
+    receipt = {
+        "event_type": "assignment_started",
+        "assignment_id": assignment["assignment_id"], "task_id": assignment["task_id"],
+        "agent_id": assignment["agent_id"], "provider": assignment["provider"],
+        "session_id": conversation_id, "worktree": assignment["worktree"],
+        "issued_at": _iso(now), "attempt": attempt, "lease_id": lease_id, "event_seq": 1,
+        "receipt_id": f"web-runtime:{assignment['assignment_id']}:{attempt}:1",
+        "assignment_contract_version": int(assignment.get("assignment_contract_version", 2)),
+        "side_effect": assignment.get("side_effect"), "idempotency_key": assignment.get("idempotency_key"),
+        "primary_goal": assignment["primary_goal"], "success_criteria": assignment["success_criteria"],
+        "owned_scope": assignment["owned_scope"], "strategy": assignment["strategy"],
+        "execution_transport": "web", "execution_role": role, "candidate_revision": candidate,
+        "exclusive_execution_key": f"task:{assignment['task_id']}",
+        "health_mode": "progress_watchdog",
+        "baseline_head": snapshot["last_observed_head"],
+        **snapshot,
+    }
+    if assignment.get("progress_deadline_minutes") is not None:
+        receipt["progress_deadline_minutes"] = assignment["progress_deadline_minutes"]
+    return receipt
+
+
+def start_web_assignment(
+    *, repo: str | Path, registry_path: str | Path, controller_id: str, conversation_id: str,
+    assignment: dict[str, Any], now: datetime | None = None,
+    watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Record a Controller-dispatched Web attempt without claiming Host generation liveness."""
+    repo_path = Path(repo).expanduser().resolve()
+    registry = Path(registry_path).expanduser().resolve()
+    now = now or datetime.now(UTC)
+    _registered_controller(repo_path, registry, controller_id)
+    attempt = int(assignment.get("attempt", 1))
+    assignment_id = str(assignment.get("assignment_id") or "").strip()
+    if not assignment_id:
+        raise ValueError("Web execution Assignment requires assignment_id")
+    lease_id = str(assignment.get("lease_id") or f"{assignment_id}:web:attempt:{attempt}")
+    receipt = _dispatch_start_receipt(
+        repo=repo_path, controller_id=controller_id, conversation_id=conversation_id,
+        assignment=assignment, now=now, attempt=attempt, lease_id=lease_id,
+    )
+    runtime = apply_runtime_receipt(repo_path, receipt, now=now)
+    lease = runtime["leases"][assignment_id]
+    launcher = watchdog_launcher or _default_watchdog_launcher
+    watchdog = launcher(
+        repo=repo_path, registry_path=registry, assignment_id=assignment_id,
+        attempt=attempt, lease_id=lease_id,
+    )
+    return {
+        "assignment_id": assignment_id, "attempt": attempt, "lease_id": lease_id,
+        "controller_id": controller_id, "runtime_state": evaluate_lease(lease, now=now)["state"],
+        "watchdog": watchdog,
+    }
+
+
+def _automatic_recovery_decision(lease: dict[str, Any], health: dict[str, Any]) -> dict[str, Any]:
+    if health.get("state") == "budget_exhausted":
+        return {"eligible": False, "reason": "recovery_budget_exhausted"}
+    if health.get("state") != "unhealthy":
+        return {"eligible": False, "reason": "runtime_not_unhealthy"}
+    if int(lease.get("side_effect_contract_version", 1)) < 2:
+        return {"eligible": False, "reason": "legacy_side_effect_unknown"}
+    if lease.get("side_effect") is not False:
+        return {"eligible": False, "reason": "unknown_side_effect_requires_reconciliation"}
+    return {"eligible": True, "reason": "side_effect_free_runtime_timeout"}
+
+
+def _runtime_continuation_result(
+    *, repo: Path, registry_path: Path, event_source: str,
+    consumer: Callable[..., dict[str, Any]] | None,
+) -> dict[str, Any]:
+    runtime_consumer = consumer or terminal_continuation.notify_runtime_change
+    try:
+        return {
+            "runtime_continuation": runtime_consumer(
+                repo=repo, registry_path=registry_path, event_source=event_source
+            )
+        }
+    except (OSError, ValueError, PermissionError, RuntimeError, subprocess.SubprocessError) as exc:
+        # The lifecycle transaction may already have persisted pending_control_event.
+        # Keep the canonical unhealthy/terminal lease intact and let the detached
+        # watchdog retry the same Controller wake rather than losing the recovery edge.
+        return {"wake_error": f"{type(exc).__name__}: {exc}"}
+
+
+def watch_web_assignment_once(
+    *, repo: str | Path, registry_path: str | Path, assignment_id: str,
+    expected_attempt: int, expected_lease_id: str, now: datetime | None = None,
+    runtime_change_consumer: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """One Host-independent health pass using canonical lease + locally verified progress."""
+    repo_path = Path(repo).expanduser().resolve()
+    registry = Path(registry_path).expanduser().resolve()
+    now = now or datetime.now(UTC)
+    state = load_runtime_state(repo_path)
+    lease = state.get("leases", {}).get(assignment_id)
+    if not isinstance(lease, dict):
+        raise ValueError("Web runtime watchdog has no canonical Assignment lease")
+    if int(lease.get("attempt", 0)) != int(expected_attempt) or str(lease.get("lease_id") or "") != str(expected_lease_id):
+        return {"assignment_id": assignment_id, "superseded": True, "runtime_state": "superseded"}
+    if lease.get("execution_transport") != "web" or lease.get("health_mode") != "progress_watchdog":
+        raise ValueError("Web runtime watchdog requires a progress-watchdog Web lease")
+    if lease.get("terminal_state"):
+        health = evaluate_lease(lease, now=now)
+        result = {
+            "assignment_id": assignment_id, "runtime_state": health["state"],
+            "reason": health["reason"], "progress_observed": False,
+            "auto_recovery_eligible": False,
+        }
+        result.update(_runtime_continuation_result(
+            repo=repo_path, registry_path=registry,
+            event_source=f"web_assignment_terminal:{assignment_id}:attempt:{expected_attempt}",
+            consumer=runtime_change_consumer,
+        ))
+        return result
+    observed = _git_progress_snapshot(lease["worktree"])
+    state, changed = apply_observed_progress(
+        repo_path, assignment_id=assignment_id, expected_attempt=expected_attempt,
+        expected_lease_id=expected_lease_id, observed=observed, now=now,
+    )
+    lease = state["leases"][assignment_id]
+    health = evaluate_lease(lease, now=now)
+    recovery = _automatic_recovery_decision(lease, health)
+    result = {
+        "assignment_id": assignment_id, "runtime_state": health["state"], "reason": health["reason"],
+        "progress_observed": changed, "auto_recovery_eligible": recovery["eligible"],
+        "recovery_reason": recovery["reason"],
+    }
+    if health["state"] in {"unhealthy", "budget_exhausted"}:
+        result.update(_runtime_continuation_result(
+            repo=repo_path, registry_path=registry,
+            event_source=f"web_assignment_{health['state']}:{assignment_id}:attempt:{expected_attempt}",
+            consumer=runtime_change_consumer,
+        ))
+    return result
+
+
+def recover_web_assignment(
+    *, repo: str | Path, registry_path: str | Path, controller_id: str, assignment_id: str,
+    conversation_id: str, now: datetime | None = None,
+    watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
+    lease_id_factory: Callable[[str, int], str] | None = None,
+) -> dict[str, Any]:
+    """Create the next fenced attempt when the woken Controller has a replacement execution session."""
+    repo_path = Path(repo).expanduser().resolve()
+    registry = Path(registry_path).expanduser().resolve()
+    now = now or datetime.now(UTC)
+    _registered_controller(repo_path, registry, controller_id)
+    state = load_runtime_state(repo_path)
+    current = state.get("leases", {}).get(assignment_id)
+    if not isinstance(current, dict):
+        raise ValueError("Web recovery requires a canonical Assignment lease")
+    health = evaluate_lease(current, now=now)
+    decision = _automatic_recovery_decision(current, health)
+    if not decision["eligible"]:
+        if decision["reason"] == "unknown_side_effect_requires_reconciliation":
+            raise ValueError("unknown side effect requires reconciliation before recovery")
+        if decision["reason"] == "recovery_budget_exhausted":
+            raise ValueError("recovery budget exhausted; strategy change requires a new execution lineage")
+        raise ValueError(f"Web recovery is not allowed: {decision['reason']}")
+    next_attempt = int(current.get("attempt", 1)) + 1
+    factory = lease_id_factory or (lambda aid, attempt: f"{aid}:web:attempt:{attempt}:{uuid.uuid4().hex}")
+    new_lease_id = factory(assignment_id, next_attempt)
+    assignment = {
+        "assignment_id": assignment_id, "task_id": current["task_id"], "agent_id": current["agent_id"],
+        "provider": current["provider"], "worktree": current["worktree"],
+        "primary_goal": current["primary_goal"], "success_criteria": current["success_criteria"],
+        "owned_scope": current["owned_scope"], "strategy": current["strategy"],
+        "assignment_contract_version": int(current.get("side_effect_contract_version", 2)),
+        "side_effect": current.get("side_effect"), "idempotency_key": current.get("idempotency_key"),
+        "progress_deadline_minutes": int(current.get("progress_deadline_minutes") or 30),
+        "role": current.get("execution_role") or "writer", "candidate_revision": current.get("candidate_revision"),
+    }
+    receipt = _dispatch_start_receipt(
+        repo=repo_path, controller_id=controller_id, conversation_id=conversation_id,
+        assignment=assignment, now=now, attempt=next_attempt, lease_id=new_lease_id,
+    )
+    runtime = apply_runtime_receipt(repo_path, receipt, now=now)
+    lease = runtime["leases"][assignment_id]
+    launcher = watchdog_launcher or _default_watchdog_launcher
+    watchdog = launcher(
+        repo=repo_path, registry_path=registry, assignment_id=assignment_id,
+        attempt=next_attempt, lease_id=new_lease_id,
+    )
+    return {
+        "assignment_id": assignment_id, "attempt": next_attempt, "lease_id": new_lease_id,
+        "controller_id": controller_id, "runtime_state": evaluate_lease(lease, now=now)["state"],
+        "watchdog": watchdog,
+    }
+
+
+def watch_web_assignment(
+    *, repo: str | Path, registry_path: str | Path, assignment_id: str,
+    expected_attempt: int, expected_lease_id: str, poll_seconds: float = 15.0,
+    runtime_change_consumer: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if poll_seconds < 0.1:
+        raise ValueError("watchdog poll interval must be at least 0.1 seconds")
+    while True:
+        result = watch_web_assignment_once(
+            repo=repo, registry_path=registry_path, assignment_id=assignment_id,
+            expected_attempt=expected_attempt, expected_lease_id=expected_lease_id,
+            runtime_change_consumer=runtime_change_consumer,
+        )
+        if result.get("superseded"):
+            return result
+        if result.get("runtime_state") in {"terminal", "unhealthy", "budget_exhausted"} and not result.get("wake_error"):
+            return result
+        time.sleep(poll_seconds)
+
+
 def apply_web_execution_event(
     *,
     repo: str | Path,
     registry_path: str | Path,
     event: dict[str, Any],
     now: datetime | None = None,
-    continuation_consumer: Callable[..., dict[str, Any]] | None = None,
     runtime_change_consumer: Callable[..., dict[str, Any]] | None = None,
     host_verifier: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
@@ -240,11 +497,15 @@ def apply_web_execution_event(
             raise ValueError("heartbeat requires observed running state")
         receipt = {"event_type": "assignment_heartbeat", **base}
     elif state == "progress":
+        if att.get("state") != "running":
+            raise ValueError("progress requires observed running state")
         receipt = {"event_type": "assignment_progress", **base}
         for key in ("last_observed_head", "last_observed_status_sha256", "evidence_receipt_id", "artifact_fingerprint", "blocker_evidence_fingerprint"):
             if event.get(key) not in (None, ""):
                 receipt[key] = event[key]
     elif terminal:
+        if state in {"interrupted", "missing"}:
+            raise ValueError("Web interruption/missing signal is not authoritative terminal evidence; runtime progress watchdog owns recovery")
         if att.get("state") != state:
             raise ValueError("terminal attestation state mismatch")
         if state == "completed":
@@ -280,30 +541,52 @@ def apply_web_execution_event(
             repo=repo, registry_path=registry, event_source=f"web_assignment_{health['state']}"
         )
     if terminal:
-        path = _terminal_receipt_path(repo, assignment_id, attempt)
-        _atomic_json(path, {
-            "schema_version": 1, "event_type": "external_agent_terminal", "engine": "chatgpt_web",
-            "repo": str(repo), "cwd": str(current["worktree"]), "exit_code": 0 if terminal_state == "completed" else 1,
-            "summary": receipt["summary"], "delivery_outcome": delivery, "assignment_id": assignment_id,
-            "task_id": current["task_id"], "agent_id": current["agent_id"], "session_id": conversation_id,
-            "attempt": attempt, "lease_id": lease_id, "completed_at": _iso(now),
-            "review_verdict": current.get("review_verdict"),
-            "candidate_revision": current.get("candidate_revision"),
-        })
-        consumer = continuation_consumer or terminal_continuation.consume_terminal_receipt
-        continuation = consumer(repo=repo, receipt_path=path, registry_path=registry)
-        result.update({"terminal_receipt": str(path), "continuation": continuation})
+        runtime_consumer = runtime_change_consumer or terminal_continuation.notify_runtime_change
+        result["runtime_continuation"] = runtime_consumer(
+            repo=repo, registry_path=registry, event_source=f"web_assignment_terminal:{assignment_id}:attempt:{attempt}"
+        )
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Translate host-attested Web Agent lifecycle evidence into Adaptive Agent Runtime receipts.")
-    parser.add_argument("--repo", required=True)
-    parser.add_argument("--registry", required=True)
+    parser = argparse.ArgumentParser(description="Runtime-owned Web Agent execution recovery adapter.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("start", "recover"):
+        cmd = sub.add_parser(name)
+        cmd.add_argument("--repo", required=True); cmd.add_argument("--registry", required=True)
+    watch = sub.add_parser("watch")
+    watch.add_argument("--repo", required=True); watch.add_argument("--registry", required=True)
+    watch.add_argument("--assignment-id", required=True); watch.add_argument("--attempt", required=True, type=int)
+    watch.add_argument("--lease-id", required=True); watch.add_argument("--poll-seconds", type=float, default=15.0)
+    legacy = sub.add_parser("host-event")
+    legacy.add_argument("--repo", required=True); legacy.add_argument("--registry", required=True)
     args = parser.parse_args(argv)
     try:
-        event = json.load(sys.stdin)
-        result = apply_web_execution_event(repo=args.repo, registry_path=args.registry, event=event)
+        if args.command == "watch":
+            result = watch_web_assignment(
+                repo=args.repo, registry_path=args.registry, assignment_id=args.assignment_id,
+                expected_attempt=args.attempt, expected_lease_id=args.lease_id, poll_seconds=args.poll_seconds,
+            )
+        else:
+            event = json.load(sys.stdin)
+            if not isinstance(event, dict):
+                raise ValueError("Web execution input must be an object")
+            if args.command == "start":
+                result = start_web_assignment(
+                    repo=args.repo, registry_path=args.registry,
+                    controller_id=str(event.get("controller_id") or ""),
+                    conversation_id=str(event.get("conversation_id") or ""),
+                    assignment=event.get("assignment") if isinstance(event.get("assignment"), dict) else {},
+                )
+            elif args.command == "recover":
+                result = recover_web_assignment(
+                    repo=args.repo, registry_path=args.registry,
+                    controller_id=str(event.get("controller_id") or ""),
+                    assignment_id=str(event.get("assignment_id") or ""),
+                    conversation_id=str(event.get("conversation_id") or ""),
+                )
+            else:
+                result = apply_web_execution_event(repo=args.repo, registry_path=args.registry, event=event)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except (OSError, ValueError, PermissionError, json.JSONDecodeError) as error:

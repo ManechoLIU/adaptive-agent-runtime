@@ -38,6 +38,7 @@ EVIDENCE_FINGERPRINT_FIELDS = (
 )
 GIT_EVIDENCE_FIELDS = ("last_observed_head", "last_observed_status_sha256")
 MAX_PROGRESS_EVIDENCE_CHARS = 128
+HEALTH_MODES = {"heartbeat_progress", "progress_watchdog"}
 LINEAGE_CONTRACT_FIELDS = ("primary_goal", "success_criteria", "owned_scope", "strategy")
 LINEAGE_WHITESPACE_RE = re.compile(r"[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
 PASS_EVIDENCE_SCHEMES = {"test-log", "green-test", "receipt", "git", "file", "artifact"}
@@ -243,6 +244,9 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "recovery_count": recovery_count,
         }
         deadline_minutes = _assignment_progress_deadline_minutes(receipt, policy)
+        health_mode = str(receipt.get("health_mode") or "heartbeat_progress").strip()
+        if health_mode not in HEALTH_MODES:
+            raise ValueError("unsupported runtime health_mode")
         exclusive_key = str(receipt.get("exclusive_execution_key") or "").strip() or None
         if exclusive_key and not existing:
             for other_id, other in leases.items():
@@ -287,6 +291,11 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "candidate_revision": str(receipt.get("candidate_revision") or "").strip() or None,
             "exclusive_execution_key": exclusive_key,
             "host_attestation_id": str(receipt.get("host_attestation_id") or "").strip() or None,
+            "health_mode": health_mode,
+            "primary_goal": receipt["primary_goal"],
+            "success_criteria": json.loads(json.dumps(receipt["success_criteria"])),
+            "owned_scope": json.loads(json.dumps(receipt["owned_scope"])),
+            "strategy": receipt["strategy"],
         })
         start_changed = [field for field in EVIDENCE_FINGERPRINT_FIELDS if lease.get(field) not in (None, "")]
         lease["last_progress_evidence"] = _bounded_progress_evidence(start_changed, lease)
@@ -426,16 +435,18 @@ def evaluate_lease(lease: dict[str, Any] | None, now: datetime | None = None, po
         if terminal != "completed" and recovery_count >= policy.max_recoveries:
             return {"state": "budget_exhausted", "reason": "recovery_budget_exhausted"}
         return {"state": "terminal", "reason": f"terminal:{terminal}"}
-    pid = lease.get("pid")
-    if pid is not None and process_probe is not None and not process_probe(int(pid)):
-        if recovery_count >= policy.max_recoveries:
-            return {"state": "budget_exhausted", "reason": "recovery_budget_exhausted"}
-        return {"state": "unhealthy", "reason": "process_not_alive"}
-    expires = _dt(lease["lease_expires_at"])
-    if now > expires:
-        if recovery_count >= policy.max_recoveries:
-            return {"state": "budget_exhausted", "reason": "recovery_budget_exhausted"}
-        return {"state": "unhealthy", "reason": "lease_expired"}
+    health_mode = str(lease.get("health_mode") or "heartbeat_progress")
+    if health_mode != "progress_watchdog":
+        pid = lease.get("pid")
+        if pid is not None and process_probe is not None and not process_probe(int(pid)):
+            if recovery_count >= policy.max_recoveries:
+                return {"state": "budget_exhausted", "reason": "recovery_budget_exhausted"}
+            return {"state": "unhealthy", "reason": "process_not_alive"}
+        expires = _dt(lease["lease_expires_at"])
+        if now > expires:
+            if recovery_count >= policy.max_recoveries:
+                return {"state": "budget_exhausted", "reason": "recovery_budget_exhausted"}
+            return {"state": "unhealthy", "reason": "lease_expired"}
     deadline = _dt(lease["progress_deadline_at"])
     if now > deadline + timedelta(minutes=policy.progress_grace_minutes):
         if recovery_count >= policy.max_recoveries:
@@ -478,6 +489,54 @@ def apply_runtime_receipt(repo: str | Path, receipt: dict[str, Any], *, now: dat
             updated = apply_receipt(state, receipt, now=now, policy=policy)
             save_runtime_state(repo, updated)
             return updated
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def apply_observed_progress(
+    repo: str | Path,
+    *,
+    assignment_id: str,
+    expected_attempt: int,
+    expected_lease_id: str,
+    observed: dict[str, Any],
+    now: datetime | None = None,
+    policy: RuntimePolicy | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Atomically record only changed authoritative progress fingerprints."""
+    now = now or datetime.now(UTC)
+    lock_path = adaptive_delivery_state_dir(repo) / "runtime-assignments.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_runtime_state(repo)
+            lease = state.get("leases", {}).get(assignment_id)
+            if not isinstance(lease, dict):
+                raise ValueError("runtime watchdog has no current Assignment lease")
+            if int(lease.get("attempt", 0)) != int(expected_attempt) or str(lease.get("lease_id") or "") != str(expected_lease_id):
+                raise ValueError("runtime watchdog attempt/lease fence no longer matches current Assignment")
+            if lease.get("terminal_state"):
+                return state, False
+            changed = {
+                field: value for field, value in observed.items()
+                if field in EVIDENCE_FINGERPRINT_FIELDS and value not in (None, "") and lease.get(field) != value
+            }
+            if not changed:
+                return state, False
+            receipt = {
+                "event_type": "assignment_progress",
+                **{field: lease[field] for field in IDENTITY_FIELDS},
+                "issued_at": _iso(now),
+                "attempt": int(lease["attempt"]),
+                "lease_id": lease["lease_id"],
+                "event_seq": int(lease.get("last_event_seq", 0)) + 1,
+                "receipt_id": f"runtime-watchdog:{assignment_id}:{lease['attempt']}:{int(lease.get('last_event_seq', 0)) + 1}",
+                **changed,
+            }
+            updated = apply_receipt(state, receipt, now=now, policy=policy)
+            save_runtime_state(repo, updated)
+            return updated, True
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 

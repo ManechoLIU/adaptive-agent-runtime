@@ -1020,3 +1020,32 @@ test("Python and Node normalize lineage information separators consistently whil
     assert.equal(result.status, 0, result.stderr);
   }
 });
+
+test("assignment-bound external terminal receipt carries current attempt and lease identity", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-terminal-identity-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, { assignment_id: "a-terminal" }, repo);
+  const terminalReceipt = path.join(bin, "terminal-assignment.json");
+  const helper = path.join(bin, "continuation-helper.py");
+  await writeFile(helper, "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n");
+  await chmod(helper, 0o755);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "a-terminal", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack, "--attempt", "1", "--lease-id", "lease-terminal-1",
+    "--terminal-receipt", terminalReceipt,
+  ], { encoding: "utf8", input: "bounded contract", env: {
+    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
+    AD_TERMINAL_CONTINUATION_HELPER: helper,
+  } });
+  assert.equal(result.status, 0, result.stderr);
+  const receipt = JSON.parse(await readFile(terminalReceipt, "utf8"));
+  assert.equal(receipt.assignment_id, "a-terminal");
+  assert.equal(receipt.attempt, 1);
+  assert.equal(receipt.lease_id, "lease-terminal-1");
+});

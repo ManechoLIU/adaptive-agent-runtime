@@ -205,5 +205,56 @@ class TerminalContinuationTests(unittest.TestCase):
         self.assertTrue(consume.call_args.kwargs["dispatch_wake"])
 
 
+class AssignmentBoundTerminalReceiptIdentityTests(unittest.TestCase):
+    def test_assignment_bound_terminal_receipt_must_match_current_attempt_and_lease(self) -> None:
+        from scripts.assignment_runtime import apply_runtime_receipt
+        module = TerminalContinuationTests()._load_module("terminal_continuation_assignment_binding_test")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            start = {
+                "event_type": "assignment_started", "assignment_id": "A-1", "task_id": "T-1",
+                "agent_id": "agent-1", "provider": "grok-build", "session_id": "session-current",
+                "worktree": str(repo), "issued_at": "2026-09-03T12:00:00+00:00", "attempt": 1,
+                "lease_id": "lease-current", "event_seq": 1, "assignment_contract_version": 2,
+                "side_effect": False, "idempotency_key": None, "primary_goal": "bounded",
+                "success_criteria": ["done"], "owned_scope": ["README.md"], "strategy": "test",
+            }
+            apply_runtime_receipt(repo, start)
+            receipt = root / "terminal.json"
+            receipt.write_text(json.dumps({
+                "schema_version": 1, "event_type": "external_agent_terminal", "repo": str(repo.resolve()),
+                "assignment_id": "A-1", "task_id": "T-1", "agent_id": "agent-1",
+                "session_id": "session-old", "attempt": 1, "lease_id": "lease-old",
+                "summary": "stale terminal", "delivery_outcome": "unresolved",
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "current canonical runtime lease"):
+                module.consume_terminal_receipt(repo=repo, receipt_path=receipt, registry_path=registry)
+
+    def test_assignment_bound_terminal_receipt_cannot_wake_while_canonical_attempt_is_active(self) -> None:
+        from scripts.assignment_runtime import apply_runtime_receipt
+        module = TerminalContinuationTests()._load_module("terminal_continuation_active_binding_test")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            start = {
+                "event_type": "assignment_started", "assignment_id": "A-1", "task_id": "T-1",
+                "agent_id": "agent-1", "provider": "grok-build", "session_id": "session-current",
+                "worktree": str(repo), "issued_at": "2026-09-03T12:00:00+00:00", "attempt": 1,
+                "lease_id": "lease-current", "event_seq": 1, "assignment_contract_version": 2,
+                "side_effect": False, "idempotency_key": None, "primary_goal": "bounded",
+                "success_criteria": ["done"], "owned_scope": ["README.md"], "strategy": "test",
+            }
+            apply_runtime_receipt(repo, start)
+            receipt = {
+                "assignment_id": "A-1", "task_id": "T-1", "agent_id": "agent-1",
+                "session_id": "session-current", "attempt": 1, "lease_id": "lease-current",
+            }
+            with self.assertRaisesRegex(PermissionError, "canonical runtime terminal"):
+                module._verify_assignment_bound_receipt(repo, receipt)
+
+
 if __name__ == "__main__":
     unittest.main()
