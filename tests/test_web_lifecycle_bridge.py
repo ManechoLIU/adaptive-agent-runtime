@@ -1318,6 +1318,26 @@ class WebLifecycleNativeStopTests(unittest.TestCase):
             self.assertIn("registered controller", result.stderr)
 
 
+class WebContinuationSupervisorBootstrapTests(unittest.TestCase):
+    def test_confirmed_old_supervisor_needs_bootstrap_while_lifecycle_pending(self) -> None:
+        self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+            {"pending_control_event": True, "requires_user": False},
+            {"state": "RESUME_CONFIRMED", "pending_control_event": True},
+        ))
+
+    def test_active_supervisor_does_not_need_duplicate_bootstrap(self) -> None:
+        self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+            {"pending_control_event": True, "requires_user": False},
+            {"state": "RESUME_PENDING", "pending_control_event": True},
+        ))
+
+    def test_user_wait_does_not_bootstrap_supervisor(self) -> None:
+        self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+            {"pending_control_event": True, "requires_user": True},
+            {"state": "RESUME_CONFIRMED", "pending_control_event": True},
+        ))
+
+
 class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
     def run_bridge(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

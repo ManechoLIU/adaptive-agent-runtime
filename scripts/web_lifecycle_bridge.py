@@ -1701,6 +1701,49 @@ def default_auto_stop_state_path(session_id: str) -> Path:
     )
 
 
+def continuation_supervisor_needs_bootstrap(
+    lifecycle_state: dict[str, Any], supervisor_state: dict[str, Any]
+) -> bool:
+    if lifecycle_state.get("pending_control_event") is not True:
+        return False
+    if lifecycle_state.get("requires_user") is True:
+        return False
+    active_states = {
+        "RESUME_PENDING",
+        "RESUME_REARMED",
+        "RESUME_DEFERRED_ACTIVE_WRITER",
+    }
+    return str(supervisor_state.get("state") or "") not in active_states
+
+
+def ensure_continuation_supervisor(
+    *,
+    lifecycle_state: dict[str, Any],
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    codex: str,
+    runtime_path: str | None = None,
+    delay_seconds: float = 1.0,
+) -> bool:
+    state_path = default_auto_stop_state_path(session_id)
+    supervisor_state = load_json(state_path)
+    if not continuation_supervisor_needs_bootstrap(lifecycle_state, supervisor_state):
+        return False
+    generation = int(lifecycle_state.get("wake_generation", 0) or 0)
+    schedule_auto_native_stop(
+        session_id=session_id,
+        repo=repo,
+        receipt_id=f"bootstrap:{generation}",
+        registry=registry,
+        codex=codex,
+        delay_seconds=delay_seconds,
+        state_path=state_path,
+        runtime_path=runtime_path,
+    )
+    return True
+
+
 def schedule_auto_native_stop(
     *,
     session_id: str,
@@ -2249,6 +2292,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     delay_seconds=1.0, state_path=default_auto_stop_state_path(session_id),
                 )
             return 78
+        ensure_continuation_supervisor(
+            lifecycle_state=lifecycle_state,
+            session_id=session_id,
+            repo=repo,
+            registry=registry_path,
+            codex="/opt/homebrew/bin/codex",
+        )
         return 0
 
     if args.command_name == "audit-once":
