@@ -1407,6 +1407,147 @@ class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
             self.assertTrue(saved["pending_control_event"])
             self.assertIn("resume controller-1", marker.read_text())
 
+    def test_auto_native_stop_rearms_after_confirmed_resume_while_lifecycle_remains_pending(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry = self.make_repo_registry(root)
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "r-cont", "session_id": "controller-1",
+                "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            initial = {
+                "pending_control_event": True, "requires_user": False, "wake_generation": 7,
+                "triggers": ["RUNNABLE:STEP-2"], "snapshot": {
+                    "head": "a", "ledger_sha256": "l1", "worktree_status_sha256": "w1",
+                    "ready_ids": ["STEP-2"], "runnable_ids": ["STEP-2"],
+                    "candidate_revisions": [], "rule_handshake": {},
+                },
+            }
+            fresh = dict(initial)
+            confirmed = {
+                "operation": "native_resume", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
+                "pending_control_event": True, "returncode": 0, "stdout_tail": "checkpoint",
+                "stderr_tail": "", "controller_id": "controller-1",
+                "execution_target_session_id": "desktop-current", "target_generation": 1,
+            }
+            with patch.object(web_bridge, "_load_lifecycle_state", side_effect=[initial, fresh]), patch.object(
+                web_bridge, "execute_native_resume", return_value=confirmed
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r-cont",
+                    registry=registry, codex="/opt/homebrew/bin/codex", delay_seconds=0,
+                    state_path=state, runtime_path="/usr/bin:/bin",
+                )
+            self.assertEqual(code, 0)
+            schedule.assert_called_once()
+            self.assertEqual(schedule.call_args.kwargs["receipt_id"], "r-cont")
+            saved = json.loads(state.read_text())
+            self.assertTrue(saved["pending_control_event"])
+            self.assertEqual(saved["continuation_count"], 1)
+
+    def test_auto_native_stop_does_not_rearm_after_confirmed_resume_when_lifecycle_closes(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry = self.make_repo_registry(root)
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "r-closed", "session_id": "controller-1",
+                "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            initial = {"pending_control_event": True, "requires_user": False, "wake_generation": 1}
+            closed = {"pending_control_event": False, "requires_user": False, "wake_generation": 1}
+            confirmed = {
+                "operation": "native_resume", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
+                "pending_control_event": True, "returncode": 0, "stdout_tail": "done",
+                "stderr_tail": "", "controller_id": "controller-1",
+            }
+            with patch.object(web_bridge, "_load_lifecycle_state", side_effect=[initial, closed]), patch.object(
+                web_bridge, "execute_native_resume", return_value=confirmed
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r-closed",
+                    registry=registry, codex="/opt/homebrew/bin/codex", delay_seconds=0,
+                    state_path=state, runtime_path="/usr/bin:/bin",
+                )
+            self.assertEqual(code, 0)
+            schedule.assert_not_called()
+            saved = json.loads(state.read_text())
+            self.assertFalse(saved["pending_control_event"])
+
+    def test_auto_native_stop_waits_for_user_only_on_explicit_requires_user(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry = self.make_repo_registry(root)
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "r-user", "session_id": "controller-1",
+                "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            initial = {"pending_control_event": True, "requires_user": False, "wake_generation": 3}
+            waiting = {"pending_control_event": True, "requires_user": True, "wake_generation": 3}
+            confirmed = {
+                "operation": "native_resume", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
+                "pending_control_event": True, "returncode": 0, "stdout_tail": "need decision",
+                "stderr_tail": "", "controller_id": "controller-1",
+            }
+            with patch.object(web_bridge, "_load_lifecycle_state", side_effect=[initial, waiting]), patch.object(
+                web_bridge, "execute_native_resume", return_value=confirmed
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r-user", registry=registry,
+                    codex="/opt/homebrew/bin/codex", delay_seconds=0, state_path=state,
+                    runtime_path="/usr/bin:/bin",
+                )
+            self.assertEqual(code, 0)
+            schedule.assert_not_called()
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["state"], "WAITING_USER")
+            self.assertEqual(saved["failure_class"], "user_decision_required")
+
+    def test_auto_native_stop_stops_rearming_after_repeated_confirmed_no_progress(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry = self.make_repo_registry(root)
+            lifecycle = {
+                "pending_control_event": True, "requires_user": False, "wake_generation": 4,
+                "triggers": ["RUNNABLE:STEP-2"], "snapshot": {
+                    "head": "a", "ledger_sha256": "l", "worktree_status_sha256": "w",
+                    "ready_ids": ["STEP-2"], "runnable_ids": ["STEP-2"],
+                    "candidate_revisions": [], "rule_handshake": {},
+                },
+            }
+            fingerprint = web_bridge._wake_event_fingerprint(lifecycle)
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "r-stall", "session_id": "controller-1",
+                "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+                "pending_control_event": True, "continuation_count": 3,
+                "unchanged_continuation_count": web_bridge.AUTO_CONTINUATION_STALL_LIMIT - 1,
+                "last_lifecycle_fingerprint": fingerprint,
+            }), encoding="utf-8")
+            confirmed = {
+                "operation": "native_resume", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
+                "pending_control_event": True, "returncode": 0, "stdout_tail": "same checkpoint",
+                "stderr_tail": "", "controller_id": "controller-1",
+            }
+            with patch.object(web_bridge, "_load_lifecycle_state", side_effect=[lifecycle, lifecycle]), patch.object(
+                web_bridge, "execute_native_resume", return_value=confirmed
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r-stall", registry=registry,
+                    codex="/opt/homebrew/bin/codex", delay_seconds=0, state_path=state,
+                    runtime_path="/usr/bin:/bin",
+                )
+            self.assertEqual(code, 78)
+            schedule.assert_not_called()
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["state"], "RESUME_STALLED_NO_PROGRESS")
+            self.assertEqual(saved["failure_class"], "confirmed_resume_without_machine_progress")
+
     def test_resume_uses_target_replaced_during_preflight_not_the_retired_target(self) -> None:
         from unittest.mock import patch
 

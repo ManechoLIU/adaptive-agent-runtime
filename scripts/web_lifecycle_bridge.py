@@ -43,6 +43,7 @@ LAUNCHER_LOG_LIMIT = 262144
 RESTORE_STATIC_DOCUMENT_NAMES = ("AGENTS.md", "MEMORY.md", "WIKI_INDEX.md")
 AUTHORITATIVE_DOCUMENT_NAMES = ("SKILL.md", "SPEC.md", "DESIGN.md", "TECHNICAL.md", "EVOLUTION.md")
 RESTORE_DOCUMENT_LIMIT = 32768
+AUTO_CONTINUATION_STALL_LIMIT = 3
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -1118,6 +1119,9 @@ def _wake_event_fingerprint(lifecycle_state: dict[str, Any]) -> str:
         "triggers": lifecycle_state.get("triggers", []),
         "wake_generation": int(lifecycle_state.get("wake_generation", 0) or 0),
         "event_generation": generation,
+        "next_action": str(lifecycle_state.get("next_action") or "").strip(),
+        "requires_user": lifecycle_state.get("requires_user") is True,
+        "pending_terminal_receipts": lifecycle_state.get("pending_terminal_receipts", []),
     }
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return __import__("hashlib").sha256(encoded).hexdigest()
@@ -1719,7 +1723,11 @@ def schedule_auto_native_stop(
         "state": "RESUME_PENDING",
         "pending_control_event": True,
         "retry_count": int(prior.get("retry_count", 0) or 0) if same_receipt else 0,
+        "continuation_count": int(prior.get("continuation_count", 0) or 0) if same_receipt else 0,
+        "unchanged_continuation_count": int(prior.get("unchanged_continuation_count", 0) or 0) if same_receipt else 0,
     }
+    if same_receipt and prior.get("last_lifecycle_fingerprint"):
+        value["last_lifecycle_fingerprint"] = str(prior["last_lifecycle_fingerprint"])
     if same_receipt and prior.get("failure_class") == "active_writer_present":
         value["last_deferred_state"] = "RESUME_DEFERRED_ACTIVE_WRITER"
         value["failure_class"] = "active_writer_present"
@@ -1868,6 +1876,61 @@ def run_auto_native_stop(
                 session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                 codex=codex, delay_seconds=retry_delay, state_path=state_path, runtime_path=runtime_path,
             )
+        return 0
+    if attempt.get("result") == "CONFIRMED":
+        fresh_lifecycle = _load_lifecycle_state(session_id)
+        current = load_json(state_path)
+        if current.get("receipt_id") != receipt_id:
+            return 0
+        if not fresh_lifecycle:
+            # No authoritative lifecycle state means there is nothing safe to re-arm from.
+            # Keep the successful receipt, preserve pending evidence, and fail closed against spinning.
+            current["state"] = "RESUME_CONFIRMED"
+            current["pending_control_event"] = True
+            current["lifecycle_rearm"] = "unavailable"
+            write_auto_stop_state(state_path, current)
+            return 0
+        pending = fresh_lifecycle.get("pending_control_event") is True
+        requires_user = fresh_lifecycle.get("requires_user") is True
+        current["pending_control_event"] = pending
+        if not pending:
+            current["state"] = "CONTINUATION_CLOSED"
+            current.pop("failure_class", None)
+            write_auto_stop_state(state_path, current)
+            return 0
+        if requires_user:
+            current["state"] = "WAITING_USER"
+            current["failure_class"] = "user_decision_required"
+            write_auto_stop_state(state_path, current)
+            return 0
+        fingerprint = _wake_event_fingerprint(fresh_lifecycle)
+        previous_fingerprint = str(current.get("last_lifecycle_fingerprint") or "")
+        unchanged = int(current.get("unchanged_continuation_count", 0) or 0)
+        unchanged = unchanged + 1 if previous_fingerprint == fingerprint else 0
+        continuation_count = int(current.get("continuation_count", 0) or 0) + 1
+        current.update({
+            "state": "RESUME_REARMED",
+            "pending_control_event": True,
+            "continuation_count": continuation_count,
+            "unchanged_continuation_count": unchanged,
+            "last_lifecycle_fingerprint": fingerprint,
+        })
+        if unchanged >= AUTO_CONTINUATION_STALL_LIMIT:
+            current.update({
+                "state": "RESUME_STALLED_NO_PROGRESS",
+                "failure_class": "confirmed_resume_without_machine_progress",
+                "error_code": "WEB_LIFECYCLE_CONTINUATION_STALLED",
+            })
+            write_auto_stop_state(state_path, current)
+            return 78
+        current.pop("failure_class", None)
+        current.pop("error_code", None)
+        write_auto_stop_state(state_path, current)
+        schedule_auto_native_stop(
+            session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+            codex=codex, delay_seconds=min(5.0, 1.0 + unchanged), state_path=state_path,
+            runtime_path=runtime_path,
+        )
         return 0
     return int(attempt["returncode"])
 
