@@ -151,6 +151,10 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
     if existing:
         current_attempt = int(existing.get("attempt", 1))
         recovery_start = event == "assignment_started" and attempt > current_attempt
+        if event != "assignment_started" and attempt != current_attempt:
+            raise ValueError("runtime receipt must match the current runtime attempt")
+        if event != "assignment_started" and lease_id != existing.get("lease_id"):
+            raise ValueError("runtime receipt must match the current runtime lease")
         stable_identity_fields = [field for field in IDENTITY_FIELDS if field != "session_id"]
         mismatches = [f for f in stable_identity_fields if existing.get(f) != receipt.get(f)]
         if existing.get("session_id") != receipt.get("session_id") and not recovery_start:
@@ -205,6 +209,11 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
                 raise ValueError("recovery attempt must increment by exactly one")
             if int(existing.get("recovery_count", 0)) >= policy.max_recoveries:
                 raise ValueError("recovery budget exhausted; strategy change requires a new execution lineage")
+            current_health = evaluate_lease(existing, now=now, policy=policy)
+            if current_health.get("state") not in {"terminal", "unhealthy"}:
+                raise ValueError("current attempt is still active; recovery requires terminal or unhealthy machine evidence")
+            if lease_id == existing.get("lease_id"):
+                raise ValueError("recovery attempt requires a new lease_id")
             existing_contract_version = int(existing.get("side_effect_contract_version", 1))
             if existing_contract_version != contract_version:
                 raise ValueError("side-effect contract version drift requires a new Assignment")
@@ -400,6 +409,10 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             lease["transport_outcome"] = transport_outcome
             lease["delivery_outcome"] = delivery_outcome
         lease["evidence"] = receipt["evidence"]; lease["artifacts"] = receipt["artifacts"]; lease["next_action"] = receipt["next_action"]; lease["retry_class"] = receipt["retry_class"]
+        if receipt.get("review_verdict") is not None:
+            if lease.get("execution_role") != "reviewer" or not isinstance(receipt.get("review_verdict"), dict):
+                raise ValueError("review_verdict is only valid for a reviewer Assignment")
+            lease["review_verdict"] = json.loads(json.dumps(receipt["review_verdict"]))
         lease["last_progress_phase"] = "DELIVERY"
     lease["runtime_receipt_id"] = receipt.get("receipt_id") or lease.get("runtime_receipt_id")
     return out

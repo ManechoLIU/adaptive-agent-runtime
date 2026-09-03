@@ -309,8 +309,8 @@ def detect_host_capabilities(
         "web_agent_execution": {
             "status": "host_limited",
             "adapter": "web-agent-execution",
-            "configured": True,
-            "reason": "runtime adapter is installed, but current AI-Bridge browser evidence does not provide host-attested ChatGPT generation running/completed/interrupted lifecycle events",
+            "configured": False,
+            "reason": "runtime adapter is installed, but no trusted Host verifier provides authenticated, fresh, replay-safe ChatGPT generation lifecycle events",
         },
     }
 

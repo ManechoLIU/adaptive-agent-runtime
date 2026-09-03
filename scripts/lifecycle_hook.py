@@ -1610,7 +1610,7 @@ def state_path(session_id: str) -> Path:
 
 
 def persist_event_state(
-    path: Path, event: dict[str, Any], snapshot: dict[str, Any]
+    path: Path, event: dict[str, Any], snapshot: dict[str, Any], *, preserve_controller_host: bool = False
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(path.suffix + ".lock")
@@ -1618,8 +1618,12 @@ def persist_event_state(
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             previous = load_json(path)
+            persisted_event = dict(event)
+            if preserve_controller_host:
+                prior_host = str(previous.get("controller_host") or "desktop_codex").strip()
+                persisted_event["controller_host"] = prior_host if prior_host in {"web", "desktop_codex"} else "desktop_codex"
             output, next_state = evaluate_event(
-                event,
+                persisted_event,
                 snapshot=snapshot,
                 prior_state=previous,
             )

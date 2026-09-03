@@ -114,6 +114,11 @@ class ReliableAttemptProtocolTests(unittest.TestCase):
         started = receipt("assignment_started", attempt=1, lease_id="lease-1", event_seq=1)
         state = apply_receipt({}, started, now=T0)
         t = T0 + timedelta(minutes=1)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", t, attempt=1, lease_id="lease-1", event_seq=2,
+            terminal_state="failed", outcome="recoverable_failure", summary="first failed",
+            evidence=["checkpoint"], artifacts=[], next_action="retry", retry_class="transport_error",
+        ), now=t)
         state = apply_receipt(state, receipt("assignment_started", t, attempt=2, lease_id="lease-2", event_seq=1), now=t)
         with self.assertRaises(ValueError):
             apply_receipt(state, receipt("assignment_terminal", t, attempt=1, lease_id="lease-1", event_seq=2,
@@ -500,7 +505,15 @@ class EvidenceDeltaAndRecoveryBudgetTests(unittest.TestCase):
     def test_budget_exhausts_on_stale_progress_even_when_heartbeat_is_current(self):
         p = RuntimePolicy(progress_deadline_minutes=5, progress_grace_minutes=5, heartbeat_ttl_minutes=30, max_recoveries=2)
         state = apply_receipt({}, receipt("assignment_started", attempt=1, lease_id="l1", event_seq=1), now=T0, policy=p)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", T0 + timedelta(seconds=30), attempt=1, lease_id="l1", event_seq=2,
+            terminal_state="failed", outcome="recoverable_failure", summary="failed-1", evidence=["checkpoint"], artifacts=[], next_action="retry", retry_class="transport_error",
+        ), now=T0 + timedelta(seconds=30), policy=p)
         state = apply_receipt(state, receipt("assignment_started", T0 + timedelta(minutes=1), attempt=2, lease_id="l2", event_seq=1), now=T0 + timedelta(minutes=1), policy=p)
+        state = apply_receipt(state, receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1, seconds=30), attempt=2, lease_id="l2", event_seq=2,
+            terminal_state="failed", outcome="recoverable_failure", summary="failed-2", evidence=["checkpoint"], artifacts=[], next_action="retry", retry_class="transport_error",
+        ), now=T0 + timedelta(minutes=1, seconds=30), policy=p)
         state = apply_receipt(state, receipt("assignment_started", T0 + timedelta(minutes=2), attempt=3, lease_id="l3", event_seq=1), now=T0 + timedelta(minutes=2), policy=p)
         heartbeat = T0 + timedelta(minutes=11)
         state = apply_receipt(state, receipt("assignment_heartbeat", heartbeat, attempt=3, lease_id="l3", event_seq=2), now=heartbeat, policy=p)
@@ -537,7 +550,15 @@ class RecoveryBudgetLaunchGateTests(unittest.TestCase):
 
     def test_budget_exhausted_lineage_blocks_a_new_assignment_with_the_same_contract(self):
         old = apply_receipt({}, receipt("assignment_started", attempt=1, lease_id="l1", event_seq=1), now=T0)
+        old = apply_receipt(old, receipt(
+            "assignment_terminal", T0 + timedelta(seconds=30), attempt=1, lease_id="l1", event_seq=2,
+            terminal_state="failed", outcome="recoverable_failure", summary="failed-1", evidence=["checkpoint"], artifacts=[], next_action="retry", retry_class="transport_error",
+        ), now=T0 + timedelta(seconds=30))
         old = apply_receipt(old, receipt("assignment_started", T0 + timedelta(minutes=1), attempt=2, lease_id="l2", event_seq=1), now=T0 + timedelta(minutes=1))
+        old = apply_receipt(old, receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1, seconds=30), attempt=2, lease_id="l2", event_seq=2,
+            terminal_state="failed", outcome="recoverable_failure", summary="failed-2", evidence=["checkpoint"], artifacts=[], next_action="retry", retry_class="transport_error",
+        ), now=T0 + timedelta(minutes=1, seconds=30))
         old = apply_receipt(old, receipt("assignment_started", T0 + timedelta(minutes=2), attempt=3, lease_id="l3", event_seq=1), now=T0 + timedelta(minutes=2))
         new_receipt = receipt("assignment_started", assignment_id="a2", task_id="T1", attempt=1, lease_id="a2-l1", event_seq=1)
         with self.assertRaisesRegex(ValueError, "recovery budget exhausted"):

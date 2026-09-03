@@ -6,6 +6,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import subprocess
 import tempfile
 import sys
 from datetime import datetime, timezone
@@ -27,7 +29,7 @@ except ModuleNotFoundError:
 
 UTC = timezone.utc
 STRONG_HOST_SOURCES = {"chatgpt_host_event"}
-WEAK_LIVENESS_SOURCES = {"ai_bridge_browser_tab"}
+WEAK_UI_SOURCES = {"ai_bridge_browser_tab"}
 TERMINAL_STATES = {"completed", "interrupted", "missing", "failed"}
 
 
@@ -54,20 +56,34 @@ def _registered_controller(repo: Path, registry_path: Path, controller_id: str) 
         raise PermissionError("Web execution event must target the existing registered logical Controller")
 
 
-def _attestation(event: dict[str, Any], *, terminal: bool = False) -> dict[str, Any]:
+def _attestation(
+    event: dict[str, Any],
+    *,
+    host_verifier: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] | None] | None,
+) -> dict[str, Any]:
     att = event.get("attestation")
     if not isinstance(att, dict) or att.get("kind") != "web_execution_state":
         raise ValueError("machine Web execution attestation is required")
     conversation = str(event.get("conversation_id") or "").strip()
     if not conversation or att.get("conversation_id") != conversation:
         raise ValueError("Web execution attestation conversation identity mismatch")
-    if not str(att.get("observation_id") or "").strip():
+    observation_id = str(att.get("observation_id") or "").strip()
+    if not observation_id:
         raise ValueError("Web execution attestation observation identity is required")
     source = str(att.get("source") or "").strip()
-    if terminal and source not in STRONG_HOST_SOURCES:
-        raise ValueError("host-attested terminal evidence is required; weak browser UI evidence fails closed")
-    if source not in STRONG_HOST_SOURCES | WEAK_LIVENESS_SOURCES:
+    if source in WEAK_UI_SOURCES:
+        raise ValueError("weak browser UI evidence cannot establish or renew a canonical Web execution lease")
+    if source not in STRONG_HOST_SOURCES:
         raise ValueError("untrusted Web execution attestation source")
+    if host_verifier is None:
+        raise ValueError("verified host provenance is required; self-asserted host attestation fails closed")
+    verified = host_verifier(dict(att), dict(event))
+    if not isinstance(verified, dict):
+        raise ValueError("verified host provenance is required")
+    if verified.get("verified") is not True or verified.get("fresh") is not True or verified.get("replay") is not False:
+        raise ValueError("host attestation must be verified, fresh, and non-replayed")
+    if str(verified.get("observation_id") or "") != observation_id:
+        raise ValueError("host verifier observation identity mismatch")
     return att
 
 
@@ -80,12 +96,28 @@ def _current_lease(repo: Path, assignment_id: str, conversation_id: str) -> dict
     return lease
 
 
+def _immutable_git_commit(repo: Path, candidate: str) -> str:
+    value = str(candidate or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value):
+        raise ValueError("Web reviewer candidate_revision must be an immutable Git commit")
+    try:
+        resolved = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--verify", f"{value}^{{commit}}"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("Web reviewer candidate_revision must be an immutable Git commit") from exc
+    if resolved != value:
+        raise ValueError("Web reviewer candidate_revision must be the exact immutable Git commit")
+    return resolved
+
+
 def _terminal_receipt_path(repo: Path, assignment_id: str, attempt: int) -> Path:
     digest = hashlib.sha256(f"{assignment_id}:{attempt}".encode()).hexdigest()
     return adaptive_delivery_state_dir(repo) / "web-agent-terminal" / f"{digest}.json"
 
 
-def _start_receipt(event: dict[str, Any], now: datetime) -> dict[str, Any]:
+def _start_receipt(repo: Path, event: dict[str, Any], now: datetime) -> dict[str, Any]:
     assignment = event.get("assignment")
     if not isinstance(assignment, dict):
         raise ValueError("Web execution start requires Assignment contract")
@@ -98,8 +130,10 @@ def _start_receipt(event: dict[str, Any], now: datetime) -> dict[str, Any]:
         raise ValueError("Web conversation identity must never be used as controller identity")
     role = str(assignment.get("role") or "writer").strip().lower()
     candidate = str(assignment.get("candidate_revision") or "").strip() or None
-    if role == "reviewer" and not candidate:
-        raise ValueError("Web reviewer requires immutable candidate_revision")
+    if role == "reviewer":
+        if not candidate:
+            raise ValueError("Web reviewer requires immutable candidate_revision")
+        candidate = _immutable_git_commit(repo, candidate)
     attempt = int(assignment.get("attempt", 1))
     receipt = {
         "event_type": "assignment_started",
@@ -160,6 +194,7 @@ def apply_web_execution_event(
     now: datetime | None = None,
     continuation_consumer: Callable[..., dict[str, Any]] | None = None,
     runtime_change_consumer: Callable[..., dict[str, Any]] | None = None,
+    host_verifier: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Translate one trusted Web-host observation into the existing runtime state machine."""
     if not isinstance(event, dict):
@@ -173,12 +208,12 @@ def apply_web_execution_event(
     _registered_controller(repo, registry, controller_id)
     state = str(event.get("state") or "").strip().lower()
     terminal = state in TERMINAL_STATES
-    att = _attestation(event, terminal=terminal)
+    att = _attestation(event, host_verifier=host_verifier)
 
     if state == "started":
         if att.get("state") != "running":
             raise ValueError("Web execution start requires host-observed running state")
-        receipt = _start_receipt(event, now)
+        receipt = _start_receipt(repo, event, now)
         runtime = apply_runtime_receipt(repo, receipt, now=now)
         lease = runtime["leases"][receipt["assignment_id"]]
         return {"assignment_id": receipt["assignment_id"], "runtime_state": evaluate_lease(lease, now=now)["state"], "controller_id": controller_id}
@@ -189,6 +224,10 @@ def apply_web_execution_event(
     lease = _current_lease(repo, assignment_id, conversation_id)
     attempt = int(event.get("attempt", lease.get("attempt", 1)))
     lease_id = str(event.get("lease_id") or lease.get("lease_id") or "")
+    if attempt != int(lease.get("attempt", 1)):
+        raise ValueError("Web execution event must match the current runtime attempt")
+    if lease_id != str(lease.get("lease_id") or ""):
+        raise ValueError("Web execution event must match the current runtime lease")
     seq = int(lease.get("last_event_seq", 0)) + 1
     base = {
         "assignment_id": assignment_id, "task_id": lease["task_id"], "agent_id": lease["agent_id"],
@@ -224,6 +263,8 @@ def apply_web_execution_event(
             "side_effect": bool(lease.get("side_effect")), "idempotency_key": lease.get("idempotency_key"),
             "result_unknown": bool(lease.get("side_effect")) if terminal_state != "completed" else bool(event.get("result_unknown", False)),
         }
+        if lease.get("execution_role") == "reviewer" and event.get("review_verdict") is not None:
+            receipt["review_verdict"] = json.loads(json.dumps(event["review_verdict"]))
         if event.get("reconciliation_evidence") is not None:
             receipt["reconciliation_evidence"] = event["reconciliation_evidence"]
     else:
@@ -246,6 +287,8 @@ def apply_web_execution_event(
             "summary": receipt["summary"], "delivery_outcome": delivery, "assignment_id": assignment_id,
             "task_id": current["task_id"], "agent_id": current["agent_id"], "session_id": conversation_id,
             "attempt": attempt, "lease_id": lease_id, "completed_at": _iso(now),
+            "review_verdict": current.get("review_verdict"),
+            "candidate_revision": current.get("candidate_revision"),
         })
         consumer = continuation_consumer or terminal_continuation.consume_terminal_receipt
         continuation = consumer(repo=repo, receipt_path=path, registry_path=registry)

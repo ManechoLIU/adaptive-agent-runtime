@@ -103,6 +103,31 @@ class TerminalContinuationTests(unittest.TestCase):
             self.assertEqual(len(wake_calls), 1)
             self.assertEqual(wake_calls[0]["session_id"], "controller-1")
 
+
+    def test_terminal_continuation_uses_locked_lifecycle_transaction(self) -> None:
+        module = self._load_module("terminal_continuation_locked_transaction_test")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            receipt = root / "terminal.json"
+            receipt.write_text(json.dumps({
+                "event_type": "external_agent_terminal", "repo": str(repo.resolve()), "agent_id": "agent-1"
+            }), encoding="utf-8")
+            state_root = root / "state"
+            snapshot = {"root": str(repo.resolve()), "assignment_liveness": {}, "ready_ids": [], "runnable_ids": [], "candidate_revisions": [], "rule_handshake": {}}
+            next_state = {"pending_control_event": True, "triggers": ["subagent_stop:agent-1"]}
+            with patch.object(module.lifecycle, "STATE_ROOT", state_root), patch.object(module.lifecycle, "project_snapshot", return_value=snapshot), patch.object(
+                module.lifecycle, "persist_event_state", return_value=({}, next_state)
+            ) as persist, patch.object(module.lifecycle, "load_json", side_effect=AssertionError("unlocked load forbidden")):
+                result = module.consume_terminal_receipt(
+                    repo=repo, receipt_path=receipt, registry_path=registry,
+                    wake_dispatcher=lambda **kwargs: {"result": "CONFIRMED"},
+                )
+            self.assertEqual(result["controller_id"], "controller-1")
+            persist.assert_called_once()
+
     def test_missing_receipt_repo_fails_closed_before_controller_attribution(self) -> None:
         spec = importlib.util.spec_from_file_location("terminal_continuation_missing_repo_test", SCRIPT)
         module = importlib.util.module_from_spec(spec)

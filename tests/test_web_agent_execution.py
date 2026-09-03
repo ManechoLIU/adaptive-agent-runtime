@@ -76,8 +76,14 @@ class WebAgentExecutionTests(unittest.TestCase):
                 "attestation": self.attestation("running"),
             },
             now=T0,
-            continuation_consumer=self._consume, runtime_change_consumer=self._runtime_change,
+            continuation_consumer=self._consume, runtime_change_consumer=self._runtime_change, host_verifier=self._verify_host,
         )
+
+    def _verify_host(self, attestation, event):
+        return {
+            "verified": True, "fresh": True, "replay": False,
+            "observation_id": attestation["observation_id"],
+        }
 
     def _runtime_change(self, **kwargs):
         self.runtime_wakes.append(kwargs)
@@ -98,7 +104,7 @@ class WebAgentExecutionTests(unittest.TestCase):
         payload.update(extra)
         return apply_web_execution_event(
             repo=self.repo, registry_path=self.registry, event=payload, now=at,
-            continuation_consumer=self._consume, runtime_change_consumer=self._runtime_change,
+            continuation_consumer=self._consume, runtime_change_consumer=self._runtime_change, host_verifier=self._verify_host,
         )
 
     def test_start_enters_canonical_runtime_and_is_healthy(self):
@@ -137,7 +143,7 @@ class WebAgentExecutionTests(unittest.TestCase):
 
     def test_browser_tab_absence_is_not_strong_enough_to_claim_disconnect(self):
         self.start()
-        with self.assertRaisesRegex(ValueError, "host-attested terminal evidence"):
+        with self.assertRaisesRegex(ValueError, "weak browser UI evidence"):
             apply_web_execution_event(
                 repo=self.repo, registry_path=self.registry,
                 event={
@@ -145,7 +151,7 @@ class WebAgentExecutionTests(unittest.TestCase):
                     "state": "missing",
                     "attestation": self.attestation("missing", source="ai_bridge_browser_tab"),
                 },
-                now=T0 + timedelta(minutes=1), continuation_consumer=self._consume,
+                now=T0 + timedelta(minutes=1), continuation_consumer=self._consume, host_verifier=self._verify_host,
             )
 
     def test_progress_stale_remains_watchdog_owned_and_bounded(self):
@@ -169,7 +175,7 @@ class WebAgentExecutionTests(unittest.TestCase):
                 "assignment": self.assignment(attempt=2, lease_id="A-1:web:attempt:2"),
                 "attestation": self.attestation("running", conversation="conv-2"),
             },
-            now=T0 + timedelta(minutes=2), continuation_consumer=self._consume,
+            now=T0 + timedelta(minutes=2), continuation_consumer=self._consume, host_verifier=self._verify_host,
         )
         with self.assertRaisesRegex(ValueError, "stale runtime attempt|execution identity"):
             self.event(
@@ -193,7 +199,7 @@ class WebAgentExecutionTests(unittest.TestCase):
                     "controller_id": "controller-1", "conversation_id": "conv-2", "state": "started",
                     "assignment": self.assignment(attempt=3, lease_id="A-1:web:attempt:3"),
                     "attestation": self.attestation("running", conversation="conv-2"),
-                }, now=T0 + timedelta(minutes=2), continuation_consumer=self._consume,
+                }, now=T0 + timedelta(minutes=2), continuation_consumer=self._consume, host_verifier=self._verify_host,
             )
 
     def test_active_execution_blocks_duplicate_assignment_even_across_transport(self):
@@ -205,7 +211,7 @@ class WebAgentExecutionTests(unittest.TestCase):
                     "controller_id": "controller-1", "conversation_id": "conv-2", "state": "started",
                     "assignment": self.assignment(assignment_id="A-2", lease_id="A-2:web:attempt:1"),
                     "attestation": self.attestation("running", conversation="conv-2"),
-                }, now=T0 + timedelta(seconds=1), continuation_consumer=self._consume,
+                }, now=T0 + timedelta(seconds=1), continuation_consumer=self._consume, host_verifier=self._verify_host,
             )
 
     def test_reviewer_verdict_is_bound_to_candidate_revision(self):
@@ -227,7 +233,7 @@ class WebAgentExecutionTests(unittest.TestCase):
                     "controller_id": "controller-1", "conversation_id": "conv-2", "state": "started",
                     "assignment": self.assignment(side_effect=True, idempotency_key=None, attempt=2, lease_id="A-1:web:attempt:2"),
                     "attestation": self.attestation("running", conversation="conv-2"),
-                }, now=T0 + timedelta(minutes=2), continuation_consumer=self._consume,
+                }, now=T0 + timedelta(minutes=2), continuation_consumer=self._consume, host_verifier=self._verify_host,
             )
 
     def test_normal_completion_creates_terminal_receipt_and_continuation(self):
@@ -252,7 +258,7 @@ class WebAgentExecutionTests(unittest.TestCase):
                     "controller_id": "controller-1", "conversation_id": conversation, "state": "started",
                     "assignment": self.assignment(attempt=attempt, lease_id=f"A-1:web:attempt:{attempt}"),
                     "attestation": self.attestation("running", conversation=conversation),
-                }, now=T0 + timedelta(minutes=minute), continuation_consumer=self._consume,
+                }, now=T0 + timedelta(minutes=minute), continuation_consumer=self._consume, host_verifier=self._verify_host,
             )
             apply_web_execution_event(
                 repo=self.repo, registry_path=self.registry,
@@ -260,7 +266,7 @@ class WebAgentExecutionTests(unittest.TestCase):
                     "controller_id": "controller-1", "conversation_id": conversation, "assignment_id": "A-1",
                     "state": "interrupted", "summary": f"lost-{attempt}",
                     "attestation": self.attestation("interrupted", conversation=conversation),
-                }, now=T0 + timedelta(minutes=minute + 1), continuation_consumer=self._consume,
+                }, now=T0 + timedelta(minutes=minute + 1), continuation_consumer=self._consume, host_verifier=self._verify_host,
             )
         lease = load_runtime_state(self.repo)["leases"]["A-1"]
         self.assertEqual(evaluate_lease(lease, now=T0 + timedelta(minutes=6))["state"], "budget_exhausted")
@@ -271,7 +277,7 @@ class WebAgentExecutionTests(unittest.TestCase):
                     "controller_id": "controller-1", "conversation_id": "conv-4", "state": "started",
                     "assignment": self.assignment(attempt=4, lease_id="A-1:web:attempt:4"),
                     "attestation": self.attestation("running", conversation="conv-4"),
-                }, now=T0 + timedelta(minutes=7), continuation_consumer=self._consume,
+                }, now=T0 + timedelta(minutes=7), continuation_consumer=self._consume, host_verifier=self._verify_host,
             )
 
     def test_reviewer_pass_accepts_only_exact_candidate_revision(self):
@@ -284,7 +290,63 @@ class WebAgentExecutionTests(unittest.TestCase):
         lease = load_runtime_state(self.repo)["leases"]["A-1"]
         self.assertEqual(lease["delivery_outcome"], "pass")
         self.assertEqual(lease["candidate_revision"], self.head)
+        self.assertEqual(lease["review_verdict"]["reviewed_head"], self.head)
+        terminal = json.loads(Path(result["terminal_receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(terminal["review_verdict"]["reviewed_head"], self.head)
         self.assertEqual(result["runtime_state"], "terminal")
+
+    def test_recovery_cannot_supersede_healthy_active_attempt(self):
+        self.start()
+        with self.assertRaisesRegex(ValueError, "current attempt is still active"):
+            apply_web_execution_event(
+                repo=self.repo, registry_path=self.registry,
+                event={
+                    "controller_id": "controller-1", "conversation_id": "conv-2", "state": "started",
+                    "assignment": self.assignment(attempt=2, lease_id="A-1:web:attempt:2"),
+                    "attestation": self.attestation("running", conversation="conv-2"),
+                }, now=T0 + timedelta(minutes=1), continuation_consumer=self._consume, host_verifier=self._verify_host,
+            )
+
+    def test_non_start_event_must_match_current_attempt_and_lease_exactly(self):
+        self.start()
+        with self.assertRaisesRegex(ValueError, "current runtime attempt"):
+            self.event("heartbeat", at=T0 + timedelta(minutes=1), attempt=2, lease_id="forged")
+        lease = load_runtime_state(self.repo)["leases"]["A-1"]
+        self.assertEqual(lease["attempt"], 1)
+        self.assertEqual(lease["lease_id"], "A-1:web:attempt:1")
+
+    def test_public_web_adapter_rejects_self_asserted_strong_attestation(self):
+        with self.assertRaisesRegex(ValueError, "verified host provenance"):
+            apply_web_execution_event(
+                repo=self.repo, registry_path=self.registry,
+                event={
+                    "controller_id": "controller-1", "conversation_id": "conv-1", "state": "started",
+                    "assignment": self.assignment(), "attestation": self.attestation("running"),
+                }, now=T0, continuation_consumer=self._consume,
+            )
+
+    def test_verified_host_observation_is_required_to_start_execution(self):
+        result = apply_web_execution_event(
+            repo=self.repo, registry_path=self.registry,
+            event={
+                "controller_id": "controller-1", "conversation_id": "conv-1", "state": "started",
+                "assignment": self.assignment(), "attestation": self.attestation("running"),
+            }, now=T0, continuation_consumer=self._consume,
+            host_verifier=self._verify_host,
+        )
+        self.assertEqual(result["runtime_state"], "healthy")
+
+    def test_reviewer_candidate_must_be_resolved_immutable_commit(self):
+        with self.assertRaisesRegex(ValueError, "immutable Git commit"):
+            apply_web_execution_event(
+                repo=self.repo, registry_path=self.registry,
+                event={
+                    "controller_id": "controller-1", "conversation_id": "conv-1", "state": "started",
+                    "assignment": self.assignment(role="reviewer", candidate_revision="main", agent_id="web-reviewer-1"),
+                    "attestation": self.attestation("running"),
+                }, now=T0, continuation_consumer=self._consume,
+                host_verifier=self._verify_host,
+            )
 
 
 if __name__ == "__main__":
