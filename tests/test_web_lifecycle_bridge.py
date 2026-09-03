@@ -3600,7 +3600,7 @@ class WebHostNativeWakeIsolationTests(unittest.TestCase):
                 )
             self.assertEqual(receipt["selected_host"], "web")
             self.assertEqual(receipt["result"], "DEFERRED")
-            self.assertEqual(receipt["error_code"], "WEB_HOST_REENTRY_ADAPTER_UNAVAILABLE")
+            self.assertEqual(receipt["error_code"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
 
     def test_web_current_host_wake_uses_web_adapter_when_supplied(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3642,9 +3642,9 @@ class WebHostNativeWakeIsolationTests(unittest.TestCase):
                     codex="codex", delay_seconds=0, state_path=state_path,
                 )
             saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(rc, 0)
-            self.assertEqual(saved["state"], "WEB_HOST_REENTRY_PENDING")
-            self.assertEqual(saved["error_code"], "WEB_HOST_REENTRY_ADAPTER_UNAVAILABLE")
+            self.assertEqual(rc, 78)
+            self.assertEqual(saved["state"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
+            self.assertEqual(saved["error_code"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
 
 class ControllerHostResolutionIsolationTests(unittest.TestCase):
     def test_missing_lifecycle_host_resolves_unique_desktop_binding(self) -> None:
@@ -3658,3 +3658,178 @@ class ControllerHostResolutionIsolationTests(unittest.TestCase):
             "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-1"], "web": ["web-1"]}}
         }
         self.assertEqual(web_bridge.resolve_controller_host({}, {}, registry, "controller-1"), "web")
+
+
+class WebLocalReentryIntegrationTests(unittest.TestCase):
+    def make_repo(self, root: Path) -> tuple[Path, Path, Path]:
+        repo = root / "repo"; repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps({
+            "controller-1": str(repo.resolve()),
+            "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+        }), encoding="utf-8")
+        state_path = root / "auto.json"
+        return repo, registry, state_path
+
+    def test_builtin_web_reentry_is_used_for_current_web_host_without_desktop_resume(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, _ = self.make_repo(Path(tmp))
+            receipt_path = Path(tmp) / "wake.json"
+            confirmed = {
+                "operation": "web_reentry", "result": "CONFIRMED", "state": "WEB_REENTRY_SUBMITTED",
+                "returncode": 0, "execution_target_session_id": "web-current",
+                "target_generation": 0, "target_mode": "web_lease",
+            }
+            with patch.object(web_bridge, "execute_web_reentry", return_value=confirmed) as reentry, patch.object(
+                web_bridge, "execute_native_resume", side_effect=AssertionError("web wake must not invoke desktop Codex")
+            ):
+                receipt = web_bridge.wake_existing_controller(
+                    lifecycle_state={"pending_control_event": True, "controller_host": "web", "wake_generation": 4},
+                    session_id="controller-1", repo=repo, registry=registry, codex="codex",
+                    receipt_path=receipt_path,
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                )
+            self.assertEqual(receipt["result"], "CONFIRMED")
+            self.assertEqual(receipt["selected_host"], "web")
+            self.assertEqual(receipt["execution_target_session_id"], "web-current")
+            reentry.assert_called_once()
+
+    def test_detached_supervisor_submits_web_reentry_then_rearms_observer(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state_path = self.make_repo(Path(tmp))
+            state_path.write_text(json.dumps({
+                "receipt_id": "web-r1", "session_id": "controller-1", "repo": str(repo.resolve()),
+                "state": "RESUME_PENDING", "pending_control_event": True,
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True, "requires_user": False, "controller_host": "web",
+                "wake_generation": 8, "triggers": ["READY:F1"],
+                "snapshot": {"head":"h1","ledger_sha256":"l1","worktree_status_sha256":"w1","ready_ids":["F1"],"runnable_ids":["F1"],"candidate_revisions":[]},
+            }
+            confirmed = {
+                "operation": "web_reentry", "result": "CONFIRMED", "state": "WEB_REENTRY_SUBMITTED",
+                "returncode": 0, "execution_target_session_id": "web-current",
+                "target_generation": 0, "target_mode": "web_lease",
+            }
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+                web_bridge, "execute_web_reentry", return_value=confirmed
+            ) as reentry, patch.object(web_bridge, "schedule_auto_native_stop") as schedule, patch.object(
+                web_bridge, "execute_native_resume", side_effect=AssertionError("web supervisor must not invoke desktop Codex")
+            ):
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="web-r1", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state_path,
+                )
+            self.assertEqual(code, 0)
+            reentry.assert_called_once()
+            schedule.assert_called_once()
+            self.assertGreaterEqual(schedule.call_args.kwargs["delay_seconds"], 5)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["state"], "WEB_REENTRY_SUBMITTED")
+            self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
+            self.assertEqual(saved["continuation_count"], 1)
+
+    def test_detached_supervisor_defers_while_web_response_is_active_and_retries_without_counting_progress(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state_path = self.make_repo(Path(tmp))
+            state_path.write_text(json.dumps({
+                "receipt_id": "web-r2", "session_id": "controller-1", "repo": str(repo.resolve()),
+                "state": "WEB_REENTRY_SUBMITTED", "pending_control_event": True,
+                "continuation_count": 1, "unchanged_continuation_count": 0,
+                "last_lifecycle_fingerprint": "fp-old",
+            }), encoding="utf-8")
+            lifecycle = {"pending_control_event": True, "requires_user": False, "controller_host": "web", "wake_generation": 8}
+            deferred = {
+                "operation": "web_reentry", "result": "DEFERRED", "state": "WEB_REENTRY_DEFERRED_ACTIVE",
+                "returncode": 0, "failure_class": "web_host_active",
+                "execution_target_session_id": "web-current", "target_generation": 0, "target_mode": "web_lease",
+            }
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+                web_bridge, "execute_web_reentry", return_value=deferred
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule, patch.object(
+                web_bridge, "execute_native_resume", side_effect=AssertionError("web supervisor must not invoke desktop Codex")
+            ):
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="web-r2", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state_path,
+                )
+            self.assertEqual(code, 0)
+            schedule.assert_called_once()
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["state"], "WEB_REENTRY_DEFERRED_ACTIVE")
+            self.assertEqual(saved["continuation_count"], 1)
+            self.assertEqual(saved["unchanged_continuation_count"], 0)
+
+
+class WebReentryDebounceTests(WebLocalReentryIntegrationTests):
+    def test_web_confirmed_wake_debounces_against_current_web_lease_not_desktop_target(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry, _ = self.make_repo(root)
+            registry_payload = json.loads(registry.read_text())
+            registry_payload["__controller_sessions__"]["controller-1"]["desktop_codex"] = ["desktop-current"]
+            registry_payload["__controller_targets__"] = {"controller-1":{"desktop_codex":{"status":"active","session_id":"desktop-current","generation":3}}}
+            registry.write_text(json.dumps(registry_payload), encoding="utf-8")
+            lease = root / "leases.json"
+            lease.write_text(json.dumps({"schema_version":1,"leases":{"controller-1":{
+                "repo":str(repo.resolve()),"controller_id":"controller-1","web_session_id":"web-current",
+                "authorized_at_unix":1,"expires_at_unix":4102444800,"provenance":"manual_user_authorized","mode":"resume_only"
+            }}}), encoding="utf-8")
+            lifecycle = {"pending_control_event":True,"controller_host":"web","wake_generation":4,"triggers":["READY:F1"]}
+            receipt_path = root / "wake.json"
+            receipt_path.write_text(json.dumps({
+                "schema_version":1,
+                "canonical_common_dir":str(web_bridge._git_common_dir(repo)),
+                "controller_id":"controller-1",
+                "event_fingerprint":web_bridge._wake_event_fingerprint(lifecycle),
+                "result":"CONFIRMED","selected_host":"web",
+                "execution_target_session_id":"web-current","target_generation":0,"target_mode":"web_lease",
+                "pending_control_event":True,
+            }), encoding="utf-8")
+            with patch.object(web_bridge, "DEFAULT_MANUAL_WEB_LEASES", lease), patch.object(
+                web_bridge, "execute_web_reentry", side_effect=AssertionError("debounced Web wake must not resubmit")
+            ):
+                result = web_bridge.dispatch_pending_lifecycle_wake(
+                    lifecycle_state=lifecycle, session_id="controller-1", repo=repo, registry=registry,
+                    codex="codex", receipt_path=receipt_path,
+                    host_facts={"controller_host":"web","resume_actionable":True},
+                )
+            self.assertTrue(result.get("debounced"))
+            self.assertEqual(result["execution_target_session_id"], "web-current")
+
+
+class WebReentryApprovalSupervisorTests(WebLocalReentryIntegrationTests):
+    def test_waiting_local_approval_is_persisted_and_retried_without_desktop_fallback(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state_path = self.make_repo(Path(tmp))
+            state_path.write_text(json.dumps({
+                "receipt_id":"approval-r1","session_id":"controller-1","repo":str(repo.resolve()),
+                "state":"RESUME_PENDING","pending_control_event":True,
+            }), encoding="utf-8")
+            lifecycle={"pending_control_event":True,"requires_user":False,"controller_host":"web","wake_generation":11}
+            waiting={
+                "operation":"web_reentry","result":"DEFERRED","state":"WEB_REENTRY_WAITING_LOCAL_APPROVAL",
+                "returncode":0,"failure_class":"local_approval_required","approval_id":"approval-1",
+                "approval_expires_at_unix":4102444800,"execution_target_session_id":"web-current","target_generation":0,"target_mode":"web_lease",
+            }
+            with patch.object(web_bridge,"_load_lifecycle_state",return_value=lifecycle), patch.object(
+                web_bridge,"execute_web_reentry",return_value=waiting
+            ) as reentry, patch.object(web_bridge,"schedule_auto_native_stop") as schedule, patch.object(
+                web_bridge,"execute_native_resume",side_effect=AssertionError("approval wait must never use desktop Codex")
+            ):
+                code=web_bridge.run_auto_native_stop(
+                    session_id="controller-1",repo=repo,receipt_id="approval-r1",registry=registry,
+                    codex="codex",delay_seconds=0,state_path=state_path,
+                )
+            self.assertEqual(code,0)
+            schedule.assert_called_once()
+            saved=json.loads(state_path.read_text())
+            self.assertEqual(saved["state"],"WEB_REENTRY_WAITING_LOCAL_APPROVAL")
+            self.assertEqual(saved["approval_id"],"approval-1")
+            self.assertEqual(saved["approval_retry_count"],1)
+            self.assertEqual(reentry.call_args.kwargs.get("approval_id"),None)

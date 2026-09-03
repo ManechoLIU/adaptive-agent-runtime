@@ -23,6 +23,11 @@ try:
 except ModuleNotFoundError:
     from scripts import controller_target_guard as target_guard
 
+try:
+    from web_reentry_adapter import execute_web_reentry, resolve_reentry_session
+except ModuleNotFoundError:
+    from scripts.web_reentry_adapter import execute_web_reentry, resolve_reentry_session
+
 
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 DEFAULT_MANUAL_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
@@ -1314,17 +1319,16 @@ def wake_existing_controller(
                     )
                 elif selected_host == "web":
                     adapter = (resume_adapters or {}).get("web")
-                    if adapter is None:
-                        attempt = {
-                            "operation": None,
-                            "result": "DEFERRED",
-                            "state": "WEB_HOST_REENTRY_PENDING",
-                            "returncode": 0,
-                            "stderr_tail": "web controller re-entry requires a host-native Web adapter",
-                            "error_code": "WEB_HOST_REENTRY_ADAPTER_UNAVAILABLE",
-                        }
-                    else:
-                        try:
+                    try:
+                        if adapter is None:
+                            attempt = execute_web_reentry(
+                                controller_id=session_id,
+                                repo=repo,
+                                registry_path=registry,
+                                lease_path=DEFAULT_MANUAL_WEB_LEASES,
+                                lifecycle_state=lifecycle_state,
+                            )
+                        else:
                             attempt = adapter(
                                 controller_id=session_id,
                                 session_id=session_id,
@@ -1333,24 +1337,26 @@ def wake_existing_controller(
                                 lifecycle_state=lifecycle_state,
                                 runtime_path=runtime_path,
                             )
-                        except Exception as exc:
-                            attempt = {
-                                "operation": "web_resume",
-                                "result": "FAILED",
-                                "state": "RESUME_FAILED",
-                                "returncode": 1,
-                                "stderr_tail": f"web host adapter failed: {exc}",
-                                "error_code": "WEB_HOST_REENTRY_ADAPTER_FAILED",
-                            }
-                        if not isinstance(attempt, dict):
-                            attempt = {
-                                "operation": "web_resume",
-                                "result": "FAILED",
-                                "state": "RESUME_FAILED",
-                                "returncode": 1,
-                                "stderr_tail": "web host adapter returned a non-object execution receipt",
-                                "error_code": "WEB_HOST_REENTRY_ADAPTER_INVALID",
-                            }
+                    except Exception as exc:
+                        attempt = {
+                            "operation": "web_reentry",
+                            "result": "DEFERRED",
+                            "state": "WEB_REENTRY_PENDING",
+                            "returncode": 78,
+                            "stderr_tail": f"web host adapter failed: {exc}",
+                            "error_code": "WEB_HOST_REENTRY_ADAPTER_FAILED",
+                            "failure_class": "web_reentry_unavailable",
+                        }
+                    if not isinstance(attempt, dict):
+                        attempt = {
+                            "operation": "web_reentry",
+                            "result": "DEFERRED",
+                            "state": "WEB_REENTRY_PENDING",
+                            "returncode": 78,
+                            "stderr_tail": "web host adapter returned a non-object execution receipt",
+                            "error_code": "WEB_HOST_REENTRY_ADAPTER_INVALID",
+                            "failure_class": "web_reentry_unavailable",
+                        }
                 else:
                     attempt = {
                         "operation": None,
@@ -1549,20 +1555,41 @@ def dispatch_pending_lifecycle_wake(
         target_receipt = receipt_path
     fingerprint = _wake_event_fingerprint(lifecycle_state)
     prior = load_json(target_receipt)
+    facts = dict(host_facts) if isinstance(host_facts, dict) else {}
+    controller_host = resolve_controller_host(
+        lifecycle_state, facts, load_json(registry), session_id
+    )
+    facts.setdefault("controller_host", controller_host)
     try:
         current_common_dir = str(_git_common_dir(repo))
         current_registered = _registered_controller_for_common_dir(repo, registry)
     except (OSError, subprocess.SubprocessError):
         current_common_dir = None
         current_registered = None
-    try:
-        current_target = resolve_native_resume_target(
-            session_id=session_id,
-            repo=repo,
-            registry=registry,
-        )
-    except (OSError, ValueError, PermissionError, subprocess.SubprocessError):
-        current_target = None
+    current_target = None
+    if controller_host == "web":
+        try:
+            current_web_session = resolve_reentry_session(
+                controller_id=session_id, repo=repo, registry_path=registry,
+                lease_path=DEFAULT_MANUAL_WEB_LEASES,
+            )
+        except (OSError, ValueError, PermissionError):
+            current_web_session = None
+        if current_web_session:
+            current_target = {
+                "execution_target_session_id": current_web_session,
+                "generation": 0,
+                "target_mode": "web_lease",
+            }
+    else:
+        try:
+            current_target = resolve_native_resume_target(
+                session_id=session_id,
+                repo=repo,
+                registry=registry,
+            )
+        except (OSError, ValueError, PermissionError, subprocess.SubprocessError):
+            current_target = None
     target_matches_prior = False
     if current_target is not None:
         current_target_id = current_target.get("execution_target_session_id")
@@ -1576,6 +1603,7 @@ def dispatch_pending_lifecycle_wake(
         target_matches_prior = (
             prior_target_id == current_target_id
             and prior_generation == current_generation
+            and prior.get("target_mode", current_target.get("target_mode")) == current_target.get("target_mode")
         )
     if (
         prior.get("event_fingerprint") == fingerprint
@@ -1590,11 +1618,6 @@ def dispatch_pending_lifecycle_wake(
         debounced["debounced"] = True
         return debounced
 
-    facts = dict(host_facts) if isinstance(host_facts, dict) else {}
-    controller_host = resolve_controller_host(
-        lifecycle_state, facts, load_json(registry), session_id
-    )
-    facts.setdefault("controller_host", controller_host)
     if (
         "resume_actionable" not in facts
         and "resume_state" not in facts
@@ -1782,6 +1805,8 @@ def continuation_supervisor_needs_bootstrap(
         "RESUME_PENDING",
         "RESUME_REARMED",
         "RESUME_DEFERRED_ACTIVE_WRITER",
+        "WEB_REENTRY_SUBMITTED",
+        "WEB_REENTRY_DEFERRED_ACTIVE",
     }
     return str(supervisor_state.get("state") or "") not in active_states
 
@@ -1841,6 +1866,12 @@ def schedule_auto_native_stop(
     }
     if same_receipt and prior.get("last_lifecycle_fingerprint"):
         value["last_lifecycle_fingerprint"] = str(prior["last_lifecycle_fingerprint"])
+    if same_receipt and prior.get("approval_id"):
+        value["approval_id"] = str(prior["approval_id"])
+    if same_receipt and isinstance(prior.get("approval_expires_at_unix"), int):
+        value["approval_expires_at_unix"] = int(prior["approval_expires_at_unix"])
+    if same_receipt:
+        value["approval_retry_count"] = int(prior.get("approval_retry_count", 0) or 0)
     if same_receipt and prior.get("failure_class") == "active_writer_present":
         value["last_deferred_state"] = "RESUME_DEFERRED_ACTIVE_WRITER"
         value["failure_class"] = "active_writer_present"
@@ -1927,18 +1958,115 @@ def run_auto_native_stop(
     )
     if controller_host == "web":
         current = load_json(state_path)
-        if current.get("receipt_id") == receipt_id:
+        if lifecycle_state.get("pending_control_event") is not True:
+            if current.get("receipt_id") == receipt_id:
+                current.update({"state": "CONTINUATION_CLOSED", "pending_control_event": False})
+                current.pop("failure_class", None)
+                current.pop("error_code", None)
+                write_auto_stop_state(state_path, current)
+            return 0
+        if lifecycle_state.get("requires_user") is True:
+            if current.get("receipt_id") == receipt_id:
+                current.update({
+                    "state": "WAITING_USER", "pending_control_event": True,
+                    "failure_class": "user_decision_required",
+                })
+                current.pop("error_code", None)
+                write_auto_stop_state(state_path, current)
+            return 0
+        fingerprint = _wake_event_fingerprint(lifecycle_state)
+        attempt = execute_web_reentry(
+            controller_id=session_id, repo=repo, registry_path=registry,
+            lease_path=DEFAULT_MANUAL_WEB_LEASES, lifecycle_state=lifecycle_state,
+            approval_id=str(current.get("approval_id") or "").strip() or None,
+        )
+        current = load_json(state_path)
+        if current.get("receipt_id") != receipt_id:
+            return 0
+        for evidence_key in (
+            "execution_target_session_id", "target_generation", "target_mode",
+        ):
+            if evidence_key in attempt:
+                current[evidence_key] = attempt[evidence_key]
+        if attempt.get("state") == "WEB_REENTRY_WAITING_LOCAL_APPROVAL":
+            retry_count = int(current.get("approval_retry_count", 0) or 0) + 1
             current.update({
-                "state": "WEB_HOST_REENTRY_PENDING",
+                "state": "WEB_REENTRY_WAITING_LOCAL_APPROVAL",
                 "pending_control_event": True,
+                "failure_class": "local_approval_required",
+                "approval_retry_count": retry_count,
                 "completed_at_unix_ms": int(time.time() * 1000),
-                "returncode": 0,
-                "error_code": "WEB_HOST_REENTRY_ADAPTER_UNAVAILABLE",
-                "failure_class": "web_host_reentry_required",
-                "stderr_tail": "web controller continuation requires a host-native Web re-entry adapter; desktop Codex resume is forbidden",
+            })
+            if isinstance(attempt.get("approval_id"), str) and attempt.get("approval_id"):
+                current["approval_id"] = attempt["approval_id"]
+            if isinstance(attempt.get("approval_expires_at_unix"), int):
+                current["approval_expires_at_unix"] = attempt["approval_expires_at_unix"]
+            write_auto_stop_state(state_path, current)
+            expires_at = current.get("approval_expires_at_unix")
+            if (not isinstance(expires_at, int) or expires_at > int(time.time())) and retry_count < 24:
+                schedule_auto_native_stop(
+                    session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+                    codex=codex, delay_seconds=5.0, state_path=state_path, runtime_path=runtime_path,
+                )
+                return 0
+            current["state"] = "WAITING_USER"
+            current["failure_class"] = "local_approval_required"
+            write_auto_stop_state(state_path, current)
+            return 0
+        if attempt.get("state") == "WEB_REENTRY_DEFERRED_ACTIVE":
+            current.update({
+                "state": "WEB_REENTRY_DEFERRED_ACTIVE",
+                "pending_control_event": True,
+                "failure_class": "web_host_active",
+                "completed_at_unix_ms": int(time.time() * 1000),
             })
             write_auto_stop_state(state_path, current)
-        return 0
+            schedule_auto_native_stop(
+                session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+                codex=codex, delay_seconds=5.0, state_path=state_path, runtime_path=runtime_path,
+            )
+            return 0
+        if attempt.get("result") == "CONFIRMED":
+            previous_fingerprint = str(current.get("last_lifecycle_fingerprint") or "")
+            unchanged = int(current.get("unchanged_continuation_count", 0) or 0)
+            unchanged = unchanged + 1 if previous_fingerprint == fingerprint else 0
+            continuation_count = int(current.get("continuation_count", 0) or 0) + 1
+            current.update({
+                "state": "WEB_REENTRY_SUBMITTED",
+                "pending_control_event": True,
+                "continuation_count": continuation_count,
+                "unchanged_continuation_count": unchanged,
+                "last_lifecycle_fingerprint": fingerprint,
+                "completed_at_unix_ms": int(time.time() * 1000),
+                "returncode": 0,
+            })
+            current.pop("failure_class", None)
+            current.pop("error_code", None)
+            if unchanged >= AUTO_CONTINUATION_STALL_LIMIT:
+                current.update({
+                    "state": "RESUME_STALLED_NO_PROGRESS",
+                    "failure_class": "confirmed_web_reentry_without_machine_progress",
+                    "error_code": "WEB_LIFECYCLE_CONTINUATION_STALLED",
+                })
+                write_auto_stop_state(state_path, current)
+                return 78
+            write_auto_stop_state(state_path, current)
+            schedule_auto_native_stop(
+                session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+                codex=codex, delay_seconds=10.0, state_path=state_path, runtime_path=runtime_path,
+            )
+            return 0
+        current.update({
+            "state": str(attempt.get("state") or "WEB_REENTRY_PENDING"),
+            "pending_control_event": True,
+            "completed_at_unix_ms": int(time.time() * 1000),
+            "returncode": int(attempt.get("returncode", 78) or 78),
+            "failure_class": str(attempt.get("failure_class") or "web_reentry_unavailable"),
+            "error_code": str(attempt.get("error_code") or "WEB_REENTRY_UNAVAILABLE"),
+            "stderr_tail": bounded_tail(str(attempt.get("stderr_tail", ""))),
+        })
+        write_auto_stop_state(state_path, current)
+        return int(attempt.get("returncode", 78) or 78)
     attempt = execute_native_resume(
         session_id=session_id, repo=repo, registry=registry, codex=codex,
         runtime_path=runtime_path,
