@@ -149,9 +149,13 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
     attempt = int(receipt.get("attempt", 1)); lease_id = str(receipt.get("lease_id") or f"{aid}:attempt:{attempt}"); event_seq = int(receipt.get("event_seq", 1))
     if attempt < 1 or event_seq < 1: raise ValueError("attempt and event_seq must be positive")
     if existing:
-        mismatches = [f for f in IDENTITY_FIELDS if existing.get(f) != receipt.get(f)]
-        if mismatches: raise ValueError("runtime receipt identity mismatch: " + ", ".join(mismatches))
         current_attempt = int(existing.get("attempt", 1))
+        recovery_start = event == "assignment_started" and attempt > current_attempt
+        stable_identity_fields = [field for field in IDENTITY_FIELDS if field != "session_id"]
+        mismatches = [f for f in stable_identity_fields if existing.get(f) != receipt.get(f)]
+        if existing.get("session_id") != receipt.get("session_id") and not recovery_start:
+            mismatches.append("session_id")
+        if mismatches: raise ValueError("runtime receipt identity mismatch: " + ", ".join(mismatches))
         if attempt < current_attempt: raise ValueError("stale runtime attempt")
         if attempt == current_attempt and existing.get("terminal_state"):
             raise ValueError("terminal attempt is immutable; create a new recovery attempt only when policy allows")
@@ -230,6 +234,13 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "recovery_count": recovery_count,
         }
         deadline_minutes = _assignment_progress_deadline_minutes(receipt, policy)
+        exclusive_key = str(receipt.get("exclusive_execution_key") or "").strip() or None
+        if exclusive_key and not existing:
+            for other_id, other in leases.items():
+                if other_id == aid or not isinstance(other, dict):
+                    continue
+                if other.get("exclusive_execution_key") == exclusive_key and not other.get("terminal_state"):
+                    raise ValueError("exclusive execution already active; reconcile or recover the existing Assignment attempt")
         lease = {f: receipt[f] for f in IDENTITY_FIELDS}
         lease.update({
             "schema_version": 1,
@@ -262,6 +273,11 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "progress_deadline_at": _iso(issued + timedelta(minutes=deadline_minutes)),
             "last_progress_phase": "STARTED",
             "runtime_receipt_id": receipt.get("receipt_id"),
+            "execution_transport": str(receipt.get("execution_transport") or "").strip() or None,
+            "execution_role": str(receipt.get("execution_role") or "").strip() or None,
+            "candidate_revision": str(receipt.get("candidate_revision") or "").strip() or None,
+            "exclusive_execution_key": exclusive_key,
+            "host_attestation_id": str(receipt.get("host_attestation_id") or "").strip() or None,
         })
         start_changed = [field for field in EVIDENCE_FINGERPRINT_FIELDS if lease.get(field) not in (None, "")]
         lease["last_progress_evidence"] = _bounded_progress_evidence(start_changed, lease)
@@ -438,6 +454,21 @@ def retry_decision(
         decision["idempotency_key"] = stable_key
     return decision
 
+def apply_runtime_receipt(repo: str | Path, receipt: dict[str, Any], *, now: datetime | None = None, policy: RuntimePolicy | None = None) -> dict[str, Any]:
+    """Atomically apply one receipt to the canonical Git-common-dir runtime state."""
+    lock_path = adaptive_delivery_state_dir(repo) / "runtime-assignments.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_runtime_state(repo)
+            updated = apply_receipt(state, receipt, now=now, policy=policy)
+            save_runtime_state(repo, updated)
+            return updated
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Apply Adaptive Agent Runtime receipts to canonical Git state.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -448,13 +479,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict):
             raise ValueError("runtime receipt must be a JSON object")
-        lock_path = adaptive_delivery_state_dir(args.repo) / "runtime-assignments.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with lock_path.open("a+") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            state = load_runtime_state(args.repo)
-            updated = apply_receipt(state, payload)
-            save_runtime_state(args.repo, updated)
+        updated = apply_runtime_receipt(args.repo, payload)
         print(json.dumps({"allowed": True, "assignment_id": payload.get("assignment_id"), "attempt": payload.get("attempt", 1)}, sort_keys=True))
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as error:

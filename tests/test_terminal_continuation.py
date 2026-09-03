@@ -67,6 +67,42 @@ class TerminalContinuationTests(unittest.TestCase):
             self.assertEqual(wake_calls[0]["session_id"], "controller-1")
             self.assertEqual(wake_calls[0]["lifecycle_state"]["pending_terminal_receipts"], [str(receipt.resolve())])
 
+    def test_runtime_health_change_marks_same_controller_pending_and_dispatches_wake(self) -> None:
+        spec = importlib.util.spec_from_file_location("terminal_continuation_runtime_change_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            state_root = root / "state"
+            wake_calls = []
+            snapshot = {
+                "root": str(repo.resolve()), "head": "h1", "ledger_sha256": "l1",
+                "worktree_status_sha256": "s1", "ready_ids": [], "runnable_ids": [],
+                "candidate_revisions": [], "ledger_errors": [],
+                "assignment_liveness": {
+                    "T-1": {"ledger_state": "ACTIVE", "state": "progress_stale", "reason": "progress_deadline_exceeded"}
+                },
+                "rule_handshake": {"state": "current", "installed_revision": "rev-1"},
+            }
+            def fake_wake(**kwargs):
+                wake_calls.append(kwargs)
+                return {"result": "CONFIRMED", "controller_id": kwargs["session_id"]}
+            with patch.object(module.lifecycle, "STATE_ROOT", state_root), patch.object(
+                module.lifecycle, "project_snapshot", return_value=snapshot
+            ):
+                result = module.notify_runtime_change(
+                    repo=repo, registry_path=registry, wake_dispatcher=fake_wake
+                )
+            state = json.loads((state_root / "controller-1.json").read_text(encoding="utf-8"))
+            self.assertTrue(state["pending_control_event"])
+            self.assertIn("active_without_progress:T-1", state["triggers"])
+            self.assertEqual(result["controller_id"], "controller-1")
+            self.assertEqual(len(wake_calls), 1)
+            self.assertEqual(wake_calls[0]["session_id"], "controller-1")
+
     def test_missing_receipt_repo_fails_closed_before_controller_attribution(self) -> None:
         spec = importlib.util.spec_from_file_location("terminal_continuation_missing_repo_test", SCRIPT)
         module = importlib.util.module_from_spec(spec)

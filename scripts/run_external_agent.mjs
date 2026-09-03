@@ -534,7 +534,11 @@ function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
       side_effect: Boolean(options.sideEffect),
       idempotency_key: options.idempotencyKey || null,
     } : {}),
-    ...(eventType === "assignment_started" ? options.executionLineage : {}), ...extra,
+    ...(eventType === "assignment_started" ? {
+      ...options.executionLineage,
+      execution_transport: "external_process",
+      exclusive_execution_key: `task:${options.taskId}`,
+    } : {}), ...extra,
   };
 }
 

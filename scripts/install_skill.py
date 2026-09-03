@@ -306,6 +306,12 @@ def detect_host_capabilities(
         "core": {"status": "enabled", "adapter": "adaptive-agent-runtime", "configured": True, "reason": "core governance is host-neutral"},
         "desktop_adapter": desktop,
         "web_local_adapter": web,
+        "web_agent_execution": {
+            "status": "host_limited",
+            "adapter": "web-agent-execution",
+            "configured": True,
+            "reason": "runtime adapter is installed, but current AI-Bridge browser evidence does not provide host-attested ChatGPT generation running/completed/interrupted lifecycle events",
+        },
     }
 
 

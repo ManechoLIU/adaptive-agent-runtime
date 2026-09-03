@@ -109,6 +109,57 @@ def consume_terminal_receipt(
     }
 
 
+def notify_runtime_change(
+    *,
+    repo: Path,
+    registry_path: Path = web_bridge.DEFAULT_REGISTRY,
+    wake_dispatcher: Callable[..., dict[str, Any] | None] | None = None,
+    codex: str = "/opt/homebrew/bin/codex",
+    event_source: str = "assignment_runtime_watchdog",
+) -> dict[str, Any]:
+    """Recompute canonical lifecycle state after a non-terminal runtime health change."""
+    repo = Path(repo).expanduser().resolve()
+    registry_path = Path(registry_path).expanduser()
+    controller_id = web_bridge._registered_controller_for_common_dir(repo, registry_path)
+    if not controller_id:
+        raise PermissionError("runtime continuation requires exactly one registered Controller")
+    registry = web_bridge.load_json(registry_path)
+    registered_repo = registry.get(controller_id)
+    if not isinstance(registered_repo, str) or not registered_repo.strip():
+        raise PermissionError("registered Controller repository is missing")
+    controller_repo = Path(registered_repo).expanduser().resolve()
+    snapshot = lifecycle.project_snapshot(controller_repo)
+    if snapshot is None:
+        raise RuntimeError("cannot snapshot registered Controller repository")
+    state_path = lifecycle.state_path(controller_id)
+    prior_state = lifecycle.load_json(state_path)
+    controller_host = str(prior_state.get("controller_host") or "desktop_codex").strip()
+    if controller_host not in {"web", "desktop_codex"}:
+        controller_host = "desktop_codex"
+    event = {
+        "hook_event_name": "AssignmentRuntime",
+        "session_id": controller_id,
+        "controller_host": controller_host,
+        "event_source": event_source,
+        "cwd": str(controller_repo),
+    }
+    _, lifecycle_state = lifecycle.evaluate_event(event, snapshot=snapshot, prior_state=prior_state)
+    lifecycle.write_json(state_path, lifecycle_state)
+    wake_receipt = None
+    if lifecycle_state.get("pending_control_event") is True:
+        dispatcher = wake_dispatcher or web_bridge.dispatch_pending_lifecycle_wake
+        wake_receipt = dispatcher(
+            lifecycle_state=lifecycle_state, session_id=controller_id, repo=controller_repo,
+            registry=registry_path, codex=codex,
+        )
+    return {
+        "controller_id": controller_id,
+        "lifecycle_state_path": str(state_path),
+        "wake_result": wake_receipt,
+        "pending_control_event": bool(lifecycle_state.get("pending_control_event")),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Continue the existing Controller from a durable external-agent terminal receipt")
     subparsers = parser.add_subparsers(dest="command", required=True)

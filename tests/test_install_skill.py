@@ -412,7 +412,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             self.assertEqual(manifest["product_name"], "Adaptive Agent Runtime")
             self.assertEqual(manifest["skill_id"], "adaptive-agent-runtime")
             self.assertIn("capabilities", manifest)
-            self.assertEqual(set(manifest["capabilities"]), {"core", "desktop_adapter", "web_local_adapter"})
+            self.assertEqual(set(manifest["capabilities"]), {"core", "desktop_adapter", "web_local_adapter", "web_agent_execution"})
+            self.assertEqual(manifest["capabilities"]["web_agent_execution"]["status"], "host_limited")
 
 
     def test_legacy_install_with_incomplete_manifest_drops_obsolete_files_not_in_selected_revision(self):
