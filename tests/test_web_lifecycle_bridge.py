@@ -3157,6 +3157,123 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
         self.assertFalse(classified["fallback_eligible"])
         self.assertTrue(classified["pending_control_event"])
 
+    def test_thread_schema_incompatibility_is_recoverable_target_failure(self) -> None:
+        classified = web_bridge.classify_native_resume_failure(
+            1,
+            "",
+            "Error: thread/resume failed: failed to deserialize stored thread item "
+            "fco_123: unknown variant `functionCallOutput`, expected one of `userMessage`, "
+            "`agentMessage` at line 1 column 28",
+        )
+        self.assertEqual(classified["state"], "RESUME_TARGET_INCOMPATIBLE")
+        self.assertEqual(classified["failure_class"], "target_schema_incompatible")
+        self.assertTrue(classified["replacement_eligible"])
+        self.assertTrue(classified["pending_control_event"])
+
+    def test_auto_native_stop_recovers_incompatible_target_without_user_turn(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {
+                    "controller-1": {"desktop_codex": {
+                        "status": "active", "session_id": "desktop-bad", "generation": 1,
+                    }}
+                },
+            }), encoding="utf-8")
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "pending-schema-1", "session_id": "controller-1",
+                "repo": str(repo.resolve()), "state": "RESUME_PENDING", "pending_control_event": True,
+            }), encoding="utf-8")
+            incompatible = {
+                "operation": "native_resume", "result": "FAILED", "state": "RESUME_TARGET_INCOMPATIBLE",
+                "pending_control_event": True, "returncode": 1, "stdout_tail": "",
+                "stderr_tail": "failed to deserialize stored thread item fco_1: unknown variant `functionCallOutput`",
+                "failure_class": "target_schema_incompatible", "replacement_eligible": True,
+                "execution_target_session_id": "desktop-bad", "target_generation": 1,
+            }
+            recovered = {
+                "operation": "native_target_recovery", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
+                "pending_control_event": True, "returncode": 0, "stdout_tail": "continued", "stderr_tail": "",
+                "execution_target_session_id": "desktop-good", "target_generation": 2,
+            }
+            with patch.object(web_bridge, "execute_native_resume", return_value=incompatible), patch.object(
+                web_bridge, "recover_incompatible_native_target", return_value=recovered
+            ) as recover, patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="pending-schema-1",
+                    registry=registry, codex="/opt/homebrew/bin/codex", delay_seconds=0,
+                    state_path=state, runtime_path="/opt/homebrew/bin:/usr/bin:/bin",
+                )
+            self.assertEqual(code, 0)
+            recover.assert_called_once()
+            schedule.assert_not_called()
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["state"], "RESUME_CONFIRMED")
+            self.assertEqual(saved["execution_target_session_id"], "desktop-good")
+            self.assertEqual(saved["target_generation"], 2)
+            self.assertTrue(saved["pending_control_event"])
+
+    def test_recover_incompatible_target_replaces_only_execution_target_then_resumes(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-bad"]}},
+                "__controller_targets__": {
+                    "controller-1": {"desktop_codex": {
+                        "status": "active", "session_id": "desktop-bad", "generation": 1,
+                    }}
+                },
+            }), encoding="utf-8")
+            codex = root / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"--version\" ]; then echo codex-test; exit 0; fi\n"
+                "printf '%s\n' '{\"type\":\"thread.started\",\"thread_id\":\"desktop-good\"}'\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+            replacement_receipt = {
+                "controller_id": "controller-1", "execution_target_session_id": "desktop-good",
+                "status": "active", "generation": 2,
+            }
+            resumed = {
+                "operation": "native_resume", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
+                "pending_control_event": True, "returncode": 0, "stdout_tail": "step2", "stderr_tail": "",
+                "controller_id": "controller-1", "execution_target_session_id": "desktop-good",
+                "target_generation": 2,
+            }
+            with patch.object(web_bridge, "replace_desktop_execution_target", return_value=replacement_receipt) as replace, patch.object(
+                web_bridge, "execute_native_resume", return_value=resumed
+            ) as resume:
+                result = web_bridge.recover_incompatible_native_target(
+                    session_id="controller-1", repo=repo, registry=registry, codex=str(codex),
+                    failed_target_session_id="desktop-bad", expected_generation=1,
+                    runtime_path="/usr/bin:/bin", terminal_receipts=["terminal.json"],
+                    next_action="execute step 2",
+                )
+            self.assertEqual(result["result"], "CONFIRMED")
+            self.assertEqual(result["execution_target_session_id"], "desktop-good")
+            self.assertEqual(result["target_generation"], 2)
+            replace.assert_called_once_with(
+                controller_id="controller-1", desktop_session_id="desktop-good", repo=repo,
+                expected_generation=1, registry=registry,
+            )
+            resume.assert_called_once()
+            self.assertEqual(resume.call_args.kwargs["session_id"], "controller-1")
+            self.assertEqual(resume.call_args.kwargs["next_action"], "execute step 2")
+
     def test_active_writer_message_without_thread_store_prefix_is_still_deferred(self) -> None:
         classified = web_bridge.classify_native_resume_failure(
             1, "", "thread abc already has an active writer"

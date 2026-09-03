@@ -463,6 +463,19 @@ def classify_native_resume_failure(returncode: int, stdout: str, stderr: str) ->
             "fallback_eligible": False,
             "error_code": "WEB_LIFECYCLE_ACTIVE_WRITER",
         }
+    if (
+        "failed to deserialize stored thread item" in combined
+        and ("unknown variant" in combined or "functioncalloutput" in combined)
+    ):
+        return {
+            "state": "RESUME_TARGET_INCOMPATIBLE",
+            "pending_control_event": True,
+            "failure_class": "target_schema_incompatible",
+            "fallback_eligible": False,
+            "replacement_eligible": True,
+            "error_code": "WEB_LIFECYCLE_TARGET_INCOMPATIBLE",
+            "returncode": returncode,
+        }
     failure_patterns = (
         ("usage_limit_exceeded", ("usage limit", "usage_limit_exceeded")),
         ("quota_exhausted", ("quota exhausted", "quota_exhausted")),
@@ -921,6 +934,150 @@ def execute_native_resume(
     attempt["result"] = "DEFERRED" if attempt["state"] == "RESUME_DEFERRED_ACTIVE_WRITER" else "FAILED"
     return attempt
 
+
+
+def _thread_id_from_json_lines(output: str) -> str | None:
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        for key in ("thread_id", "session_id", "threadId", "sessionId"):
+            value = event.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        payload = event.get("payload")
+        if isinstance(payload, dict):
+            for key in ("thread_id", "session_id", "threadId", "sessionId"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return None
+
+
+def replace_desktop_execution_target(
+    *, controller_id: str, desktop_session_id: str, repo: Path,
+    expected_generation: int, registry: Path,
+) -> dict[str, Any]:
+    lifecycle = _lifecycle_module()
+    return lifecycle.replace_desktop_session(
+        controller_id=controller_id,
+        desktop_session_id=desktop_session_id,
+        repo=repo,
+        expected_generation=expected_generation,
+        registry_path=registry,
+    )
+
+
+def recover_incompatible_native_target(
+    *, session_id: str, repo: Path, registry: Path, codex: str,
+    failed_target_session_id: str, expected_generation: int,
+    runtime_path: str | None = None,
+    terminal_receipts: Sequence[str] | None = None,
+    next_action: str | None = None,
+) -> dict[str, Any]:
+    """Replace an unreadable desktop execution target, never the logical Controller."""
+    try:
+        ok, preflight_error, env = preflight_native_resume(
+            session_id=session_id, repo=repo, registry=registry, codex=codex,
+            runtime_path=runtime_path,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        ok, preflight_error, env = False, f"native target recovery preflight error: {exc}", native_runtime_env(runtime_path)
+    if not ok:
+        return {
+            "operation": "native_target_recovery", "controller_id": session_id,
+            "result": "FAILED", "state": "RESUME_TARGET_RECOVERY_FAILED",
+            "pending_control_event": True, "returncode": 78,
+            "stderr_tail": bounded_tail(preflight_error),
+            "failure_class": "target_recovery_failed",
+            "error_code": "WEB_LIFECYCLE_TARGET_RECOVERY_FAILED",
+            "recovered_from_execution_target_session_id": failed_target_session_id,
+        }
+    bootstrap_prompt = (
+        "Adaptive Agent Runtime execution-target recovery bootstrap for existing logical Controller "
+        f"{session_id}. Do not create, appoint, or claim another logical Controller. Do not modify "
+        "project files and do not start project work in this bootstrap turn. Reply exactly TARGET_READY."
+    )
+    bootstrap_command = [codex, "exec", "--json", "-C", str(repo.resolve()), bootstrap_prompt]
+    try:
+        completed = subprocess.run(
+            bootstrap_command, check=False, capture_output=True, text=True, env=env, timeout=120
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "operation": "native_target_recovery", "controller_id": session_id,
+            "command": bootstrap_command, "result": "FAILED",
+            "state": "RESUME_TARGET_RECOVERY_FAILED", "pending_control_event": True,
+            "returncode": 78, "stderr_tail": bounded_tail(str(exc)),
+            "failure_class": "target_recovery_failed",
+            "error_code": "WEB_LIFECYCLE_TARGET_RECOVERY_FAILED",
+            "recovered_from_execution_target_session_id": failed_target_session_id,
+        }
+    new_target = _thread_id_from_json_lines(completed.stdout)
+    if completed.returncode != 0 or not new_target:
+        return {
+            "operation": "native_target_recovery", "controller_id": session_id,
+            "command": bootstrap_command, "result": "FAILED",
+            "state": "RESUME_TARGET_RECOVERY_FAILED", "pending_control_event": True,
+            "returncode": completed.returncode or 78,
+            "stdout_tail": bounded_tail(completed.stdout), "stderr_tail": bounded_tail(completed.stderr),
+            "failure_class": "target_recovery_failed",
+            "error_code": "WEB_LIFECYCLE_TARGET_RECOVERY_FAILED",
+            "recovered_from_execution_target_session_id": failed_target_session_id,
+        }
+    if new_target in {session_id, failed_target_session_id}:
+        return {
+            "operation": "native_target_recovery", "controller_id": session_id,
+            "command": bootstrap_command, "result": "FAILED",
+            "state": "RESUME_TARGET_RECOVERY_FAILED", "pending_control_event": True,
+            "returncode": 78,
+            "stderr_tail": "replacement bootstrap did not produce a distinct execution target",
+            "failure_class": "target_recovery_failed",
+            "error_code": "WEB_LIFECYCLE_TARGET_RECOVERY_FAILED",
+            "recovered_from_execution_target_session_id": failed_target_session_id,
+        }
+    try:
+        replacement = replace_desktop_execution_target(
+            controller_id=session_id, desktop_session_id=new_target, repo=repo,
+            expected_generation=expected_generation, registry=registry,
+        )
+    except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
+        return {
+            "operation": "native_target_recovery", "controller_id": session_id,
+            "command": bootstrap_command, "result": "FAILED",
+            "state": "RESUME_TARGET_RECOVERY_FAILED", "pending_control_event": True,
+            "returncode": 78, "stderr_tail": bounded_tail(f"target replacement rejected: {exc}"),
+            "failure_class": "target_recovery_failed",
+            "error_code": "WEB_LIFECYCLE_TARGET_RECOVERY_FAILED",
+            "recovered_from_execution_target_session_id": failed_target_session_id,
+            "candidate_execution_target_session_id": new_target,
+        }
+    resumed = execute_native_resume(
+        session_id=session_id, repo=repo, registry=registry, codex=codex,
+        runtime_path=runtime_path, terminal_receipts=terminal_receipts,
+        next_action=next_action,
+    )
+    resumed = dict(resumed)
+    resumed["operation"] = "native_target_recovery"
+    resumed["recovered_from_execution_target_session_id"] = failed_target_session_id
+    resumed["replacement_execution_target_session_id"] = new_target
+    resumed["target_generation"] = replacement.get("generation", resumed.get("target_generation"))
+    return resumed
+
+
+def wake_receipt_needs_auto_native_stop(receipt: object) -> bool:
+    if not isinstance(receipt, dict):
+        return False
+    if receipt.get("result") == "DEFERRED":
+        return True
+    return (
+        receipt.get("result") == "FAILED"
+        and receipt.get("failure_class") == "target_schema_incompatible"
+        and receipt.get("replacement_eligible") is True
+    )
 
 def controller_wake_lock_path(repo: Path) -> Path:
     return _git_common_dir(repo) / "adaptive-delivery" / "controller-wake.lock"
@@ -1649,6 +1806,20 @@ def run_auto_native_stop(
         terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
         next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
     )
+    if (
+        attempt.get("state") == "RESUME_TARGET_INCOMPATIBLE"
+        and attempt.get("replacement_eligible") is True
+    ):
+        failed_target = str(attempt.get("execution_target_session_id") or "").strip()
+        failed_generation = attempt.get("target_generation")
+        if failed_target and isinstance(failed_generation, int) and not isinstance(failed_generation, bool):
+            attempt = recover_incompatible_native_target(
+                session_id=session_id, repo=repo, registry=registry, codex=codex,
+                failed_target_session_id=failed_target, expected_generation=failed_generation,
+                runtime_path=runtime_path,
+                terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
+                next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
+            )
     latest = load_json(state_path)
     if latest.get("receipt_id") == receipt_id:
         for evidence_key in (
@@ -1680,7 +1851,7 @@ def run_auto_native_stop(
                 "stdout_tail": attempt.get("stdout_tail", ""),
                 "stderr_tail": attempt.get("stderr_tail", ""),
             })
-            for key in ("error_code", "failure_class", "fallback_eligible"):
+            for key in ("error_code", "failure_class", "fallback_eligible", "replacement_eligible"):
                 if key in attempt:
                     latest[key] = attempt[key]
         write_auto_stop_state(state_path, latest)
@@ -2007,6 +2178,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             codex="/opt/homebrew/bin/codex",
         )
         if lifecycle_state.get("pending_control_event") is True and not wake_receipt_confirmed(wake_receipt):
+            if wake_receipt_needs_auto_native_stop(wake_receipt):
+                schedule_auto_native_stop(
+                    session_id=session_id, repo=repo,
+                    receipt_id=f"post-shell:{lifecycle_state.get('wake_generation', 0)}",
+                    registry=registry_path, codex="/opt/homebrew/bin/codex",
+                    delay_seconds=1.0, state_path=default_auto_stop_state_path(session_id),
+                )
             return 78
         return 0
 
@@ -2084,7 +2262,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         )
                         if not wake_receipt_confirmed(wake_receipt):
                             result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
-                            if args.auto_native_stop and result == "DEFERRED":
+                            if args.auto_native_stop and wake_receipt_needs_auto_native_stop(wake_receipt):
                                 state_path = Path(args.auto_stop_state).expanduser() if args.auto_stop_state else default_auto_stop_state_path(args.session_id)
                                 schedule_auto_native_stop(
                                     session_id=args.session_id, repo=repo,
@@ -2148,7 +2326,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             )
                             if not wake_receipt_confirmed(wake_receipt):
                                 result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
-                                if args.auto_native_stop and result == "DEFERRED":
+                                if args.auto_native_stop and wake_receipt_needs_auto_native_stop(wake_receipt):
                                     state_path = Path(args.auto_stop_state).expanduser() if args.auto_stop_state else default_auto_stop_state_path(args.session_id)
                                     schedule_auto_native_stop(
                                         session_id=args.session_id, repo=repo,

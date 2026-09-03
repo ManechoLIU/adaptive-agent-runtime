@@ -1405,7 +1405,8 @@ def _reject_cross_controller_desktop_owner(
 
 
 def replace_desktop_session(
-    *, controller_id: str, desktop_session_id: str, repo: Path, expected_generation: int
+    *, controller_id: str, desktop_session_id: str, repo: Path, expected_generation: int,
+    registry_path: Path | None = None,
 ) -> dict[str, Any]:
     controller_id = controller_id.strip()
     desktop_session_id = desktop_session_id.strip()
@@ -1414,12 +1415,13 @@ def replace_desktop_session(
     canonical_root = canonical_main_root(repo)
     if canonical_root is None:
         raise ValueError("desktop session replacement requires a canonical Git project")
-    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + ".lock")
+    selected_registry = (registry_path or REGISTRY_PATH).expanduser()
+    selected_registry.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = selected_registry.with_suffix(selected_registry.suffix + ".lock")
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            registry = load_json(REGISTRY_PATH)
+            registry = load_json(selected_registry)
             _validated_controller_registry(
                 registry=registry,
                 controller_id=controller_id,
@@ -1481,7 +1483,7 @@ def replace_desktop_session(
             controller_targets[DESKTOP_SESSION_HOST] = target
             targets[controller_id] = controller_targets
             registry[CONTROLLER_TARGETS_KEY] = targets
-            write_json(REGISTRY_PATH, registry)
+            write_json(selected_registry, registry)
             return {
                 "controller_id": controller_id,
                 "controller_session_id": controller_id,
