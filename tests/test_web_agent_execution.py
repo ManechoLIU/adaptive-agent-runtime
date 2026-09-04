@@ -1258,6 +1258,53 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
                 }
                 self.assertEqual(route_policy_errors(f"T-POSITIVE-{index}", candidate), [])
 
+    def test_route_policy_full_line_grammar_rejects_intervening_and_trailing_semantics(self):
+        from scripts.route_contract import route_policy_errors
+
+        bad_lines = [
+            "frontend provider=chatgpt_web not model=gpt-5.6-sol auth_mode=host.",
+            "frontend provider=chatgpt_web model=gpt-5.6-sol auth_mode=host excluded",
+            "frontend provider=chatgpt_web arbitrary model=gpt-5.6-sol auth_mode=host.",
+            "frontend provider=chatgpt_web model=gpt-5.6-sol unexpected auth_mode=host.",
+            "frontend provider=chatgpt_web model=gpt-5.6-sol auth_mode=host unknown-directive",
+        ]
+        route = {
+            "decision": "default",
+            "policy_class": "frontend",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "auth_mode": "host",
+        }
+        for index, line in enumerate(bad_lines):
+            with self.subTest(line=line):
+                policy = Path(self.tmp.name) / f"full-line-negative-{index}.md"
+                policy.write_text(line + chr(10), encoding="utf-8")
+                candidate = dict(route)
+                candidate["policy_source"] = {
+                    "path": str(policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+                }
+                self.assertEqual(
+                    route_policy_errors(f"T-FULL-{index}", candidate),
+                    [f"T-FULL-{index} route is not declared by policy source"],
+                )
+
+        good_lines = [
+            "frontend provider=chatgpt_web model=gpt-5.6-sol auth_mode=host.",
+            "frontend default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "前端默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。",
+        ]
+        for index, line in enumerate(good_lines):
+            with self.subTest(active=line):
+                policy = Path(self.tmp.name) / f"full-line-positive-{index}.md"
+                policy.write_text(line + chr(10), encoding="utf-8")
+                candidate = dict(route)
+                candidate["policy_source"] = {
+                    "path": str(policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+                }
+                self.assertEqual(route_policy_errors(f"T-FULL-POS-{index}", candidate), [])
+
     def test_route_policy_normalizes_unicode_dash_variants_before_authorization(self):
         from scripts.route_contract import UNICODE_DASH_EQUIVALENTS, route_policy_errors
 

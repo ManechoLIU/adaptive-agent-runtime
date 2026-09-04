@@ -115,9 +115,16 @@ INACTIVE_POLICY_LINE_MARKERS = (
 
 POLICY_INLINE_COMMENT_MARKERS = ("#", "//", "<!--")
 POLICY_ROUTE_FIELDS = ("provider", "model", "auth_mode")
-POLICY_FIELD_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_-])(?P<field>provider|model|auth_mode)"
-    r"\s*=\s*(?P<value>[A-Za-z0-9_.:+/-]+)",
+POLICY_ROUTE_VALUE = r"[A-Za-z0-9_.:+/-]+"
+POLICY_ROUTE_SEPARATOR = r"(?:\s*[,，、;；]\s*|\s+)"
+POLICY_ROUTE_DECLARATION_PATTERN = re.compile(
+    r"^(?P<prefix>.*?)"
+    r"(?<![A-Za-z0-9_-])provider\s*=\s*(?P<provider>" + POLICY_ROUTE_VALUE + r")"
+    + POLICY_ROUTE_SEPARATOR
+    + r"model\s*=\s*(?P<model>" + POLICY_ROUTE_VALUE + r")"
+    + POLICY_ROUTE_SEPARATOR
+    + r"auth_mode\s*=\s*(?P<auth_mode>" + POLICY_ROUTE_VALUE + r")"
+    + r"\s*[。;；]?\s*$",
     re.IGNORECASE,
 )
 
@@ -155,21 +162,6 @@ def _active_policy_line(line: str) -> bool:
         _normalized_policy_text(token) in normalized
         for token in INACTIVE_POLICY_LINE_MARKERS
     )
-
-
-def _policy_field_assignments(line: str) -> tuple[dict[str, str], int | None]:
-    normalized_line = _normalize_policy_symbols(line)
-    values: dict[str, str] = {}
-    first_start: int | None = None
-    for match in POLICY_FIELD_PATTERN.finditer(normalized_line):
-        field = match.group("field").casefold()
-        value = match.group("value").strip().rstrip(".")
-        if first_start is None:
-            first_start = match.start()
-        if field in values and values[field] != value:
-            return {}, first_start
-        values[field] = value
-    return values, first_start
 
 
 POSITIVE_POLICY_PREFIX_WORDS = {
@@ -251,15 +243,23 @@ def _active_policy_route_declaration(
 ) -> dict[str, str] | None:
     if not _active_policy_line(line):
         return None
-    values, first_start = _policy_field_assignments(line)
-    if first_start is None or set(values) != set(POLICY_ROUTE_FIELDS):
+    normalized_line = _normalize_policy_symbols(line).strip()
+    match = POLICY_ROUTE_DECLARATION_PATTERN.fullmatch(normalized_line)
+    if match is None:
         return None
-    prefix = line[:first_start]
+    prefix = match.group("prefix")
     if not _policy_class_marker_matches(prefix, markers):
         return None
     if not _policy_prefix_is_positive(prefix, markers):
         return None
+    values = {
+        field: str(match.group(field)).strip().rstrip(".")
+        for field in POLICY_ROUTE_FIELDS
+    }
+    if any(not value for value in values.values()):
+        return None
     return values
+
 
 def route_policy_errors(task_id: str, route: dict[str, Any]) -> list[str]:
     source = route.get("policy_source")
