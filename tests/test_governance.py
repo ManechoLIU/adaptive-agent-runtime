@@ -2990,33 +2990,110 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         )
 
     def test_control_event_guard_accepts_proven_safe_fallback(self) -> None:
-        assignment = self.delegated_assignment("SERVER-1", "server-main")
-        assignment["route"] = {
-            "decision": "safe_fallback",
-            "policy_class": "backend",
-            "provider": "codex-native",
-            "model": "gpt-5.6-terra",
-            "auth_mode": "host",
-            "policy_source": self.route_policy_source(),
-            "fallback_from": {
+        from scripts.assignment_runtime import apply_runtime_receipt
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            policy = Path(directory) / "AGENTS.md"
+            policy.write_text(
+                "后端默认 provider=grok-build、model=grok-4.6、auth_mode=oauth。" + chr(10)
+                + "后端fallback provider=codex-native、model=gpt-5.6-terra、auth_mode=host。" + chr(10),
+                encoding="utf-8",
+            )
+            policy_source = {
+                "path": str(policy.resolve()),
+                "sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+            }
+            started = {
+                "event_type": "assignment_started",
+                "assignment_id": "SERVER-1-GROK-PRIOR",
+                "task_id": "SERVER-1",
+                "agent_id": "grok-prior",
                 "provider": "grok-build",
                 "model": "grok-4.6",
+                "agent_type": "external-grok",
+                "session_id": "grok-prior-session",
+                "worktree": str(repo),
+                "issued_at": "2026-09-04T00:00:00+00:00",
+                "attempt": 1,
+                "lease_id": "SERVER-1-GROK-PRIOR:attempt:1",
+                "event_seq": 1,
+                "receipt_id": "SERVER-1-GROK-PRIOR:1:1",
+                "assignment_contract_version": 2,
+                "side_effect": False,
+                "primary_goal": "attempt preferred backend route",
+                "success_criteria": ["produce bounded result"],
+                "owned_scope": ["apps/server/src/runtime.ts"],
+                "strategy": "external-preferred",
                 "auth_mode": "oauth",
-            },
-            "failure_evidence": "receipt:grok/terminal-safe-failure",
-            "prior_attempt_terminal": True,
-            "result_unknown": False,
-        }
-        snapshot = {
-            **self.complete_event_receipt(),
-            "candidate_packages": [],
-            "new_assignments": [assignment],
-        }
+                "policy_class": "backend",
+                "route_decision": "default",
+                "route_contract": {
+                    "decision": "default",
+                    "policy_class": "backend",
+                    "provider": "grok-build",
+                    "model": "grok-4.6",
+                    "auth_mode": "oauth",
+                    "policy_source": policy_source,
+                },
+            }
+            apply_runtime_receipt(repo, started)
+            terminal = {
+                "event_type": "assignment_terminal",
+                "assignment_id": "SERVER-1-GROK-PRIOR",
+                "task_id": "SERVER-1",
+                "agent_id": "grok-prior",
+                "provider": "grok-build",
+                "model": "grok-4.6",
+                "agent_type": "external-grok",
+                "session_id": "grok-prior-session",
+                "worktree": str(repo),
+                "issued_at": "2026-09-04T00:01:00+00:00",
+                "attempt": 1,
+                "lease_id": "SERVER-1-GROK-PRIOR:attempt:1",
+                "event_seq": 2,
+                "receipt_id": "SERVER-1-GROK-PRIOR:1:2",
+                "terminal_state": "failed",
+                "transport_outcome": "failed",
+                "delivery_outcome": "unresolved",
+                "summary": "preferred backend provider unavailable",
+                "evidence": ["receipt:grok/terminal-safe-failure"],
+                "artifacts": [],
+                "next_action": "use declared safe fallback",
+                "retry_class": "provider_exit",
+                "side_effect": False,
+                "result_unknown": False,
+            }
+            apply_runtime_receipt(repo, terminal)
+            assignment = self.delegated_assignment("SERVER-1", "server-main")
+            assignment["route"] = {
+                "decision": "safe_fallback",
+                "policy_class": "backend",
+                "provider": "codex-native",
+                "model": "gpt-5.6-terra",
+                "auth_mode": "host",
+                "policy_source": policy_source,
+                "fallback_from": {
+                    "provider": "grok-build",
+                    "model": "grok-4.6",
+                    "auth_mode": "oauth",
+                },
+                "prior_assignment_id": "SERVER-1-GROK-PRIOR",
+                "failure_evidence": "receipt:grok/terminal-safe-failure",
+            }
+            snapshot = {
+                **self.complete_event_receipt(),
+                "candidate_packages": [],
+                "new_assignments": [assignment],
+            }
+            self.assertEqual(
+                control_event_guard.validate_candidate_queue(
+                    snapshot, expected_candidates={}, runtime_repo=repo
+                ),
+                [],
+            )
 
-        self.assertEqual(
-            control_event_guard.validate_candidate_queue(snapshot, expected_candidates={}),
-            [],
-        )
 
     def test_control_event_guard_accepts_bounded_controller_exception(self) -> None:
         snapshot = {

@@ -525,6 +525,7 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         self.policy.write_text(
             "general 默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n"
             "前端默认 provider=kimi-code、model=kimi-k3、auth_mode=api。\n"
+            "前端fallback provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n"
             "后端默认 provider=grok-build、model=grok-4.6、auth_mode=oauth。\n",
             encoding="utf-8",
         )
@@ -543,6 +544,87 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def seed_prior_external_terminal(
+        self,
+        *,
+        assignment_id="A-KIMI-PRIOR",
+        task_id="T-RUNTIME",
+        provider="kimi-code",
+        model="kimi-k3",
+        auth_mode="api",
+        evidence=None,
+        result_unknown=False,
+        terminal_state="failed",
+        delivery_outcome="unresolved",
+    ):
+        from scripts.assignment_runtime import apply_runtime_receipt
+        evidence = list(evidence if evidence is not None else ["receipt:kimi/terminal-provider-unavailable"])
+        started = {
+            "event_type": "assignment_started",
+            "assignment_id": assignment_id,
+            "task_id": task_id,
+            "agent_id": "kimi-prior",
+            "provider": provider,
+            "model": model,
+            "agent_type": "external-kimi",
+            "session_id": "kimi-prior-session",
+            "worktree": str(self.repo),
+            "issued_at": (T0 - timedelta(minutes=2)).isoformat(),
+            "attempt": 1,
+            "lease_id": f"{assignment_id}:attempt:1",
+            "event_seq": 1,
+            "receipt_id": f"{assignment_id}:1:1",
+            "assignment_contract_version": 2,
+            "side_effect": False,
+            "primary_goal": "attempt preferred external route",
+            "success_criteria": ["produce bounded result"],
+            "owned_scope": ["apps/web/src/runtime.ts"],
+            "strategy": "external-preferred",
+            "auth_mode": auth_mode,
+            "policy_class": "frontend",
+            "route_decision": "default",
+            "route_contract": {
+                "decision": "default",
+                "policy_class": "frontend",
+                "provider": provider,
+                "model": model,
+                "auth_mode": auth_mode,
+                "policy_source": {
+                    "path": str(self.policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(self.policy.read_bytes()).hexdigest(),
+                },
+            },
+        }
+        apply_runtime_receipt(self.repo, started, now=T0 - timedelta(minutes=2))
+        terminal = {
+            "event_type": "assignment_terminal",
+            "assignment_id": assignment_id,
+            "task_id": task_id,
+            "agent_id": "kimi-prior",
+            "provider": provider,
+            "model": model,
+            "agent_type": "external-kimi",
+            "session_id": "kimi-prior-session",
+            "worktree": str(self.repo),
+            "issued_at": (T0 - timedelta(minutes=1)).isoformat(),
+            "attempt": 1,
+            "lease_id": started["lease_id"],
+            "event_seq": 2,
+            "receipt_id": f"{assignment_id}:1:2",
+            "terminal_state": terminal_state,
+            "transport_outcome": "failed" if terminal_state == "failed" else "cancelled",
+            "delivery_outcome": delivery_outcome,
+            "summary": "preferred provider failed before safe fallback",
+            "evidence": evidence,
+            "artifacts": [],
+            "next_action": "use declared safe fallback",
+            "retry_class": "provider_exit",
+            "side_effect": False,
+            "result_unknown": result_unknown,
+        }
+        apply_runtime_receipt(self.repo, terminal, now=T0 - timedelta(minutes=1))
+        return load_runtime_state(self.repo)["leases"][assignment_id]
 
     def assignment(self, **extra):
         value = {
@@ -701,7 +783,7 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
                 event_source_probe=lambda: True,
             )
 
-    def test_proven_kimi_frontend_failure_can_prepare_web_fallback_when_machine_source_ready(self):
+    def test_forged_safe_fallback_fields_without_canonical_prior_terminal_are_rejected(self):
         from scripts.web_agent_execution import prepare_web_assignment_dispatch
         assignment = self.assignment(
             owned_scope=["apps/web/src/runtime.ts"],
@@ -712,23 +794,93 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
                 model="gpt-5.6-sol",
                 auth_mode="host",
                 fallback_from={"provider": "kimi-code", "model": "kimi-k3", "auth_mode": "api"},
+                prior_assignment_id="A-KIMI-PRIOR",
                 failure_evidence="receipt:kimi/terminal-provider-unavailable",
                 prior_attempt_terminal=True,
                 result_unknown=False,
             ),
         )
+        with self.assertRaisesRegex((ValueError, PermissionError), "canonical|prior.*assignment|terminal"):
+            prepare_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id="controller-1",
+                task_name="runtime-forged-fallback", assignment=assignment, now=T0,
+                health_probe=lambda: True,
+            )
+
+    def test_safe_fallback_requires_traceable_evidence_from_canonical_prior_lease(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        self.seed_prior_external_terminal(evidence=[])
+        assignment = self.assignment(
+            owned_scope=["apps/web/src/runtime.ts"],
+            route=self.route(
+                decision="safe_fallback",
+                policy_class="frontend",
+                provider="chatgpt_web",
+                model="gpt-5.6-sol",
+                auth_mode="host",
+                fallback_from={"provider": "kimi-code", "model": "kimi-k3", "auth_mode": "api"},
+                prior_assignment_id="A-KIMI-PRIOR",
+                failure_evidence="receipt:kimi/terminal-provider-unavailable",
+            ),
+        )
+        with self.assertRaisesRegex((ValueError, PermissionError), "evidence|canonical"):
+            prepare_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id="controller-1",
+                task_name="runtime-fallback-missing-evidence", assignment=assignment, now=T0,
+                health_probe=lambda: True,
+            )
+
+    def test_safe_fallback_policy_must_declare_selected_fallback_route_not_only_origin(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        self.seed_prior_external_terminal()
+        self.policy.write_text(
+            "前端默认 provider=kimi-code、model=kimi-k3、auth_mode=api。" + chr(10),
+            encoding="utf-8",
+        )
+        assignment = self.assignment(
+            owned_scope=["apps/web/src/runtime.ts"],
+            route=self.route(
+                decision="safe_fallback",
+                policy_class="frontend",
+                provider="chatgpt_web",
+                model="gpt-5.6-sol",
+                auth_mode="host",
+                fallback_from={"provider": "kimi-code", "model": "kimi-k3", "auth_mode": "api"},
+                prior_assignment_id="A-KIMI-PRIOR",
+                failure_evidence="receipt:kimi/terminal-provider-unavailable",
+            ),
+        )
+        with self.assertRaisesRegex((ValueError, PermissionError), "policy|declared"):
+            prepare_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id="controller-1",
+                task_name="runtime-undeclared-fallback-route", assignment=assignment, now=T0,
+                health_probe=lambda: True,
+            )
+
+    def test_canonical_kimi_terminal_with_declared_route_can_prepare_web_fallback(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        self.seed_prior_external_terminal()
+        assignment = self.assignment(
+            owned_scope=["apps/web/src/runtime.ts"],
+            route=self.route(
+                decision="safe_fallback",
+                policy_class="frontend",
+                provider="chatgpt_web",
+                model="gpt-5.6-sol",
+                auth_mode="host",
+                fallback_from={"provider": "kimi-code", "model": "kimi-k3", "auth_mode": "api"},
+                prior_assignment_id="A-KIMI-PRIOR",
+                failure_evidence="receipt:kimi/terminal-provider-unavailable",
+            ),
+        )
         prepared = prepare_web_assignment_dispatch(
-            repo=self.repo,
-            registry_path=self.registry,
-            controller_id="controller-1",
-            task_name="runtime-proven-web-fallback",
-            assignment=assignment,
-            now=T0,
+            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
+            task_name="runtime-proven-web-fallback", assignment=assignment, now=T0,
             health_probe=lambda: True,
-            event_source_probe=lambda: True,
         )
         self.assertEqual(prepared["assignment"]["route"]["decision"], "safe_fallback")
-        self.assertEqual(prepared["assignment"]["route"]["fallback_from"]["provider"], "kimi-code")
+        self.assertEqual(prepared["assignment"]["route"]["prior_assignment_id"], "A-KIMI-PRIOR")
+
 
     def test_forged_local_machine_event_receipt_cannot_enable_production_prepare(self):
         from datetime import datetime, timezone

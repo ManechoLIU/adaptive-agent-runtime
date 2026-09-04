@@ -400,6 +400,10 @@ function validateAssignmentLaunch(options) {
     "--expected-repository-root", repositoryRoot,
     "--expected-branch", branch,
     "--expected-head", head,
+    "--expected-provider", options.engine,
+    "--expected-model", options.model,
+    "--expected-auth-mode", options.authMode,
+    "--runtime-repo", runtimeRepository(options),
   ], { encoding: "utf8" });
   if (result.error) throw new Error(`assignment-ack validation failed: ${result.error.message}`);
   if (result.status !== 0) {
@@ -537,6 +541,12 @@ function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
     ...(eventType === "assignment_started" ? {
       ...options.executionLineage,
       execution_transport: "external_process",
+      model: options.model,
+      agent_type: options.agentType || `external-${options.engine}`,
+      auth_mode: options.authMode,
+      policy_class: options.assignmentRoute?.policy_class || null,
+      route_decision: options.assignmentRoute?.decision || null,
+      route_contract: options.assignmentRoute || null,
       exclusive_execution_key: `task:${options.taskId}`,
     } : {}), ...extra,
   };
@@ -865,13 +875,17 @@ async function main() {
       process.exitCode = await loginExternalAgent(options);
       return;
     }
-    const assignment = validateAssignmentLaunch(options);
     validateRuntimeBinding(options);
+    const assignment = validateAssignmentLaunch(options);
     if (assignment) {
       options.assignmentContractVersion = assignment.assignment_contract_version || 1;
       options.sideEffect = typeof assignment.side_effect === "boolean" ? assignment.side_effect : null;
       options.idempotencyKey = typeof assignment.idempotency_key === "string" ? assignment.idempotency_key.trim() : null;
       options.progressDeadlineMinutes = assignment.progress_deadline_minutes;
+      options.assignmentRoute = assignment.route && typeof assignment.route === "object" ? assignment.route : null;
+      options.agentType = typeof assignment.agent_type === "string" && assignment.agent_type.trim()
+        ? assignment.agent_type.trim()
+        : `external-${options.engine}`;
       options.executionLineage = deriveExecutionLineage(options, assignment);
     }
     validateRuleHandshake(options);
@@ -913,6 +927,21 @@ async function main() {
       throw error;
     }
     if (heartbeat) clearInterval(heartbeat);
+    if (options.assignmentId) {
+      const finalSnapshot = runtimeGitSnapshot(options.cwd);
+      if (
+        finalSnapshot.head !== previousSnapshot.head
+        || finalSnapshot.statusSha256 !== previousSnapshot.statusSha256
+      ) {
+        eventSeq += 1;
+        recordRuntimeReceipt(options, "assignment_progress", eventSeq, {
+          last_observed_head: finalSnapshot.head,
+          last_observed_status_sha256: finalSnapshot.statusSha256,
+          progress_evidence: boundedProgressEvidence(previousSnapshot, finalSnapshot),
+        });
+        previousSnapshot = finalSnapshot;
+      }
+    }
     eventSeq += 1;
     let delivery = null;
     let deliveryError = null;

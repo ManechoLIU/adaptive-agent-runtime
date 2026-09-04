@@ -20,6 +20,22 @@ try:
     from scripts.controller_state import derive_runnable_tasks
 except ModuleNotFoundError:
     from controller_state import derive_runnable_tasks
+try:
+    from scripts.route_contract import (
+        ROUTE_DECISIONS,
+        canonical_safe_fallback_errors,
+        delegated_route_contract_errors,
+        route_policy_errors,
+        route_scope_errors,
+    )
+except ModuleNotFoundError:
+    from route_contract import (
+        ROUTE_DECISIONS,
+        canonical_safe_fallback_errors,
+        delegated_route_contract_errors,
+        route_policy_errors,
+        route_scope_errors,
+    )
 
 DECISIONS = {"active", "deferred", "blocked"}
 CANDIDATE_DECISIONS = {
@@ -43,16 +59,11 @@ DEFER_REASON_CODES = {
 }
 HARD_DEFER_REASON_CODES = DEFER_REASON_CODES - {"capacity"}
 EXECUTION_MODES = {"delegated", "controller"}
-ROUTE_DECISIONS = {"default", "safe_fallback", "controller_exception"}
 CONTROLLER_EXCEPTION_REASONS = {
     "shared_contract_unstable",
     "unsafe_to_split",
     "active_wip_recovery",
     "low_risk_tiny_change",
-}
-ROUTE_CLASS_MARKERS = {
-    "backend": ("backend", "后端", "server"),
-    "frontend": ("frontend", "前端", "web", "小程序", "miniapp"),
 }
 CONTROLLER_CYCLE_EVIDENCE_DIRECTORY = "controller-cycle-evidence"
 LEDGER_SUCCESS_STATES = {"DONE"}
@@ -1016,105 +1027,13 @@ def integrated_candidate_revisions(
     return merged
 
 
-def derived_route_classes(owned_files: Any) -> set[str]:
-    """Conservatively derive only unambiguous frontend/backend classes from owned paths."""
-    if not isinstance(owned_files, list):
-        return set()
-    classes: set[str] = set()
-    for raw in owned_files:
-        path = str(raw or "").strip().replace("\\", "/").casefold().lstrip("./")
-        if not path:
-            continue
-        parts = {part for part in path.split("/") if part}
-        if (
-            path.startswith("apps/web/")
-            or path.startswith("apps/miniapp/")
-            or "frontend" in parts
-            or "miniapp" in parts
-        ):
-            classes.add("frontend")
-        if (
-            path.startswith("apps/server/")
-            or "backend" in parts
-            or "server" in parts
-        ):
-            classes.add("backend")
-    return classes
-
-
-def route_scope_errors(task_id: str, owned_files: Any, route: Any) -> list[str]:
-    if not isinstance(route, dict):
-        return []
-    classes = derived_route_classes(owned_files)
-    if len(classes) > 1:
-        return [
-            f"{task_id} owned_files span multiple route classes: "
-            + ", ".join(sorted(classes))
-            + "; split the Assignment before dispatch"
-        ]
-    if len(classes) == 1:
-        derived = next(iter(classes))
-        declared = str(route.get("policy_class", "")).strip().lower()
-        if declared and declared != derived:
-            return [
-                f"{task_id} route policy_class {declared} conflicts with derived {derived}"
-            ]
-    return []
-
-
-def delegated_route_contract_errors(
-    task_id: str, owned_files: Any, route: Any
-) -> list[str]:
-    """Validate one delegated route before any executor-specific spawn can occur."""
-    errors: list[str] = []
-    if not isinstance(route, dict):
-        return [f"{task_id} delegated assignment requires route"]
-    for field in ("decision", "policy_class", "provider", "model", "auth_mode"):
-        if not str(route.get(field, "")).strip():
-            errors.append(f"{task_id} route requires {field}")
-    source = route.get("policy_source")
-    if not isinstance(source, dict):
-        errors.append(f"{task_id} route requires policy_source")
-    else:
-        for field in ("path", "sha256"):
-            if not str(source.get(field, "")).strip():
-                errors.append(f"{task_id} route policy_source requires {field}")
-    errors.extend(route_scope_errors(task_id, owned_files, route))
-    errors.extend(route_policy_errors(task_id, route))
-
-    decision = str(route.get("decision", "")).strip().lower()
-    if decision not in ROUTE_DECISIONS:
-        errors.append(
-            f"{task_id} route decision must be default, safe_fallback, or controller_exception"
-        )
-    elif decision == "controller_exception":
-        errors.append(f"{task_id} delegated assignment cannot use controller_exception")
-    elif decision == "safe_fallback":
-        missing: list[str] = []
-        fallback_from = route.get("fallback_from")
-        if not isinstance(fallback_from, dict):
-            missing.append("fallback_from")
-        else:
-            for field in ("provider", "model", "auth_mode"):
-                if not str(fallback_from.get(field, "")).strip():
-                    missing.append(f"fallback_from.{field}")
-        if not str(route.get("failure_evidence", "")).strip():
-            missing.append("failure_evidence")
-        if route.get("prior_attempt_terminal") is not True:
-            missing.append("prior_attempt_terminal=true")
-        if route.get("result_unknown") is not False:
-            missing.append("result_unknown=false")
-        if missing:
-            errors.append(f"{task_id} safe fallback requires " + ", ".join(missing))
-    return errors
-
-
 def validate_candidate_queue(
     snapshot: dict[str, Any],
     *,
     expected_candidates: dict[str, str],
     expected_main_revision: str | None = None,
     expected_integrated_revisions: set[str] | None = None,
+    runtime_repo: str | Path | None = None,
 ) -> list[str]:
     errors: list[str] = []
     raw_candidates = snapshot.get("candidate_packages")
@@ -1308,24 +1227,11 @@ def validate_candidate_queue(
                     if not str(exception.get(field, "")).strip():
                         errors.append(f"{task_id} controller_exception requires {field}")
         if route_decision == "safe_fallback":
-            missing_fallback: list[str] = []
-            fallback_from = route.get("fallback_from")
-            if not isinstance(fallback_from, dict):
-                missing_fallback.append("fallback_from")
-            else:
-                for field in ("provider", "model", "auth_mode"):
-                    if not str(fallback_from.get(field, "")).strip():
-                        missing_fallback.append(f"fallback_from.{field}")
-            if not str(route.get("failure_evidence", "")).strip():
-                missing_fallback.append("failure_evidence")
-            if route.get("prior_attempt_terminal") is not True:
-                missing_fallback.append("prior_attempt_terminal=true")
-            if route.get("result_unknown") is not False:
-                missing_fallback.append("result_unknown=false")
-            if missing_fallback:
-                errors.append(
-                    f"{task_id} safe fallback requires " + ", ".join(missing_fallback)
+            errors.extend(
+                canonical_safe_fallback_errors(
+                    task_id, route, runtime_repo=runtime_repo
                 )
+            )
     return errors
 
 
@@ -1401,62 +1307,6 @@ def traceable_runtime_evidence(value: Any) -> bool:
         return False
     scheme, locator = token.split(":", 1)
     return scheme in {"receipt", "artifact"} and bool(locator.strip())
-
-
-def route_policy_errors(task_id: str, route: dict[str, Any]) -> list[str]:
-    source = route.get("policy_source")
-    if not isinstance(source, dict):
-        return []
-    raw_path = str(source.get("path", "")).strip()
-    expected_sha = str(source.get("sha256", "")).strip().lower()
-    if not raw_path or not expected_sha:
-        return []
-    path = Path(raw_path).expanduser()
-    if not path.is_absolute():
-        return [f"{task_id} route policy_source.path must be absolute"]
-    try:
-        payload = path.read_bytes()
-    except OSError as error:
-        return [f"{task_id} route policy source is unreadable: {error}"]
-    if hashlib.sha256(payload).hexdigest() != expected_sha:
-        return [f"{task_id} route policy_source.sha256 does not match the policy file"]
-
-    decision = str(route.get("decision", "")).strip().lower()
-    if decision == "default":
-        selected: Any = route
-    elif decision == "safe_fallback":
-        selected = route.get("fallback_from")
-    elif decision == "controller_exception":
-        selected = route.get("default_route")
-        if not isinstance(selected, dict):
-            return [f"{task_id} controller_exception route requires default_route"]
-    else:
-        return []
-    if not isinstance(selected, dict):
-        return []
-    route_values = {
-        field: str(selected.get(field, "")).strip()
-        for field in ("provider", "model", "auth_mode")
-    }
-    if any(not value for value in route_values.values()):
-        return []
-    policy_class = str(route.get("policy_class", "")).strip().lower()
-    markers = ROUTE_CLASS_MARKERS.get(policy_class, (policy_class,)) if policy_class else ()
-    policy_text = payload.decode("utf-8", errors="replace")
-    for line in policy_text.splitlines():
-        lowered = line.casefold()
-        if markers and not any(marker.casefold() in lowered for marker in markers):
-            continue
-        if all(
-            re.search(
-                rf"{field}\s*=\s*{re.escape(value)}(?=$|[^A-Za-z0-9_.-])",
-                line,
-                re.IGNORECASE,
-            )
-            for field, value in route_values.items()
-        ):
-            return []
-    return [f"{task_id} route is not declared by policy source"]
 
 
 def _string_list_set(value: Any) -> set[str]:
@@ -1629,6 +1479,7 @@ def validate_snapshot(
     expected_controller_action_ids: set[str] | None = None,
     expected_corrections: Sequence[dict[str, Any]] | None = None,
     require_control_loop_receipt: bool = False,
+    runtime_repo: str | Path | None = None,
 ) -> list[str]:
     errors: list[str] = []
     contract = snapshot.get("event_contract")
@@ -1867,6 +1718,7 @@ def validate_snapshot(
                 expected_candidates=expected_candidates,
                 expected_main_revision=expected_main_revision,
                 expected_integrated_revisions=expected_integrated_revisions,
+                runtime_repo=runtime_repo,
             )
         )
     errors.extend(validate_review_transitions(snapshot, expected_main_revision=expected_main_revision))
@@ -2245,6 +2097,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_controller_action_ids=set(expected_controller_actions),
         expected_corrections=expected_corrections,
         require_control_loop_receipt=bool(trace_session),
+        runtime_repo=repo_root,
     )
     if repo_root is not None:
         errors.extend(canonical_rule_handshake_errors(repo_root, ledger, snapshot=snapshot))

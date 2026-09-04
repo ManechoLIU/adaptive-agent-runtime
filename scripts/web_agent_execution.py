@@ -107,16 +107,23 @@ def _immutable_git_commit(repo: Path, candidate: str) -> str:
     return resolved
 
 
-def _validate_web_assignment_route(assignment: dict[str, Any]) -> dict[str, Any]:
+def _validate_web_assignment_route(
+    assignment: dict[str, Any], *, runtime_repo: str | Path
+) -> dict[str, Any]:
     """Bind Web execution to the same canonical delegated route contract as every other executor."""
     try:
-        from scripts.control_event_guard import delegated_route_contract_errors
+        from scripts.route_contract import delegated_route_contract_errors
     except ModuleNotFoundError:
-        from control_event_guard import delegated_route_contract_errors
+        from route_contract import delegated_route_contract_errors
 
     task_id = str(assignment.get("task_id") or "").strip() or "unknown"
     route = assignment.get("route")
-    errors = delegated_route_contract_errors(task_id, assignment.get("owned_scope"), route)
+    errors = delegated_route_contract_errors(
+        task_id,
+        assignment.get("owned_scope"),
+        route,
+        runtime_repo=runtime_repo,
+    )
     if errors:
         raise PermissionError("Web Assignment route rejected: " + "; ".join(errors))
     assert isinstance(route, dict)
@@ -144,7 +151,7 @@ def _start_receipt(repo: Path, event: dict[str, Any], now: datetime) -> dict[str
     missing = [key for key in required if assignment.get(key) in (None, "", [])]
     if missing:
         raise ValueError("Web execution Assignment missing contract: " + ", ".join(missing))
-    route = _validate_web_assignment_route(assignment)
+    route = _validate_web_assignment_route(assignment, runtime_repo=repo)
     conversation_id = str(event.get("conversation_id") or "").strip()
     if conversation_id == str(event.get("controller_id") or "").strip():
         raise ValueError("Web conversation identity must never be used as controller identity")
@@ -272,7 +279,7 @@ def _dispatch_start_receipt(
     missing = [key for key in required if assignment.get(key) in (None, "", [])]
     if missing:
         raise ValueError("Web execution Assignment missing contract: " + ", ".join(missing))
-    route = _validate_web_assignment_route(assignment)
+    route = _validate_web_assignment_route(assignment, runtime_repo=repo)
     if not conversation_id or conversation_id == controller_id:
         raise ValueError("Web conversation execution identity must be distinct from Controller identity")
     role = str(assignment.get("role") or "writer").strip().lower()

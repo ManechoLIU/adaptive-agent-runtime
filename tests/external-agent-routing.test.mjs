@@ -15,16 +15,35 @@ const adapter = path.join(skillRoot, "scripts", "run_external_agent.mjs");
 async function assignmentAckFile(directory, overrides = {}, repositoryRoot = skillRoot) {
   const branch = execFileSync("git", ["-C", repositoryRoot, "branch", "--show-current"], { encoding: "utf8" }).trim();
   const head = execFileSync("git", ["-C", repositoryRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const policyPath = path.join(directory, "assignment-route-policy.md");
+  const policyText = [
+    "backend default provider=grok-build、model=grok-4.6、auth_mode=oauth。",
+    "frontend default provider=kimi-code、model=kimi-k3、auth_mode=api。",
+    "frontend fallback provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。",
+  ].join(String.fromCharCode(10)) + String.fromCharCode(10);
+  await writeFile(policyPath, policyText);
+  const route = {
+    decision: "default",
+    policy_class: "backend",
+    provider: "grok-build",
+    model: "grok-4.6",
+    auth_mode: "oauth",
+    policy_source: {
+      path: policyPath,
+      sha256: crypto.createHash("sha256").update(policyText).digest("hex"),
+    },
+  };
   const assignment = {
     assignment_id: "a1", task_id: "T1", agent_id: "writer", state: "ACKED",
     primary_goal: "finish bounded task", success_criteria: ["green"], owned_scope: ["scripts/run_external_agent.mjs"],
     assignment_contract_version: 2, side_effect: false, idempotency_key: null,
     forbidden_scope: [], parallelizable: true, observed_modified_files: [],
+    route,
     ack: { repository_root: repositoryRoot, branch, head, status: "clean", owned_files: ["scripts/run_external_agent.mjs"], first_red: "red", stop_condition: "candidate" },
     ...overrides,
   };
   if (overrides.ack) assignment.ack = { ...assignment.ack, ...overrides.ack };
-  const target = path.join(directory, `assignment-${Math.random().toString(36).slice(2)}.json`);
+  const target = path.join(directory, "assignment-" + Math.random().toString(36).slice(2) + ".json");
   await writeFile(target, JSON.stringify(assignment));
   return target;
 }
@@ -46,7 +65,7 @@ async function fakeInstalledSkill(directory) {
   const root = path.join(directory, "installed-skill");
   const scripts = path.join(root, "scripts");
   await mkdir(scripts, { recursive: true });
-  for (const file of ["run_external_agent.mjs", "assignment_lease_guard.py", "assignment_runtime.py", "project_state.py", "rule_handshake.py"]) {
+  for (const file of ["run_external_agent.mjs", "assignment_lease_guard.py", "assignment_runtime.py", "route_contract.py", "project_state.py", "rule_handshake.py"]) {
     await copyFile(path.join(skillRoot, "scripts", file), path.join(scripts, file));
   }
   const rel = "scripts/rule_handshake.py";
@@ -665,6 +684,98 @@ test("assignment-bound execute rejects missing side-effect contract before spawn
   await assert.rejects(readFile(marker, "utf8"));
 });
 
+test("assignment-bound execute rejects CLI route mismatch before provider spawn", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-route-mismatch-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, {
+    route: {
+      decision: "default",
+      policy_class: "frontend",
+      provider: "kimi-code",
+      model: "kimi-k3",
+      auth_mode: "api",
+      policy_source: JSON.parse(await readFile(await assignmentAckFile(bin, {}, repo), "utf8")).route.policy_source,
+    },
+  }, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack,
+  ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: [bin, process.env.PATH || ""].join(path.delimiter), GROK_HOME: grokHome, SPAWN_MARKER: marker } });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /route|provider|model|auth/i);
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
+test("assignment-bound safe fallback requires canonical prior terminal before provider spawn", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-safe-fallback-proof-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const baseAckPath = await assignmentAckFile(bin, {}, repo);
+  const baseAck = JSON.parse(await readFile(baseAckPath, "utf8"));
+  const ack = await assignmentAckFile(bin, {
+    route: {
+      decision: "safe_fallback",
+      policy_class: "backend",
+      provider: "grok-build",
+      model: "grok-4.6",
+      auth_mode: "oauth",
+      policy_source: baseAck.route.policy_source,
+      fallback_from: { provider: "kimi-code", model: "kimi-k3", auth_mode: "api" },
+      prior_assignment_id: "missing-prior",
+      failure_evidence: "receipt:kimi/missing-prior",
+      prior_attempt_terminal: true,
+      result_unknown: false,
+    },
+  }, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack,
+  ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: [bin, process.env.PATH || ""].join(path.delimiter), GROK_HOME: grokHome, SPAWN_MARKER: marker } });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /canonical|prior|fallback|runtime/i);
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
+test("assignment-bound external start persists exact canonical route contract", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-route-runtime-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, { assignment_id: "route-runtime-a1" }, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "route-runtime-a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "route-runtime-s1",
+    "--assignment-ack", ack,
+  ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: [bin, process.env.PATH || ""].join(path.delimiter), GROK_HOME: grokHome } });
+  assert.equal(result.status, 0, result.stderr);
+  const common = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
+  const state = JSON.parse(await readFile(path.join(path.resolve(repo, common), "adaptive-delivery", "runtime-assignments.json"), "utf8"));
+  const lease = state.leases["route-runtime-a1"];
+  assert.equal(lease.provider, "grok-build");
+  assert.equal(lease.model, "grok-4.6");
+  assert.equal(lease.auth_mode, "oauth");
+  assert.equal(lease.route_decision, "default");
+  assert.equal(lease.route_contract.provider, "grok-build");
+  assert.equal(lease.route_contract.model, "grok-4.6");
+  assert.equal(lease.route_contract.auth_mode, "oauth");
+});
+
 test("assignment-bound execute spawns only after exact delivered ACK passes", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-ack-good-"));
   const repo = await makeAssignmentRepo(bin);
@@ -863,6 +974,37 @@ test("external execution emits progress when tracked worktree evidence changes",
   assert.notEqual(progress.last_progress_phase, "RED");
   JSON.stringify(progress.progress_evidence);
   assert.equal(events.at(-1).event_type, "assignment_terminal");
+});
+
+test("short assignment-bound execution reconciles final Git progress before terminal", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-final-progress-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const receipts = path.join(bin, "receipts.jsonl");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "final-progress-a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", await assignmentAckFile(bin, { assignment_id: "final-progress-a1" }, repo),
+    "--attempt", "1", "--lease-id", "final-progress-lease-1", "--runtime-receipts", receipts,
+  ], { encoding: "utf8", input: "bounded contract", env: {
+    ...process.env,
+    PATH: [bin, process.env.PATH || ""].join(path.delimiter),
+    GROK_HOME: grokHome,
+    FAKE_RUNNER_TOUCH_FILE: path.join(repo, "TASK_LEDGER.md"),
+    FAKE_RUNNER_DELAY_MS: "0",
+    AD_RUNTIME_HEARTBEAT_MS: "1000",
+  } });
+  assert.equal(result.status, 0, result.stderr);
+  const events = (await readFile(receipts, "utf8")).trim().split(String.fromCharCode(10)).map(JSON.parse);
+  const progressIndex = events.findIndex((event) => event.event_type === "assignment_progress");
+  const terminalIndex = events.findIndex((event) => event.event_type === "assignment_terminal");
+  assert.ok(progressIndex >= 0, JSON.stringify(events));
+  assert.ok(terminalIndex > progressIndex, JSON.stringify(events));
+  assert.ok(events[progressIndex].progress_evidence.changed_fields.includes("last_observed_status_sha256"));
 });
 
 test("assignment-bound start carries a ten-minute implementation progress budget", async () => {

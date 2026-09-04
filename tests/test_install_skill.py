@@ -365,8 +365,8 @@ class InstallMigrationContractTests(unittest.TestCase):
         (source / "scripts").mkdir()
         for name in (
             "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
-            "web_agent_health_supervisor.py", "web_agent_events.py",
-            "control_event_guard.py", "controller_state.py",
+            "web_agent_health_supervisor.py", "web_agent_events.py", "route_contract.py",
+            "control_event_guard.py", "controller_state.py", "assignment_lease_guard.py",
         ):
             script = source / "scripts" / name
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
@@ -607,7 +607,11 @@ class InstallMigrationContractTests(unittest.TestCase):
             (tests_dir / "external-agent-routing.test.mjs").write_text(
                 "import test from 'node:test';\n"
                 "import assert from 'node:assert/strict';\n"
-                "test('heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors', () => { assert.equal(1, 1); });\n",
+                "test('heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors', () => { assert.equal(1, 1); });\n"
+                "test('assignment-bound execute rejects CLI route mismatch before provider spawn', () => { assert.equal(1, 1); });\n"
+                "test('assignment-bound safe fallback requires canonical prior terminal before provider spawn', () => { assert.equal(1, 1); });\n"
+                "test('assignment-bound external start persists exact canonical route contract', () => { assert.equal(1, 1); });\n"
+                "test('short assignment-bound execution reconciles final Git progress before terminal', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
@@ -654,6 +658,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):\n"
                 "    def test_machine_event_source_public_status_cannot_accept_caller_verifier(self): self.assertTrue(True)\n"
                 "    def test_forged_local_machine_event_receipt_cannot_enable_production_prepare(self): self.assertTrue(True)\n"
+                "    def test_forged_safe_fallback_fields_without_canonical_prior_terminal_are_rejected(self): self.assertTrue(True)\n"
+                "    def test_safe_fallback_policy_must_declare_selected_fallback_route_not_only_origin(self): self.assertTrue(True)\n"
+                "    def test_canonical_kimi_terminal_with_declared_route_can_prepare_web_fallback(self): self.assertTrue(True)\n"
                 "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
                 "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n",
                 encoding="utf-8",
@@ -687,7 +694,11 @@ class InstallMigrationContractTests(unittest.TestCase):
             (tests_dir / "external-agent-routing.test.mjs").write_text(
                 "import test from 'node:test';\n"
                 "import assert from 'node:assert/strict';\n"
-                "test('heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors', () => { assert.equal(1, 1); });\n",
+                "test('heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors', () => { assert.equal(1, 1); });\n"
+                "test('assignment-bound execute rejects CLI route mismatch before provider spawn', () => { assert.equal(1, 1); });\n"
+                "test('assignment-bound safe fallback requires canonical prior terminal before provider spawn', () => { assert.equal(1, 1); });\n"
+                "test('assignment-bound external start persists exact canonical route contract', () => { assert.equal(1, 1); });\n"
+                "test('short assignment-bound execution reconciles final Git progress before terminal', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
@@ -734,6 +745,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):\n"
                 "    def test_machine_event_source_public_status_cannot_accept_caller_verifier(self): self.assertTrue(True)\n"
                 "    def test_forged_local_machine_event_receipt_cannot_enable_production_prepare(self): self.assertTrue(True)\n"
+                "    def test_forged_safe_fallback_fields_without_canonical_prior_terminal_are_rejected(self): self.assertTrue(True)\n"
+                "    def test_safe_fallback_policy_must_declare_selected_fallback_route_not_only_origin(self): self.assertTrue(True)\n"
+                "    def test_canonical_kimi_terminal_with_declared_route_can_prepare_web_fallback(self): self.assertTrue(True)\n"
                 "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
                 "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n",
                 encoding="utf-8",

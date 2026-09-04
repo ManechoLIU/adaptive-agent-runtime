@@ -10,8 +10,10 @@ from typing import Any, Sequence
 
 try:
     from scripts.assignment_runtime import evaluate_lease
+    from scripts.route_contract import delegated_route_contract_errors
 except ModuleNotFoundError:
     from assignment_runtime import evaluate_lease
+    from route_contract import delegated_route_contract_errors
 
 
 STATES = {"RESERVED", "ACKED", "ACTIVE", "CANDIDATE", "FROZEN", "TERMINAL"}
@@ -46,6 +48,10 @@ def validate_assignment(
     expected_repository_root: str | None = None,
     expected_branch: str | None = None,
     expected_head: str | None = None,
+    expected_provider: str | None = None,
+    expected_model: str | None = None,
+    expected_auth_mode: str | None = None,
+    runtime_repo: str | Path | None = None,
 ) -> list[str]:
     errors: list[str] = []
     assignment_id = str(assignment.get("assignment_id", "")).strip()
@@ -124,6 +130,39 @@ def validate_assignment(
         if expected_head is not None and str(ack.get("head", "")).strip() != expected_head:
             errors.append("ack.head does not match launch revision")
 
+    launch_route_expected = any(
+        value is not None
+        for value in (expected_provider, expected_model, expected_auth_mode)
+    )
+    contract_version_raw = assignment.get("assignment_contract_version", 1)
+    try:
+        contract_version = int(contract_version_raw)
+    except (TypeError, ValueError):
+        contract_version = 0
+    route = assignment.get("route")
+    if launch_route_expected and contract_version >= 2 and not isinstance(route, dict):
+        errors.append("v2 assignment-bound launch requires canonical route contract")
+    if isinstance(route, dict) and launch_route_expected:
+        task_id = str(assignment.get("task_id", "")).strip() or "assignment"
+        errors.extend(
+            delegated_route_contract_errors(
+                task_id,
+                assignment.get("owned_scope"),
+                route,
+                runtime_repo=runtime_repo,
+            )
+        )
+        expected_route = {
+            "provider": str(expected_provider or "").strip(),
+            "model": str(expected_model or "").strip(),
+            "auth_mode": str(expected_auth_mode or "").strip(),
+        }
+        for field, expected in expected_route.items():
+            if expected and str(route.get(field, "")).strip() != expected:
+                errors.append(
+                    f"assignment route {field} does not match launch executor"
+                )
+
     previous = assignment.get("previous_assignment")
     if previous is not None:
         if not isinstance(previous, dict):
@@ -183,6 +222,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--expected-repository-root")
     parser.add_argument("--expected-branch")
     parser.add_argument("--expected-head")
+    parser.add_argument("--expected-provider")
+    parser.add_argument("--expected-model")
+    parser.add_argument("--expected-auth-mode")
+    parser.add_argument("--runtime-repo")
     args = parser.parse_args(argv)
     try:
         assignment = load_json(args.assignment)
@@ -197,6 +240,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_repository_root=args.expected_repository_root,
         expected_branch=args.expected_branch,
         expected_head=args.expected_head,
+        expected_provider=args.expected_provider,
+        expected_model=args.expected_model,
+        expected_auth_mode=args.expected_auth_mode,
+        runtime_repo=args.runtime_repo,
     )
     for error in errors:
         print(f"assignment-lease: blocked: {error}")
