@@ -17,9 +17,9 @@ try:
 except ModuleNotFoundError:
     from scripts.controller_scoring_guard import consume_score_guard, cycle_score_extremes, finalize_attested_cycle_score, finalize_cycle_candidate, finalize_score, governance_risk_projection, latest_score_history, read_and_record_model, receipt_path
 try:
-    from evaluation_transaction import COMPUTE, COMPUTED, READ, begin_evaluation, classify_evaluation_intent, correct_evaluation, evidence_snapshot_sha256
+    from evaluation_transaction import COMPUTE, COMPUTED, DERIVED, READ, begin_evaluation, classify_evaluation_intent, correct_evaluation, evidence_snapshot_sha256, validate_completion
 except ModuleNotFoundError:
-    from scripts.evaluation_transaction import COMPUTE, COMPUTED, READ, begin_evaluation, classify_evaluation_intent, correct_evaluation, evidence_snapshot_sha256
+    from scripts.evaluation_transaction import COMPUTE, COMPUTED, DERIVED, READ, begin_evaluation, classify_evaluation_intent, correct_evaluation, evidence_snapshot_sha256, validate_completion
 try:
     from project_context_guard import initialize_project_context
 except ModuleNotFoundError:
@@ -186,6 +186,127 @@ def _extract_labeled_score(message: str, labels: tuple[str, ...]) -> float | Non
 
 def _is_unknown(value: str | None) -> bool:
     return str(value or "").strip().upper() == "UNKNOWN"
+
+
+EVALUATION_DIMENSION_WEIGHTS = {
+    "goal_progress": 0.25,
+    "task_decomposition": 0.15,
+    "critical_path_priority": 0.15,
+    "scheduling_execution": 0.15,
+    "quality_acceptance_evidence": 0.10,
+    "recovery_flow": 0.10,
+    "control_plane_auditability": 0.10,
+}
+
+
+def _extract_evaluation_dimension_scores(message: str) -> dict[str, float]:
+    raw = _extract_labeled_value(
+        message,
+        (r"七维原始分", r"dimension raw scores"),
+    )
+    if raw is None:
+        raise ValueError(
+            "COMPUTE evaluation requires machine-checkable seven-dimension raw scores"
+        )
+    values: dict[str, float] = {}
+    for item in re.split(r"\s*[,，;；]\s*", raw):
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError("dimension raw score entry must use key=value")
+        key, text = item.split("=", 1)
+        key = key.strip()
+        if key not in EVALUATION_DIMENSION_WEIGHTS or key in values:
+            raise ValueError(f"unknown or duplicate evaluation dimension {key or 'EMPTY'}")
+        try:
+            value = float(text.strip())
+        except ValueError as error:
+            raise ValueError(f"invalid raw score for {key}") from error
+        if not 0 <= value <= 100:
+            raise ValueError(f"raw score for {key} must be within 0..100")
+        values[key] = value
+    if set(values) != set(EVALUATION_DIMENSION_WEIGHTS):
+        missing = sorted(set(EVALUATION_DIMENSION_WEIGHTS) - set(values))
+        extra = sorted(set(values) - set(EVALUATION_DIMENSION_WEIGHTS))
+        raise ValueError(
+            "seven-dimension raw score vector is incomplete"
+            + (f"; missing={missing}" if missing else "")
+            + (f"; extra={extra}" if extra else "")
+        )
+    return values
+
+
+def _runtime_weighted_performance(dimension_scores: dict[str, float]) -> float:
+    return round(
+        sum(
+            float(dimension_scores[key]) * weight
+            for key, weight in EVALUATION_DIMENSION_WEIGHTS.items()
+        ),
+        6,
+    )
+
+
+def _evaluation_calculation_receipt(
+    message: str,
+    transaction: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    errors: list[str] = []
+    try:
+        dimensions = _extract_evaluation_dimension_scores(message)
+    except ValueError as error:
+        return None, [str(error)]
+    performance = _extract_labeled_score(
+        message,
+        (r"近期履职能力", r"recent performance score"),
+    )
+    if performance is None:
+        return None, ["COMPUTE evaluation requires recent performance score"]
+    runtime_performance = _runtime_weighted_performance(dimensions)
+    if abs(float(performance) - runtime_performance) > 1e-6:
+        errors.append(
+            "recent performance score does not equal Runtime weighted seven-dimension calculation"
+        )
+
+    errors.extend(
+        validate_completion(
+            transaction,
+            result={
+                "dimension_scores": dimensions,
+                "performance_score": runtime_performance,
+            },
+            provenance={
+                "dimension_scores": COMPUTED,
+                "performance_score": DERIVED,
+            },
+            core_fields=("dimension_scores", "performance_score"),
+        )
+    )
+    material = {
+        "schema_version": 1,
+        "evaluation_id": transaction.get("evaluation_id"),
+        "evidence_snapshot_sha256": transaction.get("evidence_snapshot_sha256"),
+        "model_sha256": (
+            transaction.get("model", {}).get("sha256")
+            if isinstance(transaction.get("model"), dict)
+            else None
+        ),
+        "dimension_scores": {
+            key: dimensions[key] for key in EVALUATION_DIMENSION_WEIGHTS
+        },
+        "dimension_weights": dict(EVALUATION_DIMENSION_WEIGHTS),
+        "performance_score": runtime_performance,
+    }
+    canonical = json.dumps(
+        material,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    receipt = {
+        **material,
+        "calculation_receipt_sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+    return receipt, errors
 
 
 def _validate_cycle_extrema_claim(
@@ -379,6 +500,11 @@ def _evaluation_context(transaction: dict[str, Any]) -> str:
         + "evaluation_model_sha256=" + str(transaction.get("model", {}).get("sha256", ""))
         + chr(10)
         + "For the core new result, output provenance must be COMPUTED. Risk/cap results remain separate DERIVED layers."
+        + chr(10)
+        + "For COMPUTE, also output exactly one 七维原始分 line with these keys: "
+        + "goal_progress, task_decomposition, critical_path_priority, scheduling_execution, "
+        + "quality_acceptance_evidence, recovery_flow, control_plane_auditability. "
+        + "Use key=value pairs on 0..100. Runtime—not the response—recomputes the 25/15/15/15/10/10/10 weighted performance score and creates the calculation receipt."
     )
 
 
@@ -412,6 +538,8 @@ def _evaluation_metadata_errors(
     expected_model = str(transaction.get("model", {}).get("sha256", "")).lower()
     if str(model_sha or "").strip().lower() != expected_model:
         errors.append("model sha256 does not match the current evaluation transaction")
+    _, calculation_errors = _evaluation_calculation_receipt(message, transaction)
+    errors.extend(calculation_errors)
     return errors
 
 
@@ -787,6 +915,24 @@ def evaluate_event(
                         model_sha256=installed_digest,
                     )
                     _validate_cycle_extrema_claim(message, expected=expected_extremes)
+                    evaluation_for_history = evaluation_transaction
+                    if (
+                        isinstance(evaluation_transaction, dict)
+                        and str(evaluation_transaction.get("intent", "")).upper() == COMPUTE
+                    ):
+                        calculation_receipt, calculation_errors = _evaluation_calculation_receipt(
+                            message, evaluation_transaction
+                        )
+                        if calculation_errors or calculation_receipt is None:
+                            raise ValueError(
+                                "evaluation calculation receipt invalid: "
+                                + "; ".join(calculation_errors)
+                            )
+                        performance_score = float(calculation_receipt["performance_score"])
+                        evaluation_for_history = {
+                            **evaluation_transaction,
+                            "calculation_receipt": calculation_receipt,
+                        }
                     finalized = finalize_score(
                         Path(repo_text), skill_root=skill_root,
                         controller_session_id=controller_id,
@@ -796,9 +942,9 @@ def evaluate_event(
                         message_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
                         receipt_id=receipt_id,
                         evaluation_transaction=(
-                            evaluation_transaction
-                            if isinstance(evaluation_transaction, dict)
-                            and str(evaluation_transaction.get("intent", "")).upper() == COMPUTE
+                            evaluation_for_history
+                            if isinstance(evaluation_for_history, dict)
+                            and str(evaluation_for_history.get("intent", "")).upper() == COMPUTE
                             else None
                         ),
                     )
@@ -806,7 +952,7 @@ def evaluate_event(
                         isinstance(evaluation_transaction, dict)
                         and str(evaluation_transaction.get("intent", "")).upper() == COMPUTE
                     ):
-                        completed_evaluation = dict(evaluation_transaction)
+                        completed_evaluation = dict(evaluation_for_history)
                         completed_evaluation["state"] = "CLOSED"
                         completed_evaluation["result_provenance"] = COMPUTED
                         completed_evaluation["history_recorded_at"] = finalized.get("recorded_at")

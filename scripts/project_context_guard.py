@@ -43,6 +43,17 @@ UNKNOWN_MARKER = re.compile(
     r"(?:UNKNOWN|NOT[ 	]+FOUND|未找到|找不到|无法读取|未知)",
     re.IGNORECASE,
 )
+UNRESOLVED_MECHANISM_RESPONSE = re.compile(
+    r"^\s*(?:UNKNOWN(?:\s*/\s*NOT[ \t]+FOUND)?|NOT[ \t]+FOUND|未找到|未知)"
+    r"\s*(?:[:：]\s*(?:"
+    r"(?:当前|现有|本项目|该项目|权威|事实源|项目事实源|当前权威事实源中|当前事实源中)"
+    r".{0,80}(?:未找到|没有找到|找不到|无法读取|无法确认|缺少|不存在)"
+    r".{0,80}"
+    r"|(?:当前权威事实源中)?(?:未找到|没有找到|找不到|无法读取|无法确认|缺少|不存在)"
+    r".{0,120}"
+    r"))?[。.!！]?\s*$",
+    re.IGNORECASE,
+)
 
 _GENERIC_MECHANISM_PREFIXES = (
     "治理体系里的", "治理体系中的", "治理体系现有", "治理体系当前",
@@ -118,6 +129,57 @@ def _source(path: Path, *, required: bool = False, max_bytes: int = 256 * 1024) 
     }
 
 
+def _applicable_agents_source(root: Path, cwd: Path) -> dict[str, Any]:
+    """Resolve the full AGENTS.md scope chain from repo root through current cwd."""
+    root = root.resolve()
+    cwd = cwd.resolve()
+    try:
+        relative = cwd.relative_to(root)
+    except ValueError:
+        relative = Path(".")
+        cwd = root
+
+    directories = [root]
+    current = root
+    for part in relative.parts:
+        if part in {"", "."}:
+            continue
+        current = current / part
+        directories.append(current)
+
+    chain: list[dict[str, Any]] = []
+    for directory in directories:
+        item = _source(directory / "AGENTS.md", required=False)
+        if item.get("status") == "verified":
+            chain.append(item)
+
+    if not chain:
+        return {
+            "status": "missing_required",
+            "path": str((root / "AGENTS.md").resolve(strict=False)),
+            "scope_chain": [],
+        }
+
+    identity = [
+        {"path": item["path"], "sha256": item["sha256"]}
+        for item in chain
+    ]
+    content = (chr(10) * 2).join(
+        f"## scoped instructions: {item['path']}" + chr(10) + str(item.get("content", ""))
+        for item in chain
+    )
+    return {
+        "status": "verified",
+        "path": chain[-1]["path"],
+        "sha256": _sha256_bytes(
+            json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ),
+        "bytes": sum(int(item.get("bytes", 0)) for item in chain),
+        "content": content,
+        "scope_chain": chain,
+    }
+
+
 def _git_facts(repo: Path) -> dict[str, Any]:
     def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -151,11 +213,12 @@ def initialize_project_context(
     *,
     skill_root: str | Path,
 ) -> dict[str, Any]:
-    root = _repo_root(repo)
+    working_directory = Path(repo).expanduser().resolve()
+    root = _repo_root(working_directory)
     skill = Path(skill_root).expanduser().resolve()
     ledger = root / ("TASK_LEDGER.md" if (root / "TASK_LEDGER.md").is_file() else "PROJECT_STATUS.md")
     sources = {
-        "agents": _source(root / "AGENTS.md", required=True),
+        "agents": _applicable_agents_source(root, working_directory),
         "project_skill": _source(root / "SKILL.md", required=False),
         "runtime_skill": _source(skill / "SKILL.md", required=True),
         "ledger": _source(ledger, required=False),
@@ -179,6 +242,7 @@ def initialize_project_context(
         "schema_version": 1,
         "state": state,
         "project_root": str(root),
+        "working_directory": str(working_directory),
         "runtime_skill_root": str(skill),
         "sources": sources,
         "verified_facts": verified,
@@ -193,19 +257,48 @@ def _receipt_source_changed(receipt: dict[str, Any]) -> bool:
     sources = receipt.get("sources")
     if not isinstance(sources, dict):
         return True
-    for name in ("agents", "project_skill", "runtime_skill", "ledger", "runtime_state"):
-        source = sources.get(name)
-        if not isinstance(source, dict) or source.get("status") != "verified":
-            continue
-        path = Path(str(source.get("path", "")))
-        try:
-            current = _sha256_bytes(path.read_bytes())
-        except OSError:
-            return True
-        if current != str(source.get("sha256", "")):
-            return True
     try:
-        root = Path(str(receipt.get("project_root", ""))).resolve()
+        root = Path(str(receipt.get("project_root") or "")).resolve()
+        cwd = Path(str(receipt.get("working_directory") or root)).resolve()
+    except (OSError, ValueError):
+        return True
+
+    for name in ("agents", "project_skill", "runtime_skill", "ledger", "runtime_state"):
+        prior = sources.get(name)
+        if not isinstance(prior, dict):
+            return True
+        try:
+            if name == "agents":
+                current = _applicable_agents_source(root, cwd)
+            elif name == "runtime_state":
+                current = _runtime_state_source(root)
+            else:
+                raw_path = str(prior.get("path") or "").strip()
+                if not raw_path:
+                    return True
+                current = _source(
+                    Path(raw_path),
+                    required=(name == "runtime_skill"),
+                    max_bytes=(512 * 1024 if name == "runtime_state" else 256 * 1024),
+                )
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            return True
+
+        prior_status = str(prior.get("status") or "")
+        current_status = str(current.get("status") or "")
+        if current_status != prior_status:
+            return True
+        if current_status == "verified":
+            if str(current.get("sha256") or "") != str(prior.get("sha256") or ""):
+                return True
+        elif current_status == "too_large":
+            if str(current.get("sha256") or "") != str(prior.get("sha256") or ""):
+                return True
+        elif current_status == "unreadable":
+            if str(current.get("error") or "") != str(prior.get("error") or ""):
+                return True
+
+    try:
         current_git = _git_facts(root)
     except (OSError, subprocess.CalledProcessError, ValueError):
         return True
@@ -456,6 +549,18 @@ def is_project_fact_request(prompt: str) -> bool:
     return bool(PROJECT_FACT_REQUEST.search(str(prompt or "")) or EXISTING_MECHANISM_REQUEST.search(str(prompt or "")))
 
 
+def unresolved_mechanism_response_is_safe(message: str) -> bool:
+    """Allow only an uncertainty-only answer when current mechanism resolution is not_found."""
+    text = str(message or "").strip()
+    if not text or not UNKNOWN_MARKER.search(text):
+        return False
+    if re.search(r"\d", text):
+        return False
+    if re.search(r"\b(?:provider|model|auth_mode)\s*=", text, re.IGNORECASE):
+        return False
+    return bool(UNRESOLVED_MECHANISM_RESPONSE.fullmatch(text))
+
+
 def looks_like_project_fact_output(message: str) -> bool:
     text = str(message or "")
     return bool(PROJECT_FACT_OUTPUT.search(text) and not UNKNOWN_MARKER.search(text))
@@ -639,13 +744,15 @@ def evaluate_event(
                 state=state,
                 reason="resolved_mechanism_changed_before_stop",
             )
-        if mechanism.get("state") == "not_found" and not UNKNOWN_MARKER.search(message):
+        if mechanism.get("state") == "not_found" and not unresolved_mechanism_response_is_safe(message):
             state["correction_required"] = True
             return {
                 "decision": "block",
                 "reason": (
                     "Existing project mechanism is UNKNOWN / NOT FOUND in current authoritative sources. "
-                    "Do not synthesize or approximate a replacement; explicitly report UNKNOWN / NOT FOUND."
+                    "The final answer must be uncertainty-only: start with UNKNOWN / NOT FOUND (or 未找到/未知) "
+                    "and state only that the current authoritative sources do not establish the mechanism. "
+                    "Do not append scores, dimensions, replacement rules, provider/model declarations, or other definitive claims."
                     + chr(10)
                     + _context_text(receipt, mechanism=mechanism)
                 ),

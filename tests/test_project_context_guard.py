@@ -88,6 +88,52 @@ class ProjectContextGuardTests(unittest.TestCase):
         self.assertIn("verified_facts=", context)
         self.assertIn("unknown_facts=", context)
 
+    def test_nested_working_directory_loads_all_applicable_agents_in_scope_order(self):
+        module = self.hook()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            nested = root / "packages" / "web"
+            nested.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "AGENTS.md").write_text("root-rule" + chr(10), encoding="utf-8")
+            (root / "packages" / "AGENTS.md").write_text("package-rule" + chr(10), encoding="utf-8")
+            (nested / "AGENTS.md").write_text("web-rule" + chr(10), encoding="utf-8")
+            receipt = module.initialize_project_context(nested, skill_root=ROOT)
+        agents = receipt["sources"]["agents"]
+        self.assertEqual(receipt["state"], "initialized")
+        self.assertEqual(
+            [Path(item["path"]).parent.name for item in agents["scope_chain"]],
+            ["repo", "packages", "web"],
+        )
+        self.assertLess(agents["content"].index("root-rule"), agents["content"].index("package-rule"))
+        self.assertLess(agents["content"].index("package-rule"), agents["content"].index("web-rule"))
+
+    def test_nested_agents_can_initialize_context_when_repo_root_has_no_agents(self):
+        module = self.hook()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            nested = root / "service"
+            nested.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (nested / "AGENTS.md").write_text("service-rule" + chr(10), encoding="utf-8")
+            receipt = module.initialize_project_context(nested, skill_root=ROOT)
+        self.assertEqual(receipt["state"], "initialized")
+        self.assertEqual(len(receipt["sources"]["agents"]["scope_chain"]), 1)
+        self.assertIn("service-rule", receipt["sources"]["agents"]["content"])
+
+    def test_new_nested_agents_scope_invalidates_existing_context_receipt(self):
+        module = self.hook()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            nested = root / "packages" / "web"
+            nested.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "AGENTS.md").write_text("root-rule" + chr(10), encoding="utf-8")
+            receipt = module.initialize_project_context(nested, skill_root=ROOT)
+            self.assertFalse(module._receipt_source_changed(receipt))
+            (root / "packages" / "AGENTS.md").write_text("new-package-rule" + chr(10), encoding="utf-8")
+            self.assertTrue(module._receipt_source_changed(receipt))
+
     def test_existing_scoring_model_request_must_resolve_real_current_definition(self):
         hook = self.hook()
         output, state = hook.evaluate_event(
@@ -150,6 +196,81 @@ class ProjectContextGuardTests(unittest.TestCase):
         )
         self.assertEqual(allowed, {})
         self.assertFalse(state["pending_project_fact_turn"])
+
+    def test_not_found_unknown_token_does_not_authorize_fabricated_definitive_mechanism(self):
+        hook = self.hook()
+        _, state = hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "reader-session",
+                "turn_id": "mixed-unknown",
+                "cwd": str(self.repo),
+                "prompt": "按照项目规定的量子审计评分矩阵给我评分",
+            },
+            skill_root=self.skill,
+            prior_state={},
+        )
+        self.assertEqual(state["mechanism_resolution"]["state"], "not_found")
+        blocked, state = hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "reader-session",
+                "turn_id": "mixed-unknown",
+                "cwd": str(self.repo),
+                "last_assistant_message": (
+                    "UNKNOWN / NOT FOUND：当前权威事实源中没有找到该模型定义。"
+                    "不过量子审计评分矩阵共五维，我给 88/100。"
+                ),
+            },
+            skill_root=self.skill,
+            prior_state=state,
+        )
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("uncertainty-only", blocked["reason"])
+        self.assertTrue(state["pending_project_fact_turn"])
+        self.assertTrue(state["correction_required"])
+
+    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self):
+        hook = self.hook()
+        _, state = hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "reader-session",
+                "turn_id": "runtime-created",
+                "cwd": str(self.repo),
+                "prompt": "当前项目 Runtime 状态是什么？",
+            },
+            skill_root=self.skill,
+            prior_state={},
+        )
+        receipt = state["project_context_receipt"]
+        self.assertEqual(receipt["sources"]["runtime_state"]["status"], "not_found")
+        runtime_path = Path(receipt["sources"]["runtime_state"]["path"])
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.write_text(
+            json.dumps({"schema_version": 1, "leases": {"A1": {"terminal_state": None}}}) + chr(10),
+            encoding="utf-8",
+        )
+        self.assertTrue(hook._receipt_source_changed(receipt))
+        blocked, state = hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "reader-session",
+                "turn_id": "runtime-created",
+                "cwd": str(self.repo),
+                "last_assistant_message": "当前项目 Runtime 状态为空。",
+            },
+            skill_root=self.skill,
+            prior_state=state,
+        )
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("authoritative_project_source_changed_before_stop", blocked["reason"])
+        self.assertEqual(
+            state["project_context_receipt"]["sources"]["runtime_state"]["status"],
+            "verified",
+        )
+        self.assertTrue(state["pending_project_fact_turn"])
+        self.assertTrue(state["correction_required"])
 
     def test_current_fact_source_overrides_old_model_claim_in_prompt_history(self):
         hook = self.hook()

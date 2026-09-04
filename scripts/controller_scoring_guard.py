@@ -568,6 +568,7 @@ def finalize_score(
         "message_sha256": message_sha256,
     }
     if isinstance(evaluation_transaction, dict):
+        calculation_receipt = evaluation_transaction.get("calculation_receipt")
         record.update({
             "evaluation_id": evaluation_transaction.get("evaluation_id"),
             "evaluation_begun_at": evaluation_transaction.get("evaluation_begun_at"),
@@ -575,12 +576,19 @@ def finalize_score(
             "evidence_snapshot_sha256": evaluation_transaction.get("evidence_snapshot_sha256"),
             "result_provenance": "COMPUTED",
             "field_provenance": {
-                "performance_score": "COMPUTED",
+                "dimension_scores": "COMPUTED",
+                "performance_score": "DERIVED",
                 "governance_risk_status": "DERIVED",
                 "risk_constrained_score": "DERIVED",
                 "cycle_extremes": "READ",
             },
         })
+        if isinstance(calculation_receipt, dict):
+            record["calculation_receipt_sha256"] = calculation_receipt.get(
+                "calculation_receipt_sha256"
+            )
+            record["dimension_scores"] = calculation_receipt.get("dimension_scores")
+            record["dimension_weights"] = calculation_receipt.get("dimension_weights")
     return append_score_history(repo, record)
 
 

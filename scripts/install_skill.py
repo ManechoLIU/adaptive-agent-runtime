@@ -132,6 +132,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_controller_scoring_hook.ControllerScoringEvaluationTransactionTests."
     "test_computed_current_score_requires_exact_transaction_metadata_and_persists_it",
     "tests.test_controller_scoring_hook.ControllerScoringEvaluationTransactionTests."
+    "test_historical_total_relabelled_computed_without_fresh_dimension_vector_is_blocked",
+    "tests.test_controller_scoring_hook.ControllerScoringEvaluationTransactionTests."
+    "test_runtime_rejects_performance_total_that_does_not_match_dimension_vector",
+    "tests.test_controller_scoring_hook.ControllerScoringEvaluationTransactionTests."
     "test_fact_change_before_stop_forces_same_flow_re_evaluation_refresh",
     "tests.test_evaluation_transaction.EvaluationTransactionTests."
     "test_historical_72_8_cannot_satisfy_re_evaluate_current_capability",
@@ -143,6 +147,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_existing_scoring_model_request_must_resolve_real_current_definition",
     "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction",
+    "tests.test_project_context_guard.ProjectContextGuardTests."
+    "test_not_found_unknown_token_does_not_authorize_fabricated_definitive_mechanism",
+    "tests.test_project_context_guard.ProjectContextGuardTests."
+    "test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop",
     "tests.test_web_agent_events.WebAgentMachineEventSourceTests."
     "test_caller_created_file_inside_codex_session_root_cannot_self_attest",
     "tests.test_web_agent_events.WebAgentMachineEventSourceTests."

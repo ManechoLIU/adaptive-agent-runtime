@@ -91,6 +91,8 @@
 
 这只是评分呈现与计算契约；第 3 节某些维度内部的 10+9+6 等拆分仅用于帮助判断该维度的 0–100 原始分，不得直接拿内部子分替代原始分列。
 
+**当前能力重新评估必须由 Runtime 计算总分。** 当意图是 `COMPUTE`（重新评估当前能力，而非读取历史记录）时，回复必须提供本次证据快照下新计算出的完整七维 0–100 原始分向量。Runtime 按固定 `25/15/15/15/10/10/10` 权重重算“近期履职能力”，并生成绑定 `evaluation_id / evidence_snapshot_sha256 / model_sha256 / dimension_scores / dimension_weights / performance_score` 的 calculation receipt。回复自报的总分与 Runtime 重算不一致时 fail closed；历史总分即使被重新标成 `COMPUTED`，没有新鲜七维向量也不能成为本次结果。正式历史中的 `dimension_scores` 为 `COMPUTED`，`performance_score` 为由该向量确定性得到的 `DERIVED`。
+
 ### 2.2 单回合诊断：能力上限 / 下限，不生成第二套正式评分
 
 需要判断总控“一个完整闭环最好能做到什么、最差会掉到什么程度”时，可以执行**单回合诊断**。它复用完全相同的七维、0–100 原始分、权重、责任归因与封顶规则，只把观察单位从 24 小时窗口改成一个完整控制回合：从明确控制决策 / dispatch 开始，经监控、recovery（如有）、review、integration / blocker 决策，直到形成可验证终态。

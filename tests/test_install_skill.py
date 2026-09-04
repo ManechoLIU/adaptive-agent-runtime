@@ -640,7 +640,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class ProjectContextGuardTests(unittest.TestCase):\n"
                 "    def test_new_session_project_governance_question_requires_initialized_current_rules(self): self.assertTrue(True)\n"
                 "    def test_existing_scoring_model_request_must_resolve_real_current_definition(self): self.assertTrue(True)\n"
-                "    def test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction(self): self.assertTrue(True)\n",
+                "    def test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction(self): self.assertTrue(True)\n"
+                "    def test_not_found_unknown_token_does_not_authorize_fabricated_definitive_mechanism(self): self.assertTrue(True)\n"
+                "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(
@@ -655,6 +657,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class ControllerScoringEvaluationTransactionTests(unittest.TestCase):\n"
                 "    def test_current_re_evaluation_does_not_inject_or_accept_historical_score_as_new_result(self): self.assertTrue(True)\n"
                 "    def test_computed_current_score_requires_exact_transaction_metadata_and_persists_it(self): self.assertTrue(True)\n"
+                "    def test_historical_total_relabelled_computed_without_fresh_dimension_vector_is_blocked(self): self.assertTrue(True)\n"
+                "    def test_runtime_rejects_performance_total_that_does_not_match_dimension_vector(self): self.assertTrue(True)\n"
                 "    def test_fact_change_before_stop_forces_same_flow_re_evaluation_refresh(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
@@ -773,7 +777,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class ProjectContextGuardTests(unittest.TestCase):\n"
                 "    def test_new_session_project_governance_question_requires_initialized_current_rules(self): self.assertTrue(True)\n"
                 "    def test_existing_scoring_model_request_must_resolve_real_current_definition(self): self.assertTrue(True)\n"
-                "    def test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction(self): self.assertTrue(True)\n",
+                "    def test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction(self): self.assertTrue(True)\n"
+                "    def test_not_found_unknown_token_does_not_authorize_fabricated_definitive_mechanism(self): self.assertTrue(True)\n"
+                "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(
@@ -788,6 +794,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class ControllerScoringEvaluationTransactionTests(unittest.TestCase):\n"
                 "    def test_current_re_evaluation_does_not_inject_or_accept_historical_score_as_new_result(self): self.assertTrue(True)\n"
                 "    def test_computed_current_score_requires_exact_transaction_metadata_and_persists_it(self): self.assertTrue(True)\n"
+                "    def test_historical_total_relabelled_computed_without_fresh_dimension_vector_is_blocked(self): self.assertTrue(True)\n"
+                "    def test_runtime_rejects_performance_total_that_does_not_match_dimension_vector(self): self.assertTrue(True)\n"
                 "    def test_fact_change_before_stop_forces_same_flow_re_evaluation_refresh(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )

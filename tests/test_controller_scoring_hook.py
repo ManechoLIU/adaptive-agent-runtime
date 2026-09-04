@@ -1048,6 +1048,20 @@ class ControllerScoringEvaluationTransactionTests(unittest.TestCase):
             + "证据快照 SHA256：" + tx["evidence_snapshot_sha256"]
             + chr(10)
             + "评分模型 SHA256：" + tx["model"]["sha256"]
+            + chr(10)
+            + "七维原始分："
+            + ", ".join(
+                f"{key}={performance}"
+                for key in (
+                    "goal_progress",
+                    "task_decomposition",
+                    "critical_path_priority",
+                    "scheduling_execution",
+                    "quality_acceptance_evidence",
+                    "recovery_flow",
+                    "control_plane_auditability",
+                )
+            )
         )
 
     def test_current_re_evaluation_does_not_inject_or_accept_historical_score_as_new_result(self):
@@ -1189,6 +1203,109 @@ class ControllerScoringEvaluationTransactionTests(unittest.TestCase):
                 history["evidence_cutoff_at"],
             )
             self.assertEqual(80.0, history["performance_score"])
+            self.assertEqual("DERIVED", history["field_provenance"]["performance_score"])
+            self.assertEqual("COMPUTED", history["field_provenance"]["dimension_scores"])
+            self.assertEqual(
+                {
+                    "goal_progress": 80.0,
+                    "task_decomposition": 80.0,
+                    "critical_path_priority": 80.0,
+                    "scheduling_execution": 80.0,
+                    "quality_acceptance_evidence": 80.0,
+                    "recovery_flow": 80.0,
+                    "control_plane_auditability": 80.0,
+                },
+                history["dimension_scores"],
+            )
+            self.assertRegex(history["calculation_receipt_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_historical_total_relabelled_computed_without_fresh_dimension_vector_is_blocked(self):
+        import subprocess
+        hook = load_module()
+        guard = load_guard_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            guard.append_score_history(repo, {
+                "schema_version": 1,
+                "record_kind": "formal",
+                "controller_session_id": "controller-1",
+                "recorded_at": "2026-09-04T09:59:00+00:00",
+                "score": 72.8,
+                "performance_score": 72.8,
+                "risk_constrained_score": 72.8,
+                "model_sha256": hook.scoring_model_sha256(ROOT),
+            })
+            _, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "controller-1",
+                    "turn_id": "copy-old",
+                    "cwd": str(repo),
+                    "prompt": "重新评估当前总控能力",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            tx = state["evaluation_transaction"]
+            forged = (
+                formal_message(72.8)
+                + chr(10) + "本次评估来源：COMPUTED"
+                + chr(10) + "事实截止时间：" + tx["evidence_cutoff_at"]
+                + chr(10) + "证据快照 SHA256：" + tx["evidence_snapshot_sha256"]
+                + chr(10) + "评分模型 SHA256：" + tx["model"]["sha256"]
+            )
+            output, _ = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "controller-1",
+                    "turn_id": "copy-old",
+                    "cwd": str(repo),
+                    "last_assistant_message": forged,
+                },
+                skill_root=ROOT,
+                prior_state=state,
+            )
+            self.assertEqual("block", output["decision"])
+            self.assertIn("seven-dimension raw scores", output["reason"])
+            latest = guard.latest_score_history(repo, controller_session_id="controller-1")
+            self.assertEqual(72.8, latest["performance_score"])
+            self.assertNotIn("evaluation_id", latest)
+
+    def test_runtime_rejects_performance_total_that_does_not_match_dimension_vector(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "controller-1",
+                    "turn_id": "weighted-mismatch",
+                    "cwd": str(repo),
+                    "prompt": "重新评估当前总控能力",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            message = self.computed_message(state, performance=80.0).replace(
+                "goal_progress=80.0",
+                "goal_progress=40.0",
+            )
+            output, _ = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "controller-1",
+                    "turn_id": "weighted-mismatch",
+                    "cwd": str(repo),
+                    "last_assistant_message": message,
+                },
+                skill_root=ROOT,
+                prior_state=state,
+            )
+            self.assertEqual("block", output["decision"])
+            self.assertIn("weighted seven-dimension", output["reason"])
 
     def test_old_cutoff_in_output_is_rejected_for_current_evaluation(self):
         import subprocess
