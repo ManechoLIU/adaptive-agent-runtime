@@ -424,6 +424,7 @@ test("OAuth and API execution stay on distinct Kimi and Grok credential paths", 
 
 test("heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-heterogeneous-"));
+  const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   const kimiMarker = path.join(bin, "kimi-spawned.txt");
   const grokMarker = path.join(bin, "grok-spawned.txt");
@@ -444,7 +445,7 @@ test("heterogeneous frontend and backend tasks stay on Kimi and Grok canonical e
     "--execute", "--authorized-external-call",
     "--engine", "kimi-code", "--auth-mode", "api",
     "--model", "kimi-k3", "--reasoning-effort", "medium",
-    "--cwd", skillRoot,
+    "--cwd", repo,
   ], {
     encoding: "utf8",
     input: "frontend bounded task",
@@ -462,7 +463,7 @@ test("heterogeneous frontend and backend tasks stay on Kimi and Grok canonical e
     "--execute", "--authorized-external-call",
     "--engine", "grok-build", "--auth-mode", "oauth",
     "--model", "grok-4.6", "--reasoning-effort", "high",
-    "--cwd", skillRoot,
+    "--cwd", repo,
   ], {
     encoding: "utf8",
     input: "backend bounded task",
