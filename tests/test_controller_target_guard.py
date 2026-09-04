@@ -49,6 +49,199 @@ class ControllerTargetGuardTests(unittest.TestCase):
             "agent_type": "ui_writer",
         })
 
+    def test_identity_projection_keeps_unique_project_controller_when_session_id_unavailable(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(
+                json.dumps({"controller-1": str(repo.resolve())}),
+                encoding="utf-8",
+            )
+
+            identity = guard.controller_identity_projection(
+                repo=repo,
+                host="web",
+                source_session_id=None,
+                registry_path=registry,
+            )
+
+            project = identity["project_controller_state"]
+            binding = identity["session_binding_state"]
+            self.assertEqual(project["project_controller"], "EXISTING")
+            self.assertEqual(project["controller_id"], "controller-1")
+            self.assertEqual(project["uniqueness"], "UNIQUE")
+            self.assertEqual(project["ownership"], "ACTIVE")
+            self.assertFalse(project["create_new_controller_allowed"])
+            self.assertEqual(binding["verification"], "UNVERIFIED")
+            self.assertEqual(binding["reason"], "HOST_SESSION_ID_UNAVAILABLE")
+            self.assertEqual(
+                binding["recovery"], "SAME_CONTROLLER_SESSION_RECOVERY_REQUIRED"
+            )
+            self.assertFalse(identity["controller_actions_allowed"])
+            self.assertTrue(identity["same_controller_recovery_allowed"])
+            self.assertFalse(identity["create_new_controller_allowed"])
+
+    def test_multiple_web_aliases_without_current_target_are_stale_not_verified(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-old", "web-new"]}
+                },
+            }), encoding="utf-8")
+
+            for session_id in ("web-old", "web-new"):
+                with self.subTest(session_id=session_id):
+                    identity = guard.controller_identity_projection(
+                        repo=repo,
+                        host="web",
+                        source_session_id=session_id,
+                        registry_path=registry,
+                    )
+                    self.assertEqual(
+                        identity["project_controller_state"]["controller_id"],
+                        "controller-1",
+                    )
+                    self.assertEqual(
+                        identity["session_binding_state"]["verification"],
+                        "STALE",
+                    )
+                    self.assertEqual(
+                        identity["session_binding_state"]["reason"],
+                        "EXPLICIT_CURRENT_TARGET_REQUIRED",
+                    )
+                    self.assertEqual(
+                        identity["session_binding_state"]["recovery"],
+                        "SAME_CONTROLLER_SESSION_RECOVERY_REQUIRED",
+                    )
+                    self.assertFalse(identity["controller_actions_allowed"])
+                    self.assertFalse(identity["create_new_controller_allowed"])
+
+    def test_identity_projection_verifies_current_desktop_target_without_changing_controller_id(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-old", "desktop-current"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-current",
+                            "generation": 9,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+
+            identity = guard.controller_identity_projection(
+                repo=repo,
+                host="desktop_codex",
+                source_session_id="desktop-current",
+                registry_path=registry,
+            )
+
+            self.assertEqual(
+                identity["project_controller_state"]["controller_id"],
+                "controller-1",
+            )
+            binding = identity["session_binding_state"]
+            self.assertEqual(binding["verification"], "VERIFIED")
+            self.assertEqual(binding["binding_mode"], "explicit_current")
+            self.assertEqual(binding["target_generation"], 9)
+            self.assertTrue(identity["controller_actions_allowed"])
+
+    def test_identity_projection_marks_old_target_stale_but_keeps_project_ownership(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-old", "desktop-current"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-current",
+                            "generation": 4,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+
+            identity = guard.controller_identity_projection(
+                repo=repo,
+                host="desktop_codex",
+                source_session_id="desktop-old",
+                registry_path=registry,
+            )
+
+            self.assertEqual(
+                identity["project_controller_state"]["project_controller"],
+                "EXISTING",
+            )
+            self.assertEqual(
+                identity["project_controller_state"]["controller_id"],
+                "controller-1",
+            )
+            binding = identity["session_binding_state"]
+            self.assertEqual(binding["verification"], "STALE")
+            self.assertEqual(binding["reason"], "SESSION_NOT_CURRENT_TARGET")
+            self.assertEqual(
+                binding["recovery"], "SAME_CONTROLLER_SESSION_RECOVERY_REQUIRED"
+            )
+            self.assertFalse(identity["controller_actions_allowed"])
+            self.assertFalse(identity["create_new_controller_allowed"])
+
+    def test_identity_projection_reports_project_controller_conflict_without_silent_selection(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "controller-2": str(repo.resolve()),
+            }), encoding="utf-8")
+
+            identity = guard.controller_identity_projection(
+                repo=repo,
+                host="web",
+                source_session_id="web-current",
+                registry_path=registry,
+            )
+
+            project = identity["project_controller_state"]
+            self.assertEqual(project["project_controller"], "CONFLICT")
+            self.assertEqual(project["uniqueness"], "CONFLICT")
+            self.assertIsNone(project["controller_id"])
+            self.assertEqual(
+                set(project["matching_controller_ids"]),
+                {"controller-1", "controller-2"},
+            )
+            self.assertEqual(
+                identity["session_binding_state"]["verification"],
+                "CONFLICT",
+            )
+            self.assertFalse(identity["controller_actions_allowed"])
+            self.assertFalse(identity["same_controller_recovery_allowed"])
+            self.assertFalse(identity["create_new_controller_allowed"])
+
     def test_explicit_current_target_is_the_only_allowed_desktop_outbound_target(self) -> None:
         guard = load_guard()
         with tempfile.TemporaryDirectory() as tmp:

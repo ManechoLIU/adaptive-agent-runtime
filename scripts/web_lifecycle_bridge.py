@@ -5,6 +5,7 @@ import argparse
 import fcntl
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -165,9 +166,36 @@ def require_web_controller_session(
     *, controller_id: str, web_session_id: str | None, registry_path: Path
 ) -> str:
     value = str(web_session_id or "").strip()
-    if not value or not registered_controller_session(
-        controller_id=controller_id, session_id=value, host="web", registry_path=registry_path
-    ):
+    if not value:
+        raise PermissionError(
+            "verified Web Controller Session identity required; refusing repository-only Controller attribution"
+        )
+    registry = load_json(registry_path)
+    record = target_guard.target_record(
+        registry, controller_id=controller_id, host="web"
+    )
+    if record is None:
+        aliases = target_guard.host_sessions(
+            registry, controller_id=controller_id, host="web"
+        )
+        verified = (
+            len(aliases) == 1
+            and aliases[0] == value
+            and registered_controller_session(
+                controller_id=controller_id,
+                session_id=value,
+                host="web",
+                registry_path=registry_path,
+            )
+        )
+    else:
+        verified = (
+            target_guard.active_source_controller_id(
+                registry, source_session_id=value, host="web"
+            )
+            == controller_id
+        )
+    if not verified:
         raise PermissionError(
             "verified Web Controller Session identity required; refusing repository-only Controller attribution"
         )
@@ -188,10 +216,17 @@ def authorize_manual_web_session(
     registered = registered_controller_for_repo(repo, registry_path)
     if registered != controller_id:
         raise PermissionError("manual Web lease requires the registered Controller for this repository")
-    if not registered_controller_session(
-        controller_id=controller_id, session_id=web_session_id, host="web", registry_path=registry_path
-    ):
-        raise PermissionError("manual Web lease requires a Web session that must already be bound to this Controller")
+    try:
+        require_web_controller_session(
+            controller_id=controller_id,
+            web_session_id=web_session_id,
+            registry_path=registry_path,
+        )
+    except PermissionError as exc:
+        raise PermissionError(
+            "manual Web lease requires a Web session that must already be bound "
+            "as the current verified Web session for this Controller"
+        ) from exc
 
     now = int(time.time())
     record = {
@@ -258,11 +293,214 @@ def resolve_manual_web_session(
     except (OSError, subprocess.SubprocessError):
         if lease_repo != repo.resolve():
             return None
-    if not registered_controller_session(
-        controller_id=controller_id, session_id=session_id, host="web", registry_path=registry_path
-    ):
+    try:
+        require_web_controller_session(
+            controller_id=controller_id,
+            web_session_id=session_id,
+            registry_path=registry_path,
+        )
+    except PermissionError:
         return None
     return session_id
+
+
+def recover_same_controller_web_session(
+    *,
+    repo: Path,
+    web_session_id: str,
+    registry_path: Path,
+    host_identity_receipt: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Rebind only the existing unique Controller after Host-attested Web identity proof."""
+    repo = canonical_root(repo)
+    registry_path = registry_path.expanduser()
+    web_session_id = str(web_session_id or "").strip()
+    if not web_session_id:
+        identity = target_guard.controller_identity_projection(
+            repo=repo,
+            host="web",
+            source_session_id=None,
+            registry_path=registry_path,
+        )
+        return {
+            "result": "DEFERRED",
+            "state": "SAME_CONTROLLER_SESSION_RECOVERY",
+            "reason": "HOST_SESSION_ID_UNAVAILABLE",
+            "identity": identity,
+        }
+
+    identity = target_guard.controller_identity_projection(
+        repo=repo,
+        host="web",
+        source_session_id=web_session_id,
+        registry_path=registry_path,
+    )
+    project = identity["project_controller_state"]
+    binding = identity["session_binding_state"]
+    if project.get("project_controller") != "EXISTING":
+        raise PermissionError(
+            "same-controller recovery requires one existing unique project Controller"
+        )
+    controller_id = str(project.get("controller_id") or "").strip()
+    if not controller_id:
+        raise PermissionError("same-controller recovery has no existing controller_id")
+    if binding.get("verification") == "CONFLICT":
+        raise PermissionError(
+            "verified Web Controller Session identity required; "
+            "same-controller recovery refuses conflicting session ownership"
+        )
+    if binding.get("verification") == "VERIFIED":
+        return {
+            "result": "ALREADY_VERIFIED",
+            "state": "VERIFIED",
+            "controller_id": controller_id,
+            "identity": identity,
+        }
+
+    verifier = _registered_peer_attestation_verifier("web")
+    if not callable(verifier):
+        return {
+            "result": "DEFERRED",
+            "state": "SAME_CONTROLLER_SESSION_RECOVERY",
+            "reason": "HOST_IDENTITY_UNAVAILABLE",
+            "controller_id": controller_id,
+            "identity": identity,
+        }
+
+    prior_generation = binding.get("target_generation")
+    if not isinstance(prior_generation, int) or isinstance(prior_generation, bool):
+        prior_generation = 0
+    try:
+        attested = verifier(
+            controller_id=controller_id,
+            host="web",
+            expected_target_session_id=web_session_id,
+            expected_target_generation=prior_generation,
+            expected_target_mode="same_controller_session_recovery",
+            host_execution_receipt=host_identity_receipt,
+            adapter_attempt={
+                "operation": "controller_session_identity_recovery",
+                "repo": str(repo.resolve()),
+                "controller_id": controller_id,
+                "execution_target_session_id": web_session_id,
+            },
+        )
+    except Exception as exc:
+        raise PermissionError(
+            f"Host Controller session identity verifier failed: {exc}"
+        ) from exc
+    if attested is not True:
+        raise PermissionError("Host Controller session identity attestation rejected")
+
+    lock_path = target_guard.registry_lock_path(registry_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            registry = load_json(registry_path)
+            matches = target_guard._matching_controller_ids_for_repo(repo, registry)
+            if matches != [controller_id]:
+                raise PermissionError(
+                    "project Controller changed during same-controller session recovery"
+                )
+            target_guard.require_no_active_outbound_lease(
+                registry, controller_id=controller_id, host="web"
+            )
+            owners = target_guard._session_owners(
+                registry, session_id=web_session_id, host="web"
+            )
+            foreign = {owner for owner in owners if owner != controller_id}
+            if foreign:
+                raise PermissionError(
+                    "Web session is already owned by another Controller"
+                )
+
+            sessions = registry.get("__controller_sessions__")
+            if sessions is None:
+                sessions = {}
+            if not isinstance(sessions, dict):
+                raise ValueError("controller session registry is invalid")
+            controller_sessions = sessions.get(controller_id)
+            if controller_sessions is None:
+                controller_sessions = {}
+            if not isinstance(controller_sessions, dict):
+                raise ValueError("Controller session map is invalid")
+            web_sessions = controller_sessions.get("web")
+            if isinstance(web_sessions, str):
+                web_sessions = [web_sessions]
+            if web_sessions is None:
+                web_sessions = []
+            if not isinstance(web_sessions, list):
+                raise ValueError("Controller Web session list is invalid")
+            aliases = [
+                value.strip()
+                for value in web_sessions
+                if isinstance(value, str) and value.strip()
+            ]
+            if web_session_id not in aliases:
+                aliases.append(web_session_id)
+            controller_sessions["web"] = list(dict.fromkeys(aliases))
+            sessions[controller_id] = controller_sessions
+            registry["__controller_sessions__"] = sessions
+
+            targets = registry.get("__controller_targets__")
+            if targets is None:
+                targets = {}
+            if not isinstance(targets, dict):
+                raise ValueError("controller target registry is invalid")
+            controller_targets = targets.get(controller_id)
+            if controller_targets is None:
+                controller_targets = {}
+            if not isinstance(controller_targets, dict):
+                raise ValueError("Controller target map is invalid")
+            prior = controller_targets.get("web")
+            if prior is None:
+                generation = 1
+            else:
+                _status, _target, generation = target_guard.validate_target_record(
+                    prior, host="web"
+                )
+                generation += 1
+            receipt_fingerprint = __import__("hashlib").sha256(
+                json.dumps(
+                    host_identity_receipt or {},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            controller_targets["web"] = {
+                "status": "active",
+                "session_id": web_session_id,
+                "generation": generation,
+                "provenance": "host_attested_same_controller_recovery",
+                "binding_mode": "resume_only",
+                "host_identity_receipt_sha256": receipt_fingerprint,
+            }
+            targets[controller_id] = controller_targets
+            registry["__controller_targets__"] = targets
+            _write_json_atomic_file(registry_path, registry)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    recovered = target_guard.controller_identity_projection(
+        repo=repo,
+        host="web",
+        source_session_id=web_session_id,
+        registry_path=registry_path,
+    )
+    if recovered["session_binding_state"].get("verification") != "VERIFIED":
+        raise RuntimeError("same-controller recovery did not produce a verified current session")
+    return {
+        "result": "RECOVERED",
+        "state": "VERIFIED",
+        "controller_id": controller_id,
+        "execution_target_session_id": web_session_id,
+        "target_generation": recovered["session_binding_state"].get(
+            "target_generation"
+        ),
+        "identity": recovered,
+    }
 
 
 def post_tool_event(
@@ -384,7 +622,49 @@ except ModuleNotFoundError:
     from project_context_guard import initialize_project_context
 
 
-def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, Any]:
+def _controller_restore_lifecycle(controller_id: str) -> dict[str, Any]:
+    state = _load_lifecycle_state(controller_id)
+    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+    triggers = [
+        str(item) for item in state.get("triggers", [])
+        if str(item).strip()
+    ]
+    continuation_debt = state.get("continuation_debt")
+    if not isinstance(continuation_debt, list):
+        continuation_debt = []
+    result = {
+        "pending_control_event": state.get("pending_control_event") is True,
+        "requires_user": state.get("requires_user") is True,
+        "controller_host": str(state.get("controller_host") or "").strip() or None,
+        "wake_generation": int(state.get("wake_generation", 0) or 0),
+        "triggers": triggers,
+        "next_action": str(state.get("next_action") or "").strip() or None,
+        "continuation_debt": [
+            item for item in continuation_debt if isinstance(item, (str, dict))
+        ][:64],
+        "runnable_ids": [
+            str(item) for item in snapshot.get("runnable_ids", [])
+            if str(item).strip()
+        ][:128],
+        "candidate_revisions": [
+            str(item) for item in snapshot.get("candidate_revisions", [])
+            if str(item).strip()
+        ][:128],
+    }
+    result["resume_control_loop_required"] = bool(
+        result["pending_control_event"]
+        or result["triggers"]
+        or result["next_action"]
+        or result["continuation_debt"]
+        or result["runnable_ids"]
+        or result["candidate_revisions"]
+    ) and not result["requires_user"]
+    return result
+
+
+def web_session_restore_payload(
+    repo: Path, registry_path: Path, *, web_session_id: str | None = None
+) -> dict[str, Any]:
     root = canonical_root(repo)
     controller = registered_controller_for_repo(root, registry_path)
     if controller is None:
@@ -412,11 +692,31 @@ def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, An
     project_context = initialize_project_context(
         root,
         skill_root=Path(__file__).resolve().parents[1],
+        controller_registry_path=registry_path,
+        controller_host="web",
+        source_session_id=web_session_id,
     )
+    controller_identity = target_guard.controller_identity_projection(
+        repo=root,
+        host="web",
+        source_session_id=web_session_id,
+        registry_path=registry_path,
+    )
+    controller_lifecycle = _controller_restore_lifecycle(controller)
     return {
         "product": "Adaptive Agent Runtime",
         "project_root": str(root),
         "controller_id": controller,
+        "project_controller_state": controller_identity["project_controller_state"],
+        "session_binding_state": controller_identity["session_binding_state"],
+        "controller_actions_allowed": controller_identity["controller_actions_allowed"],
+        "controller_recovery": controller_identity["session_binding_state"].get(
+            "recovery"
+        ),
+        "controller_lifecycle": controller_lifecycle,
+        "resume_control_loop_required": controller_lifecycle[
+            "resume_control_loop_required"
+        ],
         "restore_order": [item["name"] for item in documents] + ["git_runtime"],
         "documents": documents,
         "authoritative_documents": authoritative_documents,
@@ -2035,6 +2335,60 @@ def default_auto_stop_state_path(session_id: str) -> Path:
     )
 
 
+def auto_stop_supervisor_lock_path(state_path: Path) -> Path:
+    return state_path.with_suffix(state_path.suffix + ".supervisor.lock")
+
+
+def _pid_is_alive(pid: Any) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _supervisor_token_is_current(
+    state_path: Path, *, receipt_id: str, supervisor_token: str
+) -> bool:
+    state = load_json(state_path)
+    return (
+        state.get("receipt_id") == receipt_id
+        and state.get("supervisor_receipt_id") == receipt_id
+        and state.get("supervisor_token") == supervisor_token
+    )
+
+
+def _release_supervisor_token(
+    state_path: Path, *, receipt_id: str, supervisor_token: str
+) -> None:
+    lock_path = auto_stop_supervisor_lock_path(state_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_json(state_path)
+            if (
+                state.get("receipt_id") == receipt_id
+                and state.get("supervisor_receipt_id") == receipt_id
+                and state.get("supervisor_token") == supervisor_token
+            ):
+                for key in (
+                    "supervisor_token",
+                    "supervisor_receipt_id",
+                    "supervisor_pid",
+                    "supervisor_due_at_unix_ms",
+                    "supervisor_spawned_at_unix_ms",
+                ):
+                    state.pop(key, None)
+                write_auto_stop_state(state_path, state)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def continuation_supervisor_needs_bootstrap(
     lifecycle_state: dict[str, Any], supervisor_state: dict[str, Any]
 ) -> bool:
@@ -2091,80 +2445,122 @@ def schedule_auto_native_stop(
     state_path: Path,
     capture_path: Path | None = None,
     runtime_path: str | None = None,
-) -> None:
-    prior = load_json(state_path)
-    same_receipt = prior.get("receipt_id") == receipt_id
-    value = {
-        "receipt_id": receipt_id,
-        "session_id": session_id,
-        "repo": str(repo.resolve()),
-        "scheduled_at_unix_ms": int(time.time() * 1000),
-        "state": "RESUME_PENDING",
-        "pending_control_event": True,
-        "retry_count": int(prior.get("retry_count", 0) or 0) if same_receipt else 0,
-        "continuation_count": int(prior.get("continuation_count", 0) or 0) if same_receipt else 0,
-        "unchanged_continuation_count": int(prior.get("unchanged_continuation_count", 0) or 0) if same_receipt else 0,
-    }
-    if same_receipt and prior.get("last_lifecycle_fingerprint"):
-        value["last_lifecycle_fingerprint"] = str(prior["last_lifecycle_fingerprint"])
-    if same_receipt and prior.get("approval_id"):
-        value["approval_id"] = str(prior["approval_id"])
-    if same_receipt and isinstance(prior.get("approval_expires_at_unix"), int):
-        value["approval_expires_at_unix"] = int(prior["approval_expires_at_unix"])
-    if same_receipt:
-        value["approval_retry_count"] = int(prior.get("approval_retry_count", 0) or 0)
-    if same_receipt and prior.get("failure_class") == "active_writer_present":
-        value["last_deferred_state"] = "RESUME_DEFERRED_ACTIVE_WRITER"
-        value["failure_class"] = "active_writer_present"
-        value["stderr_tail"] = bounded_tail(str(prior.get("stderr_tail", "")))
-    elif same_receipt and prior.get("failure_class") == "web_reentry_unavailable":
-        value["failure_class"] = "web_reentry_unavailable"
-        value["error_code"] = str(prior.get("error_code") or "WEB_REENTRY_UNAVAILABLE")
-        value["stderr_tail"] = bounded_tail(str(prior.get("stderr_tail", "")))
-    write_auto_stop_state(state_path, value)
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "auto-native-stop",
-        "--session-id",
-        session_id,
-        "--repo",
-        str(repo.resolve()),
-        "--receipt-id",
-        receipt_id,
-        "--registry",
-        str(registry.expanduser()),
-        "--codex",
-        codex,
-        "--delay-seconds",
-        str(delay_seconds),
-        "--state",
-        str(state_path),
-        "--runtime-path",
-        runtime_path or DEFAULT_RUNTIME_PATH,
-    ]
-    if capture_path is not None:
-        capture_path.write_text(json.dumps(command, ensure_ascii=False) + "\n", encoding="utf-8")
-        return
-    launcher_log = state_path.with_suffix(state_path.suffix + ".launcher.log")
-    rotate_launcher_log(launcher_log)
-    launcher_log.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = launcher_log.open("ab", buffering=0)
-    try:
-        subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=log_handle,
-            env=native_runtime_env(runtime_path),
-            start_new_session=True,
-            close_fds=True,
-        )
-    finally:
-        log_handle.close()
+    force_rearm: bool = False,
+    replace_supervisor_token: str | None = None,
+) -> bool:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = auto_stop_supervisor_lock_path(state_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            prior = load_json(state_path)
+            current_token = str(prior.get("supervisor_token") or "").strip()
+            current_receipt = str(prior.get("supervisor_receipt_id") or "").strip()
+            current_live = (
+                bool(current_token)
+                and current_receipt == receipt_id
+                and _pid_is_alive(prior.get("supervisor_pid"))
+            )
+            if force_rearm:
+                if (
+                    not replace_supervisor_token
+                    or current_token != replace_supervisor_token
+                    or current_receipt != receipt_id
+                ):
+                    return False
+            elif current_live:
+                prior["coalesced_schedule_count"] = (
+                    int(prior.get("coalesced_schedule_count", 0) or 0) + 1
+                )
+                prior["last_coalesced_at_unix_ms"] = int(time.time() * 1000)
+                write_auto_stop_state(state_path, prior)
+                return False
+
+            same_receipt = prior.get("receipt_id") == receipt_id
+            now_ms = int(time.time() * 1000)
+            supervisor_token = secrets.token_hex(16)
+            value = {
+                "receipt_id": receipt_id,
+                "session_id": session_id,
+                "repo": str(repo.resolve()),
+                "scheduled_at_unix_ms": now_ms,
+                "state": "RESUME_PENDING",
+                "pending_control_event": True,
+                "retry_count": int(prior.get("retry_count", 0) or 0) if same_receipt else 0,
+                "continuation_count": int(prior.get("continuation_count", 0) or 0) if same_receipt else 0,
+                "unchanged_continuation_count": int(prior.get("unchanged_continuation_count", 0) or 0) if same_receipt else 0,
+                "coalesced_schedule_count": int(prior.get("coalesced_schedule_count", 0) or 0) if same_receipt else 0,
+                "supervisor_token": supervisor_token,
+                "supervisor_receipt_id": receipt_id,
+                "supervisor_pid": 0,
+                "supervisor_due_at_unix_ms": now_ms + int(max(0.0, delay_seconds) * 1000),
+                "supervisor_spawned_at_unix_ms": now_ms,
+            }
+            if same_receipt and prior.get("last_lifecycle_fingerprint"):
+                value["last_lifecycle_fingerprint"] = str(prior["last_lifecycle_fingerprint"])
+            if same_receipt and prior.get("approval_id"):
+                value["approval_id"] = str(prior["approval_id"])
+            if same_receipt and isinstance(prior.get("approval_expires_at_unix"), int):
+                value["approval_expires_at_unix"] = int(prior["approval_expires_at_unix"])
+            if same_receipt:
+                value["approval_retry_count"] = int(prior.get("approval_retry_count", 0) or 0)
+            if same_receipt and prior.get("failure_class") == "active_writer_present":
+                value["last_deferred_state"] = "RESUME_DEFERRED_ACTIVE_WRITER"
+                value["failure_class"] = "active_writer_present"
+                value["stderr_tail"] = bounded_tail(str(prior.get("stderr_tail", "")))
+            elif same_receipt and prior.get("failure_class") == "web_reentry_unavailable":
+                value["failure_class"] = "web_reentry_unavailable"
+                value["error_code"] = str(prior.get("error_code") or "WEB_REENTRY_UNAVAILABLE")
+                value["stderr_tail"] = bounded_tail(str(prior.get("stderr_tail", "")))
+
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "auto-native-stop",
+                "--session-id", session_id,
+                "--repo", str(repo.resolve()),
+                "--receipt-id", receipt_id,
+                "--registry", str(registry.expanduser()),
+                "--codex", codex,
+                "--delay-seconds", str(delay_seconds),
+                "--state", str(state_path),
+                "--runtime-path", runtime_path or DEFAULT_RUNTIME_PATH,
+                "--supervisor-token", supervisor_token,
+            ]
+            write_auto_stop_state(state_path, value)
+            if capture_path is not None:
+                capture_path.write_text(
+                    json.dumps(command, ensure_ascii=False) + chr(10), encoding="utf-8"
+                )
+                return True
+
+            launcher_log = state_path.with_suffix(state_path.suffix + ".launcher.log")
+            rotate_launcher_log(launcher_log)
+            launcher_log.parent.mkdir(parents=True, exist_ok=True)
+            log_handle = launcher_log.open("ab", buffering=0)
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=log_handle,
+                    env=native_runtime_env(runtime_path),
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            finally:
+                log_handle.close()
+            latest = load_json(state_path)
+            if latest.get("supervisor_token") == supervisor_token:
+                latest["supervisor_pid"] = int(process.pid)
+                write_auto_stop_state(state_path, latest)
+            return True
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def run_auto_native_stop(
+def _run_auto_native_stop_impl(
     *,
     session_id: str,
     repo: Path,
@@ -2174,9 +2570,14 @@ def run_auto_native_stop(
     delay_seconds: float,
     state_path: Path,
     runtime_path: str | None = None,
+    supervisor_token: str | None = None,
 ) -> int:
     if delay_seconds > 0:
         time.sleep(delay_seconds)
+    if supervisor_token and not _supervisor_token_is_current(
+        state_path, receipt_id=receipt_id, supervisor_token=supervisor_token
+    ):
+        return 0
     state = load_json(state_path)
     if state.get("receipt_id") != receipt_id:
         return 0
@@ -2252,6 +2653,8 @@ def run_auto_native_stop(
                 schedule_auto_native_stop(
                     session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                     codex=codex, delay_seconds=5.0, state_path=state_path, runtime_path=runtime_path,
+                force_rearm=supervisor_token is not None,
+                replace_supervisor_token=supervisor_token,
                 )
                 return 0
             current["state"] = "WAITING_USER"
@@ -2269,6 +2672,8 @@ def run_auto_native_stop(
             schedule_auto_native_stop(
                 session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                 codex=codex, delay_seconds=5.0, state_path=state_path, runtime_path=runtime_path,
+            force_rearm=supervisor_token is not None,
+            replace_supervisor_token=supervisor_token,
             )
             return 0
         if attempt.get("result") == "CONFIRMED":
@@ -2299,6 +2704,8 @@ def run_auto_native_stop(
             schedule_auto_native_stop(
                 session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                 codex=codex, delay_seconds=10.0, state_path=state_path, runtime_path=runtime_path,
+            force_rearm=supervisor_token is not None,
+            replace_supervisor_token=supervisor_token,
             )
             return 0
         failure_class = str(attempt.get("failure_class") or "web_reentry_unavailable")
@@ -2322,6 +2729,8 @@ def run_auto_native_stop(
                 session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                 codex=codex, delay_seconds=max(1.0, retry_delay), state_path=state_path,
                 runtime_path=runtime_path,
+            force_rearm=supervisor_token is not None,
+            replace_supervisor_token=supervisor_token,
             )
             return 0
         return int(attempt.get("returncode", 78) or 78)
@@ -2392,6 +2801,8 @@ def run_auto_native_stop(
             schedule_auto_native_stop(
                 session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                 codex=codex, delay_seconds=retry_delay, state_path=state_path, runtime_path=runtime_path,
+            force_rearm=supervisor_token is not None,
+            replace_supervisor_token=supervisor_token,
             )
         return 0
     if attempt.get("result") == "CONFIRMED":
@@ -2447,9 +2858,48 @@ def run_auto_native_stop(
             session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
             codex=codex, delay_seconds=min(5.0, 1.0 + unchanged), state_path=state_path,
             runtime_path=runtime_path,
+        force_rearm=supervisor_token is not None,
+        replace_supervisor_token=supervisor_token,
         )
         return 0
     return int(attempt["returncode"])
+
+
+def run_auto_native_stop(
+    *,
+    session_id: str,
+    repo: Path,
+    receipt_id: str,
+    registry: Path,
+    codex: str,
+    delay_seconds: float,
+    state_path: Path,
+    runtime_path: str | None = None,
+    supervisor_token: str | None = None,
+) -> int:
+    if supervisor_token and not _supervisor_token_is_current(
+        state_path, receipt_id=receipt_id, supervisor_token=supervisor_token
+    ):
+        return 0
+    try:
+        return _run_auto_native_stop_impl(
+            session_id=session_id,
+            repo=repo,
+            receipt_id=receipt_id,
+            registry=registry,
+            codex=codex,
+            delay_seconds=delay_seconds,
+            state_path=state_path,
+            runtime_path=runtime_path,
+            supervisor_token=supervisor_token,
+        )
+    finally:
+        if supervisor_token:
+            _release_supervisor_token(
+                state_path,
+                receipt_id=receipt_id,
+                supervisor_token=supervisor_token,
+            )
 
 
 def zshenv_block() -> str:
@@ -2517,6 +2967,7 @@ def build_parser() -> argparse.ArgumentParser:
     session_start.add_argument("--repo", required=True)
     session_start.add_argument("--registry", default=str(DEFAULT_REGISTRY))
     session_start.add_argument("--web-session-id")
+    session_start.add_argument("--host-identity-receipt-json")
 
     post_shell = subparsers.add_parser("post-shell")
     post_shell.add_argument("--cwd", required=True)
@@ -2567,6 +3018,7 @@ def build_parser() -> argparse.ArgumentParser:
     auto_stop.add_argument("--runtime-path", default=DEFAULT_RUNTIME_PATH)
     auto_stop.add_argument("--delay-seconds", type=float, default=5.0)
     auto_stop.add_argument("--state")
+    auto_stop.add_argument("--supervisor-token")
 
     subparsers.add_parser("print-zshenv-block")
     return parser
@@ -2663,16 +3115,69 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command_name == "session-start":
         repo = canonical_root(args.repo)
         registry_path = Path(args.registry).expanduser()
+        host_identity_receipt: dict[str, Any] | None = None
+        if args.host_identity_receipt_json:
+            try:
+                parsed = json.loads(args.host_identity_receipt_json)
+            except json.JSONDecodeError as exc:
+                print(f"invalid Host identity receipt JSON: {exc}", file=sys.stderr)
+                return 2
+            if not isinstance(parsed, dict):
+                print("Host identity receipt must be a JSON object", file=sys.stderr)
+                return 2
+            host_identity_receipt = parsed
         try:
             controller_id = registered_controller_for_repo(repo, registry_path)
             if controller_id is None:
                 raise ValueError(f"no registered controller for {repo}")
-            web_session_id = require_web_controller_session(
-                controller_id=controller_id,
-                web_session_id=args.web_session_id,
-                registry_path=registry_path,
+            try:
+                web_session_id = require_web_controller_session(
+                    controller_id=controller_id,
+                    web_session_id=args.web_session_id,
+                    registry_path=registry_path,
+                )
+                recovery = {
+                    "result": "ALREADY_VERIFIED",
+                    "controller_id": controller_id,
+                }
+            except PermissionError:
+                recovery = recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id=str(args.web_session_id or ""),
+                    registry_path=registry_path,
+                    host_identity_receipt=host_identity_receipt,
+                )
+                if recovery.get("result") not in {"RECOVERED", "ALREADY_VERIFIED"}:
+                    diagnostic = {
+                        "message": (
+                            "verified Web Controller Session identity required; "
+                            "project Controller ownership remains independent from current session authorization"
+                        ),
+                        "project_controller_state": recovery["identity"][
+                            "project_controller_state"
+                        ],
+                        "session_binding_state": recovery["identity"][
+                            "session_binding_state"
+                        ],
+                        "controller_actions_allowed": False,
+                        "recovery": recovery.get("state")
+                        or recovery["identity"]["session_binding_state"].get(
+                            "recovery"
+                        ),
+                    }
+                    print(
+                        json.dumps(diagnostic, ensure_ascii=False, sort_keys=True),
+                        file=sys.stderr,
+                    )
+                    return 78
+                web_session_id = require_web_controller_session(
+                    controller_id=controller_id,
+                    web_session_id=args.web_session_id,
+                    registry_path=registry_path,
+                )
+            payload = web_session_restore_payload(
+                repo, registry_path, web_session_id=web_session_id
             )
-            payload = web_session_restore_payload(repo, registry_path)
         except PermissionError as exc:
             print(str(exc), file=sys.stderr)
             return 78
@@ -2683,6 +3188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload["controller_session_id"] = controller_id
         payload["web_session_id"] = web_session_id
         payload["event_source"] = "web"
+        payload["session_recovery_result"] = recovery
         print(json.dumps(payload, ensure_ascii=False))
         return 0
 
@@ -3051,6 +3557,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             delay_seconds=max(0.0, args.delay_seconds),
             state_path=state_path,
             runtime_path=args.runtime_path,
+            supervisor_token=args.supervisor_token,
         )
 
     if args.command_name == "print-zshenv-block":

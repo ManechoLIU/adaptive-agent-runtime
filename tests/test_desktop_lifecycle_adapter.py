@@ -61,7 +61,7 @@ class DesktopLifecycleTurnGateTests(unittest.TestCase):
         )
         return state
 
-    def test_successful_receipt_denies_another_tool_in_the_same_turn(self) -> None:
+    def test_successful_receipt_is_invalidated_when_same_turn_continuation_executes(self) -> None:
         state = self.successful_receipt(
             {
                 "pending_control_event": True,
@@ -76,18 +76,124 @@ class DesktopLifecycleTurnGateTests(unittest.TestCase):
                 "session_id": "controller-1",
                 "turn_id": "turn-1",
                 "tool_name": "apply_patch",
-                "tool_use_id": "late-write",
+                "tool_use_id": "continue-after-receipt",
                 "tool_input": {"command": "*** Begin Patch"},
             },
             snapshot=self.snapshot(),
             prior_state=state,
         )
 
-        decision = output["hookSpecificOutput"]
-        self.assertEqual(decision["hookEventName"], "PreToolUse")
-        self.assertEqual(decision["permissionDecision"], "deny")
-        self.assertIn("同一回合", decision["permissionDecisionReason"])
-        self.assertTrue(next_state["must_yield"])
+        self.assertEqual(output, {})
+        self.assertFalse(next_state["must_yield"])
+        self.assertNotIn("receipt_turn_id", next_state)
+        self.assertTrue(next_state["pending_control_event"])
+        self.assertIn("post_receipt_action_started", next_state["triggers"])
+
+        _post_output, after_action = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "controller-1",
+                "turn_id": "turn-1",
+                "tool_name": "apply_patch",
+                "tool_use_id": "continue-after-receipt",
+                "tool_input": {"command": "*** Begin Patch"},
+                "tool_response": {"output": "Done", "exit_code": 0},
+            },
+            snapshot=self.snapshot(),
+            prior_state=next_state,
+        )
+        blocked, blocked_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "turn_id": "turn-1",
+            },
+            snapshot=self.snapshot(),
+            prior_state=after_action,
+        )
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("control_event_guard.py", blocked["reason"])
+        self.assertFalse(blocked_state["must_yield"])
+
+    def test_status_query_does_not_clear_existing_controller_continuation(self) -> None:
+        prior = {
+            "pending_control_event": True,
+            "triggers": ["RUNNABLE:MINI-READY", "next_action_pending"],
+            "next_action": "integrate reviewed candidate",
+            "requires_user": False,
+            "active_turn_id": "turn-1",
+            "must_yield": False,
+        }
+        _output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "controller-1",
+                "turn_id": "turn-status",
+                "prompt": "进度怎么样？",
+            },
+            snapshot=self.snapshot(),
+            prior_state=prior,
+        )
+        self.assertTrue(state["pending_control_event"])
+        self.assertIn("RUNNABLE:MINI-READY", state["triggers"])
+        self.assertIn("next_action_pending", state["triggers"])
+        self.assertEqual(state["next_action"], "integrate reviewed candidate")
+        self.assertFalse(state["requires_user"])
+
+
+    def test_hard_yield_gate_rejects_declared_next_action_when_work_is_runnable(self) -> None:
+        snapshot = {
+            **self.snapshot(),
+            "runnable_ids": ["MINI-READY"],
+            "ready_ids": ["MINI-READY"],
+            "control_loop_required": True,
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "turn_id": "turn-1",
+                "last_assistant_message": "当前验证已经 PASS。下一步应该派发 MINI-READY。",
+            },
+            snapshot=snapshot,
+            prior_state={
+                "active_turn_id": "turn-1",
+                "must_yield": True,
+                "receipt_turn_id": "turn-1",
+                "pending_control_event": False,
+                "triggers": [],
+                "snapshot": snapshot,
+            },
+        )
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("不得一边声明下一步一边 Yield", output["reason"])
+        self.assertFalse(state["must_yield"])
+        self.assertTrue(state["pending_control_event"])
+        self.assertIn("KNOWN_NEXT_ACTION_NOT_EXECUTED", state["triggers"])
+
+    def test_hard_yield_gate_does_not_invent_work_from_status_only_message(self) -> None:
+        snapshot = {
+            **self.snapshot(),
+            "control_loop_required": False,
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "turn_id": "turn-1",
+                "last_assistant_message": "当前进度正常，暂无新的可执行工作。",
+            },
+            snapshot=snapshot,
+            prior_state={
+                "active_turn_id": "turn-1",
+                "must_yield": False,
+                "pending_control_event": False,
+                "triggers": [],
+                "snapshot": snapshot,
+            },
+        )
+        self.assertEqual(output, {})
+        self.assertFalse(state["pending_control_event"])
 
     def test_update_goal_blocked_is_denied_without_project_block_receipt(self) -> None:
         output, _state = lifecycle_hook.evaluate_event(
@@ -595,7 +701,7 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertFalse(output)
 
-    def test_policy_denied_outbound_pre_tool_releases_its_lease(self) -> None:
+    def test_post_receipt_outbound_continuation_holds_lease_until_post_tool(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = self.make_repo(root)
@@ -610,21 +716,40 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             old_registry, old_state_root = lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
             lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = registry, root / "state"
             lifecycle_hook.write_json(lifecycle_hook.state_path("controller-1"), {
-                "active_turn_id": "turn-1", "must_yield": True,
+                "active_turn_id": "turn-1", "must_yield": True, "receipt_turn_id": "turn-1",
             })
             try:
                 with patch.object(lifecycle_hook, "registered_controller_id", return_value="controller-1"), patch.object(lifecycle_hook, "registered_root", return_value=repo), patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch.object(lifecycle_hook, "controller_event_is_managed", return_value=True):
                     code, output = self.invoke_hook({
                         "hook_event_name": "PreToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
-                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "denied-1",
-                        "tool_input": {"threadId": "desktop-current", "prompt": "late"},
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "continue-1",
+                        "tool_input": {"threadId": "desktop-current", "prompt": "continue mandatory successor"},
                     })
-                    self.assertFalse(controller_target_guard.has_active_outbound_lease(repo=repo, host="desktop_codex", registry_path=registry))
+                    self.assertTrue(
+                        controller_target_guard.has_active_outbound_lease(
+                            repo=repo, host="desktop_codex", registry_path=registry
+                        )
+                    )
+                    post_code, post_output = self.invoke_hook({
+                        "hook_event_name": "PostToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "continue-1",
+                        "tool_input": {"threadId": "desktop-current", "prompt": "continue mandatory successor"},
+                        "tool_response": {"isError": False},
+                    })
+                    self.assertFalse(
+                        controller_target_guard.has_active_outbound_lease(
+                            repo=repo, host="desktop_codex", registry_path=registry
+                        )
+                    )
             finally:
                 lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = old_registry, old_state_root
 
         self.assertEqual(code, 0)
-        self.assertIn('"permissionDecision": "deny"', output)
+        self.assertFalse(output)
+        self.assertEqual(post_code, 0)
+        self.assertIn("post_receipt_action_started", post_output)
+        self.assertIn("control_event_guard.py", post_output)
+
 
     def test_outbound_pre_tool_without_tool_use_id_fails_closed_without_a_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

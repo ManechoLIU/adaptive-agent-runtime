@@ -88,6 +88,139 @@ class ProjectContextGuardTests(unittest.TestCase):
         self.assertIn("verified_facts=", context)
         self.assertIn("unknown_facts=", context)
 
+    def test_project_context_separates_unique_controller_from_unverified_web_session(self):
+        module = self.hook()
+        registry = Path(self.tmp.name) / "controllers.json"
+        registry.write_text(
+            json.dumps({"controller-1": str(self.repo.resolve())}),
+            encoding="utf-8",
+        )
+        receipt = module.initialize_project_context(
+            self.repo,
+            skill_root=self.skill,
+            controller_registry_path=registry,
+            controller_host="web",
+            source_session_id=None,
+        )
+        project = receipt["project_controller_state"]
+        binding = receipt["session_binding_state"]
+        self.assertEqual(project["project_controller"], "EXISTING")
+        self.assertEqual(project["controller_id"], "controller-1")
+        self.assertEqual(project["uniqueness"], "UNIQUE")
+        self.assertEqual(binding["verification"], "UNVERIFIED")
+        self.assertEqual(binding["reason"], "HOST_SESSION_ID_UNAVAILABLE")
+        self.assertEqual(
+            binding["recovery"], "SAME_CONTROLLER_SESSION_RECOVERY_REQUIRED"
+        )
+        self.assertFalse(receipt["controller_actions_allowed"])
+        self.assertFalse(receipt["create_new_controller_allowed"])
+        context = module._context_text(receipt)
+        self.assertIn('"project_controller": "EXISTING"', context)
+        self.assertIn('"verification": "UNVERIFIED"', context)
+        self.assertIn("do not create, reappoint, replace", context)
+
+    def test_session_start_infers_native_codex_as_desktop_binding(self):
+        module = self.hook()
+        registry = Path(self.tmp.name) / "controllers.json"
+        registry.write_text(json.dumps({
+            "controller-1": str(self.repo.resolve()),
+            "__controller_sessions__": {
+                "controller-1": {"desktop_codex": ["desktop-current"]}
+            },
+            "__controller_targets__": {
+                "controller-1": {
+                    "desktop_codex": {
+                        "status": "active",
+                        "session_id": "desktop-current",
+                        "generation": 5,
+                    }
+                }
+            },
+        }), encoding="utf-8")
+        with patch.object(module.target_guard, "DEFAULT_REGISTRY", registry):
+            output, state = module.evaluate_event(
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "desktop-current",
+                    "turn_id": "t-desktop",
+                    "cwd": str(self.repo),
+                },
+                skill_root=self.skill,
+                prior_state={},
+            )
+        receipt = state["project_context_receipt"]
+        self.assertEqual(receipt["session_binding_state"]["host"], "desktop_codex")
+        self.assertEqual(receipt["session_binding_state"]["verification"], "VERIFIED")
+        self.assertTrue(receipt["controller_actions_allowed"])
+        self.assertIn(
+            '"verification": "VERIFIED"',
+            output["hookSpecificOutput"]["additionalContext"],
+        )
+
+    def test_controller_target_change_invalidates_prior_project_context_identity_receipt(self):
+        module = self.hook()
+        registry = Path(self.tmp.name) / "controllers.json"
+        registry.write_text(json.dumps({
+            "controller-1": str(self.repo.resolve()),
+            "__controller_sessions__": {
+                "controller-1": {"desktop_codex": ["desktop-old", "desktop-new"]}
+            },
+            "__controller_targets__": {
+                "controller-1": {
+                    "desktop_codex": {
+                        "status": "active",
+                        "session_id": "desktop-old",
+                        "generation": 1,
+                    }
+                }
+            },
+        }), encoding="utf-8")
+        receipt = module.initialize_project_context(
+            self.repo,
+            skill_root=self.skill,
+            controller_registry_path=registry,
+            controller_host="desktop_codex",
+            source_session_id="desktop-old",
+        )
+        saved = json.loads(registry.read_text(encoding="utf-8"))
+        saved["__controller_targets__"]["controller-1"]["desktop_codex"] = {
+            "status": "active",
+            "session_id": "desktop-new",
+            "generation": 2,
+        }
+        registry.write_text(json.dumps(saved), encoding="utf-8")
+        self.assertTrue(module._receipt_source_changed(receipt))
+
+    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self):
+        module = self.hook()
+        registry = Path(self.tmp.name) / "controllers.json"
+        registry.write_text(
+            json.dumps({
+                "controller-1": str(self.repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-current"]}
+                },
+            }),
+            encoding="utf-8",
+        )
+        receipt = module.initialize_project_context(
+            self.repo,
+            skill_root=self.skill,
+            controller_registry_path=registry,
+            controller_host="web",
+            source_session_id="web-current",
+        )
+        self.assertEqual(
+            receipt["project_controller_state"]["controller_id"],
+            "controller-1",
+        )
+        self.assertEqual(
+            receipt["session_binding_state"]["verification"],
+            "VERIFIED",
+        )
+        self.assertTrue(receipt["controller_actions_allowed"])
+        self.assertFalse(receipt["create_new_controller_allowed"])
+
     def test_nested_working_directory_loads_all_applicable_agents_in_scope_order(self):
         module = self.hook()
         with tempfile.TemporaryDirectory() as td:
@@ -218,8 +351,8 @@ class ProjectContextGuardTests(unittest.TestCase):
                 "turn_id": "mixed-unknown",
                 "cwd": str(self.repo),
                 "last_assistant_message": (
-                    "UNKNOWN / NOT FOUND：当前权威事实源中没有找到该模型定义。"
-                    "不过量子审计评分矩阵共五维，我给 88/100。"
+                    "UNKNOWN / NOT FOUND：当前权威事实源中未找到该机制，"
+                    "但确定使用红黄绿三色治理。"
                 ),
             },
             skill_root=self.skill,
@@ -408,7 +541,7 @@ class ProjectContextGuardTests(unittest.TestCase):
                 "hook_event_name": "Stop",
                 "session_id": "reader-session",
                 "turn_id": "nested-refresh",
-                "cwd": str(nested),
+                "cwd": str(self.repo),
                 "last_assistant_message": "当前项目规则已确认。",
             },
             skill_root=self.skill,

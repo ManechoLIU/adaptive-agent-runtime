@@ -142,29 +142,310 @@ def _git_common_dir(repo: Path) -> Path:
     return common_dir.resolve()
 
 
+def _matching_controller_ids_for_repo(
+    repo: Path, registry: dict[str, Any]
+) -> list[str]:
+    repo = repo.expanduser().resolve()
+    requested_common_dir = _git_common_dir(repo)
+    matches: list[str] = []
+    for controller_id, registered_repo in registry.items():
+        if (
+            not isinstance(controller_id, str)
+            or controller_id.startswith("__")
+            or not isinstance(registered_repo, str)
+        ):
+            continue
+        try:
+            if _git_common_dir(Path(registered_repo)) == requested_common_dir:
+                matches.append(
+                    _bounded_string(
+                        controller_id,
+                        label="controller id",
+                        maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH,
+                    )
+                )
+        except ValueError:
+            continue
+    return sorted(set(matches))
+
+
 def registered_controller_for_repo(
     repo: Path, registry_path: Path
 ) -> tuple[str, dict[str, Any]]:
     repo = repo.expanduser().resolve()
     registry_path = registry_path.expanduser()
     registry = load_json(registry_path)
-    requested_common_dir = _git_common_dir(repo)
-    matches: list[str] = []
-    for controller_id, registered_repo in registry.items():
-        if not isinstance(controller_id, str) or not isinstance(registered_repo, str):
-            continue
-        try:
-            if _git_common_dir(Path(registered_repo)) == requested_common_dir:
-                matches.append(controller_id)
-        except ValueError:
-            continue
+    matches = _matching_controller_ids_for_repo(repo, registry)
     if len(matches) != 1:
         raise PermissionError(
             f"expected exactly one registered Controller for {repo}, found {len(matches)}"
         )
-    return _bounded_string(
-        matches[0], label="controller id", maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH
-    ), registry
+    return matches[0], registry
+
+
+def _project_controller_state_from_registry(
+    repo: Path, registry: dict[str, Any]
+) -> dict[str, Any]:
+    matches = _matching_controller_ids_for_repo(repo, registry)
+    if not matches:
+        return {
+            "project_controller": "ABSENT",
+            "controller_id": None,
+            "uniqueness": "NONE",
+            "ownership": "NONE",
+            "matching_controller_ids": [],
+            "create_new_controller_allowed": True,
+        }
+    if len(matches) > 1:
+        return {
+            "project_controller": "CONFLICT",
+            "controller_id": None,
+            "uniqueness": "CONFLICT",
+            "ownership": "CONFLICT",
+            "matching_controller_ids": matches,
+            "create_new_controller_allowed": False,
+        }
+    controller_id = matches[0]
+    return {
+        "project_controller": "EXISTING",
+        "controller_id": controller_id,
+        "uniqueness": "UNIQUE",
+        "ownership": "ACTIVE",
+        "matching_controller_ids": matches,
+        "create_new_controller_allowed": False,
+    }
+
+
+def project_controller_state(
+    *, repo: Path, registry_path: Path = DEFAULT_REGISTRY
+) -> dict[str, Any]:
+    repo = repo.expanduser().resolve()
+    registry_path = registry_path.expanduser()
+    with locked_registry(registry_path) as registry:
+        state = _project_controller_state_from_registry(repo, registry)
+    return {
+        **state,
+        "repo": str(repo),
+        "registry": str(registry_path.resolve()),
+        "registry_sha256": _registry_sha256(registry_path),
+    }
+
+
+def _session_owners(
+    registry: dict[str, Any], *, session_id: str, host: str
+) -> set[str]:
+    owners: set[str] = set()
+    if isinstance(registry.get(session_id), str):
+        owners.add(session_id)
+    for controller_id, registered_repo in registry.items():
+        if (
+            not isinstance(controller_id, str)
+            or controller_id.startswith("__")
+            or not isinstance(registered_repo, str)
+        ):
+            continue
+        if session_id in host_sessions(
+            registry, controller_id=controller_id, host=host
+        ):
+            owners.add(controller_id)
+        record = target_record(registry, controller_id=controller_id, host=host)
+        if record is not None:
+            status, target, _generation = validate_target_record(record, host=host)
+            if status == "active" and target == session_id:
+                owners.add(controller_id)
+    return owners
+
+
+def controller_identity_projection(
+    *,
+    repo: Path,
+    host: str,
+    source_session_id: str | None,
+    registry_path: Path = DEFAULT_REGISTRY,
+) -> dict[str, Any]:
+    """Project durable Controller ownership separately from current session authorization."""
+    host = str(host or "").strip()
+    if host not in SUPPORTED_HOSTS:
+        raise ValueError(f"unsupported controller host: {host}")
+    repo = repo.expanduser().resolve()
+    registry_path = registry_path.expanduser()
+    supplied_session = str(source_session_id or "").strip()
+
+    with locked_registry(registry_path) as registry:
+        project = _project_controller_state_from_registry(repo, registry)
+        project_controller = str(project.get("controller_id") or "").strip()
+
+        if project["project_controller"] == "CONFLICT":
+            binding = {
+                "host": host,
+                "session_id": supplied_session or None,
+                "verification": "CONFLICT",
+                "reason": "PROJECT_CONTROLLER_CONFLICT",
+                "provenance": "controller_registry",
+                "binding_mode": None,
+                "target_generation": None,
+                "controller_actions_allowed": False,
+                "recovery": "CONFLICT_REQUIRES_MANUAL_RESOLUTION",
+                "same_controller_recovery_allowed": False,
+            }
+        elif project["project_controller"] == "ABSENT":
+            binding = {
+                "host": host,
+                "session_id": supplied_session or None,
+                "verification": "UNVERIFIED",
+                "reason": "NO_PROJECT_CONTROLLER",
+                "provenance": "controller_registry",
+                "binding_mode": None,
+                "target_generation": None,
+                "controller_actions_allowed": False,
+                "recovery": "NEW_CONTROLLER_REQUIRED",
+                "same_controller_recovery_allowed": False,
+            }
+        elif not supplied_session:
+            binding = {
+                "host": host,
+                "session_id": None,
+                "verification": "UNVERIFIED",
+                "reason": "HOST_SESSION_ID_UNAVAILABLE",
+                "provenance": "controller_registry",
+                "binding_mode": None,
+                "target_generation": None,
+                "controller_actions_allowed": False,
+                "recovery": "SAME_CONTROLLER_SESSION_RECOVERY_REQUIRED",
+                "same_controller_recovery_allowed": True,
+            }
+        else:
+            owners = _session_owners(
+                registry, session_id=supplied_session, host=host
+            )
+            foreign_owners = {
+                owner for owner in owners if owner != project_controller
+            }
+            if foreign_owners or len(owners) > 1:
+                binding = {
+                    "host": host,
+                    "session_id": supplied_session,
+                    "verification": "CONFLICT",
+                    "reason": "SESSION_OWNERSHIP_CONFLICT",
+                    "provenance": "controller_registry",
+                    "binding_mode": None,
+                    "target_generation": None,
+                    "controller_actions_allowed": False,
+                    "recovery": "CONFLICT_REQUIRES_MANUAL_RESOLUTION",
+                    "same_controller_recovery_allowed": False,
+                    "session_owner_controller_ids": sorted(owners),
+                }
+            else:
+                aliases = host_sessions(
+                    registry, controller_id=project_controller, host=host
+                )
+                record = target_record(
+                    registry, controller_id=project_controller, host=host
+                )
+                if record is None:
+                    if (
+                        host == "web"
+                        and supplied_session in aliases
+                        and len(aliases) == 1
+                    ):
+                        verification = "VERIFIED"
+                        reason = "BOUND_REGISTERED_WEB_SESSION"
+                        mode = "legacy_single_binding"
+                        generation = 0
+                    elif host == "web" and supplied_session in aliases:
+                        verification = "STALE"
+                        reason = "EXPLICIT_CURRENT_TARGET_REQUIRED"
+                        mode = "historical_alias"
+                        generation = 0
+                    elif not aliases and supplied_session == project_controller:
+                        verification = "VERIFIED"
+                        reason = "LEGACY_CANONICAL_SESSION"
+                        mode = "legacy_canonical"
+                        generation = 0
+                    elif supplied_session in aliases:
+                        verification = "STALE"
+                        reason = "EXPLICIT_CURRENT_TARGET_REQUIRED"
+                        mode = "historical_alias"
+                        generation = 0
+                    else:
+                        verification = "UNVERIFIED"
+                        reason = "SESSION_NOT_BOUND_TO_PROJECT_CONTROLLER"
+                        mode = None
+                        generation = None
+                else:
+                    status, target, generation = validate_target_record(
+                        record, host=host
+                    )
+                    if status == "active" and target == supplied_session:
+                        verification = "VERIFIED"
+                        reason = "CURRENT_EXECUTION_TARGET"
+                        mode = str(record.get("binding_mode") or "explicit_current")
+                    elif supplied_session in aliases or supplied_session == project_controller:
+                        verification = "STALE"
+                        reason = (
+                            "EXECUTION_TARGET_UNBOUND"
+                            if status == "unbound"
+                            else "SESSION_NOT_CURRENT_TARGET"
+                        )
+                        mode = "historical_alias"
+                    else:
+                        verification = "UNVERIFIED"
+                        reason = "SESSION_NOT_BOUND_TO_PROJECT_CONTROLLER"
+                        mode = None
+
+                verified = verification == "VERIFIED"
+                recoverable = verification in {"UNVERIFIED", "STALE"}
+                target_provenance = (
+                    str(record.get("provenance") or "controller_registry")
+                    if isinstance(record, dict) and verification == "VERIFIED"
+                    else "controller_registry"
+                )
+                binding = {
+                    "host": host,
+                    "session_id": supplied_session,
+                    "verification": verification,
+                    "reason": reason,
+                    "provenance": target_provenance,
+                    "binding_mode": mode,
+                    "target_generation": generation,
+                    "controller_actions_allowed": verified,
+                    "recovery": (
+                        "NONE"
+                        if verified
+                        else "SAME_CONTROLLER_SESSION_RECOVERY_REQUIRED"
+                        if recoverable
+                        else "CONFLICT_REQUIRES_MANUAL_RESOLUTION"
+                    ),
+                    "same_controller_recovery_allowed": recoverable,
+                }
+                if (
+                    isinstance(record, dict)
+                    and verification == "VERIFIED"
+                    and str(record.get("host_identity_receipt_sha256") or "").strip()
+                ):
+                    binding["host_identity_receipt_sha256"] = str(
+                        record["host_identity_receipt_sha256"]
+                    )
+
+    project = {
+        **project,
+        "repo": str(repo),
+        "registry": str(registry_path.resolve()),
+        "registry_sha256": _registry_sha256(registry_path),
+    }
+    return {
+        "project_controller_state": project,
+        "session_binding_state": binding,
+        "controller_actions_allowed": bool(
+            binding.get("controller_actions_allowed")
+        ),
+        "same_controller_recovery_allowed": bool(
+            binding.get("same_controller_recovery_allowed")
+        ),
+        "create_new_controller_allowed": bool(
+            project.get("create_new_controller_allowed")
+        ),
+    }
 
 
 def host_sessions(
@@ -649,7 +930,8 @@ def build_parser() -> argparse.ArgumentParser:
     resolve = subparsers.add_parser("resolve")
     check = subparsers.add_parser("check")
     reconcile = subparsers.add_parser("reconcile")
-    for command in (resolve, check, reconcile):
+    identity = subparsers.add_parser("identity")
+    for command in (resolve, check, reconcile, identity):
         command.add_argument("--repo", required=True)
         command.add_argument("--host", choices=SUPPORTED_HOSTS, required=True)
         command.add_argument("--registry", default=str(DEFAULT_REGISTRY))
@@ -662,6 +944,7 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--generation", type=int, required=True)
     reconcile.add_argument("--host-receipt-reference", required=True)
     reconcile.add_argument("--reason", required=True)
+    identity.add_argument("--session-id")
     return parser
 
 
@@ -672,6 +955,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             receipt = resolve_execution_target(
                 repo=Path(args.repo),
                 host=args.host,
+                registry_path=Path(args.registry),
+            )
+        elif args.command == "identity":
+            receipt = controller_identity_projection(
+                repo=Path(args.repo),
+                host=args.host,
+                source_session_id=args.session_id,
                 registry_path=Path(args.registry),
             )
         elif args.command == "check":

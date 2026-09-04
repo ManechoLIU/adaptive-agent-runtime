@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -872,6 +873,64 @@ def continuation_reason(
     return lifecycle + "\n\n" + controller_self_check_context()
 
 
+OBSERVATION_STATUS_QUERY = re.compile(
+    r"(?:"
+    r"进度(?:怎么样|如何|情况)?|工作(?:怎么样|情况如何|情况怎么样)?|"
+    r"履职(?:情况)?(?:如何|怎么样)?|完成了吗|好了吗|卡住了吗|"
+    r"status(?:\s+update)?|progress(?:\s+update)?|how(?:'s| is) it going"
+    r")",
+    re.IGNORECASE,
+)
+
+
+KNOWN_NEXT_ACTION_MESSAGE = re.compile(
+    r"(?:下一步|接下来|next(?:\s+step)?|then)"
+    r".{0,80}?"
+    r"(?:集成|派发|恢复|验收|验证|重算|回归|修复|dispatch|integrat|recover|verify|recompute|review)",
+    re.IGNORECASE,
+)
+
+
+def _snapshot_has_immediate_controller_work(snapshot: dict[str, Any]) -> bool:
+    if snapshot.get("runnable_ids") or snapshot.get("candidate_revisions"):
+        return True
+    corrections = snapshot.get("controller_corrections")
+    if isinstance(corrections, list) and corrections:
+        return True
+    liveness = snapshot.get("assignment_liveness")
+    if isinstance(liveness, dict):
+        for value in liveness.values():
+            if not isinstance(value, dict):
+                continue
+            if str(value.get("state", "")).strip().lower() in {
+                "terminal", "unhealthy", "progress_stale", "budget_exhausted"
+            }:
+                return True
+    return False
+
+
+def _assistant_declares_executable_next_action(
+    event: dict[str, Any], snapshot: dict[str, Any]
+) -> bool:
+    if event.get("hook_event_name") != "Stop":
+        return False
+    message = str(event.get("last_assistant_message", "")).strip()
+    return bool(
+        message
+        and KNOWN_NEXT_ACTION_MESSAGE.search(message)
+        and _snapshot_has_immediate_controller_work(snapshot)
+    )
+
+
+def _is_observation_status_query(event: dict[str, Any]) -> bool:
+    if event.get("hook_event_name") != "UserPromptSubmit":
+        return False
+    prompt = str(event.get("prompt", "")).strip()
+    if not prompt or len(prompt) > 160:
+        return False
+    return bool(OBSERVATION_STATUS_QUERY.search(prompt))
+
+
 def evaluate_event(
     event: dict[str, Any],
     *,
@@ -899,10 +958,43 @@ def evaluate_event(
         state["must_yield"] = False
     if "tool_trace" not in state:
         state["tool_trace"] = []
+    if _is_observation_status_query(event):
+        state["observation_query_only"] = True
+        state["observation_query_turn_id"] = _event_turn_id(event)
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": (
+                    "Status query is observation-only. Report the current fact snapshot without "
+                    "treating this user message as a continue/resume/scheduling signal. Existing "
+                    "pending_control_event, runnable work, continuation debt, and Controller scoring "
+                    "state remain governed by their pre-existing machine facts."
+                ),
+            }
+        }, state
+
     if event_name in {"PreToolUse", "Stop"}:
         fault = _turn_fault(state, event)
         if fault:
             return _adapter_fault_output(state, event, fault), state
+    if _assistant_declares_executable_next_action(event, snapshot):
+        state["must_yield"] = False
+        state.pop("receipt_turn_id", None)
+        state["pending_control_event"] = True
+        current_triggers = {
+            str(item) for item in state.get("triggers", []) if str(item).strip()
+        }
+        current_triggers.add("KNOWN_NEXT_ACTION_NOT_EXECUTED")
+        state["triggers"] = sorted(current_triggers)
+        return {
+            "decision": "block",
+            "reason": (
+                "Hard Yield Gate: Controller 已明确给出当前可执行的下一动作，"
+                "必须先执行、hard BLOCK/DEFER，或完成事实收敛与 project-wide recompute；"
+                "不得一边声明下一步一边 Yield。"
+            ),
+        }, state
+
     if event_name == "Stop" and snapshot.get("control_loop_required") is True:
         active_turn = str(state.get("active_turn_id", "")).strip()
         receipt_turn = str(state.get("receipt_turn_id", "")).strip()
@@ -948,9 +1040,23 @@ def evaluate_event(
             state["inflight_tool_use_ids"] = inflight
             return {}, state
         if state.get("must_yield") is True:
-            return _pre_tool_denial(
-                "当前控制事件已经签发成功收据；同一回合必须立即结束，禁止继续调用工具。"
-            ), state
+            turn_id = _event_turn_id(event) or str(state.get("active_turn_id", "")).strip()
+            receipt_turn_id = str(state.get("receipt_turn_id", "")).strip()
+            if not turn_id or receipt_turn_id != turn_id:
+                return _pre_tool_denial(
+                    "Controller must_yield state is not backed by a current-turn control receipt; "
+                    "fail closed and recompute the project-wide control loop before further tools."
+                ), state
+            state["must_yield"] = False
+            state.pop("receipt_turn_id", None)
+            state.pop("goal_block_authorization", None)
+            state["pending_control_event"] = True
+            current_triggers = {
+                str(item) for item in state.get("triggers", []) if str(item).strip()
+            }
+            current_triggers.add("post_receipt_action_started")
+            state["triggers"] = sorted(current_triggers)
+            state["receipt_invalidated_reason"] = "same_turn_mandatory_continuation"
         inflight = [
             str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)
         ]

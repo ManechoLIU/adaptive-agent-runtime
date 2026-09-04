@@ -38,6 +38,23 @@ def validate_contract(contract: dict[str, Any]) -> list[str]:
     return errors
 
 
+PROJECT_WIDE_CONTROL_ACTIONS = {"dispatch", "defer", "block", "recompute"}
+
+
+def _project_wide_control_action(proposed: dict[str, Any]) -> bool:
+    action = str(proposed.get("action", "")).strip().lower()
+    files = proposed.get("files")
+    return (
+        action in PROJECT_WIDE_CONTROL_ACTIONS
+        and proposed.get("project_wide_scheduler_action") is True
+        and proposed.get("derived_from_project_projection") is True
+        and isinstance(files, list)
+        and not files
+        and proposed.get("starts_new_implementation") is not True
+        and proposed.get("waits_for_future_input") is not True
+    )
+
+
 def classify_append(
     contract: dict[str, Any], proposed: dict[str, Any]
 ) -> tuple[str, list[str]]:
@@ -59,9 +76,10 @@ def classify_append(
     if not isinstance(files, list):
         return "INVALID", ["proposed.files must be a list"]
 
-    if task != str(contract["primary_task"]).strip():
+    project_wide_control = _project_wide_control_action(proposed)
+    if task != str(contract["primary_task"]).strip() and not project_wide_control:
         reasons.append("different primary task")
-    if revision != str(contract["candidate_revision"]).strip():
+    if revision != str(contract["candidate_revision"]).strip() and not project_wide_control:
         reasons.append("different candidate revision")
     if action not in set(contract["allowed_actions"]):
         reasons.append("action is outside allowed_actions")

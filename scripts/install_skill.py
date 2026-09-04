@@ -45,6 +45,12 @@ IMPACTS = {"none", "live_assignments"}
 RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_reentry_adapter.WebReentryContinuationRegressionTests."
     "test_transient_web_reentry_failure_rearms_existing_continuation_supervisor",
+    "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
+    "test_same_receipt_live_supervisor_is_coalesced",
+    "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
+    "test_current_token_web_rearm_hands_off_with_force_rearm_proof",
+    "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
+    "test_stale_supervisor_token_exits_without_running_impl",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
     "test_regression_parent_already_yielded_then_writer_completed_wakes_same_controller_with_next_runnable",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."

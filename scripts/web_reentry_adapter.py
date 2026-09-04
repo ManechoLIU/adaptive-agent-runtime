@@ -9,6 +9,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    import controller_target_guard as target_guard
+except ModuleNotFoundError:
+    from scripts import controller_target_guard as target_guard
+
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 DEFAULT_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
 MCP_PROTOCOL_VERSION = "2025-03-26"
@@ -56,7 +61,25 @@ def resolve_reentry_session(
     session_id = record.get("web_session_id")
     if not isinstance(session_id, str) or not session_id.strip() or session_id not in bound:
         raise PermissionError("Web re-entry lease session is not bound to the registered Controller")
-    return session_id.strip()
+    session_id = session_id.strip()
+    target = target_guard.target_record(
+        registry, controller_id=controller_id, host="web"
+    )
+    if target is None:
+        if bound != {session_id}:
+            raise PermissionError(
+                "Web re-entry requires one legacy binding or an explicit current Web target"
+            )
+    elif (
+        target_guard.active_source_controller_id(
+            registry, source_session_id=session_id, host="web"
+        )
+        != controller_id
+    ):
+        raise PermissionError(
+            "Web re-entry lease session is not the current verified Controller entry"
+        )
+    return session_id
 
 
 def discover_ai_bridge_mcp_url(*, ps_text: str | None = None) -> str:

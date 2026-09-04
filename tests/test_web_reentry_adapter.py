@@ -17,6 +17,15 @@ class WebReentryAdapterTests(unittest.TestCase):
         registry.write_text(json.dumps({
             "controller-1": str(repo.resolve()),
             "__controller_sessions__": {"controller-1": {"web": [web_session_id, "web-old"]}},
+            "__controller_targets__": {
+                "controller-1": {
+                    "web": {
+                        "status": "active",
+                        "session_id": web_session_id,
+                        "generation": 3,
+                    }
+                }
+            },
         }), encoding="utf-8")
         lease = root / "web-leases.json"
         lease.write_text(json.dumps({

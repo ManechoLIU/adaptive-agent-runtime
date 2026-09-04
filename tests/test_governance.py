@@ -1606,6 +1606,65 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             event_scope_guard.classify_append(contract, proposed),
             ("SAME_EVENT", []),
         )
+    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self) -> None:
+        contract = {
+            "event_id": "review-web-1",
+            "event_type": "review_terminal",
+            "primary_task": "WEB-1",
+            "candidate_revision": "web-candidate",
+            "terminal_receipt": "receipt:web-review",
+            "allowed_actions": ["consume_review", "dispatch"],
+            "allowed_files": [],
+        }
+        proposed = {
+            "action": "dispatch",
+            "primary_task": "MINI-READY",
+            "candidate_revision": "project-wide",
+            "files": [],
+            "required_to_close_current_state": True,
+            "starts_new_implementation": False,
+            "waits_for_future_input": False,
+            "project_wide_scheduler_action": True,
+            "derived_from_project_projection": True,
+        }
+        self.assertEqual(
+            event_scope_guard.classify_append(contract, proposed),
+            ("SAME_EVENT", []),
+        )
+
+    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self) -> None:
+        contract = {
+            "event_id": "review-web-1",
+            "event_type": "review_terminal",
+            "primary_task": "WEB-1",
+            "candidate_revision": "web-candidate",
+            "terminal_receipt": "receipt:web-review",
+            "allowed_actions": ["consume_review", "dispatch"],
+            "allowed_files": [],
+        }
+        base = {
+            "action": "dispatch",
+            "primary_task": "MINI-READY",
+            "candidate_revision": "project-wide",
+            "files": [],
+            "required_to_close_current_state": True,
+            "starts_new_implementation": False,
+            "waits_for_future_input": False,
+        }
+        decision, reasons = event_scope_guard.classify_append(contract, base)
+        self.assertEqual(decision, "QUEUE_NEXT_EVENT")
+        self.assertIn("different primary task", reasons)
+
+        implementation = {
+            **base,
+            "project_wide_scheduler_action": True,
+            "derived_from_project_projection": True,
+            "starts_new_implementation": True,
+        }
+        decision, reasons = event_scope_guard.classify_append(contract, implementation)
+        self.assertEqual(decision, "QUEUE_NEXT_EVENT")
+        self.assertIn("new implementation belongs to a new event", reasons)
+
 
     def test_event_scope_guard_queues_unrelated_or_future_work(self) -> None:
         contract = {
@@ -2128,6 +2187,12 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 "integration_flow": "server-main", "decision": "integrate",
                 "controller_event_id": "event-1", "integrated_this_event": True,
                 "main_revision": "main-2", "regression_evidence": "current-main targeted 16/16 PASS",
+                "current_main_verified": True,
+                "current_main_verification_evidence": "receipt:current-main-verify",
+                "fact_converged": True,
+                "fact_convergence_evidence": "receipt:fact-convergence",
+                "post_integration_recomputed": True,
+                "post_integration_recompute_evidence": "receipt:project-recompute",
             }],
             "new_assignments": [],
         }
@@ -3483,6 +3548,12 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                     "integrated_this_event": True,
                     "main_revision": "main-after-web-1",
                     "regression_evidence": "current-main targeted regression PASS",
+                "current_main_verified": True,
+                "current_main_verification_evidence": "receipt:current-main-verify",
+                "fact_converged": True,
+                "fact_convergence_evidence": "receipt:fact-convergence",
+                "post_integration_recomputed": True,
+                "post_integration_recompute_evidence": "receipt:project-recompute",
                 }
             ],
             "new_assignments": [
@@ -3857,6 +3928,36 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             self.assertEqual(second["level"], "L4")
             self.assertEqual(second["recurrence_count"], 2)
 
+    def test_continuation_debt_fingerprint_escalates_through_existing_recurrence_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            recorded = []
+            for index in (1, 2):
+                snapshot = self.complete_event_receipt()
+                snapshot["event_contract"]["event_id"] = f"continuation-debt-{index}"
+                receipt, _ = control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    snapshot,
+                    controller_id="controller-1",
+                    ledger_sha256=f"ledger-{index}",
+                    main_revision=f"main-{index}",
+                    terminal_status="FAILED",
+                    validation_errors=[
+                        "continuation debt remains open: integration:deadbeef"
+                    ],
+                )
+                recorded.append(receipt["controller_deviations"][0])
+            first, second = recorded
+            self.assertEqual(first["deviation_code"], "CONTINUATION_DEBT_NOT_CLEARED")
+            self.assertEqual(first["fingerprint"], second["fingerprint"])
+            self.assertEqual(first["level"], "L3")
+            self.assertEqual(second["level"], "L4")
+            self.assertEqual(second["recurrence_count"], 2)
+            self.assertTrue(
+                second["correction"]["requires_unique_controller_handoff"]
+            )
+
     def test_open_correction_enters_lifecycle_projection_and_blocks_stop(self) -> None:
         snapshot = {
             "head": "abc",
@@ -4129,6 +4230,370 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertEqual(state["triggers"], [])
         self.assertTrue(state["must_yield"])
         self.assertEqual(state["receipt_turn_id"], "turn-1")
+
+    def test_reviewer_pass_integration_has_mandatory_verify_converge_recompute_successors(self) -> None:
+        snapshot = {
+            "candidate_packages": [{
+                "revision": "deadbeef",
+                "worktree": "/tmp/candidate",
+                "task_id": "WEB-TASK",
+                "integration_flow": "web",
+                "decision": "integrate",
+                "controller_event_id": "event-1",
+                "integrated_this_event": True,
+                "main_revision": "main-after",
+                "regression_evidence": "receipt:integration-regression",
+            }],
+            "required_reviews": [{
+                "id": "review-web",
+                "task_id": "WEB-TASK",
+                "delivered_ack": True,
+                "verdict": "PASS",
+                "candidate_revision": "deadbeef",
+            }],
+        }
+        errors = control_event_guard.validate_mandatory_continuations(
+            snapshot,
+            ledger_task_states={"WEB-TASK": "VERIFY"},
+        )
+        self.assertTrue(any("current-main verification" in error for error in errors))
+
+        candidate = snapshot["candidate_packages"][0]
+        candidate.update({
+            "current_main_verified": True,
+            "current_main_verification_evidence": "receipt:main-verify",
+        })
+        errors = control_event_guard.validate_mandatory_continuations(
+            snapshot,
+            ledger_task_states={"WEB-TASK": "VERIFY"},
+        )
+        self.assertTrue(any("FACT_PROJECTION_DRIFT" in error for error in errors))
+
+        candidate.update({
+            "fact_converged": True,
+            "fact_convergence_evidence": "receipt:ledger-converged",
+        })
+        errors = control_event_guard.validate_mandatory_continuations(
+            snapshot,
+            ledger_task_states={"WEB-TASK": "CLOSED"},
+        )
+        self.assertTrue(any("post-integration project-wide recompute" in error for error in errors))
+
+        candidate.update({
+            "post_integration_recomputed": True,
+            "post_integration_recompute_evidence": "receipt:project-recompute",
+        })
+        self.assertEqual(
+            control_event_guard.validate_mandatory_continuations(
+                snapshot,
+                ledger_task_states={"WEB-TASK": "CLOSED"},
+            ),
+            [],
+        )
+
+    def test_known_next_action_enters_canonical_controller_action_projection(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            with patch.object(
+                control_event_guard,
+                "_controller_lifecycle_state",
+                return_value={
+                    "next_action": "integrate reviewed candidate",
+                    "requires_user": False,
+                },
+            ):
+                actions = control_event_guard.canonical_controller_action_projection(
+                    repo,
+                    controller_id="controller-1",
+                    candidates={},
+                    required_review_ids=set(),
+                    work_in_flight={},
+                    corrections=[],
+                    snapshot={},
+                )
+            self.assertTrue(
+                any(item.get("type") == "known_next_action" for item in actions.values())
+            )
+
+    def test_continuation_debt_blocks_control_loop_receipt_until_every_action_resolved(self) -> None:
+        snapshot = {
+            "control_loop_receipt": {
+                "scope": "project_wide",
+                "completed_steps": list(control_event_guard.CONTROL_LOOP_STEPS),
+                "ledger_sha256": "ledger",
+                "runnable_ids": [],
+                "candidate_revisions": [],
+                "controller_action_ids": ["known_next_action:abc"],
+                "correction_fingerprints": [],
+                "continuation_debt_ids": ["known_next_action:abc"],
+                "open_continuation_debt_ids": ["known_next_action:abc"],
+                "recomputed_after_actions": True,
+            },
+            "controller_actions": [],
+            "correction_actions": [],
+        }
+        errors = control_event_guard.validate_control_loop_receipt(
+            snapshot,
+            expected_ledger_sha256="ledger",
+            expected_runnable_ids=set(),
+            expected_candidate_revisions=set(),
+            expected_controller_action_ids={"known_next_action:abc"},
+            expected_corrections=[],
+        )
+        self.assertTrue(any("continuation debt" in error.lower() for error in errors))
+
+        snapshot["controller_actions"] = [{
+            "id": "known_next_action:abc",
+            "decision": "executed",
+            "evidence": "receipt:next-action",
+        }]
+        snapshot["control_loop_receipt"]["open_continuation_debt_ids"] = []
+        self.assertEqual(
+            control_event_guard.validate_control_loop_receipt(
+                snapshot,
+                expected_ledger_sha256="ledger",
+                expected_runnable_ids=set(),
+                expected_candidate_revisions=set(),
+                expected_controller_action_ids={"known_next_action:abc"},
+                expected_corrections=[],
+            ),
+            [],
+        )
+
+    def test_durable_terminal_receipt_enters_debt_once_and_disappears_after_consumption(self) -> None:
+        from unittest.mock import patch
+
+        terminal_path = "/tmp/durable-terminal-verdict.json"
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            with patch.object(
+                control_event_guard,
+                "_controller_lifecycle_state",
+                return_value={
+                    "pending_terminal_receipts": [terminal_path],
+                    "requires_user": False,
+                },
+            ):
+                first = control_event_guard.canonical_controller_action_projection(
+                    repo,
+                    controller_id="controller-1",
+                    candidates={},
+                    required_review_ids=set(),
+                    work_in_flight={},
+                    corrections=[],
+                    snapshot={},
+                )
+            terminal_ids = [
+                action_id
+                for action_id, action in first.items()
+                if action.get("type") == "terminal_receipt"
+            ]
+            self.assertEqual(len(terminal_ids), 1)
+
+            action_id = terminal_ids[0]
+            receipt_snapshot = {
+                "control_loop_receipt": {
+                    "scope": "project_wide",
+                    "completed_steps": list(control_event_guard.CONTROL_LOOP_STEPS),
+                    "ledger_sha256": "ledger",
+                    "runnable_ids": [],
+                    "candidate_revisions": [],
+                    "controller_action_ids": [action_id],
+                    "correction_fingerprints": [],
+                    "continuation_debt_ids": [action_id],
+                    "open_continuation_debt_ids": [],
+                    "recomputed_after_actions": True,
+                },
+                "controller_actions": [{
+                    "id": action_id,
+                    "decision": "executed",
+                    "evidence": "receipt:durable-terminal-consumed",
+                }],
+                "correction_actions": [],
+            }
+            self.assertEqual(
+                control_event_guard.validate_control_loop_receipt(
+                    receipt_snapshot,
+                    expected_ledger_sha256="ledger",
+                    expected_runnable_ids=set(),
+                    expected_candidate_revisions=set(),
+                    expected_controller_action_ids={action_id},
+                    expected_corrections=[],
+                ),
+                [],
+            )
+
+            with patch.object(
+                control_event_guard,
+                "_controller_lifecycle_state",
+                return_value={"pending_terminal_receipts": [], "requires_user": False},
+            ):
+                second = control_event_guard.canonical_controller_action_projection(
+                    repo,
+                    controller_id="controller-1",
+                    candidates={},
+                    required_review_ids=set(),
+                    work_in_flight={},
+                    corrections=[],
+                    snapshot={},
+                )
+            self.assertNotIn(action_id, second)
+
+    def test_hard_blocked_or_deferred_actions_clear_continuation_debt_and_allow_yield(self) -> None:
+        action_ids = {"integration:abc", "recovery:T1"}
+        snapshot = {
+            "control_loop_receipt": {
+                "scope": "project_wide",
+                "completed_steps": list(control_event_guard.CONTROL_LOOP_STEPS),
+                "ledger_sha256": "ledger",
+                "runnable_ids": [],
+                "candidate_revisions": [],
+                "controller_action_ids": sorted(action_ids),
+                "correction_fingerprints": [],
+                "continuation_debt_ids": sorted(action_ids),
+                "open_continuation_debt_ids": [],
+                "recomputed_after_actions": True,
+            },
+            "controller_actions": [{
+                "id": "integration:abc",
+                "decision": "blocked",
+                "reason_code": "shared_environment",
+                "reason": "integration environment is exclusively occupied",
+                "evidence": "receipt:integration-lock",
+            }, {
+                "id": "recovery:T1",
+                "decision": "deferred",
+                "reason_code": "external_blocker",
+                "reason": "provider recovery endpoint is unavailable",
+                "evidence": "receipt:provider-outage",
+                "next_checkpoint": "provider availability change",
+            }],
+            "correction_actions": [],
+        }
+        self.assertEqual(
+            control_event_guard.validate_control_loop_receipt(
+                snapshot,
+                expected_ledger_sha256="ledger",
+                expected_runnable_ids=set(),
+                expected_candidate_revisions=set(),
+                expected_controller_action_ids=action_ids,
+                expected_corrections=[],
+            ),
+            [],
+        )
+
+    def test_scenario_a_reviewer_pass_derives_all_successors_then_releases_next_ready(self) -> None:
+        review = {
+            "id": "review-web",
+            "task_id": "WEB-1",
+            "delivered_ack": True,
+            "verdict": "PASS",
+            "candidate_revision": "candidate-web",
+        }
+        candidate = {
+            "revision": "candidate-web",
+            "worktree": "/tmp/web-candidate",
+            "task_id": "WEB-1",
+            "integration_flow": "web-main",
+            "decision": "review",
+        }
+        snapshot = {"required_reviews": [review], "candidate_packages": [candidate]}
+
+        actions = control_event_guard.mandatory_continuation_projection(snapshot)
+        self.assertEqual(actions["integration:candidate-web"]["type"], "integration")
+
+        candidate.update({
+            "decision": "integrate",
+            "integrated_this_event": True,
+            "main_revision": "main-after-web",
+            "regression_evidence": "receipt:integration-regression",
+        })
+        actions = control_event_guard.mandatory_continuation_projection(snapshot)
+        self.assertIn("current_main_verify:candidate-web", actions)
+
+        candidate.update({
+            "current_main_verified": True,
+            "current_main_verification_evidence": "receipt:main-verify",
+        })
+        actions = control_event_guard.mandatory_continuation_projection(snapshot)
+        self.assertIn("fact_convergence:WEB-1", actions)
+
+        candidate.update({
+            "fact_converged": True,
+            "fact_convergence_evidence": "receipt:fact-convergence",
+        })
+        actions = control_event_guard.mandatory_continuation_projection(snapshot)
+        self.assertIn("post_integration_recompute:candidate-web", actions)
+
+        candidate.update({
+            "post_integration_recomputed": True,
+            "post_integration_recompute_evidence": "receipt:project-recompute",
+        })
+        self.assertEqual(
+            control_event_guard.mandatory_continuation_projection(
+                snapshot,
+                ledger_task_states={"WEB-1": "CLOSED"},
+            ),
+            {},
+        )
+
+        ledger = self._fairness_ledger([
+            ("WEB-1", "CLOSED", "done"),
+            ("MINI-READY", "READY", "dispatch mini writer"),
+        ])
+        projection = control_event_guard.project_wide_dispatch_projection(ledger)
+        self.assertIn("MINI-READY", projection["derived_runnable_ids"])
+
+    def test_scenario_b_reviewer_fail_creates_rework_debt_and_blocks_yield_until_consumed(self) -> None:
+        snapshot = {
+            "required_reviews": [{
+                "id": "review-web",
+                "task_id": "WEB-1",
+                "delivered_ack": True,
+                "verdict": "FAIL",
+                "candidate_revision": "candidate-web",
+            }],
+            "candidate_packages": [{
+                "revision": "candidate-web",
+                "worktree": "/tmp/web-candidate",
+                "task_id": "WEB-1",
+                "integration_flow": "web-main",
+                "decision": "review",
+            }],
+        }
+        actions = control_event_guard.mandatory_continuation_projection(snapshot)
+        action_id = "rework:candidate-web"
+        self.assertEqual(actions[action_id]["type"], "rework")
+
+        receipt_snapshot = {
+            "control_loop_receipt": {
+                "scope": "project_wide",
+                "completed_steps": list(control_event_guard.CONTROL_LOOP_STEPS),
+                "ledger_sha256": "ledger",
+                "runnable_ids": [],
+                "candidate_revisions": [],
+                "controller_action_ids": [action_id],
+                "correction_fingerprints": [],
+                "continuation_debt_ids": [action_id],
+                "open_continuation_debt_ids": [action_id],
+                "recomputed_after_actions": True,
+            },
+            "controller_actions": [],
+            "correction_actions": [],
+        }
+        errors = control_event_guard.validate_control_loop_receipt(
+            receipt_snapshot,
+            expected_ledger_sha256="ledger",
+            expected_runnable_ids=set(),
+            expected_candidate_revisions=set(),
+            expected_controller_action_ids={action_id},
+            expected_corrections=[],
+        )
+        self.assertTrue(any("continuation debt remains open" in error for error in errors))
 
     def test_preblock_guard_rejects_derived_runnable_pending_package(self) -> None:
         snapshot = {

@@ -261,10 +261,14 @@ class SkillStructureTests(unittest.TestCase):
             "READY",
             "阻塞",
             "下一可见检查点",
-            "短事件回合",
-            "立即 yield",
+            "Mandatory Continuation",
+            "Continuation Debt",
+            "open_continuation_debt_ids",
+            "project-wide recompute",
         ):
             self.assertIn(phrase, long_task)
+        self.assertNotIn("形成收据后**立即 yield**", long_task)
+        self.assertNotIn("收据后立即 yield", long_task)
 
     def test_long_task_governance_prefers_subtraction_and_business_closure(self):
         entrypoint = read_entrypoint()
@@ -342,9 +346,10 @@ class SkillStructureTests(unittest.TestCase):
         long_task = REFERENCE_PATHS["long-task"].read_text(encoding="utf-8")
 
         for phrase in (
-            "短事件按因果边界",
+            "控制事件按因果事务",
             "QUEUE_NEXT_EVENT",
-            "若延后动作不会造成不一致、不安全或不可恢复",
+            "project-wide dispatch / defer / block / recompute",
+            "不扩张实现 scope",
             "Agent 实例和本次 Assignment 是两个身份",
             "Reviewer 改为同候选 Writer 后失去该 revision 的非作者资格",
             "任务表是状态唯一权威",

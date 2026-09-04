@@ -207,6 +207,392 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 78)
             self.assertIn("verified Web Controller Session identity", result.stderr)
 
+    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            (repo / "AGENTS.md").write_text("rules" + chr(10), encoding="utf-8")
+            registry = root / "controllers.json"
+            registry.write_text(
+                json.dumps({"controller-1": str(repo.resolve())}),
+                encoding="utf-8",
+            )
+            result = self.run_bridge(
+                "session-start",
+                "--repo", str(repo),
+                "--registry", str(registry),
+            )
+
+            self.assertEqual(result.returncode, 78)
+            diagnostic = json.loads(result.stderr.strip().splitlines()[-1])
+            self.assertEqual(
+                diagnostic["project_controller_state"]["project_controller"],
+                "EXISTING",
+            )
+            self.assertEqual(
+                diagnostic["project_controller_state"]["controller_id"],
+                "controller-1",
+            )
+            self.assertEqual(
+                diagnostic["session_binding_state"]["verification"],
+                "UNVERIFIED",
+            )
+            self.assertEqual(
+                diagnostic["session_binding_state"]["reason"],
+                "HOST_SESSION_ID_UNAVAILABLE",
+            )
+            self.assertEqual(
+                diagnostic["session_binding_state"]["recovery"],
+                "SAME_CONTROLLER_SESSION_RECOVERY_REQUIRED",
+            )
+            self.assertFalse(diagnostic["controller_actions_allowed"])
+
+    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            (repo / "AGENTS.md").write_text("rules" + chr(10), encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "AGENTS.md"], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", str(repo),
+                    "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                    "commit", "-qm", "init",
+                ],
+                check=True,
+            )
+            registry = root / "controllers.json"
+            registry.write_text(
+                json.dumps({"controller-1": str(repo.resolve())}),
+                encoding="utf-8",
+            )
+            pending_state = {
+                "pending_control_event": True,
+                "requires_user": False,
+                "triggers": ["RUNNABLE:MINI-READY", "reviewer_terminal:WEB-1"],
+                "next_action": "consume reviewer and recompute project",
+                "wake_generation": 8,
+                "snapshot": {
+                    "runnable_ids": ["MINI-READY"],
+                    "candidate_revisions": ["candidate-web"],
+                },
+            }
+            host_receipt = {
+                "host": "web",
+                "session_id": "web-new",
+                "attested": True,
+            }
+            out, err = StringIO(), StringIO()
+
+            def verifier(**kwargs: object) -> bool:
+                return (
+                    kwargs.get("controller_id") == "controller-1"
+                    and kwargs.get("expected_target_session_id") == "web-new"
+                    and kwargs.get("host_execution_receipt") == host_receipt
+                )
+
+            with patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=verifier,
+            ), patch.object(
+                web_bridge,
+                "_load_lifecycle_state",
+                return_value=pending_state,
+            ), redirect_stdout(out), redirect_stderr(err):
+                code = web_bridge.main([
+                    "session-start",
+                    "--repo", str(repo),
+                    "--registry", str(registry),
+                    "--web-session-id", "web-new",
+                    "--host-identity-receipt-json", json.dumps(host_receipt),
+                ])
+
+            self.assertEqual(code, 0, err.getvalue())
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["controller_id"], "controller-1")
+            self.assertEqual(payload["web_session_id"], "web-new")
+            self.assertEqual(
+                payload["session_binding_state"]["verification"],
+                "VERIFIED",
+            )
+            self.assertTrue(payload["controller_actions_allowed"])
+            self.assertTrue(payload["resume_control_loop_required"])
+            lifecycle = payload["controller_lifecycle"]
+            self.assertTrue(lifecycle["pending_control_event"])
+            self.assertIn("RUNNABLE:MINI-READY", lifecycle["triggers"])
+            self.assertIn("MINI-READY", lifecycle["runnable_ids"])
+            self.assertEqual(
+                payload["session_recovery_result"]["controller_id"],
+                "controller-1",
+            )
+
+    def test_same_controller_web_recovery_rebinds_trusted_new_session_without_new_controller(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-old"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "web": {
+                            "status": "active",
+                            "session_id": "web-old",
+                            "generation": 3,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+            host_receipt = {
+                "host": "web",
+                "session_id": "web-new",
+                "attested": True,
+            }
+
+            def verifier(**kwargs: object) -> bool:
+                return (
+                    kwargs.get("controller_id") == "controller-1"
+                    and kwargs.get("expected_target_session_id") == "web-new"
+                    and kwargs.get("host_execution_receipt") == host_receipt
+                )
+
+            with patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=verifier,
+            ):
+                recovered = web_bridge.recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id="web-new",
+                    registry_path=registry,
+                    host_identity_receipt=host_receipt,
+                )
+
+            self.assertEqual(recovered["result"], "RECOVERED")
+            self.assertEqual(recovered["controller_id"], "controller-1")
+            self.assertEqual(recovered["target_generation"], 4)
+            self.assertEqual(
+                recovered["identity"]["session_binding_state"]["provenance"],
+                "host_attested_same_controller_recovery",
+            )
+            self.assertEqual(
+                recovered["identity"]["session_binding_state"]["binding_mode"],
+                "resume_only",
+            )
+            self.assertRegex(
+                recovered["identity"]["session_binding_state"][
+                    "host_identity_receipt_sha256"
+                ],
+                r"^[0-9a-f]{64}$",
+            )
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            controllers = [
+                key for key, value in saved.items()
+                if isinstance(key, str)
+                and not key.startswith("__")
+                and isinstance(value, str)
+            ]
+            self.assertEqual(controllers, ["controller-1"])
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
+                "web-new",
+            )
+            old_identity = web_bridge.target_guard.controller_identity_projection(
+                repo=repo,
+                host="web",
+                source_session_id="web-old",
+                registry_path=registry,
+            )
+            self.assertEqual(
+                old_identity["session_binding_state"]["verification"],
+                "STALE",
+            )
+            self.assertEqual(
+                old_identity["project_controller_state"]["controller_id"],
+                "controller-1",
+            )
+
+    def test_same_controller_web_recovery_without_host_verifier_preserves_existing_controller_and_state(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(
+                json.dumps({"controller-1": str(repo.resolve())}),
+                encoding="utf-8",
+            )
+            lifecycle = root / "lifecycle.json"
+            lifecycle_payload = {
+                "pending_control_event": True,
+                "triggers": ["RUNNABLE:MINI-1", "continuation_debt:review"],
+                "requires_user": False,
+            }
+            lifecycle.write_text(
+                json.dumps(lifecycle_payload, sort_keys=True),
+                encoding="utf-8",
+            )
+            before_registry = registry.read_text(encoding="utf-8")
+            before_lifecycle = lifecycle.read_text(encoding="utf-8")
+
+            with patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=None,
+            ):
+                result = web_bridge.recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id="web-new",
+                    registry_path=registry,
+                    host_identity_receipt=None,
+                )
+
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(result["reason"], "HOST_IDENTITY_UNAVAILABLE")
+            identity = result["identity"]
+            self.assertEqual(
+                identity["project_controller_state"]["project_controller"],
+                "EXISTING",
+            )
+            self.assertEqual(
+                identity["project_controller_state"]["controller_id"],
+                "controller-1",
+            )
+            self.assertEqual(
+                identity["session_binding_state"]["verification"],
+                "UNVERIFIED",
+            )
+            self.assertEqual(
+                identity["session_binding_state"]["recovery"],
+                "SAME_CONTROLLER_SESSION_RECOVERY_REQUIRED",
+            )
+            self.assertFalse(identity["controller_actions_allowed"])
+            self.assertFalse(identity["create_new_controller_allowed"])
+            self.assertEqual(registry.read_text(encoding="utf-8"), before_registry)
+            self.assertEqual(lifecycle.read_text(encoding="utf-8"), before_lifecycle)
+
+    def test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(
+                json.dumps({"controller-1": str(repo.resolve())}),
+                encoding="utf-8",
+            )
+            with patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=lambda **_kwargs: True,
+            ):
+                first = web_bridge.recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id="web-current",
+                    registry_path=registry,
+                    host_identity_receipt={"attested": True},
+                )
+                second = web_bridge.recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id="web-current",
+                    registry_path=registry,
+                    host_identity_receipt={"attested": True},
+                )
+
+            self.assertEqual(first["controller_id"], "controller-1")
+            self.assertEqual(second["result"], "ALREADY_VERIFIED")
+            self.assertEqual(second["controller_id"], "controller-1")
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [key for key in saved if not key.startswith("__")],
+                ["controller-1"],
+            )
+
+    def test_web_recovery_preserves_desktop_target_and_only_advances_web_generation(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {
+                        "desktop_codex": ["desktop-current"],
+                        "web": ["web-old"],
+                    }
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-current",
+                            "generation": 7,
+                        },
+                        "web": {
+                            "status": "active",
+                            "session_id": "web-old",
+                            "generation": 2,
+                        },
+                    }
+                },
+            }), encoding="utf-8")
+            with patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=lambda **_kwargs: True,
+            ):
+                recovered = web_bridge.recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id="web-new",
+                    registry_path=registry,
+                    host_identity_receipt={"attested": True},
+                )
+
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(recovered["target_generation"], 3)
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["desktop_codex"],
+                {
+                    "status": "active",
+                    "session_id": "desktop-current",
+                    "generation": 7,
+                },
+            )
+            web_target = saved["__controller_targets__"]["controller-1"]["web"]
+            self.assertEqual(web_target["status"], "active")
+            self.assertEqual(web_target["session_id"], "web-new")
+            self.assertEqual(web_target["generation"], 3)
+            self.assertEqual(
+                web_target["provenance"],
+                "host_attested_same_controller_recovery",
+            )
+            self.assertEqual(web_target["binding_mode"], "resume_only")
+            self.assertEqual(
+                recovered["identity"]["project_controller_state"]["controller_id"],
+                "controller-1",
+            )
+
     def test_bind_web_session_cli_refuses_session_already_bound_to_other_controller(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -901,6 +1287,15 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
             registry.write_text(json.dumps({
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1", "web-session-2"]}},
+                "__controller_targets__": {
+                    "controller-1": {
+                        "web": {
+                            "status": "active",
+                            "session_id": "web-session-1",
+                            "generation": 2,
+                        }
+                    }
+                },
             }), encoding="utf-8")
             audit = root / "audit.jsonl"
             audit.write_text(json.dumps({
@@ -1266,6 +1661,160 @@ class WebLifecycleNativeStopTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("registered controller", result.stderr)
+
+
+class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
+    def make_paths(self, root: Path) -> tuple[Path, Path, Path]:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+        state = root / "auto-stop.json"
+        return repo, registry, state
+
+    def test_same_receipt_live_supervisor_is_coalesced(self) -> None:
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            with patch.object(web_bridge.subprocess, "Popen", return_value=Mock(pid=1111)) as popen, patch.object(
+                web_bridge, "_pid_is_alive", return_value=True
+            ):
+                self.assertTrue(web_bridge.schedule_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=32, state_path=state,
+                ))
+                token = json.loads(state.read_text())["supervisor_token"]
+                self.assertFalse(web_bridge.schedule_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=32, state_path=state,
+                ))
+            self.assertEqual(popen.call_count, 1)
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["supervisor_token"], token)
+            self.assertEqual(saved["supervisor_pid"], 1111)
+            self.assertEqual(saved["coalesced_schedule_count"], 1)
+
+    def test_new_receipt_supersedes_live_old_supervisor(self) -> None:
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            with patch.object(
+                web_bridge.subprocess, "Popen", side_effect=[Mock(pid=1111), Mock(pid=2222)]
+            ) as popen, patch.object(web_bridge, "_pid_is_alive", return_value=True):
+                web_bridge.schedule_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=32, state_path=state,
+                )
+                first_token = json.loads(state.read_text())["supervisor_token"]
+                self.assertTrue(web_bridge.schedule_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r2", registry=registry,
+                    codex="codex", delay_seconds=1, state_path=state,
+                ))
+            self.assertEqual(popen.call_count, 2)
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["receipt_id"], "r2")
+            self.assertEqual(saved["supervisor_pid"], 2222)
+            self.assertNotEqual(saved["supervisor_token"], first_token)
+
+    def test_only_current_supervisor_token_can_force_rearm(self) -> None:
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            with patch.object(
+                web_bridge.subprocess, "Popen", side_effect=[Mock(pid=1111), Mock(pid=2222)]
+            ) as popen, patch.object(web_bridge, "_pid_is_alive", return_value=True):
+                web_bridge.schedule_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=5, state_path=state,
+                )
+                token = json.loads(state.read_text())["supervisor_token"]
+                self.assertFalse(web_bridge.schedule_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=5, state_path=state,
+                    force_rearm=True, replace_supervisor_token="wrong-token",
+                ))
+                self.assertTrue(web_bridge.schedule_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=5, state_path=state,
+                    force_rearm=True, replace_supervisor_token=token,
+                ))
+            self.assertEqual(popen.call_count, 2)
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["supervisor_pid"], 2222)
+            self.assertNotEqual(saved["supervisor_token"], token)
+
+    def test_current_token_web_rearm_hands_off_with_force_rearm_proof(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            token = "current-token"
+            state.write_text(json.dumps({
+                "receipt_id": "r1",
+                "session_id": "controller-1",
+                "repo": str(repo.resolve()),
+                "state": "RESUME_PENDING",
+                "pending_control_event": True,
+                "supervisor_receipt_id": "r1",
+                "supervisor_token": token,
+                "supervisor_pid": 999,
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True,
+                "requires_user": False,
+                "controller_host": "web",
+                "wake_generation": 1,
+            }
+            deferred = {
+                "operation": "web_reentry",
+                "result": "DEFERRED",
+                "state": "WEB_REENTRY_DEFERRED_ACTIVE",
+                "returncode": 0,
+                "failure_class": "web_host_active",
+            }
+            with patch.object(
+                web_bridge, "_load_lifecycle_state", return_value=lifecycle
+            ), patch.object(
+                web_bridge, "execute_web_reentry", return_value=deferred
+            ), patch.object(
+                web_bridge, "schedule_auto_native_stop"
+            ) as schedule:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1",
+                    repo=repo,
+                    receipt_id="r1",
+                    registry=registry,
+                    codex="codex",
+                    delay_seconds=0,
+                    state_path=state,
+                    supervisor_token=token,
+                )
+            self.assertEqual(code, 0)
+            schedule.assert_called_once()
+            self.assertTrue(schedule.call_args.kwargs["force_rearm"])
+            self.assertEqual(
+                schedule.call_args.kwargs["replace_supervisor_token"], token
+            )
+
+    def test_stale_supervisor_token_exits_without_running_impl(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            state.write_text(json.dumps({
+                "receipt_id": "r1",
+                "supervisor_receipt_id": "r1",
+                "supervisor_token": "current-token",
+            }), encoding="utf-8")
+            with patch.object(
+                web_bridge, "_run_auto_native_stop_impl",
+                side_effect=AssertionError("stale supervisor must not execute"),
+            ):
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=32, state_path=state,
+                    supervisor_token="stale-token",
+                )
+            self.assertEqual(code, 0)
 
 
 class WebContinuationSupervisorBootstrapTests(unittest.TestCase):

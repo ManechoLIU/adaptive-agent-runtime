@@ -317,6 +317,31 @@ def _deviation_rule(error: str) -> tuple[str, int, str, str]:
             "capacity_overdispatch", 2, "controller",
             "recompute_capacity_and_remove_excess_dispatch",
         )
+    if "continuation debt remains open" in text:
+        return (
+            "CONTINUATION_DEBT_NOT_CLEARED", 3, "controller",
+            "consume_all_mandatory_successors_and_recompute",
+        )
+    if "fact_projection_drift" in text:
+        return (
+            "FACT_PROJECTION_DRIFT", 3, "controller",
+            "converge_ledger_runtime_git_and_receipts_then_recompute",
+        )
+    if "integration_not_continued" in text:
+        return (
+            "INTEGRATION_NOT_CONTINUED", 2, "controller",
+            "verify_current_main_converge_facts_and_recompute",
+        )
+    if "post_integration_recompute_missing" in text:
+        return (
+            "POST_INTEGRATION_RECOMPUTE_MISSING", 3, "controller",
+            "recompute_project_after_integration",
+        )
+    if "known_next_action" in text:
+        return (
+            "KNOWN_NEXT_ACTION_NOT_EXECUTED", 2, "controller",
+            "execute_or_hard_defer_known_next_action",
+        )
     if "required review" in text or "review pass" in text or "review fail" in text:
         return (
             "unconsumed_reviewer", 2, "controller",
@@ -1235,6 +1260,161 @@ def validate_candidate_queue(
     return errors
 
 
+def _known_next_action_id(next_action: str) -> str:
+    digest = hashlib.sha256(str(next_action).strip().encode("utf-8")).hexdigest()[:16]
+    return f"known_next_action:{digest}"
+
+
+def _controller_lifecycle_state(controller_id: str) -> dict[str, Any]:
+    try:
+        from scripts.lifecycle_hook import load_json as load_lifecycle_json, state_path
+    except ModuleNotFoundError:
+        from lifecycle_hook import load_json as load_lifecycle_json, state_path
+    return load_lifecycle_json(state_path(controller_id))
+
+
+def mandatory_continuation_projection(
+    snapshot: dict[str, Any],
+    *,
+    ledger_task_states: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Derive mandatory successors from event/candidate state without a second scheduler."""
+    ledger_task_states = {
+        str(task_id): str(state).upper()
+        for task_id, state in (ledger_task_states or {}).items()
+    }
+    actions: dict[str, dict[str, Any]] = {}
+    raw_candidates = snapshot.get("candidate_packages", [])
+    candidates = {
+        str(item.get("revision", "")).strip(): item
+        for item in raw_candidates
+        if isinstance(item, dict) and str(item.get("revision", "")).strip()
+    } if isinstance(raw_candidates, list) else {}
+
+    raw_reviews = snapshot.get("required_reviews", [])
+    if isinstance(raw_reviews, list):
+        for review in raw_reviews:
+            if not isinstance(review, dict):
+                continue
+            verdict = str(review.get("verdict", "")).strip().upper()
+            revision = str(review.get("candidate_revision", "")).strip()
+            review_id = str(review.get("id", "")).strip() or "unnamed"
+            if verdict not in {"PASS", "FAIL"} or not revision:
+                continue
+            candidate = candidates.get(revision)
+            if candidate is None:
+                actions[f"review_result:{review_id}"] = {
+                    "type": "review_result",
+                    "review_id": review_id,
+                    "candidate_revision": revision,
+                    "reason": "verdict_not_consumed",
+                }
+                continue
+            decision = str(candidate.get("decision", "")).strip().lower()
+            if verdict == "PASS" and decision not in {"integrate", "queued"}:
+                actions[f"integration:{revision}"] = {
+                    "type": "integration",
+                    "candidate_revision": revision,
+                    "reason": "review_pass_requires_integration",
+                }
+            if verdict == "FAIL" and decision != "rework":
+                actions[f"rework:{revision}"] = {
+                    "type": "rework",
+                    "candidate_revision": revision,
+                    "reason": "review_fail_requires_correction",
+                }
+
+    for revision, candidate in candidates.items():
+        decision = str(candidate.get("decision", "")).strip().lower()
+        if decision != "integrate" or candidate.get("integrated_this_event") is not True:
+            continue
+        task_id = str(candidate.get("task_id", "")).strip() or revision
+        if candidate.get("current_main_verified") is not True:
+            actions[f"current_main_verify:{revision}"] = {
+                "type": "current_main_verify",
+                "candidate_revision": revision,
+                "task_id": task_id,
+            }
+            continue
+        if candidate.get("fact_converged") is not True:
+            actions[f"fact_convergence:{task_id}"] = {
+                "type": "fact_convergence",
+                "candidate_revision": revision,
+                "task_id": task_id,
+                "reason": "FACT_PROJECTION_DRIFT",
+            }
+            continue
+        if candidate.get("post_integration_recomputed") is not True:
+            actions[f"post_integration_recompute:{revision}"] = {
+                "type": "post_integration_recompute",
+                "candidate_revision": revision,
+                "task_id": task_id,
+            }
+            continue
+        if ledger_task_states.get(task_id) in {"ACTIVE", "RECOVERING", "VERIFY"}:
+            actions[f"fact_convergence:{task_id}"] = {
+                "type": "fact_convergence",
+                "candidate_revision": revision,
+                "task_id": task_id,
+                "reason": "FACT_PROJECTION_DRIFT",
+            }
+    return actions
+
+
+def validate_mandatory_continuations(
+    snapshot: dict[str, Any],
+    *,
+    ledger_task_states: dict[str, str] | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    raw_candidates = snapshot.get("candidate_packages", [])
+    candidates = [
+        item for item in raw_candidates if isinstance(item, dict)
+    ] if isinstance(raw_candidates, list) else []
+    for candidate in candidates:
+        revision = str(candidate.get("revision", "")).strip() or "unknown"
+        task_id = str(candidate.get("task_id", "")).strip() or revision
+        if (
+            str(candidate.get("decision", "")).strip().lower() != "integrate"
+            or candidate.get("integrated_this_event") is not True
+        ):
+            continue
+        if candidate.get("current_main_verified") is not True:
+            errors.append(
+                f"INTEGRATION_NOT_CONTINUED: {revision} requires current-main verification after integration"
+            )
+            continue
+        if not traceable_runtime_evidence(candidate.get("current_main_verification_evidence")):
+            errors.append(
+                f"INTEGRATION_NOT_CONTINUED: {revision} current-main verification requires traceable evidence"
+            )
+        if candidate.get("fact_converged") is not True:
+            errors.append(
+                f"FACT_PROJECTION_DRIFT: {task_id} facts must converge after current-main verification"
+            )
+            continue
+        if not traceable_runtime_evidence(candidate.get("fact_convergence_evidence")):
+            errors.append(
+                f"FACT_PROJECTION_DRIFT: {task_id} fact convergence requires traceable evidence"
+            )
+        if candidate.get("post_integration_recomputed") is not True:
+            errors.append(
+                f"POST_INTEGRATION_RECOMPUTE_MISSING: {revision} requires post-integration project-wide recompute"
+            )
+            continue
+        if not traceable_runtime_evidence(candidate.get("post_integration_recompute_evidence")):
+            errors.append(
+                f"POST_INTEGRATION_RECOMPUTE_MISSING: {revision} project-wide recompute requires traceable evidence"
+            )
+        if ledger_task_states is not None:
+            state = str(ledger_task_states.get(task_id, "")).upper()
+            if state in {"ACTIVE", "RECOVERING", "VERIFY"}:
+                errors.append(
+                    f"FACT_PROJECTION_DRIFT: {task_id} remains {state} after verified integration and convergence"
+                )
+    return errors
+
+
 def validate_review_transitions(
     snapshot: dict[str, Any], *, expected_main_revision: str | None = None
 ) -> list[str]:
@@ -1419,6 +1599,7 @@ def validate_control_loop_receipt(
         errors.append("controller_actions must enumerate every immediate Controller action")
         raw_actions = []
     actual_action_ids: set[str] = set()
+    resolved_action_ids: set[str] = set()
     for index, action in enumerate(raw_actions):
         if not isinstance(action, dict):
             errors.append(f"controller_actions[{index}] must be an object")
@@ -1434,19 +1615,32 @@ def validate_control_loop_receipt(
         if decision == "executed":
             if not traceable_runtime_evidence(action.get("evidence")):
                 errors.append(f"controller action {action_id} executed requires traceable evidence")
-        elif decision == "blocked":
+            else:
+                resolved_action_ids.add(action_id)
+        elif decision in {"blocked", "deferred"}:
             reason_code = str(action.get("reason_code", "")).strip().lower()
             if reason_code not in HARD_DEFER_REASON_CODES:
                 errors.append(
-                    f"controller action {action_id} blocked requires a hard reason_code"
+                    f"controller action {action_id} {decision} requires a hard reason_code"
                 )
             if not str(action.get("reason", "")).strip():
-                errors.append(f"controller action {action_id} blocked requires exact reason")
+                errors.append(f"controller action {action_id} {decision} requires exact reason")
             if not traceable_runtime_evidence(action.get("evidence")):
-                errors.append(f"controller action {action_id} blocked requires traceable evidence")
+                errors.append(f"controller action {action_id} {decision} requires traceable evidence")
+            if decision == "deferred" and not str(action.get("next_checkpoint", "")).strip():
+                errors.append(
+                    f"controller action {action_id} deferred requires next_checkpoint"
+                )
+            if (
+                reason_code in HARD_DEFER_REASON_CODES
+                and str(action.get("reason", "")).strip()
+                and traceable_runtime_evidence(action.get("evidence"))
+                and (decision != "deferred" or str(action.get("next_checkpoint", "")).strip())
+            ):
+                resolved_action_ids.add(action_id)
         else:
             errors.append(
-                f"controller action {action_id} decision must be executed or hard blocked"
+                f"controller action {action_id} decision must be executed, hard blocked, or hard deferred"
             )
     missing_actions = sorted(expected_controller_action_ids - actual_action_ids)
     extra_actions = sorted(actual_action_ids - expected_controller_action_ids)
@@ -1454,6 +1648,24 @@ def validate_control_loop_receipt(
         errors.append("control cycle omitted controller actions: " + ", ".join(missing_actions))
     if extra_actions:
         errors.append("control cycle contains non-canonical controller actions: " + ", ".join(extra_actions))
+
+    debt_ids = _string_list_set(loop.get("continuation_debt_ids"))
+    if debt_ids != set(expected_controller_action_ids):
+        errors.append(
+            "control_loop_receipt continuation_debt_ids does not match canonical mandatory successors: "
+            f"expected {sorted(expected_controller_action_ids)}, got {sorted(debt_ids)}"
+        )
+    open_debt_ids = _string_list_set(loop.get("open_continuation_debt_ids"))
+    expected_open_debt = set(expected_controller_action_ids) - resolved_action_ids
+    if open_debt_ids != expected_open_debt:
+        errors.append(
+            "control_loop_receipt open_continuation_debt_ids does not match unresolved actions: "
+            f"expected {sorted(expected_open_debt)}, got {sorted(open_debt_ids)}"
+        )
+    if expected_open_debt:
+        errors.append(
+            "continuation debt remains open: " + ", ".join(sorted(expected_open_debt))
+        )
 
     errors.extend(validate_correction_actions(snapshot, expected_corrections))
     return errors
@@ -1473,6 +1685,7 @@ def validate_snapshot(
     ledger_open_ids: set[str] | None = None,
     ledger_goal_ids: set[str] | None = None,
     ledger_work_in_flight: dict[str, str] | None = None,
+    ledger_task_states: dict[str, str] | None = None,
     derived_runnable_ids: set[str] | None = None,
     expected_machine_trace: dict[str, Any] | None = None,
     expected_candidate_revisions: set[str] | None = None,
@@ -1723,6 +1936,12 @@ def validate_snapshot(
         )
     errors.extend(validate_review_transitions(snapshot, expected_main_revision=expected_main_revision))
     errors.extend(
+        validate_mandatory_continuations(
+            snapshot,
+            ledger_task_states=ledger_task_states,
+        )
+    )
+    errors.extend(
         validate_goal_rollover(
             snapshot, ledger_open_ids=ledger_open_ids, ledger_goal_ids=ledger_goal_ids
         )
@@ -1926,6 +2145,8 @@ def canonical_controller_action_projection(
     required_review_ids: set[str],
     work_in_flight: dict[str, str],
     corrections: Sequence[dict[str, Any]],
+    snapshot: dict[str, Any] | None = None,
+    ledger_task_states: dict[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Derive immediate Controller-owned actions from existing canonical facts."""
     actions: dict[str, dict[str, Any]] = {}
@@ -1964,11 +2185,7 @@ def canonical_controller_action_projection(
                 "reason": str(health.get("reason", "") or health.get("state", "")),
             }
 
-    try:
-        from scripts.lifecycle_hook import load_json as load_lifecycle_json, state_path
-    except ModuleNotFoundError:
-        from lifecycle_hook import load_json as load_lifecycle_json, state_path
-    lifecycle_state = load_lifecycle_json(state_path(controller_id))
+    lifecycle_state = _controller_lifecycle_state(controller_id)
     pending_receipts = lifecycle_state.get("pending_terminal_receipts", [])
     if isinstance(pending_receipts, list):
         for value in pending_receipts:
@@ -1980,6 +2197,20 @@ def canonical_controller_action_projection(
                 "type": "terminal_receipt",
                 "receipt": receipt,
             }
+
+    next_action = str(lifecycle_state.get("next_action") or "").strip()
+    if next_action and lifecycle_state.get("requires_user") is False:
+        action_id = _known_next_action_id(next_action)
+        actions[action_id] = {
+            "type": "known_next_action",
+            "next_action": next_action,
+        }
+
+    for action_id, action in mandatory_continuation_projection(
+        snapshot or {},
+        ledger_task_states=ledger_task_states,
+    ).items():
+        actions[action_id] = action
 
     for correction in corrections:
         if not isinstance(correction, dict):
@@ -2070,6 +2301,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 required_review_ids=set(args.require_review),
                 work_in_flight=work_in_flight,
                 corrections=expected_corrections,
+                snapshot=snapshot,
+                ledger_task_states=ledger_task_states,
             )
             if repo_root is not None and trace_session
             else {}
@@ -2091,6 +2324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ledger_open_ids=open_ids,
         ledger_goal_ids=goal_ids,
         ledger_work_in_flight=work_in_flight,
+        ledger_task_states=ledger_task_states,
         derived_runnable_ids=derived_runnable_ids,
         expected_machine_trace=expected_machine_trace,
         expected_candidate_revisions=expected_candidate_revisions,

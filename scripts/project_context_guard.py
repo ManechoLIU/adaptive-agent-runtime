@@ -13,6 +13,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+try:
+    import controller_target_guard as target_guard
+except ModuleNotFoundError:
+    from scripts import controller_target_guard as target_guard
+
 STATE_ROOT = Path(
     os.environ.get(
         "AD_PROJECT_CONTEXT_STATE_DIR",
@@ -43,17 +48,24 @@ UNKNOWN_MARKER = re.compile(
     r"(?:UNKNOWN|NOT[ 	]+FOUND|未找到|找不到|无法读取|未知)",
     re.IGNORECASE,
 )
-UNRESOLVED_MECHANISM_RESPONSE = re.compile(
+UNRESOLVED_MECHANISM_PREFIX = re.compile(
     r"^\s*(?:UNKNOWN(?:\s*/\s*NOT[ \t]+FOUND)?|NOT[ \t]+FOUND|未找到|未知)"
-    r"\s*(?:[:：]\s*(?:"
-    r"(?:当前|现有|本项目|该项目|权威|事实源|项目事实源|当前权威事实源中|当前事实源中)"
-    r".{0,80}(?:未找到|没有找到|找不到|无法读取|无法确认|缺少|不存在)"
-    r".{0,80}"
-    r"|(?:当前权威事实源中)?(?:未找到|没有找到|找不到|无法读取|无法确认|缺少|不存在)"
-    r".{0,120}"
-    r"))?[。.!！]?\s*$",
+    r"\s*(?:[:：]\s*)?(?P<reason>.*?)\s*$",
     re.IGNORECASE,
 )
+UNRESOLVED_MECHANISM_REASON = re.compile(
+    r"^(?:"
+    r"(?:当前)?(?:权威)?(?:项目)?事实源(?:中)?"
+    r"(?:没有找到|未找到|找不到|无法确认|没有建立|未建立|不存在)"
+    r"(?:该|这个|对应)?(?:模型|机制|规则|合同|标准|定义)?(?:定义)?"
+    r"|(?:current[ \t]+)?(?:authoritative[ \t]+)?(?:project[ \t]+)?sources?"
+    r"[ \t]+(?:do[ \t]+not|does[ \t]+not|cannot|could[ \t]+not)"
+    r"[ \t]+(?:find|establish|confirm|define)"
+    r"(?:[ \t]+(?:the|this|a))?[ \t]+(?:model|mechanism|rule|contract|standard|definition)"
+    r")$",
+    re.IGNORECASE,
+)
+
 
 _GENERIC_MECHANISM_PREFIXES = (
     "治理体系里的", "治理体系中的", "治理体系现有", "治理体系当前",
@@ -208,10 +220,104 @@ def _runtime_state_source(repo: Path) -> dict[str, Any]:
     return result
 
 
+def _controller_context_identity(
+    root: Path,
+    *,
+    registry_path: Path,
+    host: str | None,
+    source_session_id: str | None,
+) -> dict[str, Any]:
+    normalized_host = str(host or "").strip()
+    if normalized_host in target_guard.SUPPORTED_HOSTS:
+        return target_guard.controller_identity_projection(
+            repo=root,
+            host=normalized_host,
+            source_session_id=source_session_id,
+            registry_path=registry_path,
+        )
+
+    project = target_guard.project_controller_state(
+        repo=root,
+        registry_path=registry_path,
+    )
+    existing_unique = (
+        project.get("project_controller") == "EXISTING"
+        and project.get("uniqueness") == "UNIQUE"
+    )
+    conflict = project.get("project_controller") == "CONFLICT"
+    if conflict:
+        recovery = "CONFLICT_REQUIRES_MANUAL_RESOLUTION"
+        reason = "PROJECT_CONTROLLER_CONFLICT"
+    elif existing_unique:
+        recovery = "SAME_CONTROLLER_SESSION_RECOVERY_REQUIRED"
+        reason = "HOST_IDENTITY_UNAVAILABLE"
+    else:
+        recovery = "NEW_CONTROLLER_REQUIRED"
+        reason = "NO_PROJECT_CONTROLLER"
+    binding = {
+        "host": normalized_host or None,
+        "session_id": str(source_session_id or "").strip() or None,
+        "verification": "CONFLICT" if conflict else "UNVERIFIED",
+        "reason": reason,
+        "provenance": "controller_registry",
+        "binding_mode": None,
+        "target_generation": None,
+        "controller_actions_allowed": False,
+        "recovery": recovery,
+        "same_controller_recovery_allowed": existing_unique,
+    }
+    return {
+        "project_controller_state": project,
+        "session_binding_state": binding,
+        "controller_actions_allowed": False,
+        "same_controller_recovery_allowed": existing_unique,
+        "create_new_controller_allowed": bool(
+            project.get("create_new_controller_allowed")
+        ),
+    }
+
+
+def _event_controller_host(event: dict[str, Any]) -> str | None:
+    for key in ("controller_host", "execution_host"):
+        value = str(event.get(key) or "").strip()
+        if value in target_guard.SUPPORTED_HOSTS:
+            return value
+    source = str(event.get("source") or "").strip().lower()
+    if source == "web" or str(event.get("web_session_id") or "").strip():
+        return "web"
+    if (
+        str(event.get("source_session_id") or "").strip()
+        or str(event.get("session_id") or "").strip()
+    ):
+        return target_guard.DESKTOP_SESSION_HOST
+    return None
+
+
+def _event_controller_session_id(
+    event: dict[str, Any], host: str | None
+) -> str | None:
+    if host == "web":
+        value = str(
+            event.get("web_session_id")
+            or event.get("source_session_id")
+            or ""
+        ).strip()
+    else:
+        value = str(
+            event.get("source_session_id")
+            or event.get("session_id")
+            or ""
+        ).strip()
+    return value or None
+
+
 def initialize_project_context(
     repo: str | Path,
     *,
     skill_root: str | Path,
+    controller_registry_path: str | Path | None = None,
+    controller_host: str | None = None,
+    source_session_id: str | None = None,
 ) -> dict[str, Any]:
     working_directory = Path(repo).expanduser().resolve()
     root = _repo_root(working_directory)
@@ -238,8 +344,19 @@ def initialize_project_context(
         name for name, value in sources.items()
         if value.get("status") != "verified"
     ]
+    registry_path = Path(
+        controller_registry_path
+        if controller_registry_path is not None
+        else target_guard.DEFAULT_REGISTRY
+    ).expanduser()
+    controller_identity = _controller_context_identity(
+        root,
+        registry_path=registry_path,
+        host=controller_host,
+        source_session_id=source_session_id,
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "state": state,
         "project_root": str(root),
         "working_directory": str(working_directory),
@@ -248,6 +365,15 @@ def initialize_project_context(
         "verified_facts": verified,
         "unknown_facts": unknown,
         "required_failures": required_bad,
+        "project_controller_state": controller_identity["project_controller_state"],
+        "session_binding_state": controller_identity["session_binding_state"],
+        "controller_actions_allowed": controller_identity["controller_actions_allowed"],
+        "same_controller_recovery_allowed": controller_identity[
+            "same_controller_recovery_allowed"
+        ],
+        "create_new_controller_allowed": controller_identity[
+            "create_new_controller_allowed"
+        ],
     }
 
 
@@ -298,6 +424,50 @@ def _receipt_source_changed(receipt: dict[str, Any]) -> bool:
             if str(current.get("error") or "") != str(prior.get("error") or ""):
                 return True
 
+    prior_project = receipt.get("project_controller_state")
+    prior_binding = receipt.get("session_binding_state")
+    if isinstance(prior_project, dict) and isinstance(prior_binding, dict):
+        registry_path = str(prior_project.get("registry") or "").strip()
+        host = str(prior_binding.get("host") or "").strip()
+        session_id = str(prior_binding.get("session_id") or "").strip() or None
+        try:
+            if registry_path and host in target_guard.SUPPORTED_HOSTS:
+                current_identity = target_guard.controller_identity_projection(
+                    repo=root,
+                    host=host,
+                    source_session_id=session_id,
+                    registry_path=Path(registry_path),
+                )
+            elif registry_path:
+                current_project = target_guard.project_controller_state(
+                    repo=root,
+                    registry_path=Path(registry_path),
+                )
+                current_identity = {
+                    "project_controller_state": current_project,
+                    "session_binding_state": prior_binding,
+                }
+            else:
+                return True
+        except (OSError, ValueError, PermissionError, subprocess.CalledProcessError):
+            return True
+        current_project = current_identity.get("project_controller_state")
+        current_binding = current_identity.get("session_binding_state")
+        if not isinstance(current_project, dict) or not isinstance(current_binding, dict):
+            return True
+        for field in (
+            "project_controller", "controller_id", "uniqueness", "ownership",
+            "registry_sha256",
+        ):
+            if current_project.get(field) != prior_project.get(field):
+                return True
+        for field in (
+            "host", "session_id", "verification", "reason", "binding_mode",
+            "target_generation",
+        ):
+            if current_binding.get(field) != prior_binding.get(field):
+                return True
+
     try:
         current_git = _git_facts(root)
     except (OSError, subprocess.CalledProcessError, ValueError):
@@ -326,6 +496,37 @@ def _context_text(receipt: dict[str, Any], *, mechanism: dict[str, Any] | None =
         "verified_facts=" + json.dumps(receipt.get("verified_facts", []), ensure_ascii=False),
         "unknown_facts=" + json.dumps(receipt.get("unknown_facts", []), ensure_ascii=False),
     ]
+    project_controller = receipt.get("project_controller_state")
+    if isinstance(project_controller, dict):
+        lines.append(
+            "project_controller_state="
+            + json.dumps(project_controller, ensure_ascii=False, sort_keys=True)
+        )
+    session_binding = receipt.get("session_binding_state")
+    if isinstance(session_binding, dict):
+        lines.append(
+            "session_binding_state="
+            + json.dumps(session_binding, ensure_ascii=False, sort_keys=True)
+        )
+        lines.append(
+            "controller_actions_allowed="
+            + json.dumps(bool(receipt.get("controller_actions_allowed")))
+        )
+        lines.append(
+            "controller_recovery="
+            + str(session_binding.get("recovery") or "NONE")
+        )
+        if (
+            project_controller.get("project_controller") == "EXISTING"
+            and session_binding.get("verification") != "VERIFIED"
+        ):
+            lines.append(
+                "Identity semantics: the project still has its existing unique logical Controller. "
+                "The current host session is only an unverified/stale execution entry; do not create, "
+                "reappoint, replace, or deny the project Controller solely because this session binding "
+                "is not VERIFIED. Controller-exclusive mutations remain fail closed until same-controller "
+                "session recovery succeeds."
+            )
     sources = receipt.get("sources", {})
     if isinstance(sources, dict):
         for key in ("agents", "project_skill", "runtime_skill", "ledger"):
@@ -550,15 +751,16 @@ def is_project_fact_request(prompt: str) -> bool:
 
 
 def unresolved_mechanism_response_is_safe(message: str) -> bool:
-    """Allow only an uncertainty-only answer when current mechanism resolution is not_found."""
+    """Allow only a marker plus one bounded no-current-fact explanation."""
     text = str(message or "").strip()
-    if not text or not UNKNOWN_MARKER.search(text):
+    match = UNRESOLVED_MECHANISM_PREFIX.fullmatch(text)
+    if match is None:
         return False
-    if re.search(r"\d", text):
-        return False
-    if re.search(r"\b(?:provider|model|auth_mode)\s*=", text, re.IGNORECASE):
-        return False
-    return bool(UNRESOLVED_MECHANISM_RESPONSE.fullmatch(text))
+    reason = str(match.group("reason") or "").strip()
+    reason = re.sub(r"[。.!！]+$", "", reason).strip()
+    if not reason:
+        return True
+    return bool(UNRESOLVED_MECHANISM_REASON.fullmatch(reason))
 
 
 def looks_like_project_fact_output(message: str) -> bool:
@@ -573,10 +775,45 @@ def _refresh_for_correction(
     state: dict[str, Any],
     reason: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    prior_receipt = state.get("project_context_receipt")
+    saved_working_directory = (
+        str(prior_receipt.get("working_directory") or "").strip()
+        if isinstance(prior_receipt, dict)
+        else ""
+    )
     working_directory = Path(
-        str(event.get("cwd", "") or Path.cwd())
+        saved_working_directory
+        or str(event.get("cwd", "") or Path.cwd())
     ).expanduser().resolve()
-    receipt = initialize_project_context(working_directory, skill_root=skill_root)
+    prior_binding = (
+        prior_receipt.get("session_binding_state")
+        if isinstance(prior_receipt, dict)
+        else None
+    )
+    prior_project = (
+        prior_receipt.get("project_controller_state")
+        if isinstance(prior_receipt, dict)
+        else None
+    )
+    receipt = initialize_project_context(
+        working_directory,
+        skill_root=skill_root,
+        controller_registry_path=(
+            str(prior_project.get("registry") or "").strip()
+            if isinstance(prior_project, dict)
+            else None
+        ) or None,
+        controller_host=(
+            str(prior_binding.get("host") or "").strip()
+            if isinstance(prior_binding, dict)
+            else None
+        ) or None,
+        source_session_id=(
+            str(prior_binding.get("session_id") or "").strip()
+            if isinstance(prior_binding, dict)
+            else None
+        ) or None,
+    )
     prompt = str(state.get("prompt", ""))
     mechanism = resolve_existing_mechanism(prompt, receipt=receipt, skill_root=skill_root)
     state.update(
@@ -611,9 +848,14 @@ def evaluate_event(
 
     if event_name == "SessionStart":
         try:
+            controller_host = _event_controller_host(event)
             receipt = initialize_project_context(
                 str(event.get("cwd", "") or Path.cwd()),
                 skill_root=skill_root,
+                controller_host=controller_host,
+                source_session_id=_event_controller_session_id(
+                    event, controller_host
+                ),
             )
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
             receipt = {
@@ -656,9 +898,14 @@ def evaluate_event(
             state["turn_id"] = current_turn
             return {}, state
         try:
+            controller_host = _event_controller_host(event)
             receipt = initialize_project_context(
                 str(event.get("cwd", "") or Path.cwd()),
                 skill_root=skill_root,
+                controller_host=controller_host,
+                source_session_id=_event_controller_session_id(
+                    event, controller_host
+                ),
             )
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
             return {
