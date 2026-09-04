@@ -530,6 +530,7 @@ def _persist_observed_dispatch(
     observation_id = str(observed.get("observation_id") or "").strip()
     if not conversation_id or not observation_id:
         raise ValueError("machine-observed Web dispatch is missing child session identity")
+
     def mutate(state: dict[str, Any]) -> dict[str, Any]:
         record = state.setdefault("dispatches", {}).get(dispatch_id)
         if not isinstance(record, dict) or record.get("state") not in {"pending", "observed"}:
@@ -543,9 +544,28 @@ def _persist_observed_dispatch(
             ):
                 raise ValueError("Web dispatch ticket has conflicting machine observation")
             return dict(record)
+
         source = str(observed.get("source") or "").strip()
-        if source not in {"collaboration_session_event", "chatgpt_host_event"}:
+        provenance: dict[str, Any] = {}
+        if source == "collaboration_session_event":
+            source_path = str(observed.get("source_path") or "").strip()
+            if not source_path:
+                raise PermissionError(
+                    "collaboration Web dispatch requires machine-event source_path"
+                )
+            provenance["observation_source_path"] = str(
+                Path(source_path).expanduser().resolve(strict=False)
+            )
+        elif source == "chatgpt_host_event":
+            host_event = observed.get("host_event")
+            if not isinstance(host_event, dict):
+                raise PermissionError(
+                    "Host Web dispatch requires persisted Host event for re-verification"
+                )
+            provenance["host_event"] = json.loads(json.dumps(host_event))
+        else:
             raise PermissionError("machine-observed Web dispatch has untrusted provenance")
+
         record.update({
             "state": "observed",
             "conversation_id": conversation_id,
@@ -553,8 +573,10 @@ def _persist_observed_dispatch(
             "call_id": observed.get("call_id"),
             "observed_at": _iso(now),
             "observation_source": source,
+            **provenance,
         })
         return dict(record)
+
     return _mutate_dispatch_state(repo, mutate)
 
 
@@ -581,6 +603,56 @@ def _mark_dispatch_bound(
     _mutate_dispatch_state(repo, mutate)
 
 
+def _reverify_observed_dispatch_ticket(
+    *, repo: Path, ticket: dict[str, Any]
+) -> dict[str, Any]:
+    """Re-prove persisted provenance immediately before any canonical lease write."""
+    source = str(ticket.get("observation_source") or "").strip()
+    expected_observation = str(ticket.get("observation_id") or "").strip()
+    expected_conversation = str(ticket.get("conversation_id") or "").strip()
+    if not expected_observation or not expected_conversation:
+        raise PermissionError("persisted Web observation is incomplete")
+
+    if source == "collaboration_session_event":
+        raw_path = str(ticket.get("observation_source_path") or "").strip()
+        if not raw_path:
+            raise PermissionError("persisted Web observation has no attested source path")
+        paths = _verified_machine_event_paths([raw_path])
+        observed = _structured_started_for_ticket(ticket, paths)
+        if (
+            str(observed.get("observation_id") or "") != expected_observation
+            or str(observed.get("conversation_id") or "") != expected_conversation
+        ):
+            raise PermissionError(
+                "persisted Web observation no longer matches attested machine event"
+            )
+        assignment = ticket.get("assignment")
+        if isinstance(assignment, dict):
+            if str(observed.get("model") or "") != str(assignment.get("model") or ""):
+                raise PermissionError("reverified Web model does not match Assignment")
+            if str(observed.get("agent_type") or "") != str(assignment.get("agent_type") or ""):
+                raise PermissionError("reverified Web agent_type does not match Assignment")
+        return observed
+
+    if source == "chatgpt_host_event":
+        host_event = ticket.get("host_event")
+        if not isinstance(host_event, dict):
+            raise PermissionError("persisted Host Web observation is missing Host event")
+        att = _attestation(host_event)
+        if (
+            str(att.get("observation_id") or "") != expected_observation
+            or str(host_event.get("conversation_id") or "") != expected_conversation
+        ):
+            raise PermissionError("persisted Host Web observation failed re-verification")
+        return {
+            "source": source,
+            "observation_id": expected_observation,
+            "conversation_id": expected_conversation,
+        }
+
+    raise PermissionError("persisted Web observation has untrusted provenance")
+
+
 def _verify_persisted_replacement_session_proof(
     *, repo: Path, controller_id: str, assignment_id: str,
     conversation_id: str, proof: dict[str, Any] | None,
@@ -604,6 +676,7 @@ def _verify_persisted_replacement_session_proof(
         or str(proof.get("conversation_id") or "") != conversation_id
     ):
         raise ValueError("replacement execution session proof does not match persisted machine-observed dispatch")
+    _reverify_observed_dispatch_ticket(repo=repo, ticket=ticket)
     return dict(ticket)
 
 
@@ -660,6 +733,11 @@ def bind_web_assignment_dispatch(
     if ticket.get("controller_id") != controller_id:
         raise PermissionError("Web dispatch ticket belongs to a different logical Controller")
     observed = _structured_started_for_ticket(ticket, paths)
+    execution_started_at = _event_time(observed.get("timestamp"))
+    if execution_started_at is None:
+        raise ValueError("machine-observed Web start requires a valid timestamp")
+    if execution_started_at > now:
+        raise ValueError("machine-observed Web start cannot be in the future")
     conversation_id = str(observed.get("conversation_id") or "").strip()
     assignment = ticket.get("assignment")
     if not isinstance(assignment, dict):
@@ -673,7 +751,7 @@ def bind_web_assignment_dispatch(
         raise PermissionError("machine-observed Web Agent type does not match the prepared Runtime Assignment")
     _persist_observed_dispatch(
         repo=repo_path, dispatch_id=dispatch_id, controller_id=controller_id,
-        assignment_id=assignment_id, observed=observed, now=now,
+        assignment_id=assignment_id, observed=observed, now=execution_started_at,
     )
 
     existing = load_runtime_state(repo_path).get("leases", {}).get(assignment_id)
@@ -681,7 +759,7 @@ def bind_web_assignment_dispatch(
         result = recover_web_assignment(
             repo=repo_path, registry_path=registry, controller_id=controller_id,
             assignment_id=assignment_id, conversation_id=conversation_id,
-            now=now,
+            now=execution_started_at,
             watchdog_launcher=watchdog_launcher,
             health_probe=health_probe,
             event_source_probe=event_source_probe,
@@ -695,7 +773,8 @@ def bind_web_assignment_dispatch(
     else:
         result = _start_bound_web_assignment(
             repo=repo_path, registry_path=registry, controller_id=controller_id,
-            conversation_id=conversation_id, assignment=assignment, dispatch_id=dispatch_id, now=now,
+            conversation_id=conversation_id, assignment=assignment, dispatch_id=dispatch_id,
+            now=execution_started_at,
             watchdog_launcher=watchdog_launcher,
             health_probe=health_probe,
         )
@@ -737,6 +816,7 @@ def _start_bound_web_assignment(
         raise PermissionError(
             "Web Assignment start requires a prepared dispatch with persisted verified started observation"
         )
+    _reverify_observed_dispatch_ticket(repo=repo_path, ticket=ticket)
     attempt = int(assignment.get("attempt", 1))
     if not assignment_id:
         raise ValueError("Web execution Assignment requires assignment_id")
@@ -999,33 +1079,56 @@ def _ingest_verified_structured_subagent_terminal(
     *,
     repo: str | Path,
     assignment_id: str,
-    observation: dict[str, Any],
+    event_path: str | Path,
+    observation_id: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Persist a terminal only after the lifecycle reconciler verified Host-attested source paths."""
+    """Re-verify an attested event path and parse the exact terminal before mutation."""
     repo_path = Path(repo).expanduser().resolve()
     now = now or datetime.now(UTC)
-    if not isinstance(observation, dict) or observation.get("source") != "collaboration_session_event":
-        raise ValueError("structured Web terminal requires a collaboration session observation")
-    conversation_id = str(observation.get("conversation_id") or "").strip()
-    observation_id = str(observation.get("observation_id") or "").strip()
-    if not conversation_id or not observation_id:
-        raise ValueError("structured Web terminal requires machine session and observation identity")
+    paths = _verified_machine_event_paths([event_path])
+    observation_id = str(observation_id or "").strip()
+    if not observation_id:
+        raise ValueError("structured Web terminal requires observation_id")
+
     state = load_runtime_state(repo_path)
     lease = state.get("leases", {}).get(assignment_id)
     if not isinstance(lease, dict):
         raise ValueError("structured Web terminal has no canonical Assignment lease")
     if lease.get("execution_transport") != "web":
         raise ValueError("structured Web terminal requires a canonical Web Assignment lease")
-    if conversation_id != str(lease.get("session_id") or ""):
-        raise ValueError("structured Web terminal session does not match the canonical Assignment session")
+
+    started_at = _event_time(lease.get("started_at"))
+    candidates: list[dict[str, Any]] = []
+    for event in structured_subagent_events(paths):
+        if str(event.get("observation_id") or "") != observation_id:
+            continue
+        if event.get("kind") not in {
+            "completed", "failed", "cancelled", "interrupted", "disconnected"
+        }:
+            continue
+        if str(event.get("conversation_id") or "") != str(lease.get("session_id") or ""):
+            continue
+        observed_at = _event_time(event.get("timestamp"))
+        if started_at is not None and (observed_at is None or observed_at < started_at):
+            continue
+        candidates.append(event)
+    if len(candidates) != 1:
+        raise PermissionError(
+            "structured Web terminal requires exactly one Host-attested machine observation"
+        )
+    observation = candidates[0]
+    conversation_id = str(observation.get("conversation_id") or "").strip()
+
     terminal_state, transport_outcome, retry_class = _structured_terminal_projection(
         str(observation.get("kind") or "")
     )
     duplicate = bool(lease.get("terminal_state"))
     if duplicate:
         if str(lease.get("terminal_state") or "") != terminal_state:
-            raise ValueError("structured Web terminal conflicts with immutable canonical terminal state")
+            raise ValueError(
+                "structured Web terminal conflicts with immutable canonical terminal state"
+            )
     else:
         event_seq = int(lease.get("last_event_seq", 0)) + 1
         result_unknown = (
@@ -1038,20 +1141,27 @@ def _ingest_verified_structured_subagent_terminal(
             "task_id": lease["task_id"],
             "agent_id": lease["agent_id"],
             "provider": lease["provider"],
-            "session_id": lease["session_id"],
+            "session_id": conversation_id,
             "worktree": lease["worktree"],
             "issued_at": _iso(now),
             "attempt": int(lease["attempt"]),
             "lease_id": lease["lease_id"],
             "event_seq": event_seq,
-            "receipt_id": f"collaboration-terminal:{assignment_id}:{lease['attempt']}:{event_seq}",
+            "receipt_id": (
+                f"collaboration-terminal:{assignment_id}:{lease['attempt']}:{event_seq}"
+            ),
             "terminal_state": terminal_state,
             "transport_outcome": transport_outcome,
             "delivery_outcome": "unresolved",
-            "summary": f"machine structured SubAgentActivity {str(observation.get('kind') or '').lower()}",
+            "summary": (
+                "machine structured SubAgentActivity "
+                + str(observation.get("kind") or "").lower()
+            ),
             "evidence": [],
             "artifacts": [],
-            "next_action": "wake same Controller to reconcile child result and recompute runnable work",
+            "next_action": (
+                "wake same Controller to reconcile child result and recompute runnable work"
+            ),
             "retry_class": retry_class,
             "result_unknown": result_unknown,
         }
@@ -1062,15 +1172,24 @@ def _ingest_verified_structured_subagent_terminal(
         lease = state["leases"][assignment_id]
 
     receipt_path = _structured_terminal_receipt_path(repo_path, lease)
-    payload = _external_terminal_receipt(repo=repo_path, lease=lease, observation=observation)
+    payload = _external_terminal_receipt(
+        repo=repo_path, lease=lease, observation=observation
+    )
     if receipt_path.exists():
         try:
             existing = json.loads(receipt_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"existing structured terminal receipt is unreadable: {exc}") from exc
-        for field in ("assignment_id", "task_id", "agent_id", "provider", "model", "agent_type", "session_id", "attempt", "lease_id"):
+            raise ValueError(
+                f"existing structured terminal receipt is unreadable: {exc}"
+            ) from exc
+        for field in (
+            "assignment_id", "task_id", "agent_id", "provider", "model",
+            "agent_type", "session_id", "attempt", "lease_id",
+        ):
             if existing.get(field) != payload.get(field):
-                raise ValueError("existing structured terminal receipt conflicts with canonical Assignment attempt")
+                raise ValueError(
+                    "existing structured terminal receipt conflicts with canonical Assignment attempt"
+                )
     else:
         _atomic_write_json(receipt_path, payload)
     return {
@@ -1169,6 +1288,7 @@ def _apply_verified_web_execution_event(
             "task_name": str(ticket.get("task_name") or ""),
             "model": observed_model,
             "agent_type": observed_agent_type,
+            "host_event": json.loads(json.dumps(event)),
         }
         _persist_observed_dispatch(
             repo=repo,

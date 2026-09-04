@@ -140,9 +140,11 @@ def validate_assignment(
     except (TypeError, ValueError):
         contract_version = 0
     route = assignment.get("route")
-    if launch_route_expected and contract_version >= 2 and not isinstance(route, dict):
+    if launch_route_expected and contract_version < 2:
+        errors.append("assignment-bound external launch requires v2 canonical route contract")
+    elif launch_route_expected and not isinstance(route, dict):
         errors.append("v2 assignment-bound launch requires canonical route contract")
-    if isinstance(route, dict) and launch_route_expected:
+    if isinstance(route, dict) and launch_route_expected and contract_version >= 2:
         task_id = str(assignment.get("task_id", "")).strip() or "assignment"
         errors.extend(
             delegated_route_contract_errors(

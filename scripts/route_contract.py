@@ -110,7 +110,7 @@ def route_policy_errors(task_id: str, route: dict[str, Any]) -> list[str]:
             continue
         if all(
             re.search(
-                rf"{field}s*=s*{re.escape(value)}(?=$|[^A-Za-z0-9_.-])",
+                rf"{field}{chr(92)}s*={chr(92)}s*{re.escape(value)}(?=$|[\s,;，；。.、])",
                 line,
                 re.IGNORECASE,
             )

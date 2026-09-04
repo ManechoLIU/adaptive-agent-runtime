@@ -598,7 +598,7 @@ test("assignment-bound execute rejects stale or mismatched ACK before spawn", as
   await assert.rejects(readFile(marker, "utf8"));
 });
 
-test("legacy v1 assignment ACK without side-effect fields can resume", async () => {
+test("fresh legacy v1 assignment ACK cannot launch external provider", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-legacy-ack-"));
   const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
@@ -612,7 +612,8 @@ test("legacy v1 assignment ACK without side-effect fields can resume", async () 
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack,
   ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /v2 canonical route contract|assignment-bound external launch/i);
 });
 
 test("v2 side-effect execution propagates stable idempotency key to provider contract", async () => {

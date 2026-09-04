@@ -685,7 +685,8 @@ def reconcile_managed_web_assignments(
                     terminal_result = _ingest_verified_structured_subagent_terminal(
                         repo=repo,
                         assignment_id=assignment_id,
-                        observation=observation,
+                        event_path=str(observation.get("source_path") or ""),
+                        observation_id=str(observation.get("observation_id") or ""),
                         now=now,
                     )
                     lease = load_runtime_state(repo)["leases"][assignment_id]

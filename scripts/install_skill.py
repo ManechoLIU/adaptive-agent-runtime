@@ -95,8 +95,14 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_safe_fallback_policy_must_declare_selected_fallback_route_not_only_origin",
     "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
     "test_canonical_kimi_terminal_with_declared_route_can_prepare_web_fallback",
+    "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
+    "test_direct_internal_observation_chain_cannot_create_lease_without_attested_machine_event",
+    "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
+    "test_route_policy_accepts_normal_whitespace_declaration",
     "tests.test_web_agent_execution.StructuredCollaborationTerminalTests."
     "test_public_structured_terminal_ingest_rejects_caller_supplied_observation",
+    "tests.test_web_agent_execution.StructuredCollaborationTerminalTests."
+    "test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path",
 )
 RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors",
@@ -104,6 +110,7 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "assignment-bound safe fallback requires canonical prior terminal before provider spawn",
     "assignment-bound external start persists exact canonical route contract",
     "short assignment-bound execution reconciles final Git progress before terminal",
+    "fresh legacy v1 assignment ACK cannot launch external provider",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/web_agent_execution.py",

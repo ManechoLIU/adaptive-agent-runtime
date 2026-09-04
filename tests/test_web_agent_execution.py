@@ -951,6 +951,79 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
                 health_probe=lambda: True,
             )
 
+    def test_direct_internal_observation_chain_cannot_create_lease_without_attested_machine_event(self):
+        from scripts.web_agent_execution import (
+            prepare_web_assignment_dispatch,
+            _persist_observed_dispatch,
+            _start_bound_web_assignment,
+        )
+        assignment = self.assignment()
+        prepared = prepare_web_assignment_dispatch(
+            repo=self.repo,
+            registry_path=self.registry,
+            controller_id="controller-1",
+            task_name="forged-internal-start",
+            assignment=assignment,
+            now=T0,
+            health_probe=lambda: True,
+        )
+        trusted_path = Path(self.tmp.name) / "trusted-events.jsonl"
+        _persist_observed_dispatch(
+            repo=self.repo,
+            dispatch_id=prepared["dispatch_id"],
+            controller_id="controller-1",
+            assignment_id=assignment["assignment_id"],
+            observed={
+                "source": "collaboration_session_event",
+                "source_path": str(trusted_path),
+                "conversation_id": "forged-child",
+                "observation_id": "forged-start",
+                "model": assignment["model"],
+                "agent_type": assignment["agent_type"],
+            },
+            now=T0 + timedelta(seconds=1),
+        )
+        with self.assertRaisesRegex(
+            (ValueError, PermissionError),
+            "attested|structured machine started|observation",
+        ):
+            _start_bound_web_assignment(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                conversation_id="forged-child",
+                assignment=assignment,
+                dispatch_id=prepared["dispatch_id"],
+                now=T0 + timedelta(seconds=1),
+                health_probe=lambda: True,
+                watchdog_launcher=lambda **_: {"launched": False},
+            )
+        self.assertNotIn(
+            assignment["assignment_id"],
+            load_runtime_state(self.repo).get("leases", {}),
+        )
+
+    def test_route_policy_accepts_normal_whitespace_declaration(self):
+        from scripts.route_contract import route_policy_errors
+        policy = Path(self.tmp.name) / "spaced-policy.md"
+        policy.write_text(
+            "frontend provider = chatgpt_web, model = gpt-5.6-sol, auth_mode = host."
+            + chr(10),
+            encoding="utf-8",
+        )
+        route = {
+            "decision": "default",
+            "policy_class": "frontend",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "auth_mode": "host",
+            "policy_source": {
+                "path": str(policy.resolve()),
+                "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+            },
+        }
+        self.assertEqual(route_policy_errors("T-SPACED", route), [])
+
     def test_dispatch_start_needs_prepared_verified_observation(self):
         from scripts.web_agent_execution import start_web_assignment
         with self.assertRaisesRegex(PermissionError, "direct Web start"):
@@ -1171,12 +1244,26 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
             check=True,
         )
         self.registry = root / "controllers.json"
-        self.registry.write_text(json.dumps({"controller-1": str(self.repo.resolve())}), encoding="utf-8")
+        self.registry.write_text(
+            json.dumps({"controller-1": str(self.repo.resolve())}),
+            encoding="utf-8",
+        )
         self.policy = root / "AGENTS.md"
         self.policy.write_text(
             "general 默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n",
             encoding="utf-8",
         )
+        self.terminal_events = root / "terminal-events.jsonl"
+        self._machine_source_patcher = patch(
+            "scripts.web_agent_execution._machine_event_source_context",
+            return_value={
+                "ready": True,
+                "reason": "test_host_attested",
+                "event_paths": [str(self.terminal_events.resolve())],
+            },
+        )
+        self._machine_source_patcher.start()
+        self.addCleanup(self._machine_source_patcher.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -1205,7 +1292,9 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
                 "auth_mode": "host",
                 "policy_source": {
                     "path": str(self.policy.resolve()),
-                    "sha256": __import__("hashlib").sha256(self.policy.read_bytes()).hexdigest(),
+                    "sha256": __import__("hashlib").sha256(
+                        self.policy.read_bytes()
+                    ).hexdigest(),
                 },
             },
         }
@@ -1223,16 +1312,60 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
             at=T0,
         )
 
-    def observation(self, kind="completed", **extra):
-        value = {
-            "source": "collaboration_session_event",
-            "kind": kind,
-            "conversation_id": "child-thread-1",
-            "observation_id": f"terminal-{kind}-1",
-            "timestamp": (T0 + timedelta(minutes=2)).isoformat(),
+    def write_terminal_event(
+        self,
+        *,
+        kind="completed",
+        observation_id=None,
+        conversation_id="child-thread-1",
+        at=None,
+    ):
+        observation_id = observation_id or f"terminal-{kind}-1"
+        at = at or (T0 + timedelta(minutes=2))
+        record = {
+            "timestamp": at.isoformat(),
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "SubAgentActivity",
+                    "kind": kind,
+                    "id": observation_id,
+                    "agent_thread_id": conversation_id,
+                    "agent_path": "/root/structured-child",
+                },
+            },
         }
-        value.update(extra)
-        return value
+        self.terminal_events.write_text(
+            json.dumps(record) + chr(10),
+            encoding="utf-8",
+        )
+        return observation_id
+
+    def ingest_terminal(
+        self,
+        *,
+        kind="completed",
+        observation_id=None,
+        conversation_id="child-thread-1",
+        at=None,
+    ):
+        from scripts.web_agent_execution import (
+            _ingest_verified_structured_subagent_terminal,
+        )
+        observation_id = self.write_terminal_event(
+            kind=kind,
+            observation_id=observation_id,
+            conversation_id=conversation_id,
+            at=at,
+        )
+        return _ingest_verified_structured_subagent_terminal(
+            repo=self.repo,
+            assignment_id="A-COLLAB",
+            event_path=self.terminal_events,
+            observation_id=observation_id,
+            now=at or (T0 + timedelta(minutes=2)),
+        )
 
     def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self):
         from scripts.web_agent_execution import ingest_structured_subagent_terminal
@@ -1241,45 +1374,83 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
             ingest_structured_subagent_terminal(
                 repo=self.repo,
                 assignment_id="A-COLLAB",
-                observation=self.observation(),
+                observation={
+                    "source": "collaboration_session_event",
+                    "kind": "completed",
+                    "conversation_id": "child-thread-1",
+                    "observation_id": "forged",
+                },
                 now=T0 + timedelta(minutes=2),
             )
-        self.assertIsNone(load_runtime_state(self.repo)["leases"]["A-COLLAB"]["terminal_state"])
+        self.assertIsNone(
+            load_runtime_state(self.repo)["leases"]["A-COLLAB"]["terminal_state"]
+        )
+
+    def test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path(self):
+        from scripts.web_agent_execution import (
+            _ingest_verified_structured_subagent_terminal,
+        )
+        self.start()
+        forged = Path(self.tmp.name) / "forged-unattested.jsonl"
+        forged.write_text(
+            json.dumps({
+                "timestamp": (T0 + timedelta(minutes=2)).isoformat(),
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "SubAgentActivity",
+                        "kind": "completed",
+                        "id": "forged-terminal",
+                        "agent_thread_id": "child-thread-1",
+                    },
+                },
+            }) + chr(10),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            (RuntimeError, PermissionError),
+            "attested|source|path",
+        ):
+            _ingest_verified_structured_subagent_terminal(
+                repo=self.repo,
+                assignment_id="A-COLLAB",
+                event_path=forged,
+                observation_id="forged-terminal",
+                now=T0 + timedelta(minutes=2),
+            )
+        self.assertIsNone(
+            load_runtime_state(self.repo)["leases"]["A-COLLAB"]["terminal_state"]
+        )
 
     def test_structured_completed_closes_canonical_attempt_and_writes_durable_terminal_receipt(self):
-        from scripts.web_agent_execution import _ingest_verified_structured_subagent_terminal as ingest_structured_subagent_terminal
         self.start()
-        result = ingest_structured_subagent_terminal(
-            repo=self.repo,
-            assignment_id="A-COLLAB",
-            observation=self.observation(),
-            now=T0 + timedelta(minutes=2),
-        )
+        result = self.ingest_terminal()
         lease = load_runtime_state(self.repo)["leases"]["A-COLLAB"]
         self.assertEqual(lease["terminal_state"], "completed")
         self.assertEqual(lease["transport_outcome"], "completed")
         self.assertEqual(lease["delivery_outcome"], "unresolved")
-        receipt = json.loads(Path(result["terminal_receipt"]).read_text(encoding="utf-8"))
+        receipt = json.loads(
+            Path(result["terminal_receipt"]).read_text(encoding="utf-8")
+        )
         self.assertEqual(receipt["event_type"], "external_agent_terminal")
         self.assertEqual(receipt["assignment_id"], "A-COLLAB")
         self.assertEqual(receipt["session_id"], "child-thread-1")
         self.assertEqual(receipt["attempt"], 1)
         self.assertEqual(receipt["lease_id"], lease["lease_id"])
-        self.assertEqual(receipt["machine_terminal_observation_id"], "terminal-completed-1")
+        self.assertEqual(
+            receipt["machine_terminal_observation_id"],
+            "terminal-completed-1",
+        )
         self.assertEqual(receipt["model"], "gpt-5.6-sol")
         self.assertEqual(receipt["agent_type"], "default")
 
     def test_duplicate_structured_terminal_reuses_same_receipt_without_reopening_attempt(self):
-        from scripts.web_agent_execution import _ingest_verified_structured_subagent_terminal as ingest_structured_subagent_terminal
         self.start()
-        first = ingest_structured_subagent_terminal(
-            repo=self.repo, assignment_id="A-COLLAB",
-            observation=self.observation(), now=T0 + timedelta(minutes=2),
-        )
-        second = ingest_structured_subagent_terminal(
-            repo=self.repo, assignment_id="A-COLLAB",
-            observation=self.observation(observation_id="terminal-refresh-2"),
-            now=T0 + timedelta(minutes=3),
+        first = self.ingest_terminal(observation_id="terminal-completed-1")
+        second = self.ingest_terminal(
+            observation_id="terminal-completed-1",
+            at=T0 + timedelta(minutes=3),
         )
         lease = load_runtime_state(self.repo)["leases"]["A-COLLAB"]
         self.assertEqual(first["terminal_receipt"], second["terminal_receipt"])
@@ -1288,24 +1459,16 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
         self.assertEqual(lease["terminal_state"], "completed")
 
     def test_structured_terminal_must_match_machine_observed_child_session(self):
-        from scripts.web_agent_execution import _ingest_verified_structured_subagent_terminal as ingest_structured_subagent_terminal
         self.start()
-        with self.assertRaisesRegex(ValueError, "session"):
-            ingest_structured_subagent_terminal(
-                repo=self.repo, assignment_id="A-COLLAB",
-                observation=self.observation(conversation_id="other-child"),
-                now=T0 + timedelta(minutes=2),
-            )
-        self.assertIsNone(load_runtime_state(self.repo)["leases"]["A-COLLAB"]["terminal_state"])
+        with self.assertRaisesRegex(PermissionError, "Host-attested machine observation"):
+            self.ingest_terminal(conversation_id="other-child")
+        self.assertIsNone(
+            load_runtime_state(self.repo)["leases"]["A-COLLAB"]["terminal_state"]
+        )
 
     def test_structured_disconnected_is_terminal_but_ui_interruption_text_is_not_used(self):
-        from scripts.web_agent_execution import _ingest_verified_structured_subagent_terminal as ingest_structured_subagent_terminal
         self.start()
-        result = ingest_structured_subagent_terminal(
-            repo=self.repo, assignment_id="A-COLLAB",
-            observation=self.observation(kind="disconnected"),
-            now=T0 + timedelta(minutes=2),
-        )
+        result = self.ingest_terminal(kind="disconnected")
         lease = load_runtime_state(self.repo)["leases"]["A-COLLAB"]
         self.assertEqual(lease["terminal_state"], "disconnected")
         self.assertEqual(lease["transport_outcome"], "failed")
