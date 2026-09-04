@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.assignment_runtime import load_runtime_state
 
@@ -37,6 +38,16 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
             "general 默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n",
             encoding="utf-8",
         )
+        self._machine_source_patcher = patch(
+            "scripts.web_agent_execution._machine_event_source_context",
+            return_value={
+                "ready": True,
+                "reason": "test_host_attested",
+                "event_paths": [str(self.events.resolve())],
+            },
+        )
+        self._machine_source_patcher.start()
+        self.addCleanup(self._machine_source_patcher.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -123,7 +134,6 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             task_name=task_name, assignment=assignment or self.assignment(), now=T0 + timedelta(seconds=1),
             health_probe=lambda: True,
-            event_source_probe=lambda: True,
         )
 
     def test_completed_writer_becomes_canonical_terminal_and_handoffs_same_controller(self):
@@ -222,13 +232,53 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1)
 
     def test_stale_lease_only_handoffs_to_existing_runtime_continuation(self):
-        from scripts.web_agent_execution import start_web_assignment
+        from scripts.web_agent_execution import bind_web_assignment_dispatch
         from scripts.web_agent_health_supervisor import reconcile_web_agent_health_once
-        start_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            conversation_id="child-stale", assignment=self.assignment(), now=T0,
-            watchdog_launcher=lambda **_: {"launched": True},
-            event_source_probe=lambda: True,
+        prepared = self.prepare(task_name="stale-writer")
+        call_id = "spawn-stale-writer"
+        self.events.write_text(
+            chr(10).join([
+                json.dumps({
+                    "timestamp": T0.isoformat(),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "namespace": "collaboration",
+                        "name": "spawn_agent",
+                        "call_id": call_id,
+                        "arguments": json.dumps({
+                            "task_name": "stale-writer",
+                            "agent_type": "default",
+                            "model": "gpt-5.6-sol",
+                        }),
+                    },
+                }),
+                json.dumps({
+                    "timestamp": (T0 + timedelta(seconds=2)).isoformat(),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "item": {
+                            "type": "SubAgentActivity",
+                            "kind": "started",
+                            "id": call_id,
+                            "agent_thread_id": "child-stale",
+                            "agent_path": "/root/stale-writer",
+                        },
+                    },
+                }),
+            ]) + chr(10),
+            encoding="utf-8",
+        )
+        bind_web_assignment_dispatch(
+            repo=self.repo,
+            registry_path=self.registry,
+            controller_id="controller-1",
+            dispatch_id=prepared["dispatch_id"],
+            event_paths=[self.events],
+            now=T0 + timedelta(seconds=2),
+            health_probe=lambda: True,
+            watchdog_launcher=lambda **_: {"launched": False},
         )
         wakes = []
         result = reconcile_web_agent_health_once(

@@ -12,7 +12,7 @@ from unittest.mock import patch
 from scripts.assignment_runtime import load_runtime_state
 from scripts import terminal_continuation
 from scripts import web_lifecycle_bridge as web_bridge
-from scripts.web_agent_execution import start_web_assignment
+from scripts.web_agent_execution import prepare_web_assignment_dispatch, bind_web_assignment_dispatch
 
 UTC = timezone.utc
 T0 = datetime(2026, 9, 4, 2, 0, tzinfo=UTC)
@@ -60,6 +60,16 @@ class WebCollaborationContinuationRegressionTests(unittest.TestCase):
             "general 默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n",
             encoding="utf-8",
         )
+        self._machine_source_patcher = patch(
+            "scripts.web_agent_execution._machine_event_source_context",
+            return_value={
+                "ready": True,
+                "reason": "test_host_attested",
+                "event_paths": [str(self.events.resolve())],
+            },
+        )
+        self._machine_source_patcher.start()
+        self.addCleanup(self._machine_source_patcher.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -98,15 +108,61 @@ class WebCollaborationContinuationRegressionTests(unittest.TestCase):
         return value
 
     def start(self, *, role="writer"):
-        return start_web_assignment(
+        assignment = self.assignment(role=role)
+        task_name = f"{role}-start"
+        prepared = prepare_web_assignment_dispatch(
             repo=self.repo,
             registry_path=self.registry,
             controller_id="controller-1",
-            conversation_id="child-thread-1",
-            assignment=self.assignment(role=role),
+            task_name=task_name,
+            assignment=assignment,
             now=T0,
-            watchdog_launcher=lambda **_: {"launched": True, "pid": 101},
-            event_source_probe=lambda: True,
+            health_probe=lambda: True,
+        )
+        call_id = f"spawn-{role}-start"
+        self.events.write_text(
+            chr(10).join([
+                json.dumps({
+                    "timestamp": T0.isoformat(),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "namespace": "collaboration",
+                        "name": "spawn_agent",
+                        "call_id": call_id,
+                        "arguments": json.dumps({
+                            "task_name": task_name,
+                            "agent_type": assignment["agent_type"],
+                            "model": assignment["model"],
+                        }),
+                    },
+                }),
+                json.dumps({
+                    "timestamp": (T0 + timedelta(seconds=1)).isoformat(),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "item": {
+                            "type": "SubAgentActivity",
+                            "kind": "started",
+                            "id": call_id,
+                            "agent_thread_id": "child-thread-1",
+                            "agent_path": f"/root/{role}-child",
+                        },
+                    },
+                }),
+            ]) + chr(10),
+            encoding="utf-8",
+        )
+        return bind_web_assignment_dispatch(
+            repo=self.repo,
+            registry_path=self.registry,
+            controller_id="controller-1",
+            dispatch_id=prepared["dispatch_id"],
+            event_paths=[self.events],
+            now=T0 + timedelta(seconds=1),
+            health_probe=lambda: True,
+            watchdog_launcher=lambda **_: {"launched": False},
         )
 
     def terminal_event(self, kind="completed", observation_id="terminal-1"):

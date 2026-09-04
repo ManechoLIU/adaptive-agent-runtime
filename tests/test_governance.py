@@ -2703,6 +2703,18 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 "required_reviews": [],
                 "candidate_packages": [],
                 "new_assignments": [],
+                "controller_actions": [],
+                "correction_actions": [],
+                "control_loop_receipt": {
+                    "scope": "project_wide",
+                    "ledger_sha256": control_event_guard.ledger_sha256(ledger),
+                    "runnable_ids": ["INIT-01"],
+                    "candidate_revisions": [],
+                    "controller_action_ids": [],
+                    "correction_fingerprints": [],
+                    "completed_steps": list(control_event_guard.CONTROL_LOOP_STEPS),
+                    "recomputed_after_actions": True,
+                },
                 "machine_trace": {
                     "turn_id": "turn-1",
                     "tool_use_ids": ["tool-1"],
@@ -3637,6 +3649,389 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             snapshot, ledger_ready_ids=runnable, derived_runnable_ids=runnable
         )
         self.assertIn("active dispatch decisions exceed available capacity: 2 > 1", errors)
+
+    def test_stop_without_current_turn_control_loop_receipt_fails_closed_even_when_idle(self) -> None:
+        snapshot = {
+            "head": "abc",
+            "ledger_sha256": "ledger",
+            "worktree_status_sha256": "status",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "controller_corrections": [],
+            "control_loop_required": True,
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        output, _ = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "turn_id": "turn-1",
+            },
+            snapshot=snapshot,
+            prior_state={
+                "active_turn_id": "turn-1",
+                "pending_control_event": False,
+                "must_yield": False,
+                "snapshot": snapshot,
+            },
+        )
+        self.assertEqual(output.get("decision"), "block")
+        self.assertIn("control", str(output.get("reason", "")).lower())
+        self.assertIn("receipt", str(output.get("reason", "")).lower())
+
+    def test_failed_control_cycle_generates_executable_controller_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            snapshot = self.complete_event_receipt()
+            snapshot["event_contract"]["event_id"] = "deviation-1"
+            receipt, _ = control_event_guard.persist_controller_cycle_evidence(
+                root,
+                snapshot,
+                controller_id="controller-1",
+                ledger_sha256="ledger-1",
+                main_revision="main-1",
+                terminal_status="FAILED",
+                validation_errors=[
+                    "control event omitted derived runnable packages: MINI-READY"
+                ],
+            )
+            deviations = receipt["controller_deviations"]
+            self.assertEqual(len(deviations), 1)
+            deviation = deviations[0]
+            self.assertEqual(deviation["deviation_code"], "project_runnable_omission")
+            self.assertEqual(deviation["responsibility"], "controller")
+            self.assertEqual(deviation["level"], "L3")
+            self.assertTrue(deviation["correction"]["mandatory"])
+            self.assertTrue(deviation["correction"]["executable"])
+            self.assertEqual(
+                deviation["correction"]["projection"],
+                "canonical_project_control",
+            )
+            self.assertTrue(deviation["fingerprint"])
+
+    def test_direct_cycle_persistence_cannot_fabricate_generic_correction_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            incident = self.complete_event_receipt()
+            incident["event_contract"]["event_id"] = "generic-deviation-1"
+            failed, _ = control_event_guard.persist_controller_cycle_evidence(
+                root,
+                incident,
+                controller_id="controller-1",
+                ledger_sha256="ledger-1",
+                main_revision="main-1",
+                terminal_status="FAILED",
+                validation_errors=["control event omitted derived runnable packages: MINI-READY"],
+            )
+            correction = failed["controller_deviations"][0]
+            forged = self.complete_event_receipt()
+            forged["event_contract"]["event_id"] = "forged-close-1"
+            forged["correction_actions"] = [{
+                "fingerprint": correction["fingerprint"],
+                "decision": "corrected",
+                "action": correction["correction"]["action"],
+                "executed_by": "controller-1",
+                "verified_by": "controller-1",
+            }]
+            with self.assertRaisesRegex(ValueError, "generic correction closure failed"):
+                control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    forged,
+                    controller_id="controller-1",
+                    ledger_sha256="ledger-2",
+                    main_revision="main-2",
+                    terminal_status="CLOSED",
+                    validation_errors=[],
+                )
+            self.assertEqual(
+                [item["fingerprint"] for item in control_event_guard.open_controller_corrections(root, "controller-1")],
+                [correction["fingerprint"]],
+            )
+
+    def test_same_controller_deviation_fingerprint_escalates_on_recurrence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            for index in (1, 2):
+                snapshot = self.complete_event_receipt()
+                snapshot["event_contract"]["event_id"] = f"deviation-{index}"
+                receipt, _ = control_event_guard.persist_controller_cycle_evidence(
+                    root,
+                    snapshot,
+                    controller_id="controller-1",
+                    ledger_sha256=f"ledger-{index}",
+                    main_revision=f"main-{index}",
+                    terminal_status="FAILED",
+                    validation_errors=[
+                        "control event omitted derived runnable packages: MINI-READY"
+                    ],
+                )
+                if index == 1:
+                    first = receipt["controller_deviations"][0]
+                else:
+                    second = receipt["controller_deviations"][0]
+            self.assertEqual(first["fingerprint"], second["fingerprint"])
+            self.assertEqual(first["level"], "L3")
+            self.assertEqual(second["level"], "L4")
+            self.assertEqual(second["recurrence_count"], 2)
+
+    def test_open_correction_enters_lifecycle_projection_and_blocks_stop(self) -> None:
+        snapshot = {
+            "head": "abc",
+            "ledger_sha256": "ledger",
+            "worktree_status_sha256": "status",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "controller_corrections": [
+                {
+                    "fingerprint": "fp-1",
+                    "level": "L2",
+                    "deviation_code": "unconsumed_candidate",
+                    "correction": {
+                        "mandatory": True,
+                        "executable": True,
+                        "action": "consume_candidate_and_recompute",
+                    },
+                }
+            ],
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        triggers = lifecycle_hook.lifecycle_triggers(snapshot, None)
+        self.assertIn("CORRECTION:fp-1", triggers)
+        output, _ = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-1"},
+            snapshot=snapshot,
+            prior_state={
+                "active_turn_id": "turn-1",
+                "pending_control_event": True,
+                "triggers": ["CORRECTION:fp-1"],
+                "snapshot": snapshot,
+            },
+        )
+        self.assertEqual(output.get("decision"), "block")
+        self.assertIn("CORRECTION:fp-1", str(output.get("reason", "")))
+
+    def test_control_loop_receipt_requires_project_wide_projection_and_all_controller_actions(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "ledger-1",
+            "available_slots": 1,
+            "ready_packages": [
+                {
+                    "id": "MINI-READY",
+                    "decision": "active",
+                    "task_id": "MINI-READY-A1",
+                    "delivered_ack": True,
+                }
+            ],
+            "controller_actions": [],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids={"MINI-READY"},
+            derived_runnable_ids={"MINI-READY"},
+            expected_ledger_sha256="ledger-1",
+            expected_candidate_revisions={"cand-1"},
+            expected_controller_action_ids={"candidate:cand-1", "recovery:SERVER-ACTIVE"},
+            expected_corrections=[],
+            require_control_loop_receipt=True,
+        )
+        self.assertTrue(any("control_loop_receipt" in error for error in errors), errors)
+        self.assertTrue(any("controller action" in error for error in errors), errors)
+
+    def test_active_writer_does_not_hide_immediate_controller_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            correction = {
+                "fingerprint": "fp-live",
+                "level": "L2",
+                "deviation_code": "unconsumed_candidate",
+                "correction": {
+                    "mandatory": True,
+                    "executable": True,
+                    "action": "consume_candidate_integration_acceptance_and_recompute",
+                },
+            }
+            actions = control_event_guard.canonical_controller_action_projection(
+                root,
+                controller_id="controller-1",
+                candidates={"/tmp/candidate": "candidate-abc"},
+                required_review_ids={"review-1"},
+                work_in_flight={"WEB-ACTIVE": "ACTIVE"},
+                corrections=[correction],
+            )
+            self.assertEqual(
+                set(actions),
+                {
+                    "candidate:candidate-abc",
+                    "review:review-1",
+                    "recovery:WEB-ACTIVE",
+                    "correction:fp-live",
+                },
+            )
+            snapshot = {
+                **self.complete_event_receipt(),
+                "ledger_sha256": "ledger-live",
+                "available_slots": 0,
+                "ready_packages": [],
+                "controller_actions": [],
+                "correction_actions": [],
+                "control_loop_receipt": {
+                    "scope": "project_wide",
+                    "ledger_sha256": "ledger-live",
+                    "runnable_ids": [],
+                    "candidate_revisions": ["candidate-abc"],
+                    "controller_action_ids": sorted(actions),
+                    "correction_fingerprints": ["fp-live"],
+                    "completed_steps": list(control_event_guard.CONTROL_LOOP_STEPS),
+                    "recomputed_after_actions": True,
+                },
+            }
+            errors = control_event_guard.validate_snapshot(
+                snapshot,
+                ledger_ready_ids=set(),
+                derived_runnable_ids=set(),
+                expected_ledger_sha256="ledger-live",
+                expected_candidate_revisions={"candidate-abc"},
+                expected_controller_action_ids=set(actions),
+                expected_corrections=[correction],
+                require_control_loop_receipt=True,
+            )
+            self.assertTrue(any("omitted controller actions" in error for error in errors), errors)
+            self.assertTrue(any("mandatory correction" in error for error in errors), errors)
+
+    def test_control_loop_receipt_rejects_missing_or_reordered_control_steps(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "ledger-1",
+            "available_slots": 0,
+            "ready_packages": [],
+            "controller_actions": [],
+            "correction_actions": [],
+            "control_loop_receipt": {
+                "scope": "project_wide",
+                "ledger_sha256": "ledger-1",
+                "runnable_ids": [],
+                "candidate_revisions": [],
+                "controller_action_ids": [],
+                "correction_fingerprints": [],
+                "completed_steps": list(reversed(control_event_guard.CONTROL_LOOP_STEPS)),
+                "recomputed_after_actions": True,
+            },
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(),
+            derived_runnable_ids=set(),
+            expected_ledger_sha256="ledger-1",
+            expected_candidate_revisions=set(),
+            expected_controller_action_ids=set(),
+            expected_corrections=[],
+            require_control_loop_receipt=True,
+        )
+        self.assertTrue(any("completed_steps" in error for error in errors), errors)
+
+    def test_unfinished_correction_prevents_control_cycle_closure(self) -> None:
+        correction = {
+            "fingerprint": "fp-correction",
+            "level": "L2",
+            "deviation_code": "unconsumed_reviewer",
+            "responsibility": "controller",
+            "correction": {
+                "mandatory": True,
+                "executable": True,
+                "action": "consume_reviewer_and_recompute",
+            },
+        }
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "ledger-1",
+            "available_slots": 0,
+            "ready_packages": [],
+            "controller_actions": [],
+            "control_loop_receipt": {
+                "scope": "project_wide",
+                "ledger_sha256": "ledger-1",
+                "runnable_ids": [],
+                "candidate_revisions": [],
+                "controller_action_ids": ["correction:fp-correction"],
+                "correction_fingerprints": ["fp-correction"],
+                "recomputed_after_actions": True,
+            },
+            "correction_actions": [],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(),
+            derived_runnable_ids=set(),
+            expected_ledger_sha256="ledger-1",
+            expected_candidate_revisions=set(),
+            expected_controller_action_ids={"correction:fp-correction"},
+            expected_corrections=[correction],
+            require_control_loop_receipt=True,
+        )
+        self.assertTrue(
+            any("mandatory correction" in error and "fp-correction" in error for error in errors),
+            errors,
+        )
+
+    def test_reviewer_terminal_recomputes_unrelated_project_runnable(self) -> None:
+        snapshot = {
+            "head": "abc",
+            "ledger_sha256": "ledger",
+            "worktree_status_sha256": "status",
+            "ready_ids": ["MINI-READY"],
+            "runnable_ids": ["MINI-READY"],
+            "candidate_revisions": ["deadbeef"],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "controller_corrections": [],
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        _, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": "controller-1",
+                "agent_id": "web-reviewer-1",
+                "terminal_receipt": "/tmp/reviewer-terminal.json",
+            },
+            snapshot=snapshot,
+            prior_state={"pending_control_event": False, "snapshot": snapshot},
+        )
+        self.assertIn("READY:MINI-READY", state["triggers"])
+        self.assertIn("CANDIDATE:deadbeef", state["triggers"])
+        self.assertIn("subagent_stopped:web-reviewer-1", state["triggers"])
+
+    def test_pending_parent_partial_dependency_creates_dynamic_runnable_slice(self) -> None:
+        from scripts.controller_state import derive_runnable_tasks
+        records = [
+            {"id": "WEB-BASE", "status": "DONE", "next_action": "closed"},
+            {"id": "SERVER-BASE", "status": "ACTIVE", "next_action": "continue"},
+            {
+                "id": "MINI-PARENT",
+                "status": "PENDING",
+                "next_action": (
+                    "after WEB-BASE implement mini shell; "
+                    "after SERVER-BASE wire server synchronization"
+                ),
+            },
+        ]
+        projection = derive_runnable_tasks(records)
+        self.assertIn("MINI-PARENT", projection["runnable_task_ids"])
+        slices = projection["derived_slices"]["MINI-PARENT"]
+        self.assertEqual(len(slices), 1)
+        self.assertIn("mini shell", slices[0]["next_action"])
+        self.assertEqual(slices[0]["closed_dependencies"], ["WEB-BASE"])
+        self.assertEqual(slices[0]["open_dependencies"], [])
 
     def test_successful_control_receipt_closes_the_event_and_latches_yield(self) -> None:
         snapshot = {

@@ -375,16 +375,46 @@ def _health_supervisor_is_ready(
     return bool(health_supervisor_ready())
 
 
+def _machine_event_source_context() -> dict[str, Any]:
+    try:
+        from scripts.web_agent_events import machine_event_source_status
+    except ModuleNotFoundError:
+        from web_agent_events import machine_event_source_status
+    value = machine_event_source_status()
+    return dict(value) if isinstance(value, dict) else {
+        "ready": False, "reason": "machine_event_source_status_invalid",
+    }
+
+
 def _machine_event_source_is_ready(
     probe: Callable[[], bool] | None = None,
 ) -> bool:
-    if probe is not None:
-        return bool(probe())
-    try:
-        from scripts.web_agent_events import machine_event_source_ready
-    except ModuleNotFoundError:
-        from web_agent_events import machine_event_source_ready
-    return bool(machine_event_source_ready())
+    # Legacy probe arguments are intentionally ignored. A local caller cannot
+    # self-assert production machine-event trust.
+    return bool(_machine_event_source_context().get("ready"))
+
+
+def _verified_machine_event_paths(requested: list[str | Path]) -> list[Path]:
+    context = _machine_event_source_context()
+    if context.get("ready") is not True:
+        raise RuntimeError(
+            "trusted Web Assignment machine event source is not ready; binding fails closed"
+        )
+    trusted = {
+        str(Path(value).expanduser().resolve(strict=False))
+        for value in context.get("event_paths", [])
+        if isinstance(value, str) and value.strip()
+    }
+    if not trusted:
+        raise RuntimeError("trusted Web machine event source did not attest event paths")
+    resolved = [Path(value).expanduser().resolve(strict=False) for value in requested]
+    untrusted = [str(path) for path in resolved if str(path) not in trusted]
+    if untrusted:
+        raise PermissionError(
+            "Web bind event path is not attested by the trusted machine event source: "
+            + ", ".join(untrusted)
+        )
+    return resolved
 
 
 def prepare_web_assignment_dispatch(
@@ -440,7 +470,7 @@ def prepare_web_assignment_dispatch(
 
 def require_prepared_web_dispatch(
     *, repo: str | Path, controller_id: str, task_name: str,
-    expected_model: str | None = None, expected_agent_type: str | None = None,
+    expected_model: str, expected_agent_type: str,
     health_probe: Callable[[], bool] | None = None,
     event_source_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -463,20 +493,22 @@ def require_prepared_web_dispatch(
     assignment = ticket.get("assignment")
     if not isinstance(assignment, dict):
         raise PermissionError("prepared Web Runtime dispatch lost its Assignment contract")
-    if expected_model is not None:
-        expected = str(expected_model or "").strip()
-        prepared = str(assignment.get("model") or "").strip()
-        if expected != prepared:
-            raise PermissionError(
-                f"collaboration.spawn_agent model does not match prepared Runtime Assignment: {expected} != {prepared}"
-            )
-    if expected_agent_type is not None:
-        expected = str(expected_agent_type or "").strip()
-        prepared = str(assignment.get("agent_type") or "").strip()
-        if expected != prepared:
-            raise PermissionError(
-                f"collaboration.spawn_agent agent_type does not match prepared Runtime Assignment: {expected} != {prepared}"
-            )
+    expected = str(expected_model or "").strip()
+    if not expected:
+        raise PermissionError("collaboration.spawn_agent requires observed model")
+    prepared = str(assignment.get("model") or "").strip()
+    if expected != prepared:
+        raise PermissionError(
+            f"collaboration.spawn_agent model does not match prepared Runtime Assignment: {expected} != {prepared}"
+        )
+    expected_type = str(expected_agent_type or "").strip()
+    if not expected_type:
+        raise PermissionError("collaboration.spawn_agent requires observed agent_type")
+    prepared_type = str(assignment.get("agent_type") or "").strip()
+    if expected_type != prepared_type:
+        raise PermissionError(
+            f"collaboration.spawn_agent agent_type does not match prepared Runtime Assignment: {expected_type} != {prepared_type}"
+        )
     return ticket
 
 
@@ -502,16 +534,42 @@ def _persist_observed_dispatch(
             ):
                 raise ValueError("Web dispatch ticket has conflicting machine observation")
             return dict(record)
+        source = str(observed.get("source") or "").strip()
+        if source not in {"collaboration_session_event", "chatgpt_host_event"}:
+            raise PermissionError("machine-observed Web dispatch has untrusted provenance")
         record.update({
             "state": "observed",
             "conversation_id": conversation_id,
             "observation_id": observation_id,
             "call_id": observed.get("call_id"),
             "observed_at": _iso(now),
-            "observation_source": "collaboration_session_event",
+            "observation_source": source,
         })
         return dict(record)
     return _mutate_dispatch_state(repo, mutate)
+
+
+def _mark_dispatch_bound(
+    *, repo: Path, dispatch_id: str, conversation_id: str,
+    observation_id: str, call_id: str | None, now: datetime,
+) -> None:
+    def mutate(current: dict[str, Any]) -> None:
+        record = current.setdefault("dispatches", {}).get(dispatch_id)
+        if not isinstance(record, dict) or record.get("state") != "observed":
+            raise ValueError("Web dispatch ticket changed while binding")
+        if (
+            str(record.get("conversation_id") or "") != conversation_id
+            or str(record.get("observation_id") or "") != observation_id
+        ):
+            raise ValueError("Web dispatch binding does not match persisted observation")
+        record.update({
+            "state": "bound",
+            "conversation_id": conversation_id,
+            "observation_id": observation_id,
+            "call_id": call_id,
+            "bound_at": _iso(now),
+        })
+    _mutate_dispatch_state(repo, mutate)
 
 
 def _verify_persisted_replacement_session_proof(
@@ -522,7 +580,8 @@ def _verify_persisted_replacement_session_proof(
         raise ValueError("replacement execution session requires persisted machine-observed dispatch proof")
     dispatch_id = str(proof.get("dispatch_id") or "").strip()
     observation_id = str(proof.get("observation_id") or "").strip()
-    if proof.get("source") != "collaboration_session_event" or not dispatch_id or not observation_id:
+    proof_source = str(proof.get("source") or "").strip()
+    if proof_source not in {"collaboration_session_event", "chatgpt_host_event"} or not dispatch_id or not observation_id:
         raise ValueError("replacement execution session proof must identify a persisted machine-observed dispatch")
     ticket = _load_dispatch_state(repo).get("dispatches", {}).get(dispatch_id)
     if (
@@ -530,7 +589,7 @@ def _verify_persisted_replacement_session_proof(
         or ticket.get("state") != "observed"
         or ticket.get("controller_id") != controller_id
         or ticket.get("assignment_id") != assignment_id
-        or ticket.get("observation_source") != "collaboration_session_event"
+        or ticket.get("observation_source") != proof_source
         or str(ticket.get("conversation_id") or "") != conversation_id
         or str(ticket.get("observation_id") or "") != observation_id
         or str(proof.get("conversation_id") or "") != conversation_id
@@ -583,8 +642,7 @@ def bind_web_assignment_dispatch(
     _registered_controller(repo_path, registry, controller_id)
     if not _health_supervisor_is_ready(health_probe, watchdog_launcher=watchdog_launcher):
         raise RuntimeError("Web Assignment health supervisor is not ready; binding fails closed")
-    if not _machine_event_source_is_ready(event_source_probe):
-        raise RuntimeError("Web Assignment machine event source is not ready; binding fails closed")
+    paths = _verified_machine_event_paths(event_paths)
 
     state = _load_dispatch_state(repo_path)
     ticket = state.get("dispatches", {}).get(dispatch_id)
@@ -592,7 +650,7 @@ def bind_web_assignment_dispatch(
         raise ValueError("Web dispatch ticket is missing, consumed, or not pending")
     if ticket.get("controller_id") != controller_id:
         raise PermissionError("Web dispatch ticket belongs to a different logical Controller")
-    observed = _structured_started_for_ticket(ticket, event_paths)
+    observed = _structured_started_for_ticket(ticket, paths)
     conversation_id = str(observed.get("conversation_id") or "").strip()
     assignment = ticket.get("assignment")
     if not isinstance(assignment, dict):
@@ -626,46 +684,51 @@ def bind_web_assignment_dispatch(
             },
         )
     else:
-        result = start_web_assignment(
+        result = _start_bound_web_assignment(
             repo=repo_path, registry_path=registry, controller_id=controller_id,
-            conversation_id=conversation_id, assignment=assignment, now=now,
+            conversation_id=conversation_id, assignment=assignment, dispatch_id=dispatch_id, now=now,
             watchdog_launcher=watchdog_launcher,
             health_probe=health_probe,
-            event_source_probe=event_source_probe,
         )
 
-    def mutate(current: dict[str, Any]) -> None:
-        record = current.setdefault("dispatches", {}).get(dispatch_id)
-        if not isinstance(record, dict) or record.get("state") != "observed":
-            raise ValueError("Web dispatch ticket changed while binding")
-        record.update({
-            "state": "bound", "conversation_id": conversation_id,
-            "observation_id": observed.get("observation_id"),
-            "call_id": observed.get("call_id"), "bound_at": _iso(now),
-        })
-
-    _mutate_dispatch_state(repo_path, mutate)
+    _mark_dispatch_bound(
+        repo=repo_path,
+        dispatch_id=dispatch_id,
+        conversation_id=conversation_id,
+        observation_id=str(observed.get("observation_id") or ""),
+        call_id=str(observed.get("call_id") or "") or None,
+        now=now,
+    )
     return {**result, "dispatch_id": dispatch_id, "conversation_id": conversation_id, "observation": observed}
 
 
-def start_web_assignment(
+def _start_bound_web_assignment(
     *, repo: str | Path, registry_path: str | Path, controller_id: str, conversation_id: str,
-    assignment: dict[str, Any], now: datetime | None = None,
+    assignment: dict[str, Any], dispatch_id: str, now: datetime | None = None,
     watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
     health_probe: Callable[[], bool] | None = None,
-    event_source_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Record a Controller-dispatched Web attempt without claiming Host generation liveness."""
+    """Create the canonical lease only from a persisted observed dispatch ticket."""
     repo_path = Path(repo).expanduser().resolve()
     registry = Path(registry_path).expanduser().resolve()
     now = now or datetime.now(UTC)
     _registered_controller(repo_path, registry, controller_id)
     if not _health_supervisor_is_ready(health_probe, watchdog_launcher=watchdog_launcher):
         raise RuntimeError("Web Assignment health supervisor is not ready; active lease was not created")
-    if not _machine_event_source_is_ready(event_source_probe):
-        raise RuntimeError("Web Assignment machine event source is not ready; active lease was not created")
-    attempt = int(assignment.get("attempt", 1))
     assignment_id = str(assignment.get("assignment_id") or "").strip()
+    ticket = _load_dispatch_state(repo_path).get("dispatches", {}).get(str(dispatch_id or ""))
+    if (
+        not isinstance(ticket, dict)
+        or ticket.get("state") != "observed"
+        or ticket.get("controller_id") != controller_id
+        or ticket.get("assignment_id") != assignment_id
+        or str(ticket.get("conversation_id") or "") != conversation_id
+        or str(ticket.get("observation_id") or "").strip() == ""
+    ):
+        raise PermissionError(
+            "Web Assignment start requires a prepared dispatch with persisted verified started observation"
+        )
+    attempt = int(assignment.get("attempt", 1))
     if not assignment_id:
         raise ValueError("Web execution Assignment requires assignment_id")
     lease_id = str(assignment.get("lease_id") or f"{assignment_id}:web:attempt:{attempt}")
@@ -685,6 +748,19 @@ def start_web_assignment(
         "controller_id": controller_id, "runtime_state": evaluate_lease(lease, now=now)["state"],
         "watchdog": watchdog,
     }
+
+
+def start_web_assignment(
+    *, repo: str | Path, registry_path: str | Path, controller_id: str, conversation_id: str,
+    assignment: dict[str, Any], now: datetime | None = None,
+    watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
+    health_probe: Callable[[], bool] | None = None,
+    event_source_probe: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Compatibility entry point: direct Web start is permanently fail-closed."""
+    raise PermissionError(
+        "direct Web start is disabled; use prepared dispatch + verified started observation + bind"
+    )
 
 
 def _automatic_recovery_decision(lease: dict[str, Any], health: dict[str, Any]) -> dict[str, Any]:
@@ -910,14 +986,14 @@ def _external_terminal_receipt(
     }
 
 
-def ingest_structured_subagent_terminal(
+def _ingest_verified_structured_subagent_terminal(
     *,
     repo: str | Path,
     assignment_id: str,
     observation: dict[str, Any],
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Persist one machine-structured collaboration terminal; continuation is handled elsewhere."""
+    """Persist a terminal only after the lifecycle reconciler verified Host-attested source paths."""
     repo_path = Path(repo).expanduser().resolve()
     now = now or datetime.now(UTC)
     if not isinstance(observation, dict) or observation.get("source") != "collaboration_session_event":
@@ -998,6 +1074,19 @@ def ingest_structured_subagent_terminal(
     }
 
 
+def ingest_structured_subagent_terminal(
+    *,
+    repo: str | Path,
+    assignment_id: str,
+    observation: dict[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Compatibility entry point: caller-supplied structured terminal is fail-closed."""
+    raise PermissionError(
+        "direct structured Web terminal ingest is disabled; use trusted lifecycle reconciliation"
+    )
+
+
 def apply_web_execution_event(
     *,
     repo: str | Path,
@@ -1024,10 +1113,68 @@ def apply_web_execution_event(
     if state == "started":
         if att.get("state") != "running":
             raise ValueError("Web execution start requires host-observed running state")
-        receipt = _start_receipt(repo, event, now)
-        runtime = apply_runtime_receipt(repo, receipt, now=now)
-        lease = runtime["leases"][receipt["assignment_id"]]
-        return {"assignment_id": receipt["assignment_id"], "runtime_state": evaluate_lease(lease, now=now)["state"], "controller_id": controller_id}
+        dispatch_id = str(event.get("dispatch_id") or "").strip()
+        if not dispatch_id:
+            raise PermissionError("verified Host started event requires a prepared dispatch ticket")
+        ticket = _load_dispatch_state(repo).get("dispatches", {}).get(dispatch_id)
+        if (
+            not isinstance(ticket, dict)
+            or ticket.get("state") != "pending"
+            or ticket.get("controller_id") != controller_id
+        ):
+            raise PermissionError("verified Host started event has no matching pending prepared dispatch ticket")
+        assignment = ticket.get("assignment")
+        if not isinstance(assignment, dict):
+            raise PermissionError("prepared Web dispatch lost its Assignment contract")
+        assignment_id = str(ticket.get("assignment_id") or "").strip()
+        supplied = event.get("assignment")
+        if isinstance(supplied, dict):
+            for field in ("assignment_id", "task_id", "provider", "model", "agent_type"):
+                if str(supplied.get(field) or "") != str(assignment.get(field) or ""):
+                    raise PermissionError(f"Host started Assignment {field} does not match prepared dispatch")
+        observed_model = str(event.get("model") or "").strip()
+        observed_agent_type = str(event.get("agent_type") or "").strip()
+        if observed_model != str(assignment.get("model") or "").strip():
+            raise PermissionError("Host-observed Web Agent model does not match prepared Runtime Assignment")
+        if observed_agent_type != str(assignment.get("agent_type") or "").strip():
+            raise PermissionError("Host-observed Web Agent type does not match prepared Runtime Assignment")
+        observed = {
+            "source": "chatgpt_host_event",
+            "conversation_id": conversation_id,
+            "observation_id": str(att.get("observation_id") or ""),
+            "call_id": str(event.get("call_id") or "") or None,
+            "task_name": str(ticket.get("task_name") or ""),
+            "model": observed_model,
+            "agent_type": observed_agent_type,
+        }
+        _persist_observed_dispatch(
+            repo=repo,
+            dispatch_id=dispatch_id,
+            controller_id=controller_id,
+            assignment_id=assignment_id,
+            observed=observed,
+            now=now,
+        )
+        result = _start_bound_web_assignment(
+            repo=repo,
+            registry_path=registry,
+            controller_id=controller_id,
+            conversation_id=conversation_id,
+            assignment=assignment,
+            dispatch_id=dispatch_id,
+            now=now,
+            watchdog_launcher=lambda **_: {"launched": False, "reason": "host_event_adapter_owns_observation"},
+            health_probe=lambda: True,
+        )
+        _mark_dispatch_bound(
+            repo=repo,
+            dispatch_id=dispatch_id,
+            conversation_id=conversation_id,
+            observation_id=str(att.get("observation_id") or ""),
+            call_id=str(event.get("call_id") or "") or None,
+            now=now,
+        )
+        return {**result, "dispatch_id": dispatch_id, "conversation_id": conversation_id}
 
     assignment_id = str(event.get("assignment_id") or "").strip()
     if not assignment_id:
@@ -1105,7 +1252,7 @@ def apply_web_execution_event(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Runtime-owned Web Agent execution recovery adapter.")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("prepare", "start", "recover", "bind"):
+    for name in ("prepare", "recover", "bind"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--repo", required=True); cmd.add_argument("--registry", required=True)
     watch = sub.add_parser("watch")
@@ -1130,13 +1277,6 @@ def main(argv: list[str] | None = None) -> int:
                     repo=args.repo, registry_path=args.registry,
                     controller_id=str(event.get("controller_id") or ""),
                     task_name=str(event.get("task_name") or ""),
-                    assignment=event.get("assignment") if isinstance(event.get("assignment"), dict) else {},
-                )
-            elif args.command == "start":
-                result = start_web_assignment(
-                    repo=args.repo, registry_path=args.registry,
-                    controller_id=str(event.get("controller_id") or ""),
-                    conversation_id=str(event.get("conversation_id") or ""),
                     assignment=event.get("assignment") if isinstance(event.get("assignment"), dict) else {},
                 )
             elif args.command == "recover":

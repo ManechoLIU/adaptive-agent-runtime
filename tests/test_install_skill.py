@@ -365,7 +365,8 @@ class InstallMigrationContractTests(unittest.TestCase):
         (source / "scripts").mkdir()
         for name in (
             "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
-            "web_agent_health_supervisor.py", "control_event_guard.py", "controller_state.py",
+            "web_agent_health_supervisor.py", "web_agent_events.py",
+            "control_event_guard.py", "controller_state.py",
         ):
             script = source / "scripts" / name
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
@@ -586,15 +587,29 @@ class InstallMigrationContractTests(unittest.TestCase):
 
     def test_runtime_release_regression_gate_runs_required_tests_from_immutable_revision(self):
         import subprocess
-        from scripts.install_skill import _verify_runtime_release_regressions, RUNTIME_RELEASE_REGRESSION_TESTS
+        from scripts.install_skill import (
+            _verify_runtime_release_regressions,
+            RUNTIME_RELEASE_REGRESSION_TESTS,
+            RUNTIME_RELEASE_NODE_REGRESSION_TESTS,
+        )
 
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source = self.make_source(root)
             for name in ("web_agent_execution.py", "web_reentry_adapter.py"):
                 (source / "scripts" / name).write_text("# runtime\n", encoding="utf-8")
+            (source / "scripts" / "run_external_agent.mjs").write_text(
+                "export const marker = 'external-agent-routing';\n",
+                encoding="utf-8",
+            )
             tests_dir = source / "tests"
             tests_dir.mkdir()
+            (tests_dir / "external-agent-routing.test.mjs").write_text(
+                "import test from 'node:test';\n"
+                "import assert from 'node:assert/strict';\n"
+                "test('heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors', () => { assert.equal(1, 1); });\n",
+                encoding="utf-8",
+            )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
             (tests_dir / "test_web_reentry_adapter.py").write_text(
                 "import unittest\n"
@@ -619,7 +634,26 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_project_wide_projection_mini_active_does_not_starve_server_or_web(self): self.assertTrue(True)\n"
                 "    def test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists(self): self.assertTrue(True)\n"
                 "    def test_pending_dependency_closure_dynamically_enters_project_wide_runnable_projection(self): self.assertTrue(True)\n"
-                "    def test_project_wide_fairness_rejects_more_active_dispatches_than_capacity(self): self.assertTrue(True)\n",
+                "    def test_project_wide_fairness_rejects_more_active_dispatches_than_capacity(self): self.assertTrue(True)\n"
+                "    def test_pending_parent_partial_dependency_creates_dynamic_runnable_slice(self): self.assertTrue(True)\n"
+                "    def test_reviewer_terminal_recomputes_unrelated_project_runnable(self): self.assertTrue(True)\n"
+                "    def test_stop_without_current_turn_control_loop_receipt_fails_closed_even_when_idle(self): self.assertTrue(True)\n"
+                "    def test_active_writer_does_not_hide_immediate_controller_actions(self): self.assertTrue(True)\n"
+                "    def test_control_loop_receipt_rejects_missing_or_reordered_control_steps(self): self.assertTrue(True)\n"
+                "    def test_failed_control_cycle_generates_executable_controller_correction(self): self.assertTrue(True)\n"
+                "    def test_unfinished_correction_prevents_control_cycle_closure(self): self.assertTrue(True)\n"
+                "    def test_same_controller_deviation_fingerprint_escalates_on_recurrence(self): self.assertTrue(True)\n"
+                "    def test_direct_cycle_persistence_cannot_fabricate_generic_correction_closure(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_web_agent_execution.py").write_text(
+                "import unittest\n"
+                "class WebAgentExecutionTests(unittest.TestCase):\n"
+                "    def test_direct_start_web_assignment_is_rejected_even_with_forged_readiness_probe(self): self.assertTrue(True)\n"
+                "class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):\n"
+                "    def test_forged_local_machine_event_receipt_cannot_enable_production_prepare(self): self.assertTrue(True)\n"
+                "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
+                "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)
@@ -629,6 +663,9 @@ class InstallMigrationContractTests(unittest.TestCase):
             result = _verify_runtime_release_regressions(source, revision)
             self.assertEqual(result["status"], "passed")
             self.assertEqual(tuple(result["tests"]), RUNTIME_RELEASE_REGRESSION_TESTS)
+            self.assertEqual(
+                tuple(result["node_tests"]), RUNTIME_RELEASE_NODE_REGRESSION_TESTS
+            )
 
     def test_runtime_release_regression_gate_blocks_failing_required_case(self):
         import subprocess
@@ -639,8 +676,18 @@ class InstallMigrationContractTests(unittest.TestCase):
             source = self.make_source(root)
             for name in ("web_agent_execution.py", "web_reentry_adapter.py"):
                 (source / "scripts" / name).write_text("# runtime\n", encoding="utf-8")
+            (source / "scripts" / "run_external_agent.mjs").write_text(
+                "export const marker = 'external-agent-routing';\n",
+                encoding="utf-8",
+            )
             tests_dir = source / "tests"
             tests_dir.mkdir()
+            (tests_dir / "external-agent-routing.test.mjs").write_text(
+                "import test from 'node:test';\n"
+                "import assert from 'node:assert/strict';\n"
+                "test('heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors', () => { assert.equal(1, 1); });\n",
+                encoding="utf-8",
+            )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
             (tests_dir / "test_web_reentry_adapter.py").write_text(
                 "import unittest\n"
@@ -665,7 +712,26 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_project_wide_projection_mini_active_does_not_starve_server_or_web(self): self.assertTrue(True)\n"
                 "    def test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists(self): self.assertTrue(True)\n"
                 "    def test_pending_dependency_closure_dynamically_enters_project_wide_runnable_projection(self): self.assertTrue(True)\n"
-                "    def test_project_wide_fairness_rejects_more_active_dispatches_than_capacity(self): self.assertTrue(True)\n",
+                "    def test_project_wide_fairness_rejects_more_active_dispatches_than_capacity(self): self.assertTrue(True)\n"
+                "    def test_pending_parent_partial_dependency_creates_dynamic_runnable_slice(self): self.assertTrue(True)\n"
+                "    def test_reviewer_terminal_recomputes_unrelated_project_runnable(self): self.assertTrue(True)\n"
+                "    def test_stop_without_current_turn_control_loop_receipt_fails_closed_even_when_idle(self): self.assertTrue(True)\n"
+                "    def test_active_writer_does_not_hide_immediate_controller_actions(self): self.assertTrue(True)\n"
+                "    def test_control_loop_receipt_rejects_missing_or_reordered_control_steps(self): self.assertTrue(True)\n"
+                "    def test_failed_control_cycle_generates_executable_controller_correction(self): self.assertTrue(True)\n"
+                "    def test_unfinished_correction_prevents_control_cycle_closure(self): self.assertTrue(True)\n"
+                "    def test_same_controller_deviation_fingerprint_escalates_on_recurrence(self): self.assertTrue(True)\n"
+                "    def test_direct_cycle_persistence_cannot_fabricate_generic_correction_closure(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_web_agent_execution.py").write_text(
+                "import unittest\n"
+                "class WebAgentExecutionTests(unittest.TestCase):\n"
+                "    def test_direct_start_web_assignment_is_rejected_even_with_forged_readiness_probe(self): self.assertTrue(True)\n"
+                "class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):\n"
+                "    def test_forged_local_machine_event_receipt_cannot_enable_production_prepare(self): self.assertTrue(True)\n"
+                "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
+                "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)
@@ -1124,8 +1190,10 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
                 health_service_plist=plist,
                 web_event_source_receipt=source_receipt,
             )["web_agent_execution"]
-        self.assertTrue(report["configured"])
-        self.assertEqual(report["structured_terminal"], "chatgpt_subagent_machine_events")
+        self.assertFalse(report["configured"])
+        self.assertEqual(report["structured_terminal"], "unavailable")
+        self.assertEqual(report["dispatch_interception"], "unavailable_on_chatgpt_web")
+        self.assertTrue(any(word in report["reason"].lower() for word in ("trusted", "trustworthy")))
         self.assertEqual(report["continuation"], "existing_web_reentry_supervisor")
 
     def test_configure_runtime_health_service_activates_keepalive_without_host_adapter_changes(self):

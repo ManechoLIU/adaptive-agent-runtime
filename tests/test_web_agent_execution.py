@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.assignment_runtime import RuntimePolicy, evaluate_lease, load_runtime_state
 from scripts.web_agent_execution import apply_web_execution_event
@@ -19,43 +20,49 @@ def bind_recovery_attempt(
 ):
     from scripts.web_agent_execution import prepare_web_assignment_dispatch, bind_web_assignment_dispatch
     prepared_at = at - timedelta(seconds=1)
-    prepared = prepare_web_assignment_dispatch(
-        repo=repo, registry_path=registry, controller_id=controller_id,
-        task_name=task_name, assignment=assignment, now=prepared_at,
-        health_probe=lambda: True,
-        event_source_probe=lambda: True,
-    )
     event_path = Path(registry).parent / f"{task_name}-{conversation_id}.jsonl"
-    call_id = f"spawn-{task_name}-{conversation_id}"
-    records = [
-        {
-            "timestamp": prepared_at.isoformat(),
-            "type": "response_item",
-            "payload": {
-                "type": "function_call", "namespace": "collaboration", "name": "spawn_agent",
-                "call_id": call_id,
-                "arguments": json.dumps({"task_name": task_name, "agent_type": observed_agent_type, "model": observed_model}),
-            },
-        },
-        {
-            "timestamp": at.isoformat(),
-            "type": "event_msg",
-            "payload": {
-                "type": "item_completed",
-                "item": {
-                    "type": "SubAgentActivity", "kind": "started", "id": call_id,
-                    "agent_thread_id": conversation_id, "agent_path": f"/root/{task_name}",
+    trusted = {
+        "ready": True,
+        "reason": "test_host_attested",
+        "event_paths": [str(event_path.resolve())],
+    }
+    with patch("scripts.web_agent_execution._machine_event_source_context", return_value=trusted):
+        prepared = prepare_web_assignment_dispatch(
+            repo=repo, registry_path=registry, controller_id=controller_id,
+            task_name=task_name, assignment=assignment, now=prepared_at,
+            health_probe=lambda: True,
+        )
+        call_id = f"spawn-{task_name}-{conversation_id}"
+        records = [
+            {
+                "timestamp": prepared_at.isoformat(),
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call", "namespace": "collaboration", "name": "spawn_agent",
+                    "call_id": call_id,
+                    "arguments": json.dumps({"task_name": task_name, "agent_type": observed_agent_type, "model": observed_model}),
                 },
             },
-        },
-    ]
-    event_path.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
-    return bind_web_assignment_dispatch(
-        repo=repo, registry_path=registry, controller_id=controller_id,
-        dispatch_id=prepared["dispatch_id"], event_paths=[event_path], now=at,
-        health_probe=lambda: True,
-        event_source_probe=lambda: True,
-    )
+            {
+                "timestamp": at.isoformat(),
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "SubAgentActivity", "kind": "started", "id": call_id,
+                        "agent_thread_id": conversation_id, "agent_path": f"/root/{task_name}",
+                    },
+                },
+            },
+        ]
+        event_path.write_text(chr(10).join(json.dumps(item) for item in records) + chr(10), encoding="utf-8")
+        return bind_web_assignment_dispatch(
+            repo=repo, registry_path=registry, controller_id=controller_id,
+            dispatch_id=prepared["dispatch_id"], event_paths=[event_path], now=at,
+            health_probe=lambda: True,
+            watchdog_launcher=lambda **_: {"launched": False, "reason": "test_drives_health_explicitly"},
+        )
+
 
 
 class WebAgentExecutionTests(unittest.TestCase):
@@ -128,6 +135,23 @@ class WebAgentExecutionTests(unittest.TestCase):
         return value
 
     def start(self, **assignment_extra):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        assignment = self.assignment(**assignment_extra)
+        trusted = {
+            "ready": True,
+            "reason": "test_host_attested",
+            "event_paths": [str((Path(self.tmp.name) / "host-events.jsonl").resolve())],
+        }
+        with patch("scripts.web_agent_execution._machine_event_source_context", return_value=trusted):
+            prepared = prepare_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                task_name=f"host-start-{assignment['assignment_id']}",
+                assignment=assignment,
+                now=T0 - timedelta(seconds=1),
+                health_probe=lambda: True,
+            )
         return apply_web_execution_event(
             repo=self.repo,
             registry_path=self.registry,
@@ -135,7 +159,10 @@ class WebAgentExecutionTests(unittest.TestCase):
                 "controller_id": "controller-1",
                 "conversation_id": "conv-1",
                 "state": "started",
-                "assignment": self.assignment(**assignment_extra),
+                "dispatch_id": prepared["dispatch_id"],
+                "assignment": assignment,
+                "model": assignment["model"],
+                "agent_type": assignment["agent_type"],
                 "attestation": self.attestation("running"),
             },
             now=T0,
@@ -169,6 +196,40 @@ class WebAgentExecutionTests(unittest.TestCase):
             repo=self.repo, registry_path=self.registry, event=payload, now=at,
             runtime_change_consumer=self._runtime_change, host_verifier=self._verify_host,
         )
+
+    def test_direct_start_web_assignment_is_rejected_even_with_forged_readiness_probe(self):
+        from scripts.web_agent_execution import start_web_assignment
+        with self.assertRaisesRegex(PermissionError, "prepared dispatch|direct Web start|bind"):
+            start_web_assignment(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                conversation_id="conv-direct",
+                assignment=self.assignment(),
+                now=T0,
+                watchdog_launcher=lambda **_: {"launched": False},
+                health_probe=lambda: True,
+                event_source_probe=lambda: True,
+            )
+        self.assertNotIn("A-1", load_runtime_state(self.repo).get("leases", {}))
+
+    def test_verified_host_started_event_still_requires_prepared_dispatch_ticket(self):
+        with self.assertRaisesRegex(PermissionError, "prepared dispatch|dispatch ticket"):
+            apply_web_execution_event(
+                repo=self.repo,
+                registry_path=self.registry,
+                event={
+                    "controller_id": "controller-1",
+                    "conversation_id": "conv-direct",
+                    "state": "started",
+                    "assignment": self.assignment(),
+                    "attestation": self.attestation("running", conversation="conv-direct"),
+                },
+                now=T0,
+                runtime_change_consumer=self._runtime_change,
+                host_verifier=self._verify_host,
+            )
+        self.assertNotIn("A-1", load_runtime_state(self.repo).get("leases", {}))
 
     def test_start_enters_canonical_runtime_and_is_healthy(self):
         result = self.start()
@@ -248,42 +309,48 @@ class WebAgentExecutionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "terminal attempt is immutable"):
             self.event("heartbeat", at=T0 + timedelta(minutes=2))
-    def test_recovery_must_increment_attempt_and_change_lease(self):
+    def test_recovery_attempt_is_runtime_derived_and_caller_cannot_skip_attempts(self):
         self.start()
-        with self.assertRaisesRegex(ValueError, "recovery attempt must increment"):
-            apply_web_execution_event(
-                repo=self.repo, registry_path=self.registry,
-                event={
-                    "controller_id": "controller-1", "conversation_id": "conv-3", "state": "started",
-                    "assignment": self.assignment(attempt=3, lease_id="A-1:web:attempt:3"),
-                    "attestation": self.attestation("running", conversation="conv-3"),
-                }, now=T0 + timedelta(minutes=46), host_verifier=self._verify_host,
-            )
+        result = bind_recovery_attempt(
+            repo=self.repo,
+            registry=self.registry,
+            controller_id="controller-1",
+            assignment=self.assignment(attempt=3, lease_id="caller-forged-attempt-3"),
+            conversation_id="conv-3",
+            task_name="recover-runtime-derived-attempt",
+            at=T0 + timedelta(minutes=46),
+        )
+        lease = load_runtime_state(self.repo)["leases"]["A-1"]
+        self.assertEqual(result["attempt"], 2)
+        self.assertEqual(lease["attempt"], 2)
+        self.assertNotEqual(lease["lease_id"], "caller-forged-attempt-3")
     def test_active_execution_blocks_duplicate_assignment_even_across_transport(self):
         self.start()
         with self.assertRaisesRegex(ValueError, "exclusive execution already active"):
-            apply_web_execution_event(
-                repo=self.repo, registry_path=self.registry,
-                event={
-                    "controller_id": "controller-1", "conversation_id": "conv-2", "state": "started",
-                    "assignment": self.assignment(assignment_id="A-2", lease_id="A-2:web:attempt:1"),
-                    "attestation": self.attestation("running", conversation="conv-2"),
-                }, now=T0 + timedelta(seconds=1), host_verifier=self._verify_host,
+            bind_recovery_attempt(
+                repo=self.repo,
+                registry=self.registry,
+                controller_id="controller-1",
+                assignment=self.assignment(assignment_id="A-2", lease_id="A-2:web:attempt:1"),
+                conversation_id="conv-2",
+                task_name="duplicate-task-execution",
+                at=T0 + timedelta(seconds=1),
             )
 
     def test_active_writer_blocks_different_task_in_same_worktree(self):
         self.start()
         with self.assertRaisesRegex(ValueError, "worktree:"):
-            apply_web_execution_event(
-                repo=self.repo, registry_path=self.registry,
-                event={
-                    "controller_id": "controller-1", "conversation_id": "conv-2", "state": "started",
-                    "assignment": self.assignment(
-                        assignment_id="A-2", task_id="T-2", agent_id="web-writer-2",
-                        lease_id="A-2:web:attempt:1",
-                    ),
-                    "attestation": self.attestation("running", conversation="conv-2"),
-                }, now=T0 + timedelta(seconds=1), host_verifier=self._verify_host,
+            bind_recovery_attempt(
+                repo=self.repo,
+                registry=self.registry,
+                controller_id="controller-1",
+                assignment=self.assignment(
+                    assignment_id="A-2", task_id="T-2", agent_id="web-writer-2",
+                    lease_id="A-2:web:attempt:1",
+                ),
+                conversation_id="conv-2",
+                task_name="same-worktree-different-task",
+                at=T0 + timedelta(seconds=1),
             )
 
     def test_reviewer_does_not_claim_writer_worktree_exclusive_key(self):
@@ -303,12 +370,14 @@ class WebAgentExecutionTests(unittest.TestCase):
     def test_unknown_side_effect_timeout_cannot_auto_recover(self):
         from scripts.web_agent_execution import recover_web_assignment
         self.start(side_effect=True, idempotency_key="publish:stable")
-        with self.assertRaisesRegex(ValueError, "unknown side effect requires reconciliation"):
+        with patch(
+            "scripts.web_agent_execution._machine_event_source_context",
+            return_value={"ready": True, "reason": "test_host_attested", "event_paths": [str(self.repo / "host-events.jsonl")]},
+        ), self.assertRaisesRegex(ValueError, "unknown side effect requires reconciliation"):
             recover_web_assignment(
                 repo=self.repo, registry_path=self.registry, controller_id="controller-1",
                 assignment_id="A-1", conversation_id="conv-2", now=T0 + timedelta(minutes=46),
                 watchdog_launcher=lambda **_: {"launched": False},
-                event_source_probe=lambda: True,
             )
     def test_normal_completion_persists_runtime_terminal_and_wakes_without_external_receipt(self):
         self.start()
@@ -350,14 +419,15 @@ class WebAgentExecutionTests(unittest.TestCase):
         self.assertEqual(len(self.runtime_wakes), 1)
     def test_recovery_cannot_supersede_healthy_active_attempt(self):
         self.start()
-        with self.assertRaisesRegex(ValueError, "current attempt is still active"):
-            apply_web_execution_event(
-                repo=self.repo, registry_path=self.registry,
-                event={
-                    "controller_id": "controller-1", "conversation_id": "conv-2", "state": "started",
-                    "assignment": self.assignment(attempt=2, lease_id="A-1:web:attempt:2"),
-                    "attestation": self.attestation("running", conversation="conv-2"),
-                }, now=T0 + timedelta(minutes=1), host_verifier=self._verify_host,
+        with self.assertRaisesRegex(ValueError, "runtime_not_unhealthy|still active|not allowed"):
+            bind_recovery_attempt(
+                repo=self.repo,
+                registry=self.registry,
+                controller_id="controller-1",
+                assignment=self.assignment(),
+                conversation_id="conv-2",
+                task_name="healthy-attempt-cannot-recover",
+                at=T0 + timedelta(minutes=1),
             )
 
     def test_non_start_event_must_match_current_attempt_and_lease_exactly(self):
@@ -379,26 +449,17 @@ class WebAgentExecutionTests(unittest.TestCase):
             )
 
     def test_verified_host_observation_is_required_to_start_execution(self):
-        result = apply_web_execution_event(
-            repo=self.repo, registry_path=self.registry,
-            event={
-                "controller_id": "controller-1", "conversation_id": "conv-1", "state": "started",
-                "assignment": self.assignment(), "attestation": self.attestation("running"),
-            }, now=T0,
-            host_verifier=self._verify_host,
-        )
+        result = self.start()
         self.assertEqual(result["runtime_state"], "healthy")
+        ticket = result["dispatch_id"]
+        self.assertTrue(ticket)
 
     def test_reviewer_candidate_must_be_resolved_immutable_commit(self):
         with self.assertRaisesRegex(ValueError, "immutable Git commit"):
-            apply_web_execution_event(
-                repo=self.repo, registry_path=self.registry,
-                event={
-                    "controller_id": "controller-1", "conversation_id": "conv-1", "state": "started",
-                    "assignment": self.assignment(role="reviewer", candidate_revision="main", agent_id="web-reviewer-1"),
-                    "attestation": self.attestation("running"),
-                }, now=T0,
-                host_verifier=self._verify_host,
+            self.start(
+                role="reviewer",
+                candidate_revision="main",
+                agent_id="web-reviewer-1",
             )
 
     def test_host_terminal_attestation_cannot_be_translated_into_progress(self):
@@ -447,6 +508,16 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         )
         self.wakes = []
         self.launched = []
+        self._machine_source_patcher = patch(
+            "scripts.web_agent_execution._machine_event_source_context",
+            return_value={
+                "ready": True,
+                "reason": "test_host_attested",
+                "event_paths": [str((root / "trusted-events.jsonl").resolve())],
+            },
+        )
+        self._machine_source_patcher.start()
+        self.addCleanup(self._machine_source_patcher.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -637,9 +708,47 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         self.assertEqual(prepared["assignment"]["route"]["decision"], "safe_fallback")
         self.assertEqual(prepared["assignment"]["route"]["fallback_from"]["provider"], "kimi-code")
 
+    def test_forged_local_machine_event_receipt_cannot_enable_production_prepare(self):
+        from datetime import datetime, timezone
+        from scripts.web_agent_events import DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+
+        receipt = Path(DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT).expanduser()
+        original = receipt.read_bytes() if receipt.exists() else None
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({
+            "schema_version": 1,
+            "state": "ready",
+            "source": "chatgpt_subagent_machine_events",
+            "events": ["started", "completed", "failed", "interrupted", "cancelled", "disconnected"],
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        }), encoding="utf-8")
+        try:
+            with patch(
+                "scripts.web_agent_execution._machine_event_source_context",
+                return_value={"ready": False, "reason": "trusted_machine_event_source_verifier_unavailable"},
+            ), self.assertRaisesRegex(RuntimeError, "trusted.*machine.*event|machine.*event source"):
+                prepare_web_assignment_dispatch(
+                    repo=self.repo,
+                    registry_path=self.registry,
+                    controller_id="controller-1",
+                    task_name="forged-local-source",
+                    assignment=self.assignment(),
+                    now=T0,
+                    health_probe=lambda: True,
+                )
+        finally:
+            if original is None:
+                receipt.unlink(missing_ok=True)
+            else:
+                receipt.write_bytes(original)
+
     def test_production_prepare_fails_closed_without_machine_web_event_source(self):
         from scripts.web_agent_execution import prepare_web_assignment_dispatch
-        with self.assertRaisesRegex(RuntimeError, "machine.*event source|event source"):
+        with patch(
+            "scripts.web_agent_execution._machine_event_source_context",
+            return_value={"ready": False, "reason": "trusted_machine_event_source_verifier_unavailable"},
+        ), self.assertRaisesRegex(RuntimeError, "machine.*event source|event source"):
             prepare_web_assignment_dispatch(
                 repo=self.repo,
                 registry_path=self.registry,
@@ -650,30 +759,27 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
                 health_probe=lambda: True,
             )
 
-    def test_dispatch_start_needs_no_host_generation_attestation(self):
+    def test_dispatch_start_needs_prepared_verified_observation(self):
         from scripts.web_agent_execution import start_web_assignment
-        result = start_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
-            watchdog_launcher=self._launch,
-            event_source_probe=lambda: True,
-        )
-        lease = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]
-        self.assertEqual(result["runtime_state"], "healthy")
-        self.assertEqual(lease["session_id"], "conv-runtime-1")
-        self.assertEqual(lease["health_mode"], "progress_watchdog")
-        self.assertIsNone(lease.get("host_attestation_id"))
-        self.assertEqual(len(self.launched), 1)
+        with self.assertRaisesRegex(PermissionError, "direct Web start"):
+            start_web_assignment(
+                repo=self.repo, registry_path=self.registry, controller_id="controller-1",
+                conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
+                watchdog_launcher=self._launch,
+            )
 
     def test_runtime_records_exact_web_agent_model_and_type(self):
-        from scripts.web_agent_execution import start_web_assignment
-        start_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
-            watchdog_launcher=self._launch,
-            event_source_probe=lambda: True,
+        result = bind_recovery_attempt(
+            repo=self.repo,
+            registry=self.registry,
+            controller_id="controller-1",
+            assignment=self.assignment(),
+            conversation_id="conv-runtime-1",
+            task_name="runtime-model-type",
+            at=T0,
         )
         lease = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]
+        self.assertEqual(result["conversation_id"], "conv-runtime-1")
         self.assertEqual(lease["model"], "gpt-5.6-sol")
         self.assertEqual(lease["agent_type"], "default")
 
@@ -721,12 +827,11 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             )
 
     def test_watchdog_observes_git_progress_without_any_host_event(self):
-        from scripts.web_agent_execution import start_web_assignment, watch_web_assignment_once
-        start_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
-            watchdog_launcher=self._launch,
-            event_source_probe=lambda: True,
+        from scripts.web_agent_execution import watch_web_assignment_once
+        bind_recovery_attempt(
+            repo=self.repo, registry=self.registry, controller_id="controller-1",
+            assignment=self.assignment(), conversation_id="conv-runtime-1",
+            task_name="runtime-watch-progress", at=T0,
         )
         before = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]["progress_deadline_at"]
         (self.repo / "README.md").write_text("runtime changed\n", encoding="utf-8")
@@ -742,12 +847,11 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         self.assertEqual(self.wakes, [])
 
     def test_watchdog_no_progress_becomes_unhealthy_and_wakes_same_controller(self):
-        from scripts.web_agent_execution import start_web_assignment, watch_web_assignment_once
-        start_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
-            watchdog_launcher=self._launch,
-            event_source_probe=lambda: True,
+        from scripts.web_agent_execution import watch_web_assignment_once
+        bind_recovery_attempt(
+            repo=self.repo, registry=self.registry, controller_id="controller-1",
+            assignment=self.assignment(), conversation_id="conv-runtime-1",
+            task_name="runtime-watch-stale", at=T0,
         )
         result = watch_web_assignment_once(
             repo=self.repo, registry_path=self.registry, assignment_id="A-RUNTIME",
@@ -761,12 +865,10 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         self.assertEqual(self.wakes[0]["repo"], self.repo.resolve())
 
     def test_progress_watchdog_mode_does_not_use_pid_death_as_terminal_or_progress(self):
-        from scripts.web_agent_execution import start_web_assignment
-        start_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
-            watchdog_launcher=self._launch,
-            event_source_probe=lambda: True,
+        bind_recovery_attempt(
+            repo=self.repo, registry=self.registry, controller_id="controller-1",
+            assignment=self.assignment(), conversation_id="conv-runtime-1",
+            task_name="runtime-pid-not-terminal", at=T0,
         )
         lease = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]
         lease["pid"] = 12345
@@ -776,12 +878,10 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         self.assertEqual(decision, {"state": "healthy", "reason": "runtime_evidence_current"})
 
     def test_recovery_derives_next_attempt_and_new_lease_from_unhealthy_canonical_lease(self):
-        from scripts.web_agent_execution import start_web_assignment, recover_web_assignment
-        start_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
-            watchdog_launcher=self._launch,
-            event_source_probe=lambda: True,
+        bind_recovery_attempt(
+            repo=self.repo, registry=self.registry, controller_id="controller-1",
+            assignment=self.assignment(), conversation_id="conv-runtime-1",
+            task_name="runtime-recovery-base", at=T0,
         )
         result = bind_recovery_attempt(
             repo=self.repo, registry=self.registry, controller_id="controller-1",
@@ -799,42 +899,36 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         self.assertEqual(lease["route_contract"], self.assignment()["route"])
 
     def test_unknown_side_effect_timeout_fails_closed_even_with_stable_key(self):
-        from scripts.web_agent_execution import start_web_assignment, recover_web_assignment
-        start_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            conversation_id="conv-runtime-1",
-            assignment=self.assignment(side_effect=True, idempotency_key="publish:42"), now=T0,
-            watchdog_launcher=self._launch,
-            event_source_probe=lambda: True,
+        from scripts.web_agent_execution import recover_web_assignment
+        bind_recovery_attempt(
+            repo=self.repo, registry=self.registry, controller_id="controller-1",
+            assignment=self.assignment(side_effect=True, idempotency_key="publish:42"),
+            conversation_id="conv-runtime-1", task_name="runtime-side-effect-base", at=T0,
         )
         with self.assertRaisesRegex(ValueError, "unknown side effect"):
             recover_web_assignment(
                 repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-                assignment_id="A-RUNTIME", conversation_id="conv-runtime-2", now=T0 + timedelta(minutes=26),
-                watchdog_launcher=self._launch,
-                event_source_probe=lambda: True,
+                assignment_id="A-RUNTIME", conversation_id="conv-runtime-2",
+                now=T0 + timedelta(minutes=26), watchdog_launcher=self._launch,
             )
         lease = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]
         self.assertEqual(lease["attempt"], 1)
         self.assertTrue(lease["result_unknown"])
 
     def test_message_delivery_timeout_retries_same_controller_wake_boundedly(self):
-        from scripts.web_agent_execution import start_web_assignment, watch_web_assignment
+        from scripts.web_agent_execution import watch_web_assignment
         now = datetime.now(UTC)
-        start_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            conversation_id="conv-runtime-1", assignment=self.assignment(), now=now - timedelta(minutes=26),
-            watchdog_launcher=self._launch,
-            event_source_probe=lambda: True,
+        bind_recovery_attempt(
+            repo=self.repo, registry=self.registry, controller_id="controller-1",
+            assignment=self.assignment(), conversation_id="conv-runtime-1",
+            task_name="runtime-message-timeout", at=now - timedelta(minutes=26),
         )
         calls = []
-
         def flaky_wake(**kwargs):
             calls.append(kwargs)
             if len(calls) == 1:
                 raise RuntimeError("Message delivery timed out")
             return {"controller_id": "controller-1", "pending_control_event": True, "wake_result": {"result": "CONFIRMED"}}
-
         result = watch_web_assignment(
             repo=self.repo, registry_path=self.registry, assignment_id="A-RUNTIME",
             expected_attempt=1, expected_lease_id="A-RUNTIME:web:attempt:1",
@@ -848,12 +942,11 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         self.assertIsNone(lease["terminal_state"])
 
     def test_connection_interrupted_text_is_not_a_runtime_terminal(self):
-        from scripts.web_agent_execution import start_web_assignment, apply_web_execution_event
-        start_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
-            watchdog_launcher=self._launch,
-            event_source_probe=lambda: True,
+        from scripts.web_agent_execution import apply_web_execution_event
+        bind_recovery_attempt(
+            repo=self.repo, registry=self.registry, controller_id="controller-1",
+            assignment=self.assignment(), conversation_id="conv-runtime-1",
+            task_name="runtime-ui-interruption", at=T0,
         )
         with self.assertRaisesRegex(ValueError, "not authoritative terminal"):
             apply_web_execution_event(
@@ -871,9 +964,6 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             )
         self.assertIsNone(load_runtime_state(self.repo)["leases"]["A-RUNTIME"]["terminal_state"])
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class StructuredCollaborationTerminalTests(unittest.TestCase):
@@ -932,16 +1022,14 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
         return value
 
     def start(self, **extra):
-        from scripts.web_agent_execution import start_web_assignment
-        return start_web_assignment(
+        return bind_recovery_attempt(
             repo=self.repo,
-            registry_path=self.registry,
+            registry=self.registry,
             controller_id="controller-1",
-            conversation_id="child-thread-1",
             assignment=self.assignment(**extra),
-            now=T0,
-            watchdog_launcher=lambda **_: {"launched": True, "pid": 123},
-            event_source_probe=lambda: True,
+            conversation_id="child-thread-1",
+            task_name="structured-terminal-start",
+            at=T0,
         )
 
     def observation(self, kind="completed", **extra):
@@ -955,8 +1043,20 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
         value.update(extra)
         return value
 
-    def test_structured_completed_closes_canonical_attempt_and_writes_durable_terminal_receipt(self):
+    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self):
         from scripts.web_agent_execution import ingest_structured_subagent_terminal
+        self.start()
+        with self.assertRaisesRegex(PermissionError, "direct structured Web terminal ingest"):
+            ingest_structured_subagent_terminal(
+                repo=self.repo,
+                assignment_id="A-COLLAB",
+                observation=self.observation(),
+                now=T0 + timedelta(minutes=2),
+            )
+        self.assertIsNone(load_runtime_state(self.repo)["leases"]["A-COLLAB"]["terminal_state"])
+
+    def test_structured_completed_closes_canonical_attempt_and_writes_durable_terminal_receipt(self):
+        from scripts.web_agent_execution import _ingest_verified_structured_subagent_terminal as ingest_structured_subagent_terminal
         self.start()
         result = ingest_structured_subagent_terminal(
             repo=self.repo,
@@ -979,7 +1079,7 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
         self.assertEqual(receipt["agent_type"], "default")
 
     def test_duplicate_structured_terminal_reuses_same_receipt_without_reopening_attempt(self):
-        from scripts.web_agent_execution import ingest_structured_subagent_terminal
+        from scripts.web_agent_execution import _ingest_verified_structured_subagent_terminal as ingest_structured_subagent_terminal
         self.start()
         first = ingest_structured_subagent_terminal(
             repo=self.repo, assignment_id="A-COLLAB",
@@ -997,7 +1097,7 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
         self.assertEqual(lease["terminal_state"], "completed")
 
     def test_structured_terminal_must_match_machine_observed_child_session(self):
-        from scripts.web_agent_execution import ingest_structured_subagent_terminal
+        from scripts.web_agent_execution import _ingest_verified_structured_subagent_terminal as ingest_structured_subagent_terminal
         self.start()
         with self.assertRaisesRegex(ValueError, "session"):
             ingest_structured_subagent_terminal(
@@ -1008,7 +1108,7 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
         self.assertIsNone(load_runtime_state(self.repo)["leases"]["A-COLLAB"]["terminal_state"])
 
     def test_structured_disconnected_is_terminal_but_ui_interruption_text_is_not_used(self):
-        from scripts.web_agent_execution import ingest_structured_subagent_terminal
+        from scripts.web_agent_execution import _ingest_verified_structured_subagent_terminal as ingest_structured_subagent_terminal
         self.start()
         result = ingest_structured_subagent_terminal(
             repo=self.repo, assignment_id="A-COLLAB",

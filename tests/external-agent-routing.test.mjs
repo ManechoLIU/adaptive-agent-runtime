@@ -422,6 +422,64 @@ test("OAuth and API execution stay on distinct Kimi and Grok credential paths", 
   assert.deepEqual(grokApiCall.args.slice(-2), ["--reasoning-effort", "low"]);
 });
 
+test("heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-heterogeneous-"));
+  const grokHome = path.join(bin, "grok-home");
+  const kimiMarker = path.join(bin, "kimi-spawned.txt");
+  const grokMarker = path.join(bin, "grok-spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "kimi", "--version");
+  await fakeRunner(bin, "grok", "version");
+
+  const baseEnv = {
+    ...process.env,
+    PATH: [bin, process.env.PATH || ""].join(path.delimiter),
+    GROK_HOME: grokHome,
+    KIMI_K3_KEYCHAIN_SERVICE: "adaptive-test-kimi-" + path.basename(bin),
+    XAI_GROK_KEYCHAIN_SERVICE: "adaptive-test-xai-" + path.basename(bin),
+  };
+
+  const frontend = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call",
+    "--engine", "kimi-code", "--auth-mode", "api",
+    "--model", "kimi-k3", "--reasoning-effort", "medium",
+    "--cwd", skillRoot,
+  ], {
+    encoding: "utf8",
+    input: "frontend bounded task",
+    env: { ...baseEnv, MOONSHOT_API_KEY: "test-key", SPAWN_MARKER: kimiMarker },
+  });
+  assert.equal(frontend.status, 0, frontend.stderr);
+  const frontendCall = JSON.parse(frontend.stdout.trim());
+  assert.equal(frontendCall.kimiModelName, "kimi-k3");
+  assert.equal(frontendCall.kimiModelProviderType, "openai");
+  assert.equal(frontendCall.hasKimiApiKey, true);
+  assert.equal(frontendCall.hasXaiApiKey, false);
+  assert.equal(frontendCall.kimiThinkingEffort, "medium");
+
+  const backend = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call",
+    "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "high",
+    "--cwd", skillRoot,
+  ], {
+    encoding: "utf8",
+    input: "backend bounded task",
+    env: { ...baseEnv, XAI_API_KEY: "must-be-removed", SPAWN_MARKER: grokMarker },
+  });
+  assert.equal(backend.status, 0, backend.stderr);
+  const backendCall = JSON.parse(backend.stdout.trim());
+  assert.equal(backendCall.hasXaiApiKey, false);
+  assert.equal(backendCall.grokHome, grokHome);
+  assert.deepEqual(backendCall.args.slice(-2), ["--reasoning-effort", "high"]);
+  assert.equal(backendCall.kimiModelName, null);
+
+  assert.equal((await readFile(kimiMarker, "utf8")).trim(), "spawned");
+  assert.equal((await readFile(grokMarker, "utf8")).trim(), "spawned");
+  assert.doesNotMatch(frontend.stdout + backend.stdout, /chatgpt_web|web-agent-execution/i);
+});
+
 test("external execute persists terminal receipt and invokes controller continuation helper", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-terminal-continuation-"));
   const grokHome = path.join(bin, "grok-home");

@@ -63,16 +63,48 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_pending_dependency_closure_dynamically_enters_project_wide_runnable_projection",
     "tests.test_governance.GovernanceTests."
     "test_project_wide_fairness_rejects_more_active_dispatches_than_capacity",
+    "tests.test_governance.GovernanceTests."
+    "test_pending_parent_partial_dependency_creates_dynamic_runnable_slice",
+    "tests.test_governance.GovernanceTests."
+    "test_reviewer_terminal_recomputes_unrelated_project_runnable",
+    "tests.test_governance.GovernanceTests."
+    "test_stop_without_current_turn_control_loop_receipt_fails_closed_even_when_idle",
+    "tests.test_governance.GovernanceTests."
+    "test_active_writer_does_not_hide_immediate_controller_actions",
+    "tests.test_governance.GovernanceTests."
+    "test_control_loop_receipt_rejects_missing_or_reordered_control_steps",
+    "tests.test_governance.GovernanceTests."
+    "test_failed_control_cycle_generates_executable_controller_correction",
+    "tests.test_governance.GovernanceTests."
+    "test_unfinished_correction_prevents_control_cycle_closure",
+    "tests.test_governance.GovernanceTests."
+    "test_same_controller_deviation_fingerprint_escalates_on_recurrence",
+    "tests.test_governance.GovernanceTests."
+    "test_direct_cycle_persistence_cannot_fabricate_generic_correction_closure",
+    "tests.test_web_agent_execution.WebAgentExecutionTests."
+    "test_direct_start_web_assignment_is_rejected_even_with_forged_readiness_probe",
+    "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
+    "test_forged_local_machine_event_receipt_cannot_enable_production_prepare",
+    "tests.test_web_agent_execution.StructuredCollaborationTerminalTests."
+    "test_public_structured_terminal_ingest_rejects_caller_supplied_observation",
+)
+RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
+    "heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/web_agent_execution.py",
+    "scripts/web_agent_events.py",
     "scripts/web_lifecycle_bridge.py",
     "scripts/web_reentry_adapter.py",
+    "scripts/lifecycle_hook.py",
     "scripts/control_event_guard.py",
     "scripts/controller_state.py",
+    "scripts/run_external_agent.mjs",
+    "tests/test_web_agent_execution.py",
     "tests/test_web_reentry_adapter.py",
     "tests/test_web_collaboration_continuation.py",
     "tests/test_governance.py",
+    "tests/external-agent-routing.test.mjs",
 )
 
 
@@ -851,13 +883,13 @@ def _verify_runtime_release_regressions(
     *,
     required: bool = False,
 ) -> dict[str, Any]:
-    """Run immutable same-controller Web continuation regressions before installation."""
+    """Run immutable cross-language Runtime regressions before installation."""
     tracked = {entry[3] for entry in _revision_tree_entries(source, revision)}
     # A genuinely pre-Web/minimal package may remain not-applicable. Once the installed
     # Runtime has Web execution, however, removing the marker is a downgrade attempt and
     # the required-file gate must fail closed instead of disabling itself.
     if "scripts/web_agent_execution.py" not in tracked and not required:
-        return {"status": "not_applicable", "tests": []}
+        return {"status": "not_applicable", "tests": [], "node_tests": []}
 
     missing = sorted(path for path in RUNTIME_RELEASE_REQUIRED_FILES if path not in tracked)
     if missing:
@@ -870,21 +902,56 @@ def _verify_runtime_release_regressions(
         checkout = Path(tmp) / "candidate"
         checkout.mkdir()
         _materialize_revision(source, revision, checkout)
-        result = subprocess.run(
+        python_result = subprocess.run(
             [sys.executable, "-m", "unittest", "-v", *RUNTIME_RELEASE_REGRESSION_TESTS],
             cwd=checkout,
             capture_output=True,
             text=True,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
-    if result.returncode != 0:
-        bounded = (result.stderr or result.stdout or "release regression test failed").strip()
-        if len(bounded) > 6000:
-            bounded = bounded[-6000:]
-        raise ValueError("Runtime release regression gate failed:\n" + bounded)
+        if python_result.returncode != 0:
+            bounded = (
+                python_result.stderr
+                or python_result.stdout
+                or "release regression test failed"
+            ).strip()
+            if len(bounded) > 6000:
+                bounded = bounded[-6000:]
+            raise ValueError("Runtime release regression gate failed:" + chr(10) + bounded)
+
+        node = shutil.which("node")
+        if not node:
+            raise ValueError(
+                "Runtime release regression gate failed: node executable is required "
+                "for external-agent routing regression"
+            )
+        pattern = "|".join(re.escape(name) for name in RUNTIME_RELEASE_NODE_REGRESSION_TESTS)
+        node_result = subprocess.run(
+            [
+                node,
+                "--test",
+                "--test-name-pattern=" + pattern,
+                "tests/external-agent-routing.test.mjs",
+            ],
+            cwd=checkout,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "NODE_NO_WARNINGS": "1"},
+        )
+        if node_result.returncode != 0:
+            bounded = (
+                node_result.stderr
+                or node_result.stdout
+                or "external-agent routing regression failed"
+            ).strip()
+            if len(bounded) > 6000:
+                bounded = bounded[-6000:]
+            raise ValueError("Runtime release regression gate failed:" + chr(10) + bounded)
+
     return {
         "status": "passed",
         "tests": list(RUNTIME_RELEASE_REGRESSION_TESTS),
+        "node_tests": list(RUNTIME_RELEASE_NODE_REGRESSION_TESTS),
     }
 
 

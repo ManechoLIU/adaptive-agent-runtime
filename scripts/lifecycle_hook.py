@@ -599,6 +599,7 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
     )
     runnable_projection = derive_runnable_tasks(task_records(text))
     runnable_ids = list(runnable_projection["runnable_task_ids"])
+    derived_slices = dict(runnable_projection.get("derived_slices", {}))
     status = run_git(root, "status", "--porcelain=v1", "--untracked-files=no")
     try:
         from control_event_guard import unmerged_worktree_candidates
@@ -639,6 +640,26 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         rule_handshake = evaluate_rule_handshake(root, ledger=ledger)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         rule_handshake = {"state": "integrity_error", "blocking": True, "installed_revision": None, "errors": [str(error)]}
+
+    controller_corrections: list[dict[str, Any]] = []
+    try:
+        registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        registry = {}
+    owners = sorted(
+        controller_id
+        for controller_id, registered_path in registry.items()
+        if isinstance(controller_id, str)
+        and not controller_id.startswith("__")
+        and isinstance(registered_path, str)
+        and Path(registered_path).expanduser().resolve() == root
+    ) if isinstance(registry, dict) else []
+    if len(owners) == 1:
+        try:
+            from control_event_guard import open_controller_corrections
+        except ModuleNotFoundError:
+            from scripts.control_event_guard import open_controller_corrections
+        controller_corrections = open_controller_corrections(root, owners[0])
     return {
         "root": str(root),
         "git_common_dir": str(common_dir),
@@ -649,10 +670,13 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         "ready_ids": ready_ids,
         "runnable_ids": runnable_ids,
         "runnable_exclusions": runnable_projection["exclusions"],
+        "derived_slices": derived_slices,
         "candidate_revisions": sorted(candidates.values()),
         "ledger_errors": ledger_errors,
         "assignment_liveness": assignment_liveness,
         "task_projection": task_projection,
+        "controller_corrections": controller_corrections,
+        "control_loop_required": True,
         "rule_handshake": rule_handshake,
     }
 
@@ -709,6 +733,14 @@ def lifecycle_triggers(
     triggers.extend(
         f"LEDGER_INVALID:{error}" for error in snapshot.get("ledger_errors", [])
     )
+    corrections = snapshot.get("controller_corrections", [])
+    if isinstance(corrections, list):
+        for correction in corrections:
+            if not isinstance(correction, dict):
+                continue
+            fingerprint = str(correction.get("fingerprint", "")).strip()
+            if fingerprint:
+                triggers.append(f"CORRECTION:{fingerprint}")
     liveness = snapshot.get("assignment_liveness", {})
     if isinstance(liveness, dict):
         for task_id, decision in liveness.items():
@@ -871,6 +903,21 @@ def evaluate_event(
         fault = _turn_fault(state, event)
         if fault:
             return _adapter_fault_output(state, event, fault), state
+    if event_name == "Stop" and snapshot.get("control_loop_required") is True:
+        active_turn = str(state.get("active_turn_id", "")).strip()
+        receipt_turn = str(state.get("receipt_turn_id", "")).strip()
+        if state.get("must_yield") is not True or not active_turn or receipt_turn != active_turn:
+            pending_triggers = ", ".join(
+                str(item) for item in state.get("triggers", []) if str(item).strip()
+            )
+            reason = (
+                "Controller Stop/Yield blocked: current turn requires one successful "
+                "project-wide control-loop receipt proving complete runnable, candidate, "
+                "recovery, Controller-action, and correction closure before Stop/Yield."
+            )
+            if pending_triggers:
+                reason += " Pending triggers: " + pending_triggers + "."
+            return {"decision": "block", "reason": reason}, state
     if event_name == "PostToolUse" and _event_turn_id(event) and _event_turn_id(event) != str(state.get("active_turn_id", "")):
         # A delayed result cannot unlock a newer turn or contaminate its trace.
         state["adapter_fault"] = {
@@ -1099,11 +1146,17 @@ def evaluate_event(
     current_ready = {str(item) for item in snapshot.get("ready_ids", [])}
     current_runnable = {str(item) for item in snapshot.get("runnable_ids", snapshot.get("ready_ids", []))}
     current_candidates = {str(item) for item in snapshot.get("candidate_revisions", [])}
+    current_corrections = {
+        str(item.get("fingerprint", "")).strip()
+        for item in snapshot.get("controller_corrections", [])
+        if isinstance(item, dict) and str(item.get("fingerprint", "")).strip()
+    }
     prior_triggers = {
         item for item in prior_triggers
         if not (item.startswith("READY:") and item.removeprefix("READY:") not in current_ready)
         and not (item.startswith("RUNNABLE:") and item.removeprefix("RUNNABLE:") not in current_runnable)
         and not (item.startswith("CANDIDATE:") and item.removeprefix("CANDIDATE:") not in current_candidates)
+        and not (item.startswith("CORRECTION:") and item.removeprefix("CORRECTION:") not in current_corrections)
     }
     triggers = sorted(prior_triggers | set(detected))
     pending_next_action = str(state.get("next_action") or "").strip()

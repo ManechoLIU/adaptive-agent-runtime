@@ -557,7 +557,8 @@ def reconcile_managed_web_assignments(
         from scripts.web_agent_execution import (
             _load_dispatch_state,
             bind_web_assignment_dispatch,
-            ingest_structured_subagent_terminal,
+            _ingest_verified_structured_subagent_terminal,
+            _verified_machine_event_paths,
             watch_web_assignment_once,
         )
     except ModuleNotFoundError:
@@ -567,7 +568,8 @@ def reconcile_managed_web_assignments(
         from web_agent_execution import (
             _load_dispatch_state,
             bind_web_assignment_dispatch,
-            ingest_structured_subagent_terminal,
+            _ingest_verified_structured_subagent_terminal,
+            _verified_machine_event_paths,
             watch_web_assignment_once,
         )
 
@@ -606,6 +608,13 @@ def reconcile_managed_web_assignments(
         paths = discover_recent_session_paths(since_values=timestamps, now=now)
     else:
         paths = [Path(value).expanduser() for value in event_paths]
+    source_error: str | None = None
+    if paths:
+        try:
+            paths = _verified_machine_event_paths(paths)
+        except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+            source_error = f"{type(exc).__name__}: {exc}"
+            paths = []
     events = structured_subagent_events(paths)
 
     bound_dispatches: list[dict[str, Any]] = []
@@ -673,7 +682,7 @@ def reconcile_managed_web_assignments(
                 observation = terminal_by_session.get(str(lease.get("session_id") or ""))
                 terminal_receipt: Path | None = None
                 if observation is not None:
-                    terminal_result = ingest_structured_subagent_terminal(
+                    terminal_result = _ingest_verified_structured_subagent_terminal(
                         repo=repo,
                         assignment_id=assignment_id,
                         observation=observation,
@@ -753,6 +762,7 @@ def reconcile_managed_web_assignments(
         "event_paths": [str(path) for path in paths],
         "bound_dispatches": bound_dispatches,
         "binding_errors": binding_errors,
+        "machine_event_source_error": source_error,
         "terminal_continuations": terminal_continuations,
         "health": health_results,
         "reconcile_state_path": str(state_path),

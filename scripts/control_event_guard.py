@@ -56,6 +56,17 @@ ROUTE_CLASS_MARKERS = {
 }
 CONTROLLER_CYCLE_EVIDENCE_DIRECTORY = "controller-cycle-evidence"
 LEDGER_SUCCESS_STATES = {"DONE"}
+CONTROL_LOOP_STEPS = (
+    "read_project_facts",
+    "consume_pending_events",
+    "derive_project_runnable",
+    "derive_pending_slices",
+    "compute_capacity_and_conflicts",
+    "decide_every_runnable",
+    "dispatch_available_capacity",
+    "execute_controller_actions",
+    "recompute_after_actions",
+)
 
 
 def ready_ledger_package_ids(ledger: Path) -> set[str]:
@@ -112,6 +123,7 @@ def project_wide_dispatch_projection(ledger: Path) -> dict[str, Any]:
         "ready_ids": ready_ids,
         "derived_runnable_ids": derived_runnable_ids,
         "runnable_exclusions": dict(runnable_projection.get("exclusions", {})),
+        "derived_slices": dict(runnable_projection.get("derived_slices", {})),
         "open_ids": open_ids,
         "goal_ids": current_goal_ledger_ids(ledger, open_ids),
         "work_in_flight": work_in_flight,
@@ -247,6 +259,227 @@ def controller_cycle_evidence_path(root: Path, evidence_id: str) -> Path:
         / CONTROLLER_CYCLE_EVIDENCE_DIRECTORY
         / f"{digest}.json"
     )
+
+
+DEVIATION_LEVEL_NUMBER = {"L1": 1, "L2": 2, "L3": 3, "L4": 4}
+
+
+def _controller_cycle_records(root: Path, controller_id: str) -> list[dict[str, Any]]:
+    common = git_common_dir(Path(root).expanduser().resolve()) / "adaptive-delivery"
+    evidence_dir = common / CONTROLLER_CYCLE_EVIDENCE_DIRECTORY
+    records: list[dict[str, Any]] = []
+    for path in sorted(evidence_dir.glob("*.json")) if evidence_dir.is_dir() else []:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        if str(value.get("controller_id", "")).strip() != str(controller_id).strip():
+            continue
+        if value.get("record_kind") != "controller_cycle_evidence":
+            continue
+        records.append(value)
+    return sorted(
+        records,
+        key=lambda item: (
+            str(item.get("recorded_at", "")),
+            str(item.get("evidence_id", "")),
+        ),
+    )
+
+
+def _deviation_rule(error: str) -> tuple[str, int, str, str]:
+    text = str(error).strip().lower()
+    if "omitted ready packages" in text or "omitted derived runnable packages" in text:
+        return (
+            "project_runnable_omission", 3, "controller",
+            "recompute_project_and_dispatch_all_runnable",
+        )
+    if "idle dispatch capacity remains" in text:
+        return (
+            "idle_capacity_underdispatch", 3, "controller",
+            "recompute_capacity_and_dispatch_nonconflicting_runnable",
+        )
+    if "active dispatch decisions exceed available capacity" in text:
+        return (
+            "capacity_overdispatch", 2, "controller",
+            "recompute_capacity_and_remove_excess_dispatch",
+        )
+    if "required review" in text or "review pass" in text or "review fail" in text:
+        return (
+            "unconsumed_reviewer", 2, "controller",
+            "consume_reviewer_and_recompute_project",
+        )
+    if "candidate" in text or "integration" in text or "acceptance" in text:
+        return (
+            "unconsumed_candidate", 2, "controller",
+            "consume_candidate_integration_acceptance_and_recompute",
+        )
+    if "active runtime unhealthy" in text or "recovering runtime stalled" in text or "recovery" in text:
+        return (
+            "recovery_action_omission", 2, "controller",
+            "execute_canonical_recovery_and_recompute",
+        )
+    if "route" in text or "provider" in text or "model" in text:
+        return (
+            "routing_deviation", 3, "controller",
+            "rederive_canonical_route_and_redispatch",
+        )
+    if "duplicate" in text or "already active" in text or "exclusive execution" in text:
+        return (
+            "duplicate_dispatch", 3, "controller",
+            "reconcile_duplicate_dispatch_and_preserve_single_execution",
+        )
+    if "owned_files" in text or "file conflict" in text or "scope" in text or "worktree" in text:
+        return (
+            "scope_or_conflict_deviation", 3, "controller",
+            "rederive_owned_scope_conflicts_and_dispatch_plan",
+        )
+    if "evidence" in text or "verdict" in text or "pass" in text or "done" in text:
+        return (
+            "unsupported_conclusion", 3, "controller",
+            "invalidate_unsupported_conclusion_and_reverify",
+        )
+    if "blocked" in text or "reason_code" in text or "hard constraint" in text:
+        return (
+            "incorrect_block_or_defer", 2, "controller",
+            "reclassify_blocker_from_machine_facts_and_recompute",
+        )
+    if "machine_trace" in text or "tool trace" in text:
+        return (
+            "controller_trace_deviation", 3, "controller_adapter",
+            "repair_controller_control_receipt_trace_and_recompute",
+        )
+    if "integrity" in text and "rule" in text:
+        return (
+            "runtime_integrity_deviation", 3, "runtime",
+            "repair_runtime_integrity_before_control_continues",
+        )
+    return (
+        "control_contract_deviation", 2, "controller",
+        "recompute_full_control_loop_and_submit_complete_receipt",
+    )
+
+
+def _deviation_scope(error: str) -> list[str]:
+    task_ids = sorted(set(re.findall(
+        r"(?<![A-Za-z0-9_-])([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)(?![A-Za-z0-9_-])",
+        str(error),
+    )))
+    return task_ids[:16] or ["project"]
+
+
+def _deviation_fingerprint(code: str, responsibility: str) -> str:
+    encoded = json.dumps(
+        {"code": code, "responsibility": responsibility},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def classify_controller_deviations(
+    root: Path,
+    controller_id: str,
+    validation_errors: Sequence[str],
+) -> list[dict[str, Any]]:
+    historical: dict[str, int] = {}
+    for record in _controller_cycle_records(root, controller_id):
+        if str(record.get("terminal_status", "")).upper() != "FAILED":
+            continue
+        deviations = record.get("controller_deviations")
+        if not isinstance(deviations, list):
+            continue
+        for deviation in deviations:
+            if not isinstance(deviation, dict):
+                continue
+            fingerprint = str(deviation.get("fingerprint", "")).strip()
+            if fingerprint:
+                historical[fingerprint] = historical.get(fingerprint, 0) + 1
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for raw_error in validation_errors:
+        error = str(raw_error).strip()
+        if not error:
+            continue
+        code, base_level, responsibility, action = _deviation_rule(error)
+        fingerprint = _deviation_fingerprint(code, responsibility)
+        value = grouped.setdefault(fingerprint, {
+            "fingerprint": fingerprint,
+            "deviation_code": code,
+            "responsibility": responsibility,
+            "affected_scope": [],
+            "validation_errors": [],
+            "base_level": base_level,
+            "mandatory_action": action,
+        })
+        value["validation_errors"].append(error)
+        value["affected_scope"] = sorted(set(
+            list(value["affected_scope"]) + _deviation_scope(error)
+        ))
+
+    output: list[dict[str, Any]] = []
+    for fingerprint in sorted(grouped):
+        value = grouped[fingerprint]
+        recurrence_count = historical.get(fingerprint, 0) + 1
+        level_number = min(4, int(value["base_level"]) + recurrence_count - 1)
+        level = f"L{level_number}"
+        output.append({
+            "fingerprint": fingerprint,
+            "deviation_code": value["deviation_code"],
+            "responsibility": value["responsibility"],
+            "affected_scope": value["affected_scope"],
+            "validation_errors": value["validation_errors"],
+            "recurrence_count": recurrence_count,
+            "level": level,
+            "correction": {
+                "mandatory": True,
+                "executable": True,
+                "projection": "canonical_project_control",
+                "action": value["mandatory_action"],
+                "requires_project_wide_recompute": level_number >= 3,
+                "requires_unique_controller_handoff": level_number >= 4,
+            },
+        })
+    return output
+
+
+def open_controller_corrections(
+    root: Path, controller_id: str
+) -> list[dict[str, Any]]:
+    open_by_fingerprint: dict[str, dict[str, Any]] = {}
+    for record in _controller_cycle_records(root, controller_id):
+        status = str(record.get("terminal_status", "")).upper()
+        if status == "FAILED":
+            deviations = record.get("controller_deviations")
+            if isinstance(deviations, list):
+                for deviation in deviations:
+                    if not isinstance(deviation, dict):
+                        continue
+                    fingerprint = str(deviation.get("fingerprint", "")).strip()
+                    if fingerprint:
+                        open_by_fingerprint[fingerprint] = dict(deviation)
+        elif status == "CLOSED":
+            resolved = record.get("resolved_correction_fingerprints")
+            if isinstance(resolved, list):
+                for fingerprint in resolved:
+                    open_by_fingerprint.pop(str(fingerprint).strip(), None)
+    return [open_by_fingerprint[key] for key in sorted(open_by_fingerprint)]
+
+
+def _resolved_correction_fingerprints(snapshot: dict[str, Any]) -> list[str]:
+    actions = snapshot.get("correction_actions")
+    if not isinstance(actions, list):
+        return []
+    return sorted({
+        str(action.get("fingerprint", "")).strip()
+        for action in actions
+        if isinstance(action, dict)
+        and str(action.get("decision", "")).strip().lower() == "corrected"
+        and str(action.get("fingerprint", "")).strip()
+    })
 
 
 def _known_controller_incident_ids(root: Path, controller_id: str) -> set[str]:
@@ -557,6 +790,24 @@ def persist_controller_cycle_evidence(
                 "post-incident closure requires a strong correction evidence receipt"
             )
         clearance_markers["depends_on_correction_evidence_id"] = correction_evidence_id
+    controller_deviations = (
+        classify_controller_deviations(root, controller, errors)
+        if status == "FAILED"
+        else []
+    )
+    resolved_corrections = (
+        _resolved_correction_fingerprints(snapshot)
+        if status == "CLOSED"
+        else []
+    )
+    if status == "CLOSED" and resolved_corrections:
+        correction_errors = validate_correction_actions(
+            snapshot, open_controller_corrections(root, controller)
+        )
+        if correction_errors:
+            raise ValueError(
+                "generic correction closure failed: " + "; ".join(correction_errors)
+            )
     payload: dict[str, Any] = {
         "schema_version": 1,
         "record_kind": "controller_cycle_evidence",
@@ -578,6 +829,8 @@ def persist_controller_cycle_evidence(
         "ledger_sha256": str(ledger_sha256 or "").strip(),
         "snapshot_sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
         "validation_errors": errors,
+        "controller_deviations": controller_deviations,
+        "resolved_correction_fingerprints": resolved_corrections,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
     }
     payload.update(clearance_markers)
@@ -1206,6 +1459,156 @@ def route_policy_errors(task_id: str, route: dict[str, Any]) -> list[str]:
     return [f"{task_id} route is not declared by policy source"]
 
 
+def _string_list_set(value: Any) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    return {str(item).strip() for item in value if str(item).strip()}
+
+
+def validate_correction_actions(
+    snapshot: dict[str, Any],
+    expected_corrections: Sequence[dict[str, Any]],
+) -> list[str]:
+    errors: list[str] = []
+    raw_corrections = snapshot.get("correction_actions")
+    if not isinstance(raw_corrections, list):
+        raw_corrections = []
+    by_fp = {
+        str(item.get("fingerprint", "")).strip(): item
+        for item in raw_corrections
+        if isinstance(item, dict) and str(item.get("fingerprint", "")).strip()
+    }
+    expected_by_fp = {
+        str(item.get("fingerprint", "")).strip(): item
+        for item in expected_corrections
+        if isinstance(item, dict) and str(item.get("fingerprint", "")).strip()
+    }
+    for fingerprint, correction in sorted(expected_by_fp.items()):
+        action = by_fp.get(fingerprint)
+        if not isinstance(action, dict):
+            errors.append(f"mandatory correction {fingerprint} is not completed")
+            continue
+        if str(action.get("decision", "")).strip().lower() != "corrected":
+            errors.append(f"mandatory correction {fingerprint} must be corrected before closure")
+            continue
+        required_action = str(
+            (correction.get("correction") or {}).get("action", "")
+        ).strip() if isinstance(correction.get("correction"), dict) else ""
+        if required_action and str(action.get("action", "")).strip() != required_action:
+            errors.append(f"mandatory correction {fingerprint} action does not match derived correction")
+        if not traceable_runtime_evidence(action.get("execution_evidence")):
+            errors.append(f"mandatory correction {fingerprint} requires execution evidence")
+        if not traceable_runtime_evidence(action.get("verification_evidence")):
+            errors.append(f"mandatory correction {fingerprint} requires independent verification evidence")
+        executed_by = str(action.get("executed_by", "")).strip()
+        verified_by = str(action.get("verified_by", "")).strip()
+        if not executed_by or not verified_by or executed_by == verified_by:
+            errors.append(
+                f"mandatory correction {fingerprint} requires distinct execution and verification actors"
+            )
+        if str(correction.get("level", "")).strip().upper() == "L4":
+            if not traceable_runtime_evidence(action.get("unique_controller_handoff_evidence")):
+                errors.append(
+                    f"mandatory correction {fingerprint} L4 requires existing unique-Controller handoff evidence"
+                )
+    extra_corrections = sorted(set(by_fp) - set(expected_by_fp))
+    if extra_corrections:
+        errors.append(
+            "control cycle contains non-canonical correction actions: "
+            + ", ".join(extra_corrections)
+        )
+    return errors
+
+
+def validate_control_loop_receipt(
+    snapshot: dict[str, Any],
+    *,
+    expected_ledger_sha256: str | None,
+    expected_runnable_ids: set[str],
+    expected_candidate_revisions: set[str],
+    expected_controller_action_ids: set[str],
+    expected_corrections: Sequence[dict[str, Any]],
+) -> list[str]:
+    errors: list[str] = []
+    loop = snapshot.get("control_loop_receipt")
+    if not isinstance(loop, dict):
+        errors.append("control_loop_receipt is required for Controller Stop/Yield closure")
+        loop = {}
+    if str(loop.get("scope", "")).strip() != "project_wide":
+        errors.append("control_loop_receipt.scope must be project_wide")
+    completed_steps = loop.get("completed_steps")
+    if completed_steps != list(CONTROL_LOOP_STEPS):
+        errors.append(
+            "control_loop_receipt.completed_steps must match the fixed Controller control loop in order: "
+            + ", ".join(CONTROL_LOOP_STEPS)
+        )
+    if expected_ledger_sha256 is not None and str(loop.get("ledger_sha256", "")).strip() != expected_ledger_sha256:
+        errors.append("control_loop_receipt ledger_sha256 does not match the current ledger")
+    expected_sets = {
+        "runnable_ids": set(expected_runnable_ids),
+        "candidate_revisions": set(expected_candidate_revisions),
+        "controller_action_ids": set(expected_controller_action_ids),
+        "correction_fingerprints": {
+            str(item.get("fingerprint", "")).strip()
+            for item in expected_corrections
+            if isinstance(item, dict) and str(item.get("fingerprint", "")).strip()
+        },
+    }
+    for field, expected in expected_sets.items():
+        actual = _string_list_set(loop.get(field))
+        if actual != expected:
+            errors.append(
+                f"control_loop_receipt {field} does not match canonical project projection: "
+                f"expected {sorted(expected)}, got {sorted(actual)}"
+            )
+    if loop.get("recomputed_after_actions") is not True:
+        errors.append("control_loop_receipt requires recomputed_after_actions=true")
+
+    raw_actions = snapshot.get("controller_actions")
+    if not isinstance(raw_actions, list):
+        errors.append("controller_actions must enumerate every immediate Controller action")
+        raw_actions = []
+    actual_action_ids: set[str] = set()
+    for index, action in enumerate(raw_actions):
+        if not isinstance(action, dict):
+            errors.append(f"controller_actions[{index}] must be an object")
+            continue
+        action_id = str(action.get("id", "")).strip()
+        if not action_id:
+            errors.append(f"controller_actions[{index}].id is required")
+            continue
+        if action_id in actual_action_ids:
+            errors.append(f"duplicate controller action: {action_id}")
+        actual_action_ids.add(action_id)
+        decision = str(action.get("decision", "")).strip().lower()
+        if decision == "executed":
+            if not traceable_runtime_evidence(action.get("evidence")):
+                errors.append(f"controller action {action_id} executed requires traceable evidence")
+        elif decision == "blocked":
+            reason_code = str(action.get("reason_code", "")).strip().lower()
+            if reason_code not in HARD_DEFER_REASON_CODES:
+                errors.append(
+                    f"controller action {action_id} blocked requires a hard reason_code"
+                )
+            if not str(action.get("reason", "")).strip():
+                errors.append(f"controller action {action_id} blocked requires exact reason")
+            if not traceable_runtime_evidence(action.get("evidence")):
+                errors.append(f"controller action {action_id} blocked requires traceable evidence")
+        else:
+            errors.append(
+                f"controller action {action_id} decision must be executed or hard blocked"
+            )
+    missing_actions = sorted(expected_controller_action_ids - actual_action_ids)
+    extra_actions = sorted(actual_action_ids - expected_controller_action_ids)
+    if missing_actions:
+        errors.append("control cycle omitted controller actions: " + ", ".join(missing_actions))
+    if extra_actions:
+        errors.append("control cycle contains non-canonical controller actions: " + ", ".join(extra_actions))
+
+    errors.extend(validate_correction_actions(snapshot, expected_corrections))
+    return errors
+
+
 def validate_snapshot(
     snapshot: dict[str, Any],
     *,
@@ -1222,6 +1625,10 @@ def validate_snapshot(
     ledger_work_in_flight: dict[str, str] | None = None,
     derived_runnable_ids: set[str] | None = None,
     expected_machine_trace: dict[str, Any] | None = None,
+    expected_candidate_revisions: set[str] | None = None,
+    expected_controller_action_ids: set[str] | None = None,
+    expected_corrections: Sequence[dict[str, Any]] | None = None,
+    require_control_loop_receipt: bool = False,
 ) -> list[str]:
     errors: list[str] = []
     contract = snapshot.get("event_contract")
@@ -1468,6 +1875,17 @@ def validate_snapshot(
             snapshot, ledger_open_ids=ledger_open_ids, ledger_goal_ids=ledger_goal_ids
         )
     )
+    if require_control_loop_receipt:
+        errors.extend(
+            validate_control_loop_receipt(
+                snapshot,
+                expected_ledger_sha256=expected_ledger_sha256,
+                expected_runnable_ids=set(derived_runnable_ids or ledger_ready_ids or set()),
+                expected_candidate_revisions=set(expected_candidate_revisions or set()),
+                expected_controller_action_ids=set(expected_controller_action_ids or set()),
+                expected_corrections=list(expected_corrections or []),
+            )
+        )
     return errors
 
 
@@ -1648,6 +2066,82 @@ def resolve_controller_trace_session(
     return owner
 
 
+def canonical_controller_action_projection(
+    repo: Path,
+    *,
+    controller_id: str,
+    candidates: dict[str, str] | None,
+    required_review_ids: set[str],
+    work_in_flight: dict[str, str],
+    corrections: Sequence[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Derive immediate Controller-owned actions from existing canonical facts."""
+    actions: dict[str, dict[str, Any]] = {}
+    for revision in sorted(set((candidates or {}).values())):
+        actions[f"candidate:{revision}"] = {
+            "type": "candidate",
+            "candidate_revision": revision,
+        }
+    for review_id in sorted(required_review_ids):
+        actions[f"review:{review_id}"] = {"type": "review", "review_id": review_id}
+
+    try:
+        from scripts.assignment_runtime import evaluate_lease, load_runtime_state
+    except ModuleNotFoundError:
+        from assignment_runtime import evaluate_lease, load_runtime_state
+    runtime = load_runtime_state(repo)
+    leases = runtime.get("leases", {}) if isinstance(runtime, dict) else {}
+    for task_id in sorted(work_in_flight):
+        matching = [
+            lease for lease in leases.values()
+            if isinstance(lease, dict) and str(lease.get("task_id", "")).strip() == task_id
+        ] if isinstance(leases, dict) else []
+        if not matching:
+            actions[f"recovery:{task_id}"] = {
+                "type": "recovery",
+                "task_id": task_id,
+                "reason": "missing_runtime_lease",
+            }
+            continue
+        lease = max(matching, key=lambda item: int(item.get("attempt", 0) or 0))
+        health = evaluate_lease(lease)
+        if str(health.get("state", "")) in {"unhealthy", "budget_exhausted", "terminal"}:
+            actions[f"recovery:{task_id}"] = {
+                "type": "recovery",
+                "task_id": task_id,
+                "reason": str(health.get("reason", "") or health.get("state", "")),
+            }
+
+    try:
+        from scripts.lifecycle_hook import load_json as load_lifecycle_json, state_path
+    except ModuleNotFoundError:
+        from lifecycle_hook import load_json as load_lifecycle_json, state_path
+    lifecycle_state = load_lifecycle_json(state_path(controller_id))
+    pending_receipts = lifecycle_state.get("pending_terminal_receipts", [])
+    if isinstance(pending_receipts, list):
+        for value in pending_receipts:
+            receipt = str(value).strip()
+            if not receipt:
+                continue
+            key = hashlib.sha256(receipt.encode("utf-8")).hexdigest()[:16]
+            actions[f"terminal_receipt:{key}"] = {
+                "type": "terminal_receipt",
+                "receipt": receipt,
+            }
+
+    for correction in corrections:
+        if not isinstance(correction, dict):
+            continue
+        fingerprint = str(correction.get("fingerprint", "")).strip()
+        if fingerprint:
+            actions[f"correction:{fingerprint}"] = {
+                "type": "correction",
+                "fingerprint": fingerprint,
+                "level": str(correction.get("level", "")),
+            }
+    return actions
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -1710,6 +2204,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_machine_trace = (
             observed_machine_trace(trace_session) if trace_session else None
         )
+        expected_corrections = (
+            open_controller_corrections(repo_root, trace_session)
+            if repo_root is not None and trace_session
+            else []
+        )
+        expected_candidate_revisions = set((candidates or {}).values())
+        expected_controller_actions = (
+            canonical_controller_action_projection(
+                repo_root,
+                controller_id=trace_session,
+                candidates=candidates,
+                required_review_ids=set(args.require_review),
+                work_in_flight=work_in_flight,
+                corrections=expected_corrections,
+            )
+            if repo_root is not None and trace_session
+            else {}
+        )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"control-event: invalid snapshot: {error}")
         return 2
@@ -1729,6 +2241,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         ledger_work_in_flight=work_in_flight,
         derived_runnable_ids=derived_runnable_ids,
         expected_machine_trace=expected_machine_trace,
+        expected_candidate_revisions=expected_candidate_revisions,
+        expected_controller_action_ids=set(expected_controller_actions),
+        expected_corrections=expected_corrections,
+        require_control_loop_receipt=bool(trace_session),
     )
     if repo_root is not None:
         errors.extend(canonical_rule_handshake_errors(repo_root, ledger, snapshot=snapshot))

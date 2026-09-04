@@ -2,6 +2,7 @@
 """Pure controller-facing lifecycle projection for legacy task states."""
 from __future__ import annotations
 
+import hashlib
 import re
 
 from typing import Any
@@ -44,17 +45,28 @@ def _mentioned_task_ids(text: str, declared_ids: set[str], self_id: str) -> set[
     return mentions
 
 
-def derive_runnable_tasks(records: list[dict[str, str]]) -> dict[str, object]:
-    """Derive dispatchable work from the canonical task rows only.
+def _pending_action_clauses(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[;；]+", text) if part.strip()]
 
-    READY is always runnable. PENDING becomes runnable only when every task ID it
-    references is closed and the row does not declare an external/environment
-    gate. The result is an ephemeral projection, never a second task state.
+
+def derive_runnable_tasks(records: list[dict[str, str]]) -> dict[str, object]:
+    """Derive project runnable work without inventing a second task state.
+
+    READY is always runnable. A PENDING row becomes runnable when its declared
+    dependencies are closed. When one PENDING row contains multiple explicitly
+    separable action clauses, a clause whose own declared dependencies are
+    already closed may form an ephemeral derived slice even while sibling
+    clauses still wait. The parent ledger row remains PENDING and authoritative.
     """
-    status_by_id = {str(r.get("id", "")).strip(): str(r.get("status", "")).strip().upper() for r in records if str(r.get("id", "")).strip()}
+    status_by_id = {
+        str(r.get("id", "")).strip(): str(r.get("status", "")).strip().upper()
+        for r in records
+        if str(r.get("id", "")).strip()
+    }
     declared_ids = set(status_by_id)
     runnable: list[str] = []
     exclusions: dict[str, list[str]] = {}
+    derived_slices: dict[str, list[dict[str, object]]] = {}
     for record in records:
         task_id = str(record.get("id", "")).strip()
         status = str(record.get("status", "")).strip().upper()
@@ -67,9 +79,42 @@ def derive_runnable_tasks(records: list[dict[str, str]]) -> dict[str, object]:
             continue
         text = str(record.get("next_action", ""))
         dependencies = _mentioned_task_ids(text, declared_ids, task_id)
-        open_dependencies = sorted(dep for dep in dependencies if status_by_id.get(dep) not in CLOSED_LEGACY_STATES)
+        open_dependencies = sorted(
+            dep for dep in dependencies
+            if status_by_id.get(dep) not in CLOSED_LEGACY_STATES
+        )
         reasons: list[str] = []
         if open_dependencies:
+            clauses = _pending_action_clauses(text)
+            slices: list[dict[str, object]] = []
+            if len(clauses) > 1:
+                for clause in clauses:
+                    clause_dependencies = _mentioned_task_ids(
+                        clause, declared_ids, task_id
+                    )
+                    if not clause_dependencies:
+                        continue
+                    clause_open = sorted(
+                        dep for dep in clause_dependencies
+                        if status_by_id.get(dep) not in CLOSED_LEGACY_STATES
+                    )
+                    if clause_open or EXTERNAL_GATE_RE.search(clause):
+                        continue
+                    closed = sorted(clause_dependencies)
+                    slice_id = hashlib.sha256(
+                        f"{task_id}::{clause}".encode("utf-8")
+                    ).hexdigest()[:12]
+                    slices.append({
+                        "slice_id": slice_id,
+                        "parent_task_id": task_id,
+                        "next_action": clause,
+                        "closed_dependencies": closed,
+                        "open_dependencies": [],
+                    })
+            if slices:
+                runnable.append(task_id)
+                derived_slices[task_id] = slices
+                continue
             reasons.append("open_dependencies:" + ",".join(open_dependencies))
         elif (DEPENDENCY_GATE_RE.search(text) or SHORTHAND_TASK_REF_RE.search(text)) and not dependencies:
             reasons.append("unresolved_dependency_gate")
@@ -79,7 +124,11 @@ def derive_runnable_tasks(records: list[dict[str, str]]) -> dict[str, object]:
             exclusions[task_id] = reasons
         else:
             runnable.append(task_id)
-    return {"runnable_task_ids": sorted(set(runnable)), "exclusions": exclusions}
+    return {
+        "runnable_task_ids": sorted(set(runnable)),
+        "exclusions": exclusions,
+        "derived_slices": derived_slices,
+    }
 
 
 def project_task_state(

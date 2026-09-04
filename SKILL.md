@@ -52,7 +52,7 @@ description: Use when initializing or governing a long-running project, choosing
 - 子 Agent 分派、前后端模型选择、模型降级或并发配置：读 [Agent and model routing](references/agent-model-routing.md) 与 [Agent delivery contract](references/agent-delivery-contract.md)。需要配置、登录、预检或执行 Kimi/Grok 外部 Agent 时，再读 [External Agent authentication and execution](references/external-agent-auth.md)；该流程由 Adaptive Agent Runtime 直接执行，不依赖任务生命周期插件。
 - 长期项目、Goal、台账粒度、候选分支或共享环境治理：读 [long-task governance](references/long-task-governance.md)。
 - 用户要求审计或评分项目总控履职时：使用 [controller performance scoring](references/controller-performance-scoring.md)。正式七维原始分固定为**0–100**，输出必须分开报告近期能力、风险状态与依据、约束分，并附同 Controller、同模型的已核验单回合最佳/最差；无样本写 `UNKNOWN`。有 `UserPromptSubmit + Stop` 的宿主启用 `controller_scoring_hook.py`；不提供 UserPromptSubmit / Stop 的宿主执行 `record-read` 与带完整三层参数的 `finalize-score`，未通过禁止输出分数。比较先用 `latest-score`；单回合诊断不能覆盖正式评分。重大事故的 `49` 分上限不按时间消失，仅在纠正验收、控制面对齐和后续 L3/L4 闭环均有证据后解除，历史最差回合仍保留。
-- 长期总控的 SessionStart 与异常/控制事件同时注入由正式评分模型即时派生的 **Controller Self-Check**；只暴露优秀履职标准，不暴露或推算实时总分/维度分。自检用于纠偏，不构成新评分系统，也不得因单次事故自动新增全局治理规则。
+- **Controller Self-Check**：按 [long-task governance](references/long-task-governance.md) 固定循环；Stop/Yield收据不完整或correction未闭合即fail-closed；禁止第二scheduler、台账、Controller。
 - 上下文、Compact、Raw Sources、Wiki、长期记忆、知识目录初始化或资料摄取：读 [context governance](references/context-governance.md)。
 - 涉及风险证据、外部服务、本地/Web 发布或恢复：读 [Harness and release](references/harness-and-release.md)。
 - 用户明确认可视觉参考，或任务涉及视觉基线：读 [visual reference governance](references/visual-reference-governance.md)。

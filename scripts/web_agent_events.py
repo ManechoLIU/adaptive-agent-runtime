@@ -16,18 +16,34 @@ REQUIRED_MACHINE_WEB_EVENTS = {
 TRUSTED_MACHINE_WEB_EVENT_SOURCES = {"chatgpt_subagent_machine_events"}
 
 
+def _trusted_machine_event_source_verifier():
+    """Return a Host-owned verifier when one is installed; absent by default."""
+    return None
+
+
 def machine_event_source_status(
     *,
     path: str | Path = DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT,
     now: Any | None = None,
     max_age_seconds: float = MACHINE_EVENT_SOURCE_MAX_AGE_SECONDS,
+    verifier: Any | None = None,
 ) -> dict[str, Any]:
-    """Validate a host-produced machine lifecycle receipt; Runtime never creates this receipt."""
+    """Authorize machine events only with independent Host provenance.
+
+    A locally writable JSON receipt is diagnostic data, never trust by itself.
+    """
     from datetime import datetime, timezone
     UTC = timezone.utc
     now = now or datetime.now(UTC)
+    receipt_path = Path(path).expanduser().resolve(strict=False)
+    verifier = verifier or _trusted_machine_event_source_verifier()
+    if verifier is None:
+        return {
+            "ready": False,
+            "reason": "trusted_machine_event_source_verifier_unavailable",
+        }
     try:
-        payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
         observed = datetime.fromisoformat(
             str(payload.get("observed_at") or "").replace("Z", "+00:00")
         )
@@ -50,12 +66,34 @@ def machine_event_source_status(
         return {"ready": False, "reason": "machine_event_source_incomplete"}
     if age < 0 or age > max_age_seconds:
         return {"ready": False, "reason": "machine_event_source_stale"}
+    try:
+        verified = verifier(dict(payload), receipt_path)
+    except Exception:
+        return {"ready": False, "reason": "machine_event_source_verifier_failed"}
+    if not isinstance(verified, dict):
+        return {"ready": False, "reason": "machine_event_source_verifier_failed"}
+    if (
+        verified.get("verified") is not True
+        or verified.get("fresh") is not True
+        or verified.get("replay") is not False
+        or str(verified.get("source") or "") != source
+    ):
+        return {"ready": False, "reason": "machine_event_source_provenance_rejected"}
+    raw_paths = verified.get("event_paths")
+    if not isinstance(raw_paths, list) or not raw_paths:
+        return {"ready": False, "reason": "machine_event_source_paths_unattested"}
+    event_paths = []
+    for value in raw_paths:
+        if not isinstance(value, str) or not value.strip():
+            return {"ready": False, "reason": "machine_event_source_paths_unattested"}
+        event_paths.append(str(Path(value).expanduser().resolve(strict=False)))
     return {
         "ready": True,
         "reason": "machine_event_source_ready",
         "source": source,
         "events": sorted(events),
         "observed_at": observed.astimezone(UTC).isoformat(),
+        "event_paths": sorted(set(event_paths)),
     }
 
 
