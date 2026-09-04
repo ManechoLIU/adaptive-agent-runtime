@@ -164,10 +164,12 @@ def _active_policy_line(line: str) -> bool:
     )
 
 
-POSITIVE_POLICY_PREFIX_WORDS = {
+CANONICAL_POLICY_DIRECTIVES = {
+    "",
     "default",
+    "default route",
     "fallback",
-    "route",
+    "fallback route",
     "默认",
     "回退",
     "备用",
@@ -176,43 +178,38 @@ POSITIVE_POLICY_PREFIX_WORDS = {
 }
 
 
-def _ascii_marker_match(text: str, marker: str) -> list[tuple[int, int]]:
-    return [
-        match.span()
-        for match in re.finditer(
-            rf"(?<![A-Za-z0-9_-]){re.escape(marker)}(?![A-Za-z0-9_-])",
-            text,
-            re.IGNORECASE,
-        )
-    ]
+def _ascii_marker_prefix(text: str, marker: str) -> tuple[int, int] | None:
+    match = re.match(
+        rf"^{re.escape(marker)}(?![A-Za-z0-9_-])",
+        text,
+        re.IGNORECASE,
+    )
+    return match.span() if match else None
 
 
 def _policy_prefix_is_positive(prefix: str, markers: tuple[str, ...]) -> bool:
-    """Accept only a small positive declaration grammar before route fields."""
+    """Require one canonical class marker first, then at most one formal directive."""
     normalized = _normalize_policy_symbols(prefix).casefold().strip()
+    normalized = re.sub(r"^[\s:：,，;；/\|()\[\]{}<>]+", "", normalized)
+    normalized = re.sub(r"[\s:：,，;；/\|()\[\]{}<>]+$", "", normalized)
     if not normalized:
         return not markers
 
-    spans: list[tuple[int, int]] = []
     for marker in markers:
         token = _normalize_policy_symbols(marker).casefold()
+        span: tuple[int, int] | None
         if token.isascii():
-            spans.extend(_ascii_marker_match(normalized, token))
+            span = _ascii_marker_prefix(normalized, token)
         else:
-            spans.extend(
-                match.span()
-                for match in re.finditer(re.escape(token), normalized)
-            )
-
-    for start, end in spans:
-        remainder = normalized[:start] + " " + normalized[end:]
-        remainder = re.sub(r"[:：,，;；/\|()\[\]{}<>]+", " ", remainder)
+            span = (0, len(token)) if normalized.startswith(token) else None
+        if span is None:
+            continue
+        remainder = normalized[span[1]:]
+        remainder = re.sub(r"^[\s:：,，;；/\|()\[\]{}<>-]+", "", remainder)
+        remainder = re.sub(r"[\s:：,，;；/\|()\[\]{}<>-]+$", "", remainder)
         remainder = re.sub(r"[-_]+", " ", remainder)
         remainder = re.sub(r"\s+", " ", remainder).strip()
-        if not remainder:
-            return True
-        words = remainder.split(" ")
-        if all(word in POSITIVE_POLICY_PREFIX_WORDS for word in words):
+        if remainder in CANONICAL_POLICY_DIRECTIVES:
             return True
     return False
 
