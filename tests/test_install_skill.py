@@ -368,7 +368,7 @@ class InstallMigrationContractTests(unittest.TestCase):
         for name in (
             "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
             "web_agent_health_supervisor.py", "web_agent_events.py", "route_contract.py",
-            "control_event_guard.py", "controller_state.py", "assignment_lease_guard.py",
+            "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "assignment_lease_guard.py",
             "controller_scoring_guard.py", "project_context_guard.py", "evaluation_transaction.py",
         ):
             script = source / "scripts" / name
@@ -643,7 +643,27 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction(self): self.assertTrue(True)\n"
                 "    def test_not_found_unknown_token_does_not_authorize_fabricated_definitive_mechanism(self): self.assertTrue(True)\n"
                 "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n"
-                "    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self): self.assertTrue(True)\n",
+                "    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self): self.assertTrue(True)\n"
+                "    def test_project_context_separates_unique_controller_from_unverified_web_session(self): self.assertTrue(True)\n"
+                "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_controller_target_guard.py").write_text(
+                "import unittest\n"
+                "class ControllerTargetGuardTests(unittest.TestCase):\n"
+                "    def test_identity_projection_keeps_unique_project_controller_when_session_id_unavailable(self): self.assertTrue(True)\n"
+                "    def test_identity_projection_verifies_current_desktop_target_without_changing_controller_id(self): self.assertTrue(True)\n"
+                "    def test_identity_projection_marks_old_target_stale_but_keeps_project_ownership(self): self.assertTrue(True)\n"
+                "    def test_identity_projection_reports_project_controller_conflict_without_silent_selection(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_web_lifecycle_bridge.py").write_text(
+                "import unittest\n"
+                "class WebLifecycleBridgeTests(unittest.TestCase):\n"
+                "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
+                "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
+                "    def test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership(self): self.assertTrue(True)\n"
+                "    def test_web_recovery_preserves_desktop_target_and_only_advances_web_generation(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(
@@ -686,7 +706,24 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_failed_control_cycle_generates_executable_controller_correction(self): self.assertTrue(True)\n"
                 "    def test_unfinished_correction_prevents_control_cycle_closure(self): self.assertTrue(True)\n"
                 "    def test_same_controller_deviation_fingerprint_escalates_on_recurrence(self): self.assertTrue(True)\n"
-                "    def test_direct_cycle_persistence_cannot_fabricate_generic_correction_closure(self): self.assertTrue(True)\n",
+                "    def test_direct_cycle_persistence_cannot_fabricate_generic_correction_closure(self): self.assertTrue(True)\n"
+                "    def test_reviewer_pass_integration_has_mandatory_verify_converge_recompute_successors(self): self.assertTrue(True)\n"
+                "    def test_known_next_action_enters_canonical_controller_action_projection(self): self.assertTrue(True)\n"
+                "    def test_continuation_debt_blocks_control_loop_receipt_until_every_action_resolved(self): self.assertTrue(True)\n"
+                "    def test_durable_terminal_receipt_enters_debt_once_and_disappears_after_consumption(self): self.assertTrue(True)\n"
+                "    def test_hard_blocked_or_deferred_actions_clear_continuation_debt_and_allow_yield(self): self.assertTrue(True)\n"
+                "    def test_continuation_debt_fingerprint_escalates_through_existing_recurrence_rules(self): self.assertTrue(True)\n"
+                "    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self): self.assertTrue(True)\n"
+                "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_desktop_lifecycle_adapter.py").write_text(
+                "import unittest\n"
+                "class DesktopLifecycleTurnGateTests(unittest.TestCase):\n"
+                "    def test_successful_receipt_is_invalidated_when_same_turn_continuation_executes(self): self.assertTrue(True)\n"
+                "    def test_status_query_does_not_clear_existing_controller_continuation(self): self.assertTrue(True)\n"
+                "    def test_hard_yield_gate_rejects_declared_next_action_when_work_is_runnable(self): self.assertTrue(True)\n"
+                "    def test_hard_yield_gate_does_not_invent_work_from_status_only_message(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_web_agent_execution.py").write_text(
@@ -781,7 +818,27 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction(self): self.assertTrue(True)\n"
                 "    def test_not_found_unknown_token_does_not_authorize_fabricated_definitive_mechanism(self): self.assertTrue(True)\n"
                 "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n"
-                "    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self): self.assertTrue(True)\n",
+                "    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self): self.assertTrue(True)\n"
+                "    def test_project_context_separates_unique_controller_from_unverified_web_session(self): self.assertTrue(True)\n"
+                "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_controller_target_guard.py").write_text(
+                "import unittest\n"
+                "class ControllerTargetGuardTests(unittest.TestCase):\n"
+                "    def test_identity_projection_keeps_unique_project_controller_when_session_id_unavailable(self): self.assertTrue(True)\n"
+                "    def test_identity_projection_verifies_current_desktop_target_without_changing_controller_id(self): self.assertTrue(True)\n"
+                "    def test_identity_projection_marks_old_target_stale_but_keeps_project_ownership(self): self.assertTrue(True)\n"
+                "    def test_identity_projection_reports_project_controller_conflict_without_silent_selection(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_web_lifecycle_bridge.py").write_text(
+                "import unittest\n"
+                "class WebLifecycleBridgeTests(unittest.TestCase):\n"
+                "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
+                "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
+                "    def test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership(self): self.assertTrue(True)\n"
+                "    def test_web_recovery_preserves_desktop_target_and_only_advances_web_generation(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(
@@ -824,7 +881,24 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_failed_control_cycle_generates_executable_controller_correction(self): self.assertTrue(True)\n"
                 "    def test_unfinished_correction_prevents_control_cycle_closure(self): self.assertTrue(True)\n"
                 "    def test_same_controller_deviation_fingerprint_escalates_on_recurrence(self): self.assertTrue(True)\n"
-                "    def test_direct_cycle_persistence_cannot_fabricate_generic_correction_closure(self): self.assertTrue(True)\n",
+                "    def test_direct_cycle_persistence_cannot_fabricate_generic_correction_closure(self): self.assertTrue(True)\n"
+                "    def test_reviewer_pass_integration_has_mandatory_verify_converge_recompute_successors(self): self.assertTrue(True)\n"
+                "    def test_known_next_action_enters_canonical_controller_action_projection(self): self.assertTrue(True)\n"
+                "    def test_continuation_debt_blocks_control_loop_receipt_until_every_action_resolved(self): self.assertTrue(True)\n"
+                "    def test_durable_terminal_receipt_enters_debt_once_and_disappears_after_consumption(self): self.assertTrue(True)\n"
+                "    def test_hard_blocked_or_deferred_actions_clear_continuation_debt_and_allow_yield(self): self.assertTrue(True)\n"
+                "    def test_continuation_debt_fingerprint_escalates_through_existing_recurrence_rules(self): self.assertTrue(True)\n"
+                "    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self): self.assertTrue(True)\n"
+                "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_desktop_lifecycle_adapter.py").write_text(
+                "import unittest\n"
+                "class DesktopLifecycleTurnGateTests(unittest.TestCase):\n"
+                "    def test_successful_receipt_is_invalidated_when_same_turn_continuation_executes(self): self.assertTrue(True)\n"
+                "    def test_status_query_does_not_clear_existing_controller_continuation(self): self.assertTrue(True)\n"
+                "    def test_hard_yield_gate_rejects_declared_next_action_when_work_is_runnable(self): self.assertTrue(True)\n"
+                "    def test_hard_yield_gate_does_not_invent_work_from_status_only_message(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_web_agent_execution.py").write_text(

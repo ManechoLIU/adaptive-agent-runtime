@@ -81,6 +81,30 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_same_controller_deviation_fingerprint_escalates_on_recurrence",
     "tests.test_governance.GovernanceTests."
     "test_direct_cycle_persistence_cannot_fabricate_generic_correction_closure",
+    "tests.test_governance.GovernanceTests."
+    "test_reviewer_pass_integration_has_mandatory_verify_converge_recompute_successors",
+    "tests.test_governance.GovernanceTests."
+    "test_known_next_action_enters_canonical_controller_action_projection",
+    "tests.test_governance.GovernanceTests."
+    "test_continuation_debt_blocks_control_loop_receipt_until_every_action_resolved",
+    "tests.test_governance.GovernanceTests."
+    "test_durable_terminal_receipt_enters_debt_once_and_disappears_after_consumption",
+    "tests.test_governance.GovernanceTests."
+    "test_hard_blocked_or_deferred_actions_clear_continuation_debt_and_allow_yield",
+    "tests.test_governance.GovernanceTests."
+    "test_continuation_debt_fingerprint_escalates_through_existing_recurrence_rules",
+    "tests.test_governance.GovernanceTests."
+    "test_event_scope_guard_allows_project_wide_dispatch_across_business_lines",
+    "tests.test_governance.GovernanceTests."
+    "test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof",
+    "tests.test_desktop_lifecycle_adapter.DesktopLifecycleTurnGateTests."
+    "test_successful_receipt_is_invalidated_when_same_turn_continuation_executes",
+    "tests.test_desktop_lifecycle_adapter.DesktopLifecycleTurnGateTests."
+    "test_status_query_does_not_clear_existing_controller_continuation",
+    "tests.test_desktop_lifecycle_adapter.DesktopLifecycleTurnGateTests."
+    "test_hard_yield_gate_rejects_declared_next_action_when_work_is_runnable",
+    "tests.test_desktop_lifecycle_adapter.DesktopLifecycleTurnGateTests."
+    "test_hard_yield_gate_does_not_invent_work_from_status_only_message",
     "tests.test_web_agent_execution.WebAgentExecutionTests."
     "test_direct_start_web_assignment_is_rejected_even_with_forged_readiness_probe",
     "tests.test_web_agent_execution.WebAgentExecutionTests."
@@ -153,6 +177,26 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop",
     "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain",
+    "tests.test_controller_target_guard.ControllerTargetGuardTests."
+    "test_identity_projection_keeps_unique_project_controller_when_session_id_unavailable",
+    "tests.test_controller_target_guard.ControllerTargetGuardTests."
+    "test_identity_projection_verifies_current_desktop_target_without_changing_controller_id",
+    "tests.test_controller_target_guard.ControllerTargetGuardTests."
+    "test_identity_projection_marks_old_target_stale_but_keeps_project_ownership",
+    "tests.test_controller_target_guard.ControllerTargetGuardTests."
+    "test_identity_projection_reports_project_controller_conflict_without_silent_selection",
+    "tests.test_project_context_guard.ProjectContextGuardTests."
+    "test_project_context_separates_unique_controller_from_unverified_web_session",
+    "tests.test_project_context_guard.ProjectContextGuardTests."
+    "test_project_context_reports_verified_bound_web_session_without_changing_ownership",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_session_start_without_host_session_id_reports_existing_controller_not_new_controller",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_web_recovery_preserves_desktop_target_and_only_advances_web_generation",
     "tests.test_web_agent_events.WebAgentMachineEventSourceTests."
     "test_caller_created_file_inside_codex_session_root_cannot_self_attest",
     "tests.test_web_agent_events.WebAgentMachineEventSourceTests."
@@ -174,7 +218,9 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/web_reentry_adapter.py",
     "scripts/lifecycle_hook.py",
     "scripts/control_event_guard.py",
+    "scripts/event_scope_guard.py",
     "scripts/controller_state.py",
+    "scripts/controller_target_guard.py",
     "scripts/controller_scoring_guard.py",
     "scripts/controller_scoring_hook.py",
     "scripts/project_context_guard.py",
@@ -186,8 +232,11 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_web_reentry_adapter.py",
     "tests/test_web_collaboration_continuation.py",
     "tests/test_governance.py",
+    "tests/test_desktop_lifecycle_adapter.py",
     "tests/test_controller_scoring_hook.py",
     "tests/test_project_context_guard.py",
+    "tests/test_controller_target_guard.py",
+    "tests/test_web_lifecycle_bridge.py",
     "tests/test_web_agent_events.py",
     "tests/test_evaluation_transaction.py",
     "tests/external-agent-routing.test.mjs",
