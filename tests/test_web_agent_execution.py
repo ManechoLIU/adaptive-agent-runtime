@@ -159,6 +159,10 @@ class WebAgentExecutionTests(unittest.TestCase):
         self.assertEqual(lease["session_id"], "conv-1")
         self.assertEqual(lease["execution_transport"], "web")
         self.assertEqual(lease["exclusive_execution_key"], "task:T-1")
+        self.assertEqual(
+            lease["exclusive_execution_keys"],
+            ["task:T-1", f"worktree:{self.repo.resolve()}"],
+        )
         self.assertNotEqual(lease["session_id"], "controller-1")
 
     def test_heartbeat_proves_liveness_but_not_progress(self):
@@ -248,6 +252,26 @@ class WebAgentExecutionTests(unittest.TestCase):
                     "attestation": self.attestation("running", conversation="conv-2"),
                 }, now=T0 + timedelta(seconds=1), host_verifier=self._verify_host,
             )
+
+    def test_active_writer_blocks_different_task_in_same_worktree(self):
+        self.start()
+        with self.assertRaisesRegex(ValueError, "worktree:"):
+            apply_web_execution_event(
+                repo=self.repo, registry_path=self.registry,
+                event={
+                    "controller_id": "controller-1", "conversation_id": "conv-2", "state": "started",
+                    "assignment": self.assignment(
+                        assignment_id="A-2", task_id="T-2", agent_id="web-writer-2",
+                        lease_id="A-2:web:attempt:1",
+                    ),
+                    "attestation": self.attestation("running", conversation="conv-2"),
+                }, now=T0 + timedelta(seconds=1), host_verifier=self._verify_host,
+            )
+
+    def test_reviewer_does_not_claim_writer_worktree_exclusive_key(self):
+        self.start(role="reviewer", candidate_revision=self.head, agent_id="web-reviewer-1")
+        lease = load_runtime_state(self.repo)["leases"]["A-1"]
+        self.assertEqual(lease["exclusive_execution_keys"], ["task:T-1"])
 
     def test_reviewer_verdict_is_bound_to_candidate_revision(self):
         self.start(role="reviewer", candidate_revision=self.head, agent_id="web-reviewer-1")

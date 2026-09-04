@@ -39,6 +39,25 @@ WEB_BLOCK_START = "# >>> adaptive-delivery web lifecycle bridge >>>"
 WEB_BLOCK_END = "# <<< adaptive-delivery web lifecycle bridge <<<"
 MANIFEST_NAME = ".adaptive-delivery-install.json"
 IMPACTS = {"none", "live_assignments"}
+RUNTIME_RELEASE_REGRESSION_TESTS = (
+    "tests.test_web_reentry_adapter.WebReentryContinuationRegressionTests."
+    "test_transient_web_reentry_failure_rearms_existing_continuation_supervisor",
+    "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
+    "test_regression_parent_already_yielded_then_writer_completed_wakes_same_controller_with_next_runnable",
+    "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
+    "test_completed_reviewer_uses_same_terminal_continuation_path",
+    "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
+    "test_stale_child_is_second_observed_by_existing_audit_and_wakes_same_controller",
+    "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
+    "test_duplicate_terminal_observation_after_confirmed_continuation_does_not_wake_twice",
+)
+RUNTIME_RELEASE_REQUIRED_FILES = (
+    "scripts/web_agent_execution.py",
+    "scripts/web_lifecycle_bridge.py",
+    "scripts/web_reentry_adapter.py",
+    "tests/test_web_reentry_adapter.py",
+    "tests/test_web_collaboration_continuation.py",
+)
 
 
 def default_install_target(skills_root: str | Path | None = None) -> Path:
@@ -792,6 +811,42 @@ def _materialize_revision(source: Path, revision: str, destination: Path) -> lis
     return sorted(tracked)
 
 
+def _verify_runtime_release_regressions(source: Path, revision: str) -> dict[str, Any]:
+    """Run immutable same-controller Web continuation regressions before installation."""
+    tracked = {entry[3] for entry in _revision_tree_entries(source, revision)}
+    # Older/minimal packages without Web Assignment execution predate this release contract.
+    if "scripts/web_agent_execution.py" not in tracked:
+        return {"status": "not_applicable", "tests": []}
+
+    missing = sorted(path for path in RUNTIME_RELEASE_REQUIRED_FILES if path not in tracked)
+    if missing:
+        raise ValueError(
+            "Runtime release regression gate is incomplete; required files are missing: "
+            + ", ".join(missing)
+        )
+
+    with tempfile.TemporaryDirectory(prefix="adaptive-agent-runtime-release-gate-") as tmp:
+        checkout = Path(tmp) / "candidate"
+        checkout.mkdir()
+        _materialize_revision(source, revision, checkout)
+        result = subprocess.run(
+            [sys.executable, "-m", "unittest", "-v", *RUNTIME_RELEASE_REGRESSION_TESTS],
+            cwd=checkout,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    if result.returncode != 0:
+        bounded = (result.stderr or result.stdout or "release regression test failed").strip()
+        if len(bounded) > 6000:
+            bounded = bounded[-6000:]
+        raise ValueError("Runtime release regression gate failed:\n" + bounded)
+    return {
+        "status": "passed",
+        "tests": list(RUNTIME_RELEASE_REGRESSION_TESTS),
+    }
+
+
 def _promote_staged_install(stage: Path, target: Path) -> None:
     backup = target.parent / f".{target.name}.backup-{next(tempfile._get_candidate_names())}"
     had_target = target.exists() or target.is_symlink()
@@ -835,6 +890,7 @@ def install_skill(
     prior_files = prior_manifest.get("files", {}) if isinstance(prior_manifest.get("files"), dict) else {}
     prior_revision = previous_revision or str(prior_manifest.get("revision", "")).strip() or None
     upgrade_lineage = _verify_upgrade_lineage(source_path, prior_revision, revision)
+    release_regressions = _verify_runtime_release_regressions(source_path, revision)
 
     stage = Path(tempfile.mkdtemp(prefix=f".{target_path.name}.stage-", dir=target_path.parent))
     try:
@@ -852,6 +908,7 @@ def install_skill(
             "revision": revision,
             "previous_revision": prior_revision,
             "upgrade_lineage": upgrade_lineage,
+            "release_regressions": release_regressions,
             "installed_at": installed_at,
             "source_root": str(source_path),
             "summary": summary.strip(),

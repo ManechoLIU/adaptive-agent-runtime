@@ -149,6 +149,10 @@ def _start_receipt(repo: Path, event: dict[str, Any], now: datetime) -> dict[str
         "execution_role": role,
         "candidate_revision": candidate,
         "exclusive_execution_key": f"task:{assignment['task_id']}",
+        "exclusive_execution_keys": [
+            f"task:{assignment['task_id']}",
+            *([f"worktree:{Path(assignment['worktree']).expanduser().resolve()}"] if role == "writer" else []),
+        ],
         "host_attestation_id": event["attestation"]["observation_id"],
     }
     if receipt["progress_deadline_minutes"] is None:
@@ -254,6 +258,10 @@ def _dispatch_start_receipt(
         "owned_scope": assignment["owned_scope"], "strategy": assignment["strategy"],
         "execution_transport": "web", "execution_role": role, "candidate_revision": candidate,
         "exclusive_execution_key": f"task:{assignment['task_id']}",
+        "exclusive_execution_keys": [
+            f"task:{assignment['task_id']}",
+            *([f"worktree:{Path(assignment['worktree']).expanduser().resolve()}"] if role == "writer" else []),
+        ],
         "health_mode": "progress_watchdog",
         "baseline_head": snapshot["last_observed_head"],
         **snapshot,

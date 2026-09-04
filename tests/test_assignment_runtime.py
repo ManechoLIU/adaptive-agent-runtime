@@ -21,6 +21,31 @@ class RuntimeTests(unittest.TestCase):
     def test_start_creates_healthy_provider_lease_without_pid(self):
         state=apply_receipt({},receipt("assignment_started"),now=T0)
         self.assertEqual(evaluate_lease(state["leases"]["a1"],now=T0)["state"],"healthy")
+    def test_multiple_exclusive_keys_block_any_active_overlap(self):
+        state = apply_receipt(
+            {},
+            receipt(
+                "assignment_started",
+                exclusive_execution_key="task:T1",
+                exclusive_execution_keys=["task:T1", "worktree:/tmp/wt"],
+            ),
+            now=T0,
+        )
+        with self.assertRaisesRegex(ValueError, "worktree:/tmp/wt"):
+            apply_receipt(
+                state,
+                receipt(
+                    "assignment_started",
+                    assignment_id="a2",
+                    task_id="T2",
+                    agent_id="writer-2",
+                    session_id="s2",
+                    exclusive_execution_key="task:T2",
+                    exclusive_execution_keys=["task:T2", "worktree:/tmp/wt"],
+                ),
+                now=T0,
+            )
+
     def test_heartbeat_refreshes_lease_not_progress(self):
         state=apply_receipt({},receipt("assignment_started"),now=T0)
         state=apply_receipt(state,receipt("assignment_heartbeat",T0+timedelta(minutes=10),event_seq=2),now=T0+timedelta(minutes=10))

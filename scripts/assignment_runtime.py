@@ -248,12 +248,35 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
         if health_mode not in HEALTH_MODES:
             raise ValueError("unsupported runtime health_mode")
         exclusive_key = str(receipt.get("exclusive_execution_key") or "").strip() or None
-        if exclusive_key and not existing:
+        raw_exclusive_keys = receipt.get("exclusive_execution_keys")
+        if raw_exclusive_keys is None:
+            exclusive_keys = [exclusive_key] if exclusive_key else []
+        elif (
+            not isinstance(raw_exclusive_keys, list)
+            or any(not isinstance(item, str) or not item.strip() for item in raw_exclusive_keys)
+        ):
+            raise ValueError("exclusive_execution_keys must be a list of non-empty strings")
+        else:
+            exclusive_keys = [item.strip() for item in raw_exclusive_keys]
+            if len(set(exclusive_keys)) != len(exclusive_keys):
+                raise ValueError("exclusive_execution_keys must contain unique values")
+            if exclusive_key and exclusive_key not in exclusive_keys:
+                exclusive_keys.insert(0, exclusive_key)
+        if exclusive_keys and not existing:
+            requested = set(exclusive_keys)
             for other_id, other in leases.items():
-                if other_id == aid or not isinstance(other, dict):
+                if other_id == aid or not isinstance(other, dict) or other.get("terminal_state"):
                     continue
-                if other.get("exclusive_execution_key") == exclusive_key and not other.get("terminal_state"):
-                    raise ValueError("exclusive execution already active; reconcile or recover the existing Assignment attempt")
+                other_keys = other.get("exclusive_execution_keys")
+                if not isinstance(other_keys, list):
+                    legacy = str(other.get("exclusive_execution_key") or "").strip()
+                    other_keys = [legacy] if legacy else []
+                conflict = sorted(requested.intersection(str(item).strip() for item in other_keys if str(item).strip()))
+                if conflict:
+                    raise ValueError(
+                        "exclusive execution already active for " + ", ".join(conflict)
+                        + "; reconcile or recover the existing Assignment attempt"
+                    )
         lease = {f: receipt[f] for f in IDENTITY_FIELDS}
         lease.update({
             "schema_version": 1,
@@ -292,6 +315,7 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "agent_type": str(receipt.get("agent_type") or "").strip() or None,
             "candidate_revision": str(receipt.get("candidate_revision") or "").strip() or None,
             "exclusive_execution_key": exclusive_key,
+            "exclusive_execution_keys": exclusive_keys,
             "host_attestation_id": str(receipt.get("host_attestation_id") or "").strip() or None,
             "health_mode": health_mode,
             "primary_goal": receipt["primary_goal"],

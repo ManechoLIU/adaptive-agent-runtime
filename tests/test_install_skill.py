@@ -494,6 +494,92 @@ class InstallMigrationContractTests(unittest.TestCase):
             self.assertEqual(second["upgrade_lineage"]["previous_revision"], first["revision"])
             self.assertEqual(second["upgrade_lineage"]["revision"], second["revision"])
 
+    def test_runtime_release_regression_gate_requires_contract_files_for_full_web_runtime(self):
+        import subprocess
+        from scripts.install_skill import _verify_runtime_release_regressions
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            (source / "scripts" / "web_agent_execution.py").write_text("# web runtime\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "full web runtime marker"], check=True, capture_output=True)
+            revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+
+            with self.assertRaisesRegex(ValueError, "required files are missing"):
+                _verify_runtime_release_regressions(source, revision)
+
+    def test_runtime_release_regression_gate_runs_required_tests_from_immutable_revision(self):
+        import subprocess
+        from scripts.install_skill import _verify_runtime_release_regressions, RUNTIME_RELEASE_REGRESSION_TESTS
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            for name in ("web_agent_execution.py", "web_reentry_adapter.py"):
+                (source / "scripts" / name).write_text("# runtime\n", encoding="utf-8")
+            tests_dir = source / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+            (tests_dir / "test_web_reentry_adapter.py").write_text(
+                "import unittest\n"
+                "class WebReentryContinuationRegressionTests(unittest.TestCase):\n"
+                "    def test_transient_web_reentry_failure_rearms_existing_continuation_supervisor(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_web_collaboration_continuation.py").write_text(
+                "import unittest\n"
+                "class WebCollaborationContinuationRegressionTests(unittest.TestCase):\n"
+                "    def test_regression_parent_already_yielded_then_writer_completed_wakes_same_controller_with_next_runnable(self): self.assertTrue(True)\n"
+                "    def test_completed_reviewer_uses_same_terminal_continuation_path(self): self.assertTrue(True)\n"
+                "    def test_stale_child_is_second_observed_by_existing_audit_and_wakes_same_controller(self): self.assertTrue(True)\n"
+                "    def test_duplicate_terminal_observation_after_confirmed_continuation_does_not_wake_twice(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "release regressions"], check=True, capture_output=True)
+            revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+
+            result = _verify_runtime_release_regressions(source, revision)
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(tuple(result["tests"]), RUNTIME_RELEASE_REGRESSION_TESTS)
+
+    def test_runtime_release_regression_gate_blocks_failing_required_case(self):
+        import subprocess
+        from scripts.install_skill import _verify_runtime_release_regressions
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            for name in ("web_agent_execution.py", "web_reentry_adapter.py"):
+                (source / "scripts" / name).write_text("# runtime\n", encoding="utf-8")
+            tests_dir = source / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+            (tests_dir / "test_web_reentry_adapter.py").write_text(
+                "import unittest\n"
+                "class WebReentryContinuationRegressionTests(unittest.TestCase):\n"
+                "    def test_transient_web_reentry_failure_rearms_existing_continuation_supervisor(self):\n"
+                "        self.fail('regression returned')\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_web_collaboration_continuation.py").write_text(
+                "import unittest\n"
+                "class WebCollaborationContinuationRegressionTests(unittest.TestCase):\n"
+                "    def test_regression_parent_already_yielded_then_writer_completed_wakes_same_controller_with_next_runnable(self): self.assertTrue(True)\n"
+                "    def test_completed_reviewer_uses_same_terminal_continuation_path(self): self.assertTrue(True)\n"
+                "    def test_stale_child_is_second_observed_by_existing_audit_and_wakes_same_controller(self): self.assertTrue(True)\n"
+                "    def test_duplicate_terminal_observation_after_confirmed_continuation_does_not_wake_twice(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "failing release regression"], check=True, capture_output=True)
+            revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+
+            with self.assertRaisesRegex(ValueError, "Runtime release regression gate failed"):
+                _verify_runtime_release_regressions(source, revision)
+
     def test_fresh_install_manifest_reports_product_and_host_capabilities_without_new_state_identity(self):
         from scripts.install_skill import install_skill
         with tempfile.TemporaryDirectory() as d:
