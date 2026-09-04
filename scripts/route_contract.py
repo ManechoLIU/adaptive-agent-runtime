@@ -172,6 +172,59 @@ def _policy_field_assignments(line: str) -> tuple[dict[str, str], int | None]:
     return values, first_start
 
 
+POSITIVE_POLICY_PREFIX_WORDS = {
+    "default",
+    "fallback",
+    "route",
+    "默认",
+    "回退",
+    "备用",
+    "默认路由",
+    "回退路由",
+}
+
+
+def _ascii_marker_match(text: str, marker: str) -> list[tuple[int, int]]:
+    return [
+        match.span()
+        for match in re.finditer(
+            rf"(?<![A-Za-z0-9_-]){re.escape(marker)}(?![A-Za-z0-9_-])",
+            text,
+            re.IGNORECASE,
+        )
+    ]
+
+
+def _policy_prefix_is_positive(prefix: str, markers: tuple[str, ...]) -> bool:
+    """Accept only a small positive declaration grammar before route fields."""
+    normalized = _normalize_policy_symbols(prefix).casefold().strip()
+    if not normalized:
+        return not markers
+
+    spans: list[tuple[int, int]] = []
+    for marker in markers:
+        token = _normalize_policy_symbols(marker).casefold()
+        if token.isascii():
+            spans.extend(_ascii_marker_match(normalized, token))
+        else:
+            spans.extend(
+                match.span()
+                for match in re.finditer(re.escape(token), normalized)
+            )
+
+    for start, end in spans:
+        remainder = normalized[:start] + " " + normalized[end:]
+        remainder = re.sub(r"[:：,，;；/\|()\[\]{}<>]+", " ", remainder)
+        remainder = re.sub(r"[-_]+", " ", remainder)
+        remainder = re.sub(r"\s+", " ", remainder).strip()
+        if not remainder:
+            return True
+        words = remainder.split(" ")
+        if all(word in POSITIVE_POLICY_PREFIX_WORDS for word in words):
+            return True
+    return False
+
+
 def _policy_class_marker_matches(prefix: str, markers: tuple[str, ...]) -> bool:
     if not markers:
         return True
@@ -201,7 +254,10 @@ def _active_policy_route_declaration(
     values, first_start = _policy_field_assignments(line)
     if first_start is None or set(values) != set(POLICY_ROUTE_FIELDS):
         return None
-    if not _policy_class_marker_matches(line[:first_start], markers):
+    prefix = line[:first_start]
+    if not _policy_class_marker_matches(prefix, markers):
+        return None
+    if not _policy_prefix_is_positive(prefix, markers):
         return None
     return values
 

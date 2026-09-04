@@ -112,6 +112,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
     "test_route_policy_normalizes_unicode_dash_variants_before_authorization",
     "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
+    "test_route_policy_uses_positive_prefix_grammar_not_negative_phrase_allowlist",
+    "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
     "test_route_policy_accepts_explicit_web_class_marker_before_fields",
     "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
     "test_route_policy_rejects_tilde_fenced_route_examples",

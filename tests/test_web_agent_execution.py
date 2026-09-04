@@ -1183,6 +1183,10 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             "frontend must−not use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
             "frontend backup－provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
             "frontend backup–provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "not frontend: provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend excluded provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend exclude route provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend no route provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
         ]
         route = {
             "decision": "default",
@@ -1204,6 +1208,55 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
                     route_policy_errors(f"T-INACTIVE-{index}", candidate),
                     [f"T-INACTIVE-{index} route is not declared by policy source"],
                 )
+
+    def test_route_policy_uses_positive_prefix_grammar_not_negative_phrase_allowlist(self):
+        from scripts.route_contract import route_policy_errors
+
+        documents = [
+            "not frontend: provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend excluded provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend exclude route provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend no route provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend unknown-directive provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+        ]
+        route = {
+            "decision": "default",
+            "policy_class": "frontend",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "auth_mode": "host",
+        }
+        for index, line in enumerate(documents):
+            with self.subTest(line=line):
+                policy = Path(self.tmp.name) / f"negative-prefix-{index}.md"
+                policy.write_text(line + chr(10), encoding="utf-8")
+                candidate = dict(route)
+                candidate["policy_source"] = {
+                    "path": str(policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+                }
+                self.assertEqual(
+                    route_policy_errors(f"T-PREFIX-{index}", candidate),
+                    [f"T-PREFIX-{index} route is not declared by policy source"],
+                )
+
+        for index, line in enumerate(
+            [
+                "frontend provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+                "frontend default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+                "frontend fallback route provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+                "前端默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。",
+            ]
+        ):
+            with self.subTest(active=line):
+                policy = Path(self.tmp.name) / f"positive-prefix-{index}.md"
+                policy.write_text(line + chr(10), encoding="utf-8")
+                candidate = dict(route)
+                candidate["policy_source"] = {
+                    "path": str(policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+                }
+                self.assertEqual(route_policy_errors(f"T-POSITIVE-{index}", candidate), [])
 
     def test_route_policy_normalizes_unicode_dash_variants_before_authorization(self):
         from scripts.route_contract import UNICODE_DASH_EQUIVALENTS, route_policy_errors
