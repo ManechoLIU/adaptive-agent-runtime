@@ -91,7 +91,10 @@ INACTIVE_POLICY_LINE_MARKERS = (
     "e.g.",
     "eg:",
     "historical",
-    "legacy only",
+    "obsolete",
+    "retired",
+    "old route",
+    "legacy",
     "禁止",
     "不允许",
     "不要",
@@ -118,16 +121,29 @@ POLICY_FIELD_PATTERN = re.compile(
 )
 
 
+def _normalized_policy_text(value: str) -> str:
+    lowered = value.casefold()
+    lowered = re.sub(r"[-_‐‑‒–—−]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
 def _active_policy_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
-    if stripped.startswith(("#", "//", "<!--", ">")):
+    if line.startswith(("    ", "	")):
+        return False
+    if stripped.startswith(("#", "//", "<!--", "-->", ">")):
+        return False
+    if chr(96) in stripped:
         return False
     if any(marker in stripped for marker in POLICY_INLINE_COMMENT_MARKERS):
         return False
-    lowered = stripped.casefold()
-    return not any(token.casefold() in lowered for token in INACTIVE_POLICY_LINE_MARKERS)
+    normalized = _normalized_policy_text(stripped)
+    return not any(
+        _normalized_policy_text(token) in normalized
+        for token in INACTIVE_POLICY_LINE_MARKERS
+    )
 
 
 def _policy_field_assignments(line: str) -> tuple[dict[str, str], int | None]:
@@ -157,7 +173,11 @@ def _policy_class_marker_matches(prefix: str, markers: tuple[str, ...]) -> bool:
             ):
                 return True
         elif token in lowered:
-            return True
+            for match in re.finditer(re.escape(token), lowered):
+                prefix = lowered[: match.start()].rstrip()
+                if prefix.endswith(("非", "不", "无")):
+                    continue
+                return True
     return False
 
 
@@ -211,14 +231,30 @@ def route_policy_errors(task_id: str, route: dict[str, Any]) -> list[str]:
     policy_class = str(route.get("policy_class", "")).strip().lower()
     markers = ROUTE_CLASS_MARKERS.get(policy_class, (policy_class,)) if policy_class else ()
     policy_text = payload.decode("utf-8", errors="replace")
-    in_fence = False
-    fence = chr(96) * 3
+    active_fence: str | None = None
+    in_html_comment = False
+    fence_tokens = (chr(96) * 3, "~" * 3)
     for line in policy_text.splitlines():
         stripped = line.strip()
-        if stripped.startswith(fence):
-            in_fence = not in_fence
+        if in_html_comment:
+            if "-->" in stripped:
+                in_html_comment = False
             continue
-        if in_fence:
+        if "<!--" in stripped:
+            if "-->" not in stripped.split("<!--", 1)[1]:
+                in_html_comment = True
+            continue
+        matched_fence = next(
+            (token for token in fence_tokens if stripped.startswith(token)),
+            None,
+        )
+        if matched_fence is not None:
+            if active_fence is None:
+                active_fence = matched_fence
+            elif matched_fence == active_fence:
+                active_fence = None
+            continue
+        if active_fence is not None:
             continue
         declaration = _active_policy_route_declaration(line, markers)
         if declaration is None:

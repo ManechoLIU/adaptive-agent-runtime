@@ -1173,6 +1173,10 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             "provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
             "frontend provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host. # historical only",
             "frontend must not use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend must-not use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend must_not use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend should-not use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend may-not use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
             "frontend never use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
             "frontend backup-provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
         ]
@@ -1195,6 +1199,54 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
                 self.assertEqual(
                     route_policy_errors(f"T-INACTIVE-{index}", candidate),
                     [f"T-INACTIVE-{index} route is not declared by policy source"],
+                )
+
+    def test_route_policy_rejects_tilde_fenced_route_examples(self):
+        from scripts.route_contract import route_policy_errors
+
+        fence = "~" * 3
+        inline = chr(96)
+        bad_documents = [
+            fence
+            + "text"
+            + chr(10)
+            + "frontend provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host."
+            + chr(10)
+            + fence
+            + chr(10),
+            "<!--"
+            + chr(10)
+            + "frontend provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host."
+            + chr(10)
+            + "-->"
+            + chr(10),
+            "    frontend provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host."
+            + chr(10),
+            "frontend "
+            + inline
+            + "provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host"
+            + inline
+            + chr(10),
+        ]
+        route = {
+            "decision": "default",
+            "policy_class": "frontend",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "auth_mode": "host",
+        }
+        for index, text in enumerate(bad_documents):
+            with self.subTest(index=index):
+                policy = Path(self.tmp.name) / f"code-example-{index}.md"
+                policy.write_text(text, encoding="utf-8")
+                candidate = dict(route)
+                candidate["policy_source"] = {
+                    "path": str(policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+                }
+                self.assertEqual(
+                    route_policy_errors(f"T-CODE-{index}", candidate),
+                    [f"T-CODE-{index} route is not declared by policy source"],
                 )
 
     def test_route_policy_accepts_explicit_web_class_marker_before_fields(self):

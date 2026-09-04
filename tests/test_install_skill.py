@@ -670,6 +670,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_route_policy_accepts_active_rule_after_inactive_examples(self): self.assertTrue(True)\n"
                 "    def test_route_policy_rejects_inline_comments_negation_hyphen_prefix_and_value_only_class_marker(self): self.assertTrue(True)\n"
                 "    def test_route_policy_accepts_explicit_web_class_marker_before_fields(self): self.assertTrue(True)\n"
+                "    def test_route_policy_rejects_tilde_fenced_route_examples(self): self.assertTrue(True)\n"
                 "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
                 "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n"
                 "    def test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path(self): self.assertTrue(True)\n",
@@ -767,6 +768,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_route_policy_accepts_active_rule_after_inactive_examples(self): self.assertTrue(True)\n"
                 "    def test_route_policy_rejects_inline_comments_negation_hyphen_prefix_and_value_only_class_marker(self): self.assertTrue(True)\n"
                 "    def test_route_policy_accepts_explicit_web_class_marker_before_fields(self): self.assertTrue(True)\n"
+                "    def test_route_policy_rejects_tilde_fenced_route_examples(self): self.assertTrue(True)\n"
                 "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
                 "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n"
                 "    def test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path(self): self.assertTrue(True)\n",

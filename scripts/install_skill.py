@@ -111,6 +111,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_route_policy_rejects_inline_comments_negation_hyphen_prefix_and_value_only_class_marker",
     "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
     "test_route_policy_accepts_explicit_web_class_marker_before_fields",
+    "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
+    "test_route_policy_rejects_tilde_fenced_route_examples",
     "tests.test_web_agent_execution.StructuredCollaborationTerminalTests."
     "test_public_structured_terminal_ingest_rejects_caller_supplied_observation",
     "tests.test_web_agent_execution.StructuredCollaborationTerminalTests."
