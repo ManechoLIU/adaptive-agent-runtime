@@ -79,7 +79,16 @@ def _attestation(event: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("host attestation must be verified, fresh, and non-replayed")
     if str(verified.get("observation_id") or "") != observation_id:
         raise ValueError("host verifier observation identity mismatch")
-    return att
+    normalized = dict(att)
+    if str(event.get("state") or "").strip().lower() == "started":
+        attested_started_at = _event_time(att.get("observed_at"))
+        verified_started_at = _event_time(verified.get("observed_at"))
+        if attested_started_at is None or verified_started_at is None:
+            raise ValueError("Host started attestation requires machine-observed started timestamp")
+        if attested_started_at != verified_started_at:
+            raise ValueError("Host verifier started timestamp mismatch")
+        normalized["observed_at"] = _iso(attested_started_at)
+    return normalized
 
 
 def _current_lease(repo: Path, assignment_id: str, conversation_id: str) -> dict[str, Any]:
@@ -648,6 +657,7 @@ def _reverify_observed_dispatch_ticket(
             "source": source,
             "observation_id": expected_observation,
             "conversation_id": expected_conversation,
+            "observed_at": att.get("observed_at"),
         }
 
     raise PermissionError("persisted Web observation has untrusted provenance")
@@ -816,16 +826,28 @@ def _start_bound_web_assignment(
         raise PermissionError(
             "Web Assignment start requires a prepared dispatch with persisted verified started observation"
         )
-    _reverify_observed_dispatch_ticket(repo=repo_path, ticket=ticket)
+    verified_observation = _reverify_observed_dispatch_ticket(repo=repo_path, ticket=ticket)
+    execution_started_at = _event_time(
+        verified_observation.get("timestamp") or verified_observation.get("observed_at")
+    )
+    if execution_started_at is None:
+        raise PermissionError(
+            "Web Assignment start requires reverified machine-observed started timestamp"
+        )
+    if execution_started_at > now:
+        raise PermissionError("machine-observed Web start cannot be in the future")
+    prepared_at = _event_time(ticket.get("prepared_at"))
+    if prepared_at is None or execution_started_at < prepared_at:
+        raise PermissionError("machine-observed Web start predates its prepared dispatch ticket")
     attempt = int(assignment.get("attempt", 1))
     if not assignment_id:
         raise ValueError("Web execution Assignment requires assignment_id")
     lease_id = str(assignment.get("lease_id") or f"{assignment_id}:web:attempt:{attempt}")
     receipt = _dispatch_start_receipt(
         repo=repo_path, controller_id=controller_id, conversation_id=conversation_id,
-        assignment=assignment, now=now, attempt=attempt, lease_id=lease_id,
+        assignment=assignment, now=execution_started_at, attempt=attempt, lease_id=lease_id,
     )
-    runtime = apply_runtime_receipt(repo_path, receipt, now=now)
+    runtime = apply_runtime_receipt(repo_path, receipt, now=execution_started_at)
     lease = runtime["leases"][assignment_id]
     launcher = watchdog_launcher or _default_watchdog_launcher
     watchdog = launcher(
@@ -1289,6 +1311,7 @@ def _apply_verified_web_execution_event(
             "model": observed_model,
             "agent_type": observed_agent_type,
             "host_event": json.loads(json.dumps(event)),
+            "timestamp": att.get("observed_at"),
         }
         _persist_observed_dispatch(
             repo=repo,

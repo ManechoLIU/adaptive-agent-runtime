@@ -103,14 +103,19 @@ class WebAgentExecutionTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def attestation(self, state, *, source="chatgpt_host_event", conversation="conv-1"):
-        return {
+    def attestation(
+        self, state, *, source="chatgpt_host_event", conversation="conv-1", observed_at=None
+    ):
+        value = {
             "kind": "web_execution_state",
             "source": source,
             "observation_id": f"obs:{state}:{conversation}",
             "conversation_id": conversation,
             "state": state,
         }
+        if observed_at is not None:
+            value["observed_at"] = observed_at.isoformat()
+        return value
 
     def assignment(self, **extra):
         value = {
@@ -174,17 +179,20 @@ class WebAgentExecutionTests(unittest.TestCase):
                 "assignment": assignment,
                 "model": assignment["model"],
                 "agent_type": assignment["agent_type"],
-                "attestation": self.attestation("running"),
+                "attestation": self.attestation("running", observed_at=T0),
             },
             now=T0,
             runtime_change_consumer=self._runtime_change, host_verifier=self._verify_host,
         )
 
     def _verify_host(self, attestation, event):
-        return {
+        result = {
             "verified": True, "fresh": True, "replay": False,
             "observation_id": attestation["observation_id"],
         }
+        if attestation.get("observed_at"):
+            result["observed_at"] = attestation["observed_at"]
+        return result
 
     def _runtime_change(self, **kwargs):
         self.runtime_wakes.append(kwargs)
@@ -234,7 +242,9 @@ class WebAgentExecutionTests(unittest.TestCase):
                     "conversation_id": "conv-direct",
                     "state": "started",
                     "assignment": self.assignment(),
-                    "attestation": self.attestation("running", conversation="conv-direct"),
+                    "attestation": self.attestation(
+                        "running", conversation="conv-direct", observed_at=T0
+                    ),
                 },
                 now=T0,
                 runtime_change_consumer=self._runtime_change,
@@ -254,6 +264,103 @@ class WebAgentExecutionTests(unittest.TestCase):
             ["task:T-1", f"worktree:{self.repo.resolve()}"],
         )
         self.assertNotEqual(lease["session_id"], "controller-1")
+
+    def test_host_started_lease_uses_attested_machine_start_time_not_ingestion_time(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        assignment = self.assignment(assignment_id="A-HOST-TIME", lease_id="A-HOST-TIME:web:attempt:1")
+        trusted = {
+            "ready": True,
+            "reason": "test_host_attested",
+            "event_paths": [str((Path(self.tmp.name) / "host-events-time.jsonl").resolve())],
+        }
+        prepared_at = T0 - timedelta(seconds=5)
+        machine_started_at = T0 - timedelta(seconds=2)
+        ingestion_at = T0 + timedelta(minutes=7)
+        with patch("scripts.web_agent_execution._machine_event_source_context", return_value=trusted):
+            prepared = prepare_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                task_name="host-machine-start-time",
+                assignment=assignment,
+                now=prepared_at,
+                health_probe=lambda: True,
+            )
+        verified_web_execution_event(
+            repo=self.repo,
+            registry_path=self.registry,
+            event={
+                "controller_id": "controller-1",
+                "conversation_id": "conv-host-time",
+                "state": "started",
+                "dispatch_id": prepared["dispatch_id"],
+                "assignment": assignment,
+                "model": assignment["model"],
+                "agent_type": assignment["agent_type"],
+                "attestation": self.attestation(
+                    "running",
+                    conversation="conv-host-time",
+                    observed_at=machine_started_at,
+                ),
+            },
+            now=ingestion_at,
+            runtime_change_consumer=self._runtime_change,
+            host_verifier=self._verify_host,
+        )
+        lease = load_runtime_state(self.repo)["leases"]["A-HOST-TIME"]
+        self.assertEqual(lease["started_at"], machine_started_at.isoformat())
+        self.assertNotEqual(lease["started_at"], ingestion_at.isoformat())
+
+    def test_host_started_rejects_unattested_or_mismatched_machine_start_time(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        assignment = self.assignment(assignment_id="A-HOST-TIME-BAD", lease_id="A-HOST-TIME-BAD:web:attempt:1")
+        trusted = {
+            "ready": True,
+            "reason": "test_host_attested",
+            "event_paths": [str((Path(self.tmp.name) / "host-events-time-bad.jsonl").resolve())],
+        }
+        with patch("scripts.web_agent_execution._machine_event_source_context", return_value=trusted):
+            prepared = prepare_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                task_name="host-machine-start-time-bad",
+                assignment=assignment,
+                now=T0 - timedelta(seconds=5),
+                health_probe=lambda: True,
+            )
+        event = {
+            "controller_id": "controller-1",
+            "conversation_id": "conv-host-time-bad",
+            "state": "started",
+            "dispatch_id": prepared["dispatch_id"],
+            "assignment": assignment,
+            "model": assignment["model"],
+            "agent_type": assignment["agent_type"],
+            "attestation": self.attestation(
+                "running",
+                conversation="conv-host-time-bad",
+                observed_at=T0 - timedelta(seconds=2),
+            ),
+        }
+        def mismatched_verifier(attestation, _event):
+            return {
+                "verified": True,
+                "fresh": True,
+                "replay": False,
+                "observation_id": attestation["observation_id"],
+                "observed_at": T0.isoformat(),
+            }
+        with self.assertRaisesRegex(ValueError, "started timestamp mismatch"):
+            verified_web_execution_event(
+                repo=self.repo,
+                registry_path=self.registry,
+                event=event,
+                now=T0,
+                runtime_change_consumer=self._runtime_change,
+                host_verifier=mismatched_verifier,
+            )
+        self.assertNotIn("A-HOST-TIME-BAD", load_runtime_state(self.repo).get("leases", {}))
 
     def test_heartbeat_proves_liveness_but_not_progress(self):
         self.start()

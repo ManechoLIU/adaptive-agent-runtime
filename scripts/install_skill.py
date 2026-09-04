@@ -85,6 +85,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_direct_start_web_assignment_is_rejected_even_with_forged_readiness_probe",
     "tests.test_web_agent_execution.WebAgentExecutionTests."
     "test_public_web_adapter_rejects_self_asserted_strong_attestation",
+    "tests.test_web_agent_execution.WebAgentExecutionTests."
+    "test_host_started_lease_uses_attested_machine_start_time_not_ingestion_time",
+    "tests.test_web_agent_execution.WebAgentExecutionTests."
+    "test_host_started_rejects_unattested_or_mismatched_machine_start_time",
     "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
     "test_machine_event_source_public_status_cannot_accept_caller_verifier",
     "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
