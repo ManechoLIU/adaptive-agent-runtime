@@ -573,8 +573,10 @@ def _refresh_for_correction(
     state: dict[str, Any],
     reason: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    repo = _repo_root(str(event.get("cwd", "") or Path.cwd()))
-    receipt = initialize_project_context(repo, skill_root=skill_root)
+    working_directory = Path(
+        str(event.get("cwd", "") or Path.cwd())
+    ).expanduser().resolve()
+    receipt = initialize_project_context(working_directory, skill_root=skill_root)
     prompt = str(state.get("prompt", ""))
     mechanism = resolve_existing_mechanism(prompt, receipt=receipt, skill_root=skill_root)
     state.update(

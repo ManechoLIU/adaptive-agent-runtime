@@ -151,6 +151,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_not_found_unknown_token_does_not_authorize_fabricated_definitive_mechanism",
     "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop",
+    "tests.test_project_context_guard.ProjectContextGuardTests."
+    "test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain",
     "tests.test_web_agent_events.WebAgentMachineEventSourceTests."
     "test_caller_created_file_inside_codex_session_root_cannot_self_attest",
     "tests.test_web_agent_events.WebAgentMachineEventSourceTests."

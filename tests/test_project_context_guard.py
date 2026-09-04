@@ -369,6 +369,58 @@ class ProjectContextGuardTests(unittest.TestCase):
                     output["hookSpecificOutput"]["additionalContext"],
                 )
 
+    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self):
+        hook = self.hook()
+        nested = self.repo / "packages" / "web"
+        nested.mkdir(parents=True)
+        (self.repo / "packages" / "AGENTS.md").write_text(
+            "package-rule" + chr(10),
+            encoding="utf-8",
+        )
+        (nested / "AGENTS.md").write_text(
+            "nested-web-rule" + chr(10),
+            encoding="utf-8",
+        )
+        _, state = hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "reader-session",
+                "turn_id": "nested-refresh",
+                "cwd": str(nested),
+                "prompt": "当前项目规则是什么？",
+            },
+            skill_root=self.skill,
+            prior_state={},
+        )
+        initial = state["project_context_receipt"]
+        self.assertEqual(Path(initial["working_directory"]).resolve(), nested.resolve())
+        self.assertIn("package-rule", initial["sources"]["agents"]["content"])
+        self.assertIn("nested-web-rule", initial["sources"]["agents"]["content"])
+
+        runtime_path = Path(initial["sources"]["runtime_state"]["path"])
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.write_text(
+            json.dumps({"schema_version": 1, "leases": {}}) + chr(10),
+            encoding="utf-8",
+        )
+        blocked, state = hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "reader-session",
+                "turn_id": "nested-refresh",
+                "cwd": str(nested),
+                "last_assistant_message": "当前项目规则已确认。",
+            },
+            skill_root=self.skill,
+            prior_state=state,
+        )
+        self.assertEqual(blocked["decision"], "block")
+        refreshed = state["project_context_receipt"]
+        self.assertEqual(Path(refreshed["working_directory"]).resolve(), nested.resolve())
+        self.assertIn("package-rule", refreshed["sources"]["agents"]["content"])
+        self.assertIn("nested-web-rule", refreshed["sources"]["agents"]["content"])
+        self.assertEqual(refreshed["sources"]["runtime_state"]["status"], "verified")
+
     def test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction(self):
         hook = self.hook()
         _, state = hook.evaluate_event(

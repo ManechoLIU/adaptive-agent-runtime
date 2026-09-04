@@ -642,7 +642,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_existing_scoring_model_request_must_resolve_real_current_definition(self): self.assertTrue(True)\n"
                 "    def test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction(self): self.assertTrue(True)\n"
                 "    def test_not_found_unknown_token_does_not_authorize_fabricated_definitive_mechanism(self): self.assertTrue(True)\n"
-                "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n",
+                "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n"
+                "    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(
@@ -779,7 +780,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_existing_scoring_model_request_must_resolve_real_current_definition(self): self.assertTrue(True)\n"
                 "    def test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction(self): self.assertTrue(True)\n"
                 "    def test_not_found_unknown_token_does_not_authorize_fabricated_definitive_mechanism(self): self.assertTrue(True)\n"
-                "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n",
+                "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n"
+                "    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(
