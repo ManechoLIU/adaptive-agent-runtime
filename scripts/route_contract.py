@@ -71,43 +71,107 @@ INACTIVE_POLICY_LINE_MARKERS = (
     "disabled",
     "deprecated",
     "forbidden",
+    "must not",
+    "mustn't",
+    "should not",
+    "shouldn't",
+    "may not",
+    "cannot",
+    "can't",
+    "never",
     "do not",
     "don't",
     "not allowed",
+    "not authorized",
+    "not permitted",
+    "not recommended",
+    "deny",
+    "denied",
     "example",
     "e.g.",
     "eg:",
+    "historical",
+    "legacy only",
     "禁止",
     "不允许",
     "不要",
     "勿用",
+    "不可",
+    "不得",
+    "不能",
+    "禁用",
     "废弃",
+    "不推荐",
     "示例",
     "例如",
     "历史规则",
+    "仅历史",
 )
 
 
-def _active_policy_line(line: str, markers: tuple[str, ...]) -> bool:
+POLICY_INLINE_COMMENT_MARKERS = ("#", "//", "<!--")
+POLICY_ROUTE_FIELDS = ("provider", "model", "auth_mode")
+POLICY_FIELD_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<field>provider|model|auth_mode)"
+    r"\s*=\s*(?P<value>[A-Za-z0-9_.:+/-]+)",
+    re.IGNORECASE,
+)
+
+
+def _active_policy_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
     if stripped.startswith(("#", "//", "<!--", ">")):
         return False
-    lowered = stripped.casefold()
-    if any(token.casefold() in lowered for token in INACTIVE_POLICY_LINE_MARKERS):
+    if any(marker in stripped for marker in POLICY_INLINE_COMMENT_MARKERS):
         return False
-    return not markers or any(marker.casefold() in lowered for marker in markers)
+    lowered = stripped.casefold()
+    return not any(token.casefold() in lowered for token in INACTIVE_POLICY_LINE_MARKERS)
 
 
-def _policy_field_matches(line: str, field: str, value: str) -> bool:
-    pattern = (
-        rf"(?<![A-Za-z0-9_]){re.escape(field)}"
-        rf"{chr(92)}s*={chr(92)}s*{re.escape(value)}"
-        rf"(?=$|[{chr(92)}s,;，；。.、])"
-    )
-    return bool(re.search(pattern, line, re.IGNORECASE))
+def _policy_field_assignments(line: str) -> tuple[dict[str, str], int | None]:
+    values: dict[str, str] = {}
+    first_start: int | None = None
+    for match in POLICY_FIELD_PATTERN.finditer(line):
+        field = match.group("field").casefold()
+        value = match.group("value").strip().rstrip(".")
+        if first_start is None:
+            first_start = match.start()
+        if field in values and values[field] != value:
+            return {}, first_start
+        values[field] = value
+    return values, first_start
 
+
+def _policy_class_marker_matches(prefix: str, markers: tuple[str, ...]) -> bool:
+    if not markers:
+        return True
+    lowered = prefix.casefold()
+    for marker in markers:
+        token = marker.casefold()
+        if token.isascii():
+            if re.search(
+                rf"(?<![A-Za-z0-9_-]){re.escape(token)}(?![A-Za-z0-9_-])",
+                lowered,
+            ):
+                return True
+        elif token in lowered:
+            return True
+    return False
+
+
+def _active_policy_route_declaration(
+    line: str, markers: tuple[str, ...]
+) -> dict[str, str] | None:
+    if not _active_policy_line(line):
+        return None
+    values, first_start = _policy_field_assignments(line)
+    if first_start is None or set(values) != set(POLICY_ROUTE_FIELDS):
+        return None
+    if not _policy_class_marker_matches(line[:first_start], markers):
+        return None
+    return values
 
 def route_policy_errors(task_id: str, route: dict[str, Any]) -> list[str]:
     source = route.get("policy_source")
@@ -154,10 +218,13 @@ def route_policy_errors(task_id: str, route: dict[str, Any]) -> list[str]:
         if stripped.startswith(fence):
             in_fence = not in_fence
             continue
-        if in_fence or not _active_policy_line(line, markers):
+        if in_fence:
+            continue
+        declaration = _active_policy_route_declaration(line, markers)
+        if declaration is None:
             continue
         if all(
-            _policy_field_matches(line, field, value)
+            declaration.get(field, "").casefold() == value.casefold()
             for field, value in route_values.items()
         ):
             return []

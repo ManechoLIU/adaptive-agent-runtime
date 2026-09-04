@@ -1166,6 +1166,58 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             ["T-INACTIVE route is not declared by policy source"],
         )
 
+    def test_route_policy_rejects_inline_comments_negation_hyphen_prefix_and_value_only_class_marker(self):
+        from scripts.route_contract import route_policy_errors
+
+        bad_lines = [
+            "provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host. # historical only",
+            "frontend must not use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend never use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend backup-provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+        ]
+        route = {
+            "decision": "default",
+            "policy_class": "frontend",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "auth_mode": "host",
+        }
+        for index, line in enumerate(bad_lines):
+            with self.subTest(line=line):
+                policy = Path(self.tmp.name) / f"inactive-policy-{index}.md"
+                policy.write_text(line + chr(10), encoding="utf-8")
+                candidate = dict(route)
+                candidate["policy_source"] = {
+                    "path": str(policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+                }
+                self.assertEqual(
+                    route_policy_errors(f"T-INACTIVE-{index}", candidate),
+                    [f"T-INACTIVE-{index} route is not declared by policy source"],
+                )
+
+    def test_route_policy_accepts_explicit_web_class_marker_before_fields(self):
+        from scripts.route_contract import route_policy_errors
+        policy = Path(self.tmp.name) / "web-class-policy.md"
+        policy.write_text(
+            "Web 默认 provider = chatgpt_web, model = gpt-5.6-sol, auth_mode = host."
+            + chr(10),
+            encoding="utf-8",
+        )
+        route = {
+            "decision": "default",
+            "policy_class": "frontend",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "auth_mode": "host",
+            "policy_source": {
+                "path": str(policy.resolve()),
+                "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+            },
+        }
+        self.assertEqual(route_policy_errors("T-WEB-CLASS", route), [])
+
     def test_route_policy_accepts_active_rule_after_inactive_examples(self):
         from scripts.route_contract import route_policy_errors
         policy = Path(self.tmp.name) / "active-policy.md"
