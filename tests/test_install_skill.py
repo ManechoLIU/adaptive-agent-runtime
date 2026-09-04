@@ -402,6 +402,44 @@ class InstallMigrationContractTests(unittest.TestCase):
             self.assertEqual(manifest["capabilities"]["core"]["status"], "enabled")
             self.assertFalse((target.parent / "adaptive-agent-runtime").exists())
 
+    def test_install_rejects_previous_revision_override_of_manifest_truth(self):
+        import json
+        import subprocess
+        from scripts.install_skill import MANIFEST_NAME, install_skill
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            installed_revision = subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+            ).strip()
+            (source / "SKILL.md").write_text(
+                "---\nname: adaptive-agent-runtime\n---\n# Adaptive Agent Runtime\n# next\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "next"], check=True, capture_output=True)
+            candidate = subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+            ).strip()
+            target = root / "installed" / "adaptive-delivery"
+            target.mkdir(parents=True)
+            (target / MANIFEST_NAME).write_text(json.dumps({
+                "schema_version": 1,
+                "revision": installed_revision,
+                "files": {},
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "previous revision override"):
+                install_skill(
+                    source,
+                    target,
+                    summary="must trust installed manifest",
+                    impact="none",
+                    stop_condition="manifest revision is authoritative",
+                    previous_revision=candidate,
+                )
+
     def test_install_blocks_upgrade_when_installed_revision_is_absent_from_candidate_history(self):
         import json
         from scripts.install_skill import MANIFEST_NAME, install_skill
@@ -493,6 +531,43 @@ class InstallMigrationContractTests(unittest.TestCase):
             self.assertEqual(second["upgrade_lineage"]["status"], "linear")
             self.assertEqual(second["upgrade_lineage"]["previous_revision"], first["revision"])
             self.assertEqual(second["upgrade_lineage"]["revision"], second["revision"])
+
+    def test_full_web_runtime_upgrade_cannot_delete_marker_to_skip_release_gate(self):
+        import json
+        import subprocess
+        from scripts.install_skill import MANIFEST_NAME, install_skill
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            (source / "scripts" / "web_agent_execution.py").write_text("# web runtime\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "full runtime"], check=True, capture_output=True)
+            installed_revision = subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+            ).strip()
+            target = root / "installed" / "adaptive-delivery"
+            target.mkdir(parents=True)
+            (target / "scripts").mkdir()
+            (target / "scripts" / "web_agent_execution.py").write_text("# installed web runtime\n", encoding="utf-8")
+            (target / MANIFEST_NAME).write_text(json.dumps({
+                "schema_version": 1,
+                "revision": installed_revision,
+                "files": {"scripts/web_agent_execution.py": "present"},
+            }), encoding="utf-8")
+
+            (source / "scripts" / "web_agent_execution.py").unlink()
+            subprocess.run(["git", "-C", str(source), "add", "-A"], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "accidentally remove web runtime"], check=True, capture_output=True)
+
+            with self.assertRaisesRegex(ValueError, "required files are missing"):
+                install_skill(
+                    source,
+                    target,
+                    summary="must not skip regression gate",
+                    impact="none",
+                    stop_condition="full runtime release gate remains mandatory",
+                )
 
     def test_runtime_release_regression_gate_requires_contract_files_for_full_web_runtime(self):
         import subprocess

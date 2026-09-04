@@ -811,11 +811,18 @@ def _materialize_revision(source: Path, revision: str, destination: Path) -> lis
     return sorted(tracked)
 
 
-def _verify_runtime_release_regressions(source: Path, revision: str) -> dict[str, Any]:
+def _verify_runtime_release_regressions(
+    source: Path,
+    revision: str,
+    *,
+    required: bool = False,
+) -> dict[str, Any]:
     """Run immutable same-controller Web continuation regressions before installation."""
     tracked = {entry[3] for entry in _revision_tree_entries(source, revision)}
-    # Older/minimal packages without Web Assignment execution predate this release contract.
-    if "scripts/web_agent_execution.py" not in tracked:
+    # A genuinely pre-Web/minimal package may remain not-applicable. Once the installed
+    # Runtime has Web execution, however, removing the marker is a downgrade attempt and
+    # the required-file gate must fail closed instead of disabling itself.
+    if "scripts/web_agent_execution.py" not in tracked and not required:
         return {"status": "not_applicable", "tests": []}
 
     missing = sorted(path for path in RUNTIME_RELEASE_REQUIRED_FILES if path not in tracked)
@@ -888,9 +895,28 @@ def install_skill(
     target_path.parent.mkdir(parents=True, exist_ok=True)
     prior_manifest = _read_manifest(target_path / MANIFEST_NAME)
     prior_files = prior_manifest.get("files", {}) if isinstance(prior_manifest.get("files"), dict) else {}
-    prior_revision = previous_revision or str(prior_manifest.get("revision", "")).strip() or None
+    installed_revision = str(prior_manifest.get("revision", "")).strip() or None
+    explicit_previous_revision = str(previous_revision or "").strip() or None
+    if (
+        installed_revision
+        and explicit_previous_revision
+        and explicit_previous_revision != installed_revision
+    ):
+        raise ValueError(
+            "previous revision override does not match the installed manifest revision: "
+            f"{explicit_previous_revision} != {installed_revision}"
+        )
+    prior_revision = installed_revision or explicit_previous_revision
     upgrade_lineage = _verify_upgrade_lineage(source_path, prior_revision, revision)
-    release_regressions = _verify_runtime_release_regressions(source_path, revision)
+    installed_web_runtime = (
+        "scripts/web_agent_execution.py" in prior_files
+        or (target_path / "scripts" / "web_agent_execution.py").is_file()
+    )
+    release_regressions = _verify_runtime_release_regressions(
+        source_path,
+        revision,
+        required=installed_web_runtime,
+    )
 
     stage = Path(tempfile.mkdtemp(prefix=f".{target_path.name}.stage-", dir=target_path.parent))
     try:

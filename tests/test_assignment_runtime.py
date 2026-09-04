@@ -46,6 +46,48 @@ class RuntimeTests(unittest.TestCase):
                 now=T0,
             )
 
+    def test_recovery_rechecks_worktree_exclusive_key_against_other_active_writer(self):
+        state = apply_receipt(
+            {},
+            receipt(
+                "assignment_started",
+                exclusive_execution_key="task:T1",
+                exclusive_execution_keys=["task:T1", "worktree:/tmp/wt"],
+            ),
+            now=T0,
+        )
+        state = apply_receipt(
+            state,
+            receipt(
+                "assignment_terminal", T0 + timedelta(minutes=1),
+                event_seq=2, terminal_state="failed", outcome="recoverable_failure",
+                summary="first writer failed", evidence=["checkpoint"], artifacts=[],
+                next_action="retry", retry_class="transport_error",
+            ),
+            now=T0 + timedelta(minutes=1),
+        )
+        state = apply_receipt(
+            state,
+            receipt(
+                "assignment_started", T0 + timedelta(minutes=2),
+                assignment_id="a2", task_id="T2", agent_id="writer-2", session_id="s2",
+                exclusive_execution_key="task:T2",
+                exclusive_execution_keys=["task:T2", "worktree:/tmp/wt"],
+            ),
+            now=T0 + timedelta(minutes=2),
+        )
+        with self.assertRaisesRegex(ValueError, "worktree:/tmp/wt"):
+            apply_receipt(
+                state,
+                receipt(
+                    "assignment_started", T0 + timedelta(minutes=3),
+                    attempt=2, lease_id="a1:attempt:2", session_id="s1-recovery",
+                    exclusive_execution_key="task:T1",
+                    exclusive_execution_keys=["task:T1", "worktree:/tmp/wt"],
+                ),
+                now=T0 + timedelta(minutes=3),
+            )
+
     def test_heartbeat_refreshes_lease_not_progress(self):
         state=apply_receipt({},receipt("assignment_started"),now=T0)
         state=apply_receipt(state,receipt("assignment_heartbeat",T0+timedelta(minutes=10),event_seq=2),now=T0+timedelta(minutes=10))

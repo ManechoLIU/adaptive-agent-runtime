@@ -262,7 +262,7 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
                 raise ValueError("exclusive_execution_keys must contain unique values")
             if exclusive_key and exclusive_key not in exclusive_keys:
                 exclusive_keys.insert(0, exclusive_key)
-        if exclusive_keys and not existing:
+        if exclusive_keys:
             requested = set(exclusive_keys)
             for other_id, other in leases.items():
                 if other_id == aid or not isinstance(other, dict) or other.get("terminal_state"):
