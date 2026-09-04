@@ -115,7 +115,7 @@ INACTIVE_POLICY_LINE_MARKERS = (
 
 POLICY_INLINE_COMMENT_MARKERS = ("#", "//", "<!--")
 POLICY_ROUTE_FIELDS = ("provider", "model", "auth_mode")
-POLICY_ROUTE_VALUE = r"[A-Za-z0-9_.:+/-]+"
+POLICY_ROUTE_VALUE = r"[A-Za-z0-9_.+/-]+"
 POLICY_ROUTE_SEPARATOR = r"(?:\s*[,，、;；]\s*|\s+)"
 POLICY_ROUTE_DECLARATION_PATTERN = re.compile(
     r"^(?P<prefix>.*?)"
