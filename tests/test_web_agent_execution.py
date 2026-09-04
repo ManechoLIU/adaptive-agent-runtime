@@ -1024,6 +1024,64 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         }
         self.assertEqual(route_policy_errors("T-SPACED", route), [])
 
+    def test_route_policy_rejects_prefixed_fields_comments_and_negative_examples(self):
+        from scripts.route_contract import route_policy_errors
+        policy = Path(self.tmp.name) / "inactive-policy.md"
+        fence = chr(96) * 3
+        policy.write_text(
+            "# frontend provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host."
+            + chr(10)
+            + "frontend disallowed_provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host."
+            + chr(10)
+            + "frontend 禁止 provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host."
+            + chr(10)
+            + fence
+            + chr(10)
+            + "frontend provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host."
+            + chr(10)
+            + fence
+            + chr(10),
+            encoding="utf-8",
+        )
+        route = {
+            "decision": "default",
+            "policy_class": "frontend",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "auth_mode": "host",
+            "policy_source": {
+                "path": str(policy.resolve()),
+                "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+            },
+        }
+        self.assertEqual(
+            route_policy_errors("T-INACTIVE", route),
+            ["T-INACTIVE route is not declared by policy source"],
+        )
+
+    def test_route_policy_accepts_active_rule_after_inactive_examples(self):
+        from scripts.route_contract import route_policy_errors
+        policy = Path(self.tmp.name) / "active-policy.md"
+        policy.write_text(
+            "frontend disallowed_provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host."
+            + chr(10)
+            + "frontend 默认 provider = chatgpt_web, model = gpt-5.6-sol, auth_mode = host."
+            + chr(10),
+            encoding="utf-8",
+        )
+        route = {
+            "decision": "default",
+            "policy_class": "frontend",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "auth_mode": "host",
+            "policy_source": {
+                "path": str(policy.resolve()),
+                "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+            },
+        }
+        self.assertEqual(route_policy_errors("T-ACTIVE", route), [])
+
     def test_dispatch_start_needs_prepared_verified_observation(self):
         from scripts.web_agent_execution import start_web_assignment
         with self.assertRaisesRegex(PermissionError, "direct Web start"):

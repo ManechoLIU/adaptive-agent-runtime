@@ -664,6 +664,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_canonical_kimi_terminal_with_declared_route_can_prepare_web_fallback(self): self.assertTrue(True)\n"
                 "    def test_direct_internal_observation_chain_cannot_create_lease_without_attested_machine_event(self): self.assertTrue(True)\n"
                 "    def test_route_policy_accepts_normal_whitespace_declaration(self): self.assertTrue(True)\n"
+                "    def test_route_policy_rejects_prefixed_fields_comments_and_negative_examples(self): self.assertTrue(True)\n"
+                "    def test_route_policy_accepts_active_rule_after_inactive_examples(self): self.assertTrue(True)\n"
                 "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
                 "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n"
                 "    def test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path(self): self.assertTrue(True)\n",
@@ -755,6 +757,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_canonical_kimi_terminal_with_declared_route_can_prepare_web_fallback(self): self.assertTrue(True)\n"
                 "    def test_direct_internal_observation_chain_cannot_create_lease_without_attested_machine_event(self): self.assertTrue(True)\n"
                 "    def test_route_policy_accepts_normal_whitespace_declaration(self): self.assertTrue(True)\n"
+                "    def test_route_policy_rejects_prefixed_fields_comments_and_negative_examples(self): self.assertTrue(True)\n"
+                "    def test_route_policy_accepts_active_rule_after_inactive_examples(self): self.assertTrue(True)\n"
                 "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
                 "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n"
                 "    def test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path(self): self.assertTrue(True)\n",

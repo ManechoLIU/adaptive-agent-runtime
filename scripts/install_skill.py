@@ -99,6 +99,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_direct_internal_observation_chain_cannot_create_lease_without_attested_machine_event",
     "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
     "test_route_policy_accepts_normal_whitespace_declaration",
+    "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
+    "test_route_policy_rejects_prefixed_fields_comments_and_negative_examples",
+    "tests.test_web_agent_execution.RuntimeOwnedWebRecoveryContractTests."
+    "test_route_policy_accepts_active_rule_after_inactive_examples",
     "tests.test_web_agent_execution.StructuredCollaborationTerminalTests."
     "test_public_structured_terminal_ingest_rejects_caller_supplied_observation",
     "tests.test_web_agent_execution.StructuredCollaborationTerminalTests."

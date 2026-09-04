@@ -66,6 +66,49 @@ def route_scope_errors(task_id: str, owned_files: Any, route: Any) -> list[str]:
     return []
 
 
+INACTIVE_POLICY_LINE_MARKERS = (
+    "disallowed",
+    "disabled",
+    "deprecated",
+    "forbidden",
+    "do not",
+    "don't",
+    "not allowed",
+    "example",
+    "e.g.",
+    "eg:",
+    "禁止",
+    "不允许",
+    "不要",
+    "勿用",
+    "废弃",
+    "示例",
+    "例如",
+    "历史规则",
+)
+
+
+def _active_policy_line(line: str, markers: tuple[str, ...]) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith(("#", "//", "<!--", ">")):
+        return False
+    lowered = stripped.casefold()
+    if any(token.casefold() in lowered for token in INACTIVE_POLICY_LINE_MARKERS):
+        return False
+    return not markers or any(marker.casefold() in lowered for marker in markers)
+
+
+def _policy_field_matches(line: str, field: str, value: str) -> bool:
+    pattern = (
+        rf"(?<![A-Za-z0-9_]){re.escape(field)}"
+        rf"{chr(92)}s*={chr(92)}s*{re.escape(value)}"
+        rf"(?=$|[{chr(92)}s,;，；。.、])"
+    )
+    return bool(re.search(pattern, line, re.IGNORECASE))
+
+
 def route_policy_errors(task_id: str, route: dict[str, Any]) -> list[str]:
     source = route.get("policy_source")
     if not isinstance(source, dict):
@@ -104,21 +147,21 @@ def route_policy_errors(task_id: str, route: dict[str, Any]) -> list[str]:
     policy_class = str(route.get("policy_class", "")).strip().lower()
     markers = ROUTE_CLASS_MARKERS.get(policy_class, (policy_class,)) if policy_class else ()
     policy_text = payload.decode("utf-8", errors="replace")
+    in_fence = False
+    fence = chr(96) * 3
     for line in policy_text.splitlines():
-        lowered = line.casefold()
-        if markers and not any(marker.casefold() in lowered for marker in markers):
+        stripped = line.strip()
+        if stripped.startswith(fence):
+            in_fence = not in_fence
+            continue
+        if in_fence or not _active_policy_line(line, markers):
             continue
         if all(
-            re.search(
-                rf"{field}{chr(92)}s*={chr(92)}s*{re.escape(value)}(?=$|[\s,;，；。.、])",
-                line,
-                re.IGNORECASE,
-            )
+            _policy_field_matches(line, field, value)
             for field, value in route_values.items()
         ):
             return []
     return [f"{task_id} route is not declared by policy source"]
-
 
 def canonical_safe_fallback_errors(
     task_id: str,
