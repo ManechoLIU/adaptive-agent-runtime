@@ -55,6 +55,11 @@ class WebCollaborationContinuationRegressionTests(unittest.TestCase):
         )
         self.events = root / "controller.jsonl"
         self.lifecycle_state = root / "lifecycle-controller-1.json"
+        self.policy = root / "AGENTS.md"
+        self.policy.write_text(
+            "general 默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -76,6 +81,17 @@ class WebCollaborationContinuationRegressionTests(unittest.TestCase):
             "side_effect": False,
             "progress_deadline_minutes": 10,
             "role": role,
+            "route": {
+                "decision": "default",
+                "policy_class": "general",
+                "provider": "chatgpt_web",
+                "model": "gpt-5.6-sol",
+                "auth_mode": "host",
+                "policy_source": {
+                    "path": str(self.policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(self.policy.read_bytes()).hexdigest(),
+                },
+            },
         }
         if role == "reviewer":
             value["candidate_revision"] = self.head
@@ -90,6 +106,7 @@ class WebCollaborationContinuationRegressionTests(unittest.TestCase):
             assignment=self.assignment(role=role),
             now=T0,
             watchdog_launcher=lambda **_: {"launched": True, "pid": 101},
+            event_source_probe=lambda: True,
         )
 
     def terminal_event(self, kind="completed", observation_id="terminal-1"):

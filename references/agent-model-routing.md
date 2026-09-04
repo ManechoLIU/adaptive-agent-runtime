@@ -127,3 +127,8 @@ route:
 `default` 的 provider / model / auth_mode 必须在 `policy_source` 对应类别的真实规则行中出现。`safe_fallback` 另需 `fallback_from`、可追溯 `failure_evidence`、`prior_attempt_terminal=true` 与 `result_unknown=false`；缺一项都不能降级。`controller_exception` 必须回指规则中的 `default_route`，并提供 `controller_exception.reason_code / reason / stop_condition`；reason code 只接受共享契约未稳定、不可安全拆分、既有 WIP 恢复或低风险微小改动。它是例外 Assignment，不是总控可以省略路由和文件租约的捷径。
 
 执行器如果不能精确保留合同中的模型或权限边界，应拒绝派发并把冲突交回主 Agent，不自行猜测。
+
+
+## Web transport truth
+
+Web execution transport may execute only the canonical `chatgpt_web` provider. A Kimi or Grok route remains an external-provider route and must use its canonical external executor; copying `provider/model/agent_type` metadata onto a Web child does not authorize Web execution. Before any Web child is prepared, Runtime must have both the formal delegated route contract and a fresh trusted machine-event source capable of proving child start and terminal events. If that source is unavailable, Web child dispatch fails closed rather than falling back to browser-only observation. After same-controller reentry, the Controller must recompute the current project-wide runnable set and resolve route policy again before delegating new work.

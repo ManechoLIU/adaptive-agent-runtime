@@ -12,11 +12,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from lint_governance import task_records, task_rows
 try:
-    from controller_state import derive_runnable_tasks
+    from scripts.lint_governance import task_records, task_rows
 except ModuleNotFoundError:
+    from lint_governance import task_records, task_rows
+try:
     from scripts.controller_state import derive_runnable_tasks
+except ModuleNotFoundError:
+    from controller_state import derive_runnable_tasks
 
 DECISIONS = {"active", "deferred", "blocked"}
 CANDIDATE_DECISIONS = {
@@ -76,6 +79,42 @@ def work_in_flight_ledger_packages(ledger: Path) -> dict[str, str]:
         identifier: status
         for identifier, status in task_rows(ledger.read_text(encoding="utf-8"))
         if status in {"ACTIVE", "RECOVERING"}
+    }
+
+
+def project_wide_dispatch_projection(ledger: Path) -> dict[str, Any]:
+    """Derive one control-event scheduling view from the entire canonical TASK_LEDGER."""
+    text = ledger.read_text(encoding="utf-8")
+    records = task_records(text)
+    rows = task_rows(text)
+    task_states = {identifier: status for identifier, status in rows}
+    ready_ids = {identifier for identifier, status in rows if status == "READY"}
+    runnable_projection = derive_runnable_tasks(records)
+    derived_runnable_ids = {
+        str(item).strip()
+        for item in runnable_projection.get("runnable_task_ids", [])
+        if str(item).strip()
+    }
+    open_ids = {
+        identifier
+        for identifier, status in rows
+        if status in {"PENDING", "READY", "ACTIVE", "RECOVERING", "VERIFY", "BLOCKED"}
+    }
+    work_in_flight = {
+        identifier: status
+        for identifier, status in rows
+        if status in {"ACTIVE", "RECOVERING"}
+    }
+    return {
+        "ledger_text": text,
+        "records": records,
+        "task_states": task_states,
+        "ready_ids": ready_ids,
+        "derived_runnable_ids": derived_runnable_ids,
+        "runnable_exclusions": dict(runnable_projection.get("exclusions", {})),
+        "open_ids": open_ids,
+        "goal_ids": current_goal_ledger_ids(ledger, open_ids),
+        "work_in_flight": work_in_flight,
     }
 
 
@@ -724,6 +763,99 @@ def integrated_candidate_revisions(
     return merged
 
 
+def derived_route_classes(owned_files: Any) -> set[str]:
+    """Conservatively derive only unambiguous frontend/backend classes from owned paths."""
+    if not isinstance(owned_files, list):
+        return set()
+    classes: set[str] = set()
+    for raw in owned_files:
+        path = str(raw or "").strip().replace("\\", "/").casefold().lstrip("./")
+        if not path:
+            continue
+        parts = {part for part in path.split("/") if part}
+        if (
+            path.startswith("apps/web/")
+            or path.startswith("apps/miniapp/")
+            or "frontend" in parts
+            or "miniapp" in parts
+        ):
+            classes.add("frontend")
+        if (
+            path.startswith("apps/server/")
+            or "backend" in parts
+            or "server" in parts
+        ):
+            classes.add("backend")
+    return classes
+
+
+def route_scope_errors(task_id: str, owned_files: Any, route: Any) -> list[str]:
+    if not isinstance(route, dict):
+        return []
+    classes = derived_route_classes(owned_files)
+    if len(classes) > 1:
+        return [
+            f"{task_id} owned_files span multiple route classes: "
+            + ", ".join(sorted(classes))
+            + "; split the Assignment before dispatch"
+        ]
+    if len(classes) == 1:
+        derived = next(iter(classes))
+        declared = str(route.get("policy_class", "")).strip().lower()
+        if declared and declared != derived:
+            return [
+                f"{task_id} route policy_class {declared} conflicts with derived {derived}"
+            ]
+    return []
+
+
+def delegated_route_contract_errors(
+    task_id: str, owned_files: Any, route: Any
+) -> list[str]:
+    """Validate one delegated route before any executor-specific spawn can occur."""
+    errors: list[str] = []
+    if not isinstance(route, dict):
+        return [f"{task_id} delegated assignment requires route"]
+    for field in ("decision", "policy_class", "provider", "model", "auth_mode"):
+        if not str(route.get(field, "")).strip():
+            errors.append(f"{task_id} route requires {field}")
+    source = route.get("policy_source")
+    if not isinstance(source, dict):
+        errors.append(f"{task_id} route requires policy_source")
+    else:
+        for field in ("path", "sha256"):
+            if not str(source.get(field, "")).strip():
+                errors.append(f"{task_id} route policy_source requires {field}")
+    errors.extend(route_scope_errors(task_id, owned_files, route))
+    errors.extend(route_policy_errors(task_id, route))
+
+    decision = str(route.get("decision", "")).strip().lower()
+    if decision not in ROUTE_DECISIONS:
+        errors.append(
+            f"{task_id} route decision must be default, safe_fallback, or controller_exception"
+        )
+    elif decision == "controller_exception":
+        errors.append(f"{task_id} delegated assignment cannot use controller_exception")
+    elif decision == "safe_fallback":
+        missing: list[str] = []
+        fallback_from = route.get("fallback_from")
+        if not isinstance(fallback_from, dict):
+            missing.append("fallback_from")
+        else:
+            for field in ("provider", "model", "auth_mode"):
+                if not str(fallback_from.get(field, "")).strip():
+                    missing.append(f"fallback_from.{field}")
+        if not str(route.get("failure_evidence", "")).strip():
+            missing.append("failure_evidence")
+        if route.get("prior_attempt_terminal") is not True:
+            missing.append("prior_attempt_terminal=true")
+        if route.get("result_unknown") is not False:
+            missing.append("result_unknown=false")
+        if missing:
+            errors.append(f"{task_id} safe fallback requires " + ", ".join(missing))
+    return errors
+
+
 def validate_candidate_queue(
     snapshot: dict[str, Any],
     *,
@@ -880,6 +1012,7 @@ def validate_candidate_queue(
                 )
 
         route = assignment.get("route")
+        errors.extend(route_scope_errors(task_id, owned_files, route))
         if not isinstance(route, dict):
             if execution_mode == "delegated":
                 errors.append(f"{task_id} delegated assignment requires route")
@@ -1240,9 +1373,13 @@ def validate_snapshot(
             if reason_code not in HARD_DEFER_REASON_CODES:
                 deferred_without_hard_constraint.append(package_id)
 
+    if isinstance(slots, int) and active_decisions > slots:
+        errors.append(
+            f"active dispatch decisions exceed available capacity: {active_decisions} > {slots}"
+        )
     if isinstance(slots, int) and slots > active_decisions and deferred_without_hard_constraint:
         errors.append(
-            "idle dispatch capacity remains for READY packages without a hard constraint: "
+            "idle dispatch capacity remains for project-wide runnable packages without a hard constraint: "
             + ", ".join(sorted(deferred_without_hard_constraint))
         )
 
@@ -1546,16 +1683,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         ledger = Path(args.ledger).resolve()
         if not ledger.is_file():
             raise ValueError("ledger path must be an existing file")
-        ledger_text = ledger.read_text(encoding="utf-8")
-        ledger_records = task_records(ledger_text)
-        ledger_task_states = {
-            record["id"]: record["status"] for record in ledger_records
-        }
-        ready_ids = ready_ledger_package_ids(ledger)
-        derived_runnable_ids = set(derive_runnable_tasks(ledger_records)["runnable_task_ids"])
-        open_ids = open_ledger_package_ids(ledger)
-        goal_ids = current_goal_ledger_ids(ledger, open_ids)
-        work_in_flight = work_in_flight_ledger_packages(ledger)
+        projection = project_wide_dispatch_projection(ledger)
+        ledger_text = str(projection["ledger_text"])
+        ledger_task_states = dict(projection["task_states"])
+        ready_ids = set(projection["ready_ids"])
+        derived_runnable_ids = set(projection["derived_runnable_ids"])
+        open_ids = set(projection["open_ids"])
+        goal_ids = set(projection["goal_ids"])
+        work_in_flight = dict(projection["work_in_flight"])
         current_ledger_sha256 = ledger_sha256(ledger)
         if args.affected_task and not args.rule_revision:
             raise ValueError("--affected-task requires --rule-revision")

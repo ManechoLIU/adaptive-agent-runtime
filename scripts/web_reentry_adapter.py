@@ -205,9 +205,22 @@ def build_reentry_prompt(
         f"only (controller_id={controller_id}); do not create or fork another controller and do not invoke "
         "desktop Codex merely to continue this Web-hosted controller. Read the current authoritative project "
         "state and lifecycle, reconcile the pending control event, and keep rolling the open Goal while "
-        "requires_user=false. Stop only for a closed lifecycle, an explicit user decision, or verified blocking "
+        "requires_user=false. Before any new delegation, recompute the current DAG / READY / WIP projection "
+        "from authoritative project facts and apply the canonical route policy again, including the selected "
+        "provider/model; do not reuse the most recent executor merely because it is convenient. "
+        "Do not create a new ChatGPT Web child as a shortcut. A Web child may be spawned only after a "
+        "prepared canonical Web dispatch exists and the Runtime can verify its machine event source; otherwise "
+        "use the canonical selected non-Web executor or remain blocked with explicit evidence. "
+        "Stop only for a closed lifecycle, an explicit user decision, or verified blocking "
         f"evidence. Wake generation={generation}."
     )
+    triggers = [
+        str(value).strip()
+        for value in lifecycle_state.get("triggers", [])
+        if str(value).strip()
+    ] if isinstance(lifecycle_state.get("triggers"), list) else []
+    if triggers:
+        prompt += " Current lifecycle triggers: " + "; ".join(triggers[:16]) + "."
     if next_action:
         prompt += f" Persisted next action: {next_action}."
     receipts = [str(value) for value in terminal_receipts or [] if str(value).strip()]

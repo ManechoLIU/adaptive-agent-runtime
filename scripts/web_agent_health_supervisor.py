@@ -18,8 +18,10 @@ from typing import Any, Callable, Iterable
 
 try:
     from scripts import web_lifecycle_bridge
+    from scripts.web_agent_events import machine_event_source_ready
 except ModuleNotFoundError:
     import web_lifecycle_bridge
+    from web_agent_events import machine_event_source_ready
 
 UTC = timezone.utc
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
@@ -91,6 +93,7 @@ def reconcile_web_agent_health_once(
     now: datetime | None = None,
     terminal_consumer: Callable[..., dict[str, Any]] | None = None,
     runtime_change_consumer: Callable[..., dict[str, Any]] | None = None,
+    event_source_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     result = web_lifecycle_bridge.reconcile_managed_web_assignments(
         repo=Path(repo).expanduser().resolve(),
@@ -100,6 +103,7 @@ def reconcile_web_agent_health_once(
         now=now,
         terminal_consumer=terminal_consumer,
         runtime_change_consumer=runtime_change_consumer,
+        event_source_probe=event_source_probe,
     )
     # Compatibility aliases for the health-service tests/callers; canonical semantics live
     # in web_lifecycle_bridge.reconcile_managed_web_assignments.
@@ -146,7 +150,7 @@ def reconcile_all_web_agent_health_once(
                 repo=repo,
                 registry_path=registry,
                 controller_id=controller_id,
-                event_paths=None,
+                event_paths=None if machine_event_source_ready(now=now) else [],
                 now=now,
             ))
         except (OSError, ValueError, PermissionError, RuntimeError):

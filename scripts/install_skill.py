@@ -27,6 +27,9 @@ DEFAULT_AI_BRIDGE_EXECUTABLE = Path("/Applications/AI-Bridge.app/Contents/MacOS/
 DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
 DEFAULT_ZSHENV = Path.home() / ".zshenv"
 DEFAULT_CONTROLLER_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
+DEFAULT_WEB_AGENT_EVENT_SOURCE = (
+    Path.home() / ".codex" / "state" / "adaptive-delivery-web-agent-health" / "event-source.json"
+)
 DEFAULT_WEB_AGENT_HEALTH_PLIST = (
     Path.home() / "Library" / "LaunchAgents"
     / "com.openai.adaptive-agent-runtime.web-agent-health.plist"
@@ -50,13 +53,26 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_stale_child_is_second_observed_by_existing_audit_and_wakes_same_controller",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
     "test_duplicate_terminal_observation_after_confirmed_continuation_does_not_wake_twice",
+    "tests.test_governance.GovernanceTests."
+    "test_project_wide_projection_web_active_verify_do_not_starve_mini_runnables",
+    "tests.test_governance.GovernanceTests."
+    "test_project_wide_projection_mini_active_does_not_starve_server_or_web",
+    "tests.test_governance.GovernanceTests."
+    "test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists",
+    "tests.test_governance.GovernanceTests."
+    "test_pending_dependency_closure_dynamically_enters_project_wide_runnable_projection",
+    "tests.test_governance.GovernanceTests."
+    "test_project_wide_fairness_rejects_more_active_dispatches_than_capacity",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/web_agent_execution.py",
     "scripts/web_lifecycle_bridge.py",
     "scripts/web_reentry_adapter.py",
+    "scripts/control_event_guard.py",
+    "scripts/controller_state.py",
     "tests/test_web_reentry_adapter.py",
     "tests/test_web_collaboration_continuation.py",
+    "tests/test_governance.py",
 )
 
 
@@ -383,6 +399,14 @@ def configure_runtime_services(
     }
 
 
+def _machine_web_event_source_ready(path: Path) -> bool:
+    try:
+        from scripts.web_agent_events import machine_event_source_ready
+    except ModuleNotFoundError:
+        from web_agent_events import machine_event_source_ready
+    return bool(machine_event_source_ready(path=path))
+
+
 def detect_host_capabilities(
     *,
     codex_executable: str | Path | None = None,
@@ -392,6 +416,7 @@ def detect_host_capabilities(
     skill_root: str | Path | None = None,
     desktop_canary_file: str | Path = DEFAULT_DESKTOP_CANARY,
     health_service_plist: str | Path = DEFAULT_WEB_AGENT_HEALTH_PLIST,
+    web_event_source_receipt: str | Path = DEFAULT_WEB_AGENT_EVENT_SOURCE,
 ) -> dict[str, dict[str, Any]]:
     codex_path = Path(codex_executable).expanduser() if codex_executable else None
     if codex_path is None:
@@ -406,6 +431,8 @@ def detect_host_capabilities(
     health_service_configured = _health_service_plist_matches(
         health_service_path, skill_root=skill_root_path
     )
+    web_event_source_path = Path(web_event_source_receipt).expanduser().resolve(strict=False)
+    machine_event_source_ready = _machine_web_event_source_ready(web_event_source_path)
 
     codex_available = bool(codex_path and codex_path.is_file() and os.access(codex_path, os.X_OK))
     lifecycle_events = {
@@ -478,16 +505,23 @@ def detect_host_capabilities(
         "web_agent_execution": {
             "status": "host_limited",
             "adapter": "web-agent-execution",
-            "configured": health_service_configured,
+            "configured": health_service_configured and machine_event_source_ready,
             "health_supervisor": "launchd_keepalive" if health_service_configured else "not_configured",
             "continuation": "existing_web_reentry_supervisor",
             "recovery_mode": "canonical_progress_health_supervisor",
             "host_terminal": "unavailable",
-            "structured_terminal": "collaboration_subagent_activity",
+            "structured_terminal": (
+                "chatgpt_subagent_machine_events" if machine_event_source_ready else "unavailable"
+            ),
+            "dispatch_interception": "unavailable_on_chatgpt_web",
             "reason": (
-                "Runtime health-only supervisor is installed; terminal/health continuation reuses the existing Web reentry supervisor"
-                if health_service_configured
-                else "Web execution code is installed but the Runtime health supervisor service is not configured"
+                "Runtime health scheduler is installed, but no trustworthy ChatGPT Web child machine event source is available; native Web child dispatch must fail closed"
+                if health_service_configured and not machine_event_source_ready
+                else (
+                    "Runtime health scheduler and trustworthy Web child machine event source are ready; continuation reuses the existing Web reentry supervisor"
+                    if health_service_configured and machine_event_source_ready
+                    else "Web execution code is installed but the Runtime health supervisor service is not configured"
+                )
             ),
         },
     }

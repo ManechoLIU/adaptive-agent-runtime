@@ -65,13 +65,35 @@ def _bounded_string(value: object, *, label: str, maximum: int) -> str:
 COLLABORATION_SPAWN_TOOLS = {"spawn_agent", "collaboration.spawn_agent", "mcp__collaboration__spawn_agent"}
 
 
-def collaboration_spawn_task_name(*, tool_name: object, tool_input: object) -> str | None:
+def collaboration_spawn_contract(*, tool_name: object, tool_input: object) -> dict[str, str] | None:
     normalized_tool = str(tool_name or "").strip()
     if normalized_tool not in COLLABORATION_SPAWN_TOOLS:
         return None
     if not isinstance(tool_input, dict):
         raise ValueError(f"{normalized_tool} requires structured tool input")
-    return _bounded_string(tool_input.get("task_name"), label="collaboration spawn task_name", maximum=256)
+    return {
+        "task_name": _bounded_string(
+            tool_input.get("task_name"), label="collaboration spawn task_name", maximum=256
+        ),
+        "model": _bounded_string(
+            tool_input.get("model"), label="collaboration spawn model", maximum=128
+        ),
+        "agent_type": _bounded_string(
+            tool_input.get("agent_type"), label="collaboration spawn agent_type", maximum=128
+        ),
+    }
+
+
+def collaboration_spawn_task_name(*, tool_name: object, tool_input: object) -> str | None:
+    """Compatibility parser for callers that only need to recognize the task name."""
+    normalized_tool = str(tool_name or "").strip()
+    if normalized_tool not in COLLABORATION_SPAWN_TOOLS:
+        return None
+    if not isinstance(tool_input, dict):
+        raise ValueError(f"{normalized_tool} requires structured tool input")
+    return _bounded_string(
+        tool_input.get("task_name"), label="collaboration spawn task_name", maximum=256
+    )
 
 
 def codex_app_outbound_request(

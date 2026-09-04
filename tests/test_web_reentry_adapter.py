@@ -63,6 +63,24 @@ class WebReentryAdapterTests(unittest.TestCase):
                     controller_id="controller-1", repo=repo, registry_path=registry, lease_path=lease
                 )
 
+    def test_reentry_checkpoint_recomputes_dag_and_route_before_any_new_dispatch(self) -> None:
+        prompt = web_reentry_adapter.build_reentry_prompt(
+            controller_id="controller-1",
+            lifecycle_state={
+                "pending_control_event": True,
+                "requires_user": False,
+                "wake_generation": 9,
+                "triggers": ["RUNNABLE:T-NEXT", "terminal_receipt_pending"],
+            },
+            terminal_receipts=["/tmp/terminal.json"],
+        )
+        self.assertIn("DAG / READY / WIP", prompt)
+        self.assertIn("canonical route", prompt)
+        self.assertIn("provider/model", prompt)
+        self.assertIn("prepared canonical Web dispatch", prompt)
+        self.assertIn("Do not create a new ChatGPT Web child", prompt)
+        self.assertIn("RUNNABLE:T-NEXT", prompt)
+
     def test_existing_target_tab_is_focused_then_composer_submitted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, registry, lease = self.make_identity(Path(tmp))

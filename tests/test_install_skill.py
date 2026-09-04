@@ -365,7 +365,7 @@ class InstallMigrationContractTests(unittest.TestCase):
         (source / "scripts").mkdir()
         for name in (
             "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
-            "web_agent_health_supervisor.py",
+            "web_agent_health_supervisor.py", "control_event_guard.py", "controller_state.py",
         ):
             script = source / "scripts" / name
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
@@ -612,6 +612,16 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_duplicate_terminal_observation_after_confirmed_continuation_does_not_wake_twice(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
+            (tests_dir / "test_governance.py").write_text(
+                "import unittest\n"
+                "class GovernanceTests(unittest.TestCase):\n"
+                "    def test_project_wide_projection_web_active_verify_do_not_starve_mini_runnables(self): self.assertTrue(True)\n"
+                "    def test_project_wide_projection_mini_active_does_not_starve_server_or_web(self): self.assertTrue(True)\n"
+                "    def test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists(self): self.assertTrue(True)\n"
+                "    def test_pending_dependency_closure_dynamically_enters_project_wide_runnable_projection(self): self.assertTrue(True)\n"
+                "    def test_project_wide_fairness_rejects_more_active_dispatches_than_capacity(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)
             subprocess.run(["git", "-C", str(source), "commit", "-m", "release regressions"], check=True, capture_output=True)
             revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
@@ -646,6 +656,16 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_completed_reviewer_uses_same_terminal_continuation_path(self): self.assertTrue(True)\n"
                 "    def test_stale_child_is_second_observed_by_existing_audit_and_wakes_same_controller(self): self.assertTrue(True)\n"
                 "    def test_duplicate_terminal_observation_after_confirmed_continuation_does_not_wake_twice(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_governance.py").write_text(
+                "import unittest\n"
+                "class GovernanceTests(unittest.TestCase):\n"
+                "    def test_project_wide_projection_web_active_verify_do_not_starve_mini_runnables(self): self.assertTrue(True)\n"
+                "    def test_project_wide_projection_mini_active_does_not_starve_server_or_web(self): self.assertTrue(True)\n"
+                "    def test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists(self): self.assertTrue(True)\n"
+                "    def test_pending_dependency_closure_dynamically_enters_project_wide_runnable_projection(self): self.assertTrue(True)\n"
+                "    def test_project_wide_fairness_rejects_more_active_dispatches_than_capacity(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)
@@ -1065,9 +1085,48 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
                 health_service_plist=plist,
             )
         self.assertFalse(before["web_agent_execution"]["configured"])
-        self.assertTrue(after["web_agent_execution"]["configured"])
+        self.assertFalse(after["web_agent_execution"]["configured"])
         self.assertEqual(after["web_agent_execution"]["health_supervisor"], "launchd_keepalive")
         self.assertEqual(after["web_agent_execution"]["continuation"], "existing_web_reentry_supervisor")
+        self.assertEqual(after["web_agent_execution"]["structured_terminal"], "unavailable")
+        self.assertIn("machine event source", after["web_agent_execution"]["reason"])
+
+    def test_web_agent_execution_capability_requires_both_health_and_machine_event_source(self):
+        import json
+        from datetime import datetime, timezone
+        from scripts.install_skill import (
+            detect_host_capabilities, install_web_agent_health_service_plist,
+        )
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / "adaptive-delivery"
+            (target / "scripts").mkdir(parents=True)
+            script = target / "scripts" / "web_agent_health_supervisor.py"
+            script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            plist = root / "health.plist"
+            source_receipt = root / "event-source.json"
+            install_web_agent_health_service_plist(
+                plist, target, python_executable="/usr/bin/python3",
+                registry_path=root / "controllers.json",
+            )
+            source_receipt.write_text(json.dumps({
+                "schema_version": 1,
+                "state": "ready",
+                "source": "chatgpt_subagent_machine_events",
+                "events": ["started", "completed", "failed", "interrupted", "cancelled", "disconnected"],
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+            }), encoding="utf-8")
+            report = detect_host_capabilities(
+                skill_root=target,
+                ai_bridge_executable=root / "missing-bridge",
+                hooks_file=root / "hooks.json",
+                zshenv_file=root / ".zshenv",
+                health_service_plist=plist,
+                web_event_source_receipt=source_receipt,
+            )["web_agent_execution"]
+        self.assertTrue(report["configured"])
+        self.assertEqual(report["structured_terminal"], "chatgpt_subagent_machine_events")
+        self.assertEqual(report["continuation"], "existing_web_reentry_supervisor")
 
     def test_configure_runtime_health_service_activates_keepalive_without_host_adapter_changes(self):
         from scripts.install_skill import configure_runtime_services

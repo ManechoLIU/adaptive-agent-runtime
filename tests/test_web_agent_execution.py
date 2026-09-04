@@ -23,6 +23,7 @@ def bind_recovery_attempt(
         repo=repo, registry_path=registry, controller_id=controller_id,
         task_name=task_name, assignment=assignment, now=prepared_at,
         health_probe=lambda: True,
+        event_source_probe=lambda: True,
     )
     event_path = Path(registry).parent / f"{task_name}-{conversation_id}.jsonl"
     call_id = f"spawn-{task_name}-{conversation_id}"
@@ -53,6 +54,7 @@ def bind_recovery_attempt(
         repo=repo, registry_path=registry, controller_id=controller_id,
         dispatch_id=prepared["dispatch_id"], event_paths=[event_path], now=at,
         health_probe=lambda: True,
+        event_source_probe=lambda: True,
     )
 
 
@@ -72,6 +74,11 @@ class WebAgentExecutionTests(unittest.TestCase):
         self.head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
         self.registry = root / "controllers.json"
         self.registry.write_text(json.dumps({"controller-1": str(self.repo.resolve())}), encoding="utf-8")
+        self.policy = root / "AGENTS.md"
+        self.policy.write_text(
+            "general 默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n",
+            encoding="utf-8",
+        )
         self.wakes = []
         self.runtime_wakes = []
 
@@ -105,6 +112,17 @@ class WebAgentExecutionTests(unittest.TestCase):
             "attempt": 1,
             "lease_id": "A-1:web:attempt:1",
             "role": "writer",
+            "route": {
+                "decision": "default",
+                "policy_class": "general",
+                "provider": "chatgpt_web",
+                "model": "gpt-5.6-sol",
+                "auth_mode": "host",
+                "policy_source": {
+                    "path": str(self.policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(self.policy.read_bytes()).hexdigest(),
+                },
+            },
         }
         value.update(extra)
         return value
@@ -290,6 +308,7 @@ class WebAgentExecutionTests(unittest.TestCase):
                 repo=self.repo, registry_path=self.registry, controller_id="controller-1",
                 assignment_id="A-1", conversation_id="conv-2", now=T0 + timedelta(minutes=46),
                 watchdog_launcher=lambda **_: {"launched": False},
+                event_source_probe=lambda: True,
             )
     def test_normal_completion_persists_runtime_terminal_and_wakes_without_external_receipt(self):
         self.start()
@@ -419,6 +438,13 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         )
         self.registry = root / "controllers.json"
         self.registry.write_text(json.dumps({"controller-1": str(self.repo.resolve())}), encoding="utf-8")
+        self.policy = root / "AGENTS.md"
+        self.policy.write_text(
+            "general 默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n"
+            "前端默认 provider=kimi-code、model=kimi-k3、auth_mode=api。\n"
+            "后端默认 provider=grok-build、model=grok-4.6、auth_mode=oauth。\n",
+            encoding="utf-8",
+        )
         self.wakes = []
         self.launched = []
 
@@ -442,6 +468,17 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             "side_effect": False,
             "progress_deadline_minutes": 10,
             "role": "writer",
+            "route": {
+                "decision": "default",
+                "policy_class": "general",
+                "provider": "chatgpt_web",
+                "model": "gpt-5.6-sol",
+                "auth_mode": "host",
+                "policy_source": {
+                    "path": str(self.policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(self.policy.read_bytes()).hexdigest(),
+                },
+            },
         }
         value.update(extra)
         return value
@@ -454,12 +491,172 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         self.wakes.append(kwargs)
         return {"controller_id": "controller-1", "pending_control_event": True, "wake_result": {"result": "CONFIRMED"}}
 
+    def route(self, *, decision="default", policy_class="general", provider="chatgpt_web",
+              model="gpt-5.6-sol", auth_mode="host", **extra):
+        policy = Path(self.tmp.name) / "AGENTS.md"
+        if not policy.exists():
+            policy.write_text(
+                "前端默认 provider=kimi-code、model=kimi-k3、auth_mode=api。\n"
+                "后端默认 provider=grok-build、model=grok-4.6、auth_mode=oauth。\n"
+                "general 默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n",
+                encoding="utf-8",
+            )
+        import hashlib
+        value = {
+            "decision": decision,
+            "policy_class": policy_class,
+            "provider": provider,
+            "model": model,
+            "auth_mode": auth_mode,
+            "policy_source": {
+                "path": str(policy.resolve()),
+                "sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+            },
+        }
+        value.update(extra)
+        return value
+
+    def test_prepare_web_dispatch_requires_formal_route_contract(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        with self.assertRaisesRegex((ValueError, PermissionError), "route"):
+            prepare_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id="controller-1",
+                task_name="runtime-route-missing", assignment=self.assignment(route=None), now=T0,
+                health_probe=lambda: True,
+                event_source_probe=lambda: True,
+            )
+
+    def test_frontend_default_kimi_route_cannot_prepare_chatgpt_web_assignment(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        assignment = self.assignment(
+            owned_scope=["apps/web/src/runtime.ts"],
+            route=self.route(
+                policy_class="frontend", provider="kimi-code", model="kimi-k3", auth_mode="api"
+            ),
+            auth_mode="host",
+        )
+        with self.assertRaisesRegex((ValueError, PermissionError), "provider|model|route"):
+            prepare_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id="controller-1",
+                task_name="runtime-frontend-route-bypass", assignment=assignment, now=T0,
+                health_probe=lambda: True,
+                event_source_probe=lambda: True,
+            )
+
+    def test_heterogeneous_kimi_and_grok_routes_cannot_be_executed_by_web_transport(self):
+        from scripts.control_event_guard import delegated_route_contract_errors
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+
+        frontend_route = self.route(
+            policy_class="frontend", provider="kimi-code", model="kimi-k3", auth_mode="api"
+        )
+        backend_route = self.route(
+            policy_class="backend", provider="grok-build", model="grok-4.6", auth_mode="oauth"
+        )
+        self.assertEqual(
+            delegated_route_contract_errors(
+                "WEB-KIMI", ["apps/web/src/runtime.ts"], frontend_route
+            ),
+            [],
+        )
+        self.assertEqual(
+            delegated_route_contract_errors(
+                "SERVER-GROK", ["apps/server/src/runtime.ts"], backend_route
+            ),
+            [],
+        )
+
+        frontend = self.assignment(
+            assignment_id="A-KIMI", task_id="WEB-KIMI", agent_id="kimi-writer",
+            provider="kimi-code", model="kimi-k3", agent_type="external-kimi",
+            owned_scope=["apps/web/src/runtime.ts"], strategy="kimi-code:kimi-k3",
+            route=frontend_route,
+        )
+        backend = self.assignment(
+            assignment_id="A-GROK", task_id="SERVER-GROK", agent_id="grok-writer",
+            provider="grok-build", model="grok-4.6", agent_type="external-grok",
+            owned_scope=["apps/server/src/runtime.ts"], strategy="grok-build:grok-4.6",
+            route=backend_route,
+        )
+        for task_name, assignment in (("frontend-kimi", frontend), ("backend-grok", backend)):
+            with self.assertRaisesRegex(PermissionError, "Web execution.*provider|Web transport|chatgpt_web"):
+                prepare_web_assignment_dispatch(
+                    repo=self.repo, registry_path=self.registry, controller_id="controller-1",
+                    task_name=task_name, assignment=assignment, now=T0,
+                    health_probe=lambda: True, event_source_probe=lambda: True,
+                )
+
+    def test_web_safe_fallback_requires_terminal_failure_proof(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        assignment = self.assignment(
+            owned_scope=["apps/web/src/runtime.ts"],
+            auth_mode="host",
+            route=self.route(
+                decision="safe_fallback",
+                policy_class="frontend",
+                provider="chatgpt_web",
+                model="gpt-5.6-sol",
+                auth_mode="host",
+                fallback_from={"provider": "kimi-code", "model": "kimi-k3", "auth_mode": "api"},
+            ),
+        )
+        with self.assertRaisesRegex((ValueError, PermissionError), "fallback|terminal|failure|result"):
+            prepare_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id="controller-1",
+                task_name="runtime-unproven-fallback", assignment=assignment, now=T0,
+                health_probe=lambda: True,
+                event_source_probe=lambda: True,
+            )
+
+    def test_proven_kimi_frontend_failure_can_prepare_web_fallback_when_machine_source_ready(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        assignment = self.assignment(
+            owned_scope=["apps/web/src/runtime.ts"],
+            route=self.route(
+                decision="safe_fallback",
+                policy_class="frontend",
+                provider="chatgpt_web",
+                model="gpt-5.6-sol",
+                auth_mode="host",
+                fallback_from={"provider": "kimi-code", "model": "kimi-k3", "auth_mode": "api"},
+                failure_evidence="receipt:kimi/terminal-provider-unavailable",
+                prior_attempt_terminal=True,
+                result_unknown=False,
+            ),
+        )
+        prepared = prepare_web_assignment_dispatch(
+            repo=self.repo,
+            registry_path=self.registry,
+            controller_id="controller-1",
+            task_name="runtime-proven-web-fallback",
+            assignment=assignment,
+            now=T0,
+            health_probe=lambda: True,
+            event_source_probe=lambda: True,
+        )
+        self.assertEqual(prepared["assignment"]["route"]["decision"], "safe_fallback")
+        self.assertEqual(prepared["assignment"]["route"]["fallback_from"]["provider"], "kimi-code")
+
+    def test_production_prepare_fails_closed_without_machine_web_event_source(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        with self.assertRaisesRegex(RuntimeError, "machine.*event source|event source"):
+            prepare_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                task_name="runtime-no-real-web-events",
+                assignment=self.assignment(),
+                now=T0,
+                health_probe=lambda: True,
+            )
+
     def test_dispatch_start_needs_no_host_generation_attestation(self):
         from scripts.web_agent_execution import start_web_assignment
         result = start_web_assignment(
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
             watchdog_launcher=self._launch,
+            event_source_probe=lambda: True,
         )
         lease = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]
         self.assertEqual(result["runtime_state"], "healthy")
@@ -474,10 +671,45 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
             watchdog_launcher=self._launch,
+            event_source_probe=lambda: True,
         )
         lease = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]
         self.assertEqual(lease["model"], "gpt-5.6-sol")
         self.assertEqual(lease["agent_type"], "default")
+
+    def test_prepared_dispatch_rejects_spawn_model_or_agent_type_mismatch_before_start(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch, require_prepared_web_dispatch
+        prepared = prepare_web_assignment_dispatch(
+            repo=self.repo,
+            registry_path=self.registry,
+            controller_id="controller-1",
+            task_name="runtime-pretool-match",
+            assignment=self.assignment(),
+            now=T0,
+            health_probe=lambda: True,
+            event_source_probe=lambda: True,
+        )
+        self.assertEqual(prepared["task_name"], "runtime-pretool-match")
+        with self.assertRaisesRegex(PermissionError, "model"):
+            require_prepared_web_dispatch(
+                repo=self.repo,
+                controller_id="controller-1",
+                task_name="runtime-pretool-match",
+                expected_model="gpt-5.6-luna",
+                expected_agent_type="default",
+                health_probe=lambda: True,
+                event_source_probe=lambda: True,
+            )
+        with self.assertRaisesRegex(PermissionError, "agent_type"):
+            require_prepared_web_dispatch(
+                repo=self.repo,
+                controller_id="controller-1",
+                task_name="runtime-pretool-match",
+                expected_model="gpt-5.6-sol",
+                expected_agent_type="reviewer",
+                health_probe=lambda: True,
+                event_source_probe=lambda: True,
+            )
 
     def test_machine_observed_spawn_must_match_prepared_model_and_agent_type(self):
         with self.assertRaisesRegex(PermissionError, "model does not match"):
@@ -494,6 +726,7 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
             watchdog_launcher=self._launch,
+            event_source_probe=lambda: True,
         )
         before = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]["progress_deadline_at"]
         (self.repo / "README.md").write_text("runtime changed\n", encoding="utf-8")
@@ -514,6 +747,7 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
             watchdog_launcher=self._launch,
+            event_source_probe=lambda: True,
         )
         result = watch_web_assignment_once(
             repo=self.repo, registry_path=self.registry, assignment_id="A-RUNTIME",
@@ -532,6 +766,7 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
             watchdog_launcher=self._launch,
+            event_source_probe=lambda: True,
         )
         lease = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]
         lease["pid"] = 12345
@@ -546,6 +781,7 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
             watchdog_launcher=self._launch,
+            event_source_probe=lambda: True,
         )
         result = bind_recovery_attempt(
             repo=self.repo, registry=self.registry, controller_id="controller-1",
@@ -558,6 +794,9 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         self.assertEqual(lease["session_id"], "conv-runtime-2")
         self.assertNotEqual(lease["lease_id"], "A-RUNTIME:web:attempt:1")
         self.assertEqual(lease["recovery_count"], 1)
+        self.assertEqual(lease["route_decision"], "default")
+        self.assertEqual(lease["policy_class"], "general")
+        self.assertEqual(lease["route_contract"], self.assignment()["route"])
 
     def test_unknown_side_effect_timeout_fails_closed_even_with_stable_key(self):
         from scripts.web_agent_execution import start_web_assignment, recover_web_assignment
@@ -566,31 +805,34 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             conversation_id="conv-runtime-1",
             assignment=self.assignment(side_effect=True, idempotency_key="publish:42"), now=T0,
             watchdog_launcher=self._launch,
+            event_source_probe=lambda: True,
         )
         with self.assertRaisesRegex(ValueError, "unknown side effect"):
             recover_web_assignment(
                 repo=self.repo, registry_path=self.registry, controller_id="controller-1",
                 assignment_id="A-RUNTIME", conversation_id="conv-runtime-2", now=T0 + timedelta(minutes=26),
                 watchdog_launcher=self._launch,
+                event_source_probe=lambda: True,
             )
         lease = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]
         self.assertEqual(lease["attempt"], 1)
         self.assertTrue(lease["result_unknown"])
 
-    def test_watchdog_retries_same_controller_wake_after_transient_dispatch_failure(self):
+    def test_message_delivery_timeout_retries_same_controller_wake_boundedly(self):
         from scripts.web_agent_execution import start_web_assignment, watch_web_assignment
         now = datetime.now(UTC)
         start_web_assignment(
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             conversation_id="conv-runtime-1", assignment=self.assignment(), now=now - timedelta(minutes=26),
             watchdog_launcher=self._launch,
+            event_source_probe=lambda: True,
         )
         calls = []
 
         def flaky_wake(**kwargs):
             calls.append(kwargs)
             if len(calls) == 1:
-                raise RuntimeError("transient wake transport failure")
+                raise RuntimeError("Message delivery timed out")
             return {"controller_id": "controller-1", "pending_control_event": True, "wake_result": {"result": "CONFIRMED"}}
 
         result = watch_web_assignment(
@@ -611,6 +853,7 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
             watchdog_launcher=self._launch,
+            event_source_probe=lambda: True,
         )
         with self.assertRaisesRegex(ValueError, "not authoritative terminal"):
             apply_web_execution_event(
@@ -648,6 +891,11 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
         )
         self.registry = root / "controllers.json"
         self.registry.write_text(json.dumps({"controller-1": str(self.repo.resolve())}), encoding="utf-8")
+        self.policy = root / "AGENTS.md"
+        self.policy.write_text(
+            "general 默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -668,6 +916,17 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
             "assignment_contract_version": 2,
             "side_effect": False,
             "role": "writer",
+            "route": {
+                "decision": "default",
+                "policy_class": "general",
+                "provider": "chatgpt_web",
+                "model": "gpt-5.6-sol",
+                "auth_mode": "host",
+                "policy_source": {
+                    "path": str(self.policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(self.policy.read_bytes()).hexdigest(),
+                },
+            },
         }
         value.update(extra)
         return value
@@ -682,6 +941,7 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
             assignment=self.assignment(**extra),
             now=T0,
             watchdog_launcher=lambda **_: {"launched": True, "pid": 123},
+            event_source_probe=lambda: True,
         )
 
     def observation(self, kind="completed", **extra):

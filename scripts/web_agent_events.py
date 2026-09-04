@@ -6,6 +6,64 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT = (
+    Path.home() / ".codex" / "state" / "adaptive-delivery-web-agent-health" / "event-source.json"
+)
+MACHINE_EVENT_SOURCE_MAX_AGE_SECONDS = 90.0
+REQUIRED_MACHINE_WEB_EVENTS = {
+    "started", "completed", "failed", "interrupted", "cancelled", "disconnected",
+}
+TRUSTED_MACHINE_WEB_EVENT_SOURCES = {"chatgpt_subagent_machine_events"}
+
+
+def machine_event_source_status(
+    *,
+    path: str | Path = DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT,
+    now: Any | None = None,
+    max_age_seconds: float = MACHINE_EVENT_SOURCE_MAX_AGE_SECONDS,
+) -> dict[str, Any]:
+    """Validate a host-produced machine lifecycle receipt; Runtime never creates this receipt."""
+    from datetime import datetime, timezone
+    UTC = timezone.utc
+    now = now or datetime.now(UTC)
+    try:
+        payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+        observed = datetime.fromisoformat(
+            str(payload.get("observed_at") or "").replace("Z", "+00:00")
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {"ready": False, "reason": "machine_event_source_receipt_unavailable"}
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=UTC)
+    age = (now.astimezone(UTC) - observed.astimezone(UTC)).total_seconds()
+    source = str(payload.get("source") or "").strip()
+    events = {
+        str(item).strip().lower()
+        for item in payload.get("events", [])
+        if isinstance(item, str) and item.strip()
+    } if isinstance(payload.get("events"), list) else set()
+    if payload.get("schema_version") != 1 or payload.get("state") != "ready":
+        return {"ready": False, "reason": "machine_event_source_not_ready"}
+    if source not in TRUSTED_MACHINE_WEB_EVENT_SOURCES:
+        return {"ready": False, "reason": "machine_event_source_untrusted"}
+    if not REQUIRED_MACHINE_WEB_EVENTS.issubset(events):
+        return {"ready": False, "reason": "machine_event_source_incomplete"}
+    if age < 0 or age > max_age_seconds:
+        return {"ready": False, "reason": "machine_event_source_stale"}
+    return {
+        "ready": True,
+        "reason": "machine_event_source_ready",
+        "source": source,
+        "events": sorted(events),
+        "observed_at": observed.astimezone(UTC).isoformat(),
+    }
+
+
+def machine_event_source_ready(
+    *, path: str | Path = DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT, now: Any | None = None
+) -> bool:
+    return bool(machine_event_source_status(path=path, now=now).get("ready"))
+
 
 def _payload(record: dict[str, Any]) -> dict[str, Any]:
     value = record.get("payload")

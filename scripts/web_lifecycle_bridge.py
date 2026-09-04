@@ -546,6 +546,7 @@ def reconcile_managed_web_assignments(
     now: Any | None = None,
     terminal_consumer: Callable[..., dict[str, Any]] | None = None,
     runtime_change_consumer: Callable[..., dict[str, Any]] | None = None,
+    event_source_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Bridge managed collaboration child lifecycle into the existing Runtime continuation path."""
     from datetime import datetime, timezone
@@ -628,12 +629,13 @@ def reconcile_managed_web_assignments(
                 event_paths=paths,
                 now=now,
                 health_probe=lambda: True,
+                event_source_probe=event_source_probe,
                 watchdog_launcher=lambda **_: {
                     "launched": False,
                     "reason": "global_health_supervisor_owns_periodic_observation",
                 },
             ))
-        except (OSError, ValueError, PermissionError) as exc:
+        except (OSError, ValueError, PermissionError, RuntimeError) as exc:
             binding_errors.append({"dispatch_id": dispatch_id, "error": f"{type(exc).__name__}: {exc}"})
 
     runtime = load_runtime_state(repo)

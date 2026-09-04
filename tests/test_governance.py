@@ -2772,6 +2772,57 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
 
         self.assertTrue(any("SERVER-1 delegated assignment requires route" in error for error in errors))
 
+    def test_frontend_owned_files_cannot_claim_backend_route(self) -> None:
+        assignment = self.delegated_assignment("WEB-ROUTE-1", "web-main", policy_class="backend")
+        assignment["owned_files"] = ["apps/web/src/runtime.ts"]
+        snapshot = {
+            **self.complete_event_receipt(),
+            "candidate_packages": [],
+            "new_assignments": [assignment],
+        }
+
+        errors = control_event_guard.validate_candidate_queue(snapshot, expected_candidates={})
+
+        self.assertTrue(
+            any("WEB-ROUTE-1 route policy_class backend conflicts with derived frontend" in error for error in errors),
+            errors,
+        )
+
+    def test_backend_owned_files_cannot_claim_frontend_route(self) -> None:
+        assignment = self.delegated_assignment("SERVER-ROUTE-1", "server-main", policy_class="frontend")
+        assignment["owned_files"] = ["apps/server/src/runtime.ts"]
+        snapshot = {
+            **self.complete_event_receipt(),
+            "candidate_packages": [],
+            "new_assignments": [assignment],
+        }
+
+        errors = control_event_guard.validate_candidate_queue(snapshot, expected_candidates={})
+
+        self.assertTrue(
+            any("SERVER-ROUTE-1 route policy_class frontend conflicts with derived backend" in error for error in errors),
+            errors,
+        )
+
+    def test_mixed_frontend_backend_owned_files_require_split_before_dispatch(self) -> None:
+        assignment = self.delegated_assignment("MIXED-ROUTE-1", "mixed-main", policy_class="frontend")
+        assignment["owned_files"] = [
+            "apps/web/src/runtime.ts",
+            "apps/server/src/runtime.ts",
+        ]
+        snapshot = {
+            **self.complete_event_receipt(),
+            "candidate_packages": [],
+            "new_assignments": [assignment],
+        }
+
+        errors = control_event_guard.validate_candidate_queue(snapshot, expected_candidates={})
+
+        self.assertTrue(
+            any("MIXED-ROUTE-1 owned_files span multiple route classes" in error for error in errors),
+            errors,
+        )
+
     def test_control_event_guard_rejects_controller_self_write_without_exception(self) -> None:
         snapshot = {
             **self.complete_event_receipt(),
@@ -3410,6 +3461,182 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             snapshot, ledger_ready_ids=set(), derived_runnable_ids={"PENDING-RUNNABLE"}
         )
         self.assertEqual(errors, [])
+
+    def _fairness_ledger(self, rows: list[tuple[str, str, str]]) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        ledger = Path(directory.name) / "TASK_LEDGER.md"
+        q = chr(96)
+        body = chr(10).join(
+            f"| {q}{task_id}{q} | {q}{status}{q} | owner | {next_action} |"
+            for task_id, status, next_action in rows
+        )
+        ledger.write_text(
+            chr(10).join([
+                "# Ledger",
+                "",
+                "- 当前 Goal：project-wide fairness",
+                "- 下一可见检查点：project-wide dispatch",
+                "- 当前阻塞：none",
+                "- 规则版本：test",
+                "",
+                "| ID | 状态 | 负责人 | 下一步 |",
+                "|---|---|---|---|",
+                body,
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        return ledger
+    def test_project_wide_projection_web_active_verify_do_not_starve_mini_runnables(self) -> None:
+        ledger = self._fairness_ledger([
+            ("WEB-ACTIVE", "ACTIVE", "continue web writer"),
+            ("WEB-VERIFY", "VERIFY", "review web candidate"),
+            ("MINI-READY", "READY", "dispatch mini writer"),
+            ("MINI-PENDING", "PENDING", "implement independent mini slice"),
+        ])
+        projection = control_event_guard.project_wide_dispatch_projection(ledger)
+        self.assertEqual(
+            projection["derived_runnable_ids"],
+            {"MINI-READY", "MINI-PENDING"},
+        )
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 2,
+            "ready_packages": [
+                {"id": "MINI-READY", "decision": "active", "task_id": "MINI-READY-A1", "delivered_ack": True},
+                {"id": "MINI-PENDING", "decision": "active", "task_id": "MINI-PENDING-A1", "delivered_ack": True},
+            ],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(projection["ready_ids"]),
+            derived_runnable_ids=set(projection["derived_runnable_ids"]),
+        )
+        self.assertEqual(errors, [])
+
+    def test_project_wide_projection_mini_active_does_not_starve_server_or_web(self) -> None:
+        ledger = self._fairness_ledger([
+            ("MINI-ACTIVE", "ACTIVE", "continue mini writer"),
+            ("SERVER-READY", "READY", "dispatch server writer"),
+            ("WEB-PENDING", "PENDING", "implement independent web slice"),
+        ])
+        projection = control_event_guard.project_wide_dispatch_projection(ledger)
+        self.assertEqual(
+            projection["derived_runnable_ids"],
+            {"SERVER-READY", "WEB-PENDING"},
+        )
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 2,
+            "ready_packages": [
+                {"id": "SERVER-READY", "decision": "active", "task_id": "SERVER-A1", "delivered_ack": True},
+            ],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(projection["ready_ids"]),
+            derived_runnable_ids=set(projection["derived_runnable_ids"]),
+        )
+        self.assertTrue(
+            any("omitted derived runnable packages" in error and "WEB-PENDING" in error for error in errors),
+            errors,
+        )
+
+    def test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists(self) -> None:
+        runnable = {"WEB-READY", "MINI-READY", "SERVER-READY"}
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 3,
+            "ready_packages": [
+                {"id": "WEB-READY", "decision": "active", "task_id": "WEB-A1", "delivered_ack": True},
+                {
+                    "id": "MINI-READY",
+                    "decision": "deferred",
+                    "reason": "leave mini for a later controller turn",
+                    "reason_code": "capacity",
+                },
+                {
+                    "id": "SERVER-READY",
+                    "decision": "deferred",
+                    "reason": "leave server for a later controller turn",
+                    "reason_code": "capacity",
+                },
+            ],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=runnable, derived_runnable_ids=runnable
+        )
+        self.assertTrue(
+            any("idle dispatch capacity remains for project-wide runnable packages" in error for error in errors),
+            errors,
+        )
+
+        snapshot["ready_packages"] = [
+            {"id": task_id, "decision": "active", "task_id": f"{task_id}-A1", "delivered_ack": True}
+            for task_id in sorted(runnable)
+        ]
+        self.assertEqual(
+            control_event_guard.validate_snapshot(
+                snapshot, ledger_ready_ids=runnable, derived_runnable_ids=runnable
+            ),
+            [],
+        )
+
+    def test_pending_dependency_closure_dynamically_enters_project_wide_runnable_projection(self) -> None:
+        ledger = self._fairness_ledger([
+            ("WEB-BASE", "ACTIVE", "finish base contract"),
+            ("MINI-SPLIT", "PENDING", "after WEB-BASE implement mini split"),
+            ("SERVER-READY", "READY", "dispatch server writer"),
+        ])
+        before = control_event_guard.project_wide_dispatch_projection(ledger)
+        self.assertEqual(before["derived_runnable_ids"], {"SERVER-READY"})
+        self.assertIn("MINI-SPLIT", before["runnable_exclusions"])
+
+        q = chr(96)
+        ledger.write_text(
+            ledger.read_text(encoding="utf-8").replace(
+                f"| {q}WEB-BASE{q} | {q}ACTIVE{q} |",
+                f"| {q}WEB-BASE{q} | {q}DONE{q} |",
+            ),
+            encoding="utf-8",
+        )
+        after = control_event_guard.project_wide_dispatch_projection(ledger)
+        self.assertEqual(after["derived_runnable_ids"], {"MINI-SPLIT", "SERVER-READY"})
+
+        prior_snapshot = {
+            "head": "h1", "ledger_sha256": "l1", "worktree_status_sha256": "s1",
+            "ready_ids": ["SERVER-READY"], "runnable_ids": ["SERVER-READY"],
+            "candidate_revisions": [], "assignment_liveness": {},
+        }
+        next_snapshot = {
+            **prior_snapshot,
+            "ledger_sha256": "l2",
+            "runnable_ids": ["MINI-SPLIT", "SERVER-READY"],
+        }
+        triggers = lifecycle_hook.lifecycle_triggers(
+            next_snapshot, {"snapshot": prior_snapshot}
+        )
+        self.assertIn("RUNNABLE:MINI-SPLIT", triggers)
+
+    def test_project_wide_fairness_rejects_more_active_dispatches_than_capacity(self) -> None:
+        runnable = {"WEB-READY", "MINI-READY"}
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 1,
+            "ready_packages": [
+                {"id": "WEB-READY", "decision": "active", "task_id": "WEB-A1", "delivered_ack": True},
+                {"id": "MINI-READY", "decision": "active", "task_id": "MINI-A1", "delivered_ack": True},
+            ],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=runnable, derived_runnable_ids=runnable
+        )
+        self.assertIn("active dispatch decisions exceed available capacity: 2 > 1", errors)
 
     def test_successful_control_receipt_closes_the_event_and_latches_yield(self) -> None:
         snapshot = {

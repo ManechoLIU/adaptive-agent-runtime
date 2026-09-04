@@ -1684,11 +1684,11 @@ def run_hook() -> int:
     post_outbound_request: tuple[str, str] | None = None
     if normalized_event.get("hook_event_name") == "PreToolUse":
         try:
-            spawn_task_name = target_guard.collaboration_spawn_task_name(
+            spawn_contract = target_guard.collaboration_spawn_contract(
                 tool_name=normalized_event.get("tool_name"),
                 tool_input=normalized_event.get("tool_input"),
             )
-            if spawn_task_name is not None:
+            if spawn_contract is not None:
                 try:
                     from scripts.web_agent_execution import require_prepared_web_dispatch
                 except ModuleNotFoundError:
@@ -1696,7 +1696,9 @@ def run_hook() -> int:
                 require_prepared_web_dispatch(
                     repo=expected_root,
                     controller_id=controller_id,
-                    task_name=spawn_task_name,
+                    task_name=spawn_contract["task_name"],
+                    expected_model=spawn_contract["model"],
+                    expected_agent_type=spawn_contract["agent_type"],
                 )
         except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
             print(json.dumps(_pre_tool_denial(

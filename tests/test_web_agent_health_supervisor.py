@@ -32,6 +32,11 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
             json.dumps({"controller-1": str(self.repo.resolve())}), encoding="utf-8"
         )
         self.events = root / "controller-1.jsonl"
+        self.policy = root / "AGENTS.md"
+        self.policy.write_text(
+            "general 默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -53,6 +58,17 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
             "side_effect": False,
             "progress_deadline_minutes": 10,
             "role": "writer",
+            "route": {
+                "decision": "default",
+                "policy_class": "general",
+                "provider": "chatgpt_web",
+                "model": "gpt-5.6-sol",
+                "auth_mode": "host",
+                "policy_source": {
+                    "path": str(self.policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(self.policy.read_bytes()).hexdigest(),
+                },
+            },
         }
         value.update(extra)
         return value
@@ -107,6 +123,7 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             task_name=task_name, assignment=assignment or self.assignment(), now=T0 + timedelta(seconds=1),
             health_probe=lambda: True,
+            event_source_probe=lambda: True,
         )
 
     def test_completed_writer_becomes_canonical_terminal_and_handoffs_same_controller(self):
@@ -124,6 +141,7 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             event_paths=[self.events], now=T0 + timedelta(minutes=2),
             terminal_consumer=consume,
+            event_source_probe=lambda: True,
         )
         lease = load_runtime_state(self.repo)["leases"]["A-WEB"]
         self.assertEqual(lease["terminal_state"], "completed")
@@ -143,6 +161,7 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
         result = reconcile_web_agent_health_once(
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             event_paths=[self.events], now=T0 + timedelta(minutes=2),
+            event_source_probe=lambda: True,
             terminal_consumer=lambda **kwargs: calls.append(kwargs) or {
                 "controller_id": "controller-1", "pending_control_event": True,
                 "wake_result": {"result": "CONFIRMED"}, "supervisor_armed": False,
@@ -155,6 +174,53 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
         self.assertEqual(result["terminal_handoffs"][0]["controller_id"], "controller-1")
         self.assertEqual(len(calls), 1)
 
+    def test_failed_cancelled_and_disconnected_all_handoff_same_controller(self):
+        from scripts.web_agent_health_supervisor import reconcile_web_agent_health_once
+
+        expectations = {
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "disconnected": "disconnected",
+        }
+        for index, (kind, expected_terminal) in enumerate(expectations.items(), start=1):
+            with self.subTest(kind=kind):
+                # Each subcase needs a distinct Assignment/session so immutable terminal state
+                # from the previous case cannot hide a routing/continuation defect.
+                assignment = self.assignment(
+                    assignment_id=f"A-WEB-{index}",
+                    task_id=f"T-WEB-{index}",
+                    agent_id=f"web-writer-{index}",
+                )
+                task_name = f"writer-task-{index}"
+                self.prepare(assignment=assignment, task_name=task_name)
+                child = f"child-{index}"
+                self.write_spawn_and_terminal(
+                    task_name=task_name,
+                    child=child,
+                    kind=kind,
+                    call_id=f"spawn-{index}",
+                    started_at=T0 + timedelta(seconds=2 + index),
+                )
+                calls = []
+                result = reconcile_web_agent_health_once(
+                    repo=self.repo,
+                    registry_path=self.registry,
+                    controller_id="controller-1",
+                    event_paths=[self.events],
+                    now=T0 + timedelta(minutes=2),
+                    terminal_consumer=lambda **kwargs: calls.append(kwargs) or {
+                        "controller_id": "controller-1",
+                        "pending_control_event": True,
+                        "wake_result": {"result": "CONFIRMED"},
+                        "supervisor_armed": False,
+                    },
+                    event_source_probe=lambda: True,
+                )
+                lease = load_runtime_state(self.repo)["leases"][assignment["assignment_id"]]
+                self.assertEqual(lease["terminal_state"], expected_terminal)
+                self.assertEqual(result["terminal_handoffs"][0]["controller_id"], "controller-1")
+                self.assertEqual(len(calls), 1)
+
     def test_stale_lease_only_handoffs_to_existing_runtime_continuation(self):
         from scripts.web_agent_execution import start_web_assignment
         from scripts.web_agent_health_supervisor import reconcile_web_agent_health_once
@@ -162,11 +228,13 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             conversation_id="child-stale", assignment=self.assignment(), now=T0,
             watchdog_launcher=lambda **_: {"launched": True},
+            event_source_probe=lambda: True,
         )
         wakes = []
         result = reconcile_web_agent_health_once(
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             event_paths=[], now=T0 + timedelta(minutes=26),
+            event_source_probe=lambda: True,
             runtime_change_consumer=lambda **kwargs: wakes.append(kwargs) or {
                 "controller_id": "controller-1", "pending_control_event": True,
                 "wake_result": {"result": "DEFERRED"}, "supervisor_armed": True,
@@ -188,10 +256,12 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
         first = reconcile_web_agent_health_once(
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             event_paths=[self.events], now=T0 + timedelta(minutes=2), terminal_consumer=consume,
+            event_source_probe=lambda: True,
         )
         second = reconcile_web_agent_health_once(
             repo=self.repo, registry_path=self.registry, controller_id="controller-1",
             event_paths=[self.events], now=T0 + timedelta(minutes=3), terminal_consumer=consume,
+            event_source_probe=lambda: True,
         )
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(first["terminal_handoffs"]), 1)

@@ -33,6 +33,22 @@ class ControllerTargetGuardTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
         return repo
 
+    def test_collaboration_spawn_contract_captures_task_model_and_agent_type(self) -> None:
+        guard = load_guard()
+        contract = guard.collaboration_spawn_contract(
+            tool_name="collaboration.spawn_agent",
+            tool_input={
+                "task_name": "WEB-1",
+                "model": "gpt-5.6-terra",
+                "agent_type": "ui_writer",
+            },
+        )
+        self.assertEqual(contract, {
+            "task_name": "WEB-1",
+            "model": "gpt-5.6-terra",
+            "agent_type": "ui_writer",
+        })
+
     def test_explicit_current_target_is_the_only_allowed_desktop_outbound_target(self) -> None:
         guard = load_guard()
         with tempfile.TemporaryDirectory() as tmp:

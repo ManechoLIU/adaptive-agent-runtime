@@ -36,6 +36,7 @@ UTC = timezone.utc
 STRONG_HOST_SOURCES = {"chatgpt_host_event"}
 WEAK_UI_SOURCES = {"ai_bridge_browser_tab"}
 TERMINAL_STATES = {"completed", "interrupted", "missing", "failed"}
+WEB_EXECUTION_PROVIDERS = {"chatgpt_web"}
 
 
 def _iso(now: datetime) -> str:
@@ -104,6 +105,35 @@ def _immutable_git_commit(repo: Path, candidate: str) -> str:
     return resolved
 
 
+def _validate_web_assignment_route(assignment: dict[str, Any]) -> dict[str, Any]:
+    """Bind Web execution to the same canonical delegated route contract as every other executor."""
+    try:
+        from scripts.control_event_guard import delegated_route_contract_errors
+    except ModuleNotFoundError:
+        from control_event_guard import delegated_route_contract_errors
+
+    task_id = str(assignment.get("task_id") or "").strip() or "unknown"
+    route = assignment.get("route")
+    errors = delegated_route_contract_errors(task_id, assignment.get("owned_scope"), route)
+    if errors:
+        raise PermissionError("Web Assignment route rejected: " + "; ".join(errors))
+    assert isinstance(route, dict)
+    for field in ("provider", "model"):
+        actual = str(assignment.get(field) or "").strip()
+        routed = str(route.get(field) or "").strip()
+        if actual != routed:
+            raise PermissionError(
+                f"Web Assignment {field} does not match canonical route: {actual} != {routed}"
+            )
+    provider = str(assignment.get("provider") or "").strip()
+    if provider not in WEB_EXECUTION_PROVIDERS:
+        raise PermissionError(
+            f"Web execution transport cannot execute provider {provider}; "
+            "dispatch through the canonical provider executor instead"
+        )
+    return route
+
+
 def _start_receipt(repo: Path, event: dict[str, Any], now: datetime) -> dict[str, Any]:
     assignment = event.get("assignment")
     if not isinstance(assignment, dict):
@@ -112,6 +142,7 @@ def _start_receipt(repo: Path, event: dict[str, Any], now: datetime) -> dict[str
     missing = [key for key in required if assignment.get(key) in (None, "", [])]
     if missing:
         raise ValueError("Web execution Assignment missing contract: " + ", ".join(missing))
+    route = _validate_web_assignment_route(assignment)
     conversation_id = str(event.get("conversation_id") or "").strip()
     if conversation_id == str(event.get("controller_id") or "").strip():
         raise ValueError("Web conversation identity must never be used as controller identity")
@@ -148,6 +179,10 @@ def _start_receipt(repo: Path, event: dict[str, Any], now: datetime) -> dict[str
         "execution_transport": "web",
         "execution_role": role,
         "candidate_revision": candidate,
+        "auth_mode": str(route.get("auth_mode") or "").strip() or None,
+        "policy_class": str(route.get("policy_class") or "").strip() or None,
+        "route_decision": str(route.get("decision") or "").strip() or None,
+        "route_contract": json.loads(json.dumps(route)),
         "exclusive_execution_key": f"task:{assignment['task_id']}",
         "exclusive_execution_keys": [
             f"task:{assignment['task_id']}",
@@ -235,6 +270,7 @@ def _dispatch_start_receipt(
     missing = [key for key in required if assignment.get(key) in (None, "", [])]
     if missing:
         raise ValueError("Web execution Assignment missing contract: " + ", ".join(missing))
+    route = _validate_web_assignment_route(assignment)
     if not conversation_id or conversation_id == controller_id:
         raise ValueError("Web conversation execution identity must be distinct from Controller identity")
     role = str(assignment.get("role") or "writer").strip().lower()
@@ -257,6 +293,10 @@ def _dispatch_start_receipt(
         "primary_goal": assignment["primary_goal"], "success_criteria": assignment["success_criteria"],
         "owned_scope": assignment["owned_scope"], "strategy": assignment["strategy"],
         "execution_transport": "web", "execution_role": role, "candidate_revision": candidate,
+        "auth_mode": str(route.get("auth_mode") or "").strip() or None,
+        "policy_class": str(route.get("policy_class") or "").strip() or None,
+        "route_decision": str(route.get("decision") or "").strip() or None,
+        "route_contract": json.loads(json.dumps(route)),
         "exclusive_execution_key": f"task:{assignment['task_id']}",
         "exclusive_execution_keys": [
             f"task:{assignment['task_id']}",
@@ -335,10 +375,23 @@ def _health_supervisor_is_ready(
     return bool(health_supervisor_ready())
 
 
+def _machine_event_source_is_ready(
+    probe: Callable[[], bool] | None = None,
+) -> bool:
+    if probe is not None:
+        return bool(probe())
+    try:
+        from scripts.web_agent_events import machine_event_source_ready
+    except ModuleNotFoundError:
+        from web_agent_events import machine_event_source_ready
+    return bool(machine_event_source_ready())
+
+
 def prepare_web_assignment_dispatch(
     *, repo: str | Path, registry_path: str | Path, controller_id: str, task_name: str,
     assignment: dict[str, Any], now: datetime | None = None,
     health_probe: Callable[[], bool] | None = None,
+    event_source_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Create a durable pre-spawn ticket; no child execution may be represented before a real started event."""
     repo_path = Path(repo).expanduser().resolve()
@@ -347,6 +400,8 @@ def prepare_web_assignment_dispatch(
     _registered_controller(repo_path, registry, controller_id)
     if not _health_supervisor_is_ready(health_probe):
         raise RuntimeError("Web Assignment health supervisor is not ready; dispatch fails closed")
+    if not _machine_event_source_is_ready(event_source_probe):
+        raise RuntimeError("Web Assignment machine event source is not ready; dispatch fails closed")
     task_name = str(task_name or "").strip()
     if not task_name:
         raise ValueError("Web dispatch requires a non-empty task_name")
@@ -385,11 +440,15 @@ def prepare_web_assignment_dispatch(
 
 def require_prepared_web_dispatch(
     *, repo: str | Path, controller_id: str, task_name: str,
+    expected_model: str | None = None, expected_agent_type: str | None = None,
     health_probe: Callable[[], bool] | None = None,
+    event_source_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     repo_path = Path(repo).expanduser().resolve()
     if not _health_supervisor_is_ready(health_probe):
         raise PermissionError("Web Assignment health supervisor is not ready")
+    if not _machine_event_source_is_ready(event_source_probe):
+        raise PermissionError("Web Assignment machine event source is not ready")
     task_name = str(task_name or "").strip()
     candidates = [
         record for record in _load_dispatch_state(repo_path).get("dispatches", {}).values()
@@ -400,7 +459,25 @@ def require_prepared_web_dispatch(
     ]
     if len(candidates) != 1:
         raise PermissionError("collaboration.spawn_agent requires exactly one prepared canonical Web Runtime dispatch ticket")
-    return dict(candidates[0])
+    ticket = dict(candidates[0])
+    assignment = ticket.get("assignment")
+    if not isinstance(assignment, dict):
+        raise PermissionError("prepared Web Runtime dispatch lost its Assignment contract")
+    if expected_model is not None:
+        expected = str(expected_model or "").strip()
+        prepared = str(assignment.get("model") or "").strip()
+        if expected != prepared:
+            raise PermissionError(
+                f"collaboration.spawn_agent model does not match prepared Runtime Assignment: {expected} != {prepared}"
+            )
+    if expected_agent_type is not None:
+        expected = str(expected_agent_type or "").strip()
+        prepared = str(assignment.get("agent_type") or "").strip()
+        if expected != prepared:
+            raise PermissionError(
+                f"collaboration.spawn_agent agent_type does not match prepared Runtime Assignment: {expected} != {prepared}"
+            )
+    return ticket
 
 
 
@@ -497,6 +574,7 @@ def bind_web_assignment_dispatch(
     event_paths: list[str | Path], now: datetime | None = None,
     watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
     health_probe: Callable[[], bool] | None = None,
+    event_source_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Bind a pre-spawn ticket to the machine-observed child thread and create its canonical lease."""
     repo_path = Path(repo).expanduser().resolve()
@@ -505,6 +583,8 @@ def bind_web_assignment_dispatch(
     _registered_controller(repo_path, registry, controller_id)
     if not _health_supervisor_is_ready(health_probe, watchdog_launcher=watchdog_launcher):
         raise RuntimeError("Web Assignment health supervisor is not ready; binding fails closed")
+    if not _machine_event_source_is_ready(event_source_probe):
+        raise RuntimeError("Web Assignment machine event source is not ready; binding fails closed")
 
     state = _load_dispatch_state(repo_path)
     ticket = state.get("dispatches", {}).get(dispatch_id)
@@ -537,6 +617,7 @@ def bind_web_assignment_dispatch(
             now=now,
             watchdog_launcher=watchdog_launcher,
             health_probe=health_probe,
+            event_source_probe=event_source_probe,
             replacement_session_proof={
                 "source": "collaboration_session_event",
                 "dispatch_id": dispatch_id,
@@ -550,6 +631,7 @@ def bind_web_assignment_dispatch(
             conversation_id=conversation_id, assignment=assignment, now=now,
             watchdog_launcher=watchdog_launcher,
             health_probe=health_probe,
+            event_source_probe=event_source_probe,
         )
 
     def mutate(current: dict[str, Any]) -> None:
@@ -571,6 +653,7 @@ def start_web_assignment(
     assignment: dict[str, Any], now: datetime | None = None,
     watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
     health_probe: Callable[[], bool] | None = None,
+    event_source_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Record a Controller-dispatched Web attempt without claiming Host generation liveness."""
     repo_path = Path(repo).expanduser().resolve()
@@ -579,6 +662,8 @@ def start_web_assignment(
     _registered_controller(repo_path, registry, controller_id)
     if not _health_supervisor_is_ready(health_probe, watchdog_launcher=watchdog_launcher):
         raise RuntimeError("Web Assignment health supervisor is not ready; active lease was not created")
+    if not _machine_event_source_is_ready(event_source_probe):
+        raise RuntimeError("Web Assignment machine event source is not ready; active lease was not created")
     attempt = int(assignment.get("attempt", 1))
     assignment_id = str(assignment.get("assignment_id") or "").strip()
     if not assignment_id:
@@ -691,6 +776,7 @@ def recover_web_assignment(
     lease_id_factory: Callable[[str, int], str] | None = None,
     replacement_session_proof: dict[str, Any] | None = None,
     health_probe: Callable[[], bool] | None = None,
+    event_source_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Create the next fenced attempt when the woken Controller has a replacement execution session."""
     repo_path = Path(repo).expanduser().resolve()
@@ -699,6 +785,8 @@ def recover_web_assignment(
     _registered_controller(repo_path, registry, controller_id)
     if not _health_supervisor_is_ready(health_probe, watchdog_launcher=watchdog_launcher):
         raise RuntimeError("Web Assignment health supervisor is not ready; recovery fails closed")
+    if not _machine_event_source_is_ready(event_source_probe):
+        raise RuntimeError("Web Assignment machine event source is not ready; recovery fails closed")
     state = load_runtime_state(repo_path)
     current = state.get("leases", {}).get(assignment_id)
     if not isinstance(current, dict):
@@ -731,6 +819,7 @@ def recover_web_assignment(
         "side_effect": current.get("side_effect"), "idempotency_key": current.get("idempotency_key"),
         "progress_deadline_minutes": int(current.get("progress_deadline_minutes") or 30),
         "role": current.get("execution_role") or "writer", "candidate_revision": current.get("candidate_revision"),
+        "route": json.loads(json.dumps(current.get("route_contract"))) if isinstance(current.get("route_contract"), dict) else None,
     }
     receipt = _dispatch_start_receipt(
         repo=repo_path, controller_id=controller_id, conversation_id=conversation_id,
