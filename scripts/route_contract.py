@@ -187,33 +187,33 @@ def _ascii_marker_prefix(text: str, marker: str) -> tuple[int, int] | None:
     return match.span() if match else None
 
 
+def _normalized_prefix_token(value: str) -> str:
+    normalized = _normalize_policy_symbols(value).casefold().strip()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _canonical_policy_prefix_forms(marker: str) -> set[str]:
+    token = _normalized_prefix_token(marker)
+    forms = {token, token + ":"}
+    for directive in CANONICAL_POLICY_DIRECTIVES - {""}:
+        directive_token = _normalized_prefix_token(directive)
+        forms.add(f"{token} {directive_token}")
+        forms.add(f"{token}: {directive_token}")
+        forms.add(f"{token}:{directive_token}")
+        if not token.isascii() or not directive_token.isascii():
+            forms.add(token + directive_token)
+    return forms
+
+
 def _policy_prefix_is_positive(prefix: str, markers: tuple[str, ...]) -> bool:
-    """Require class marker first and one exact optional directive grammar."""
-    normalized = _normalize_policy_symbols(prefix).casefold().strip()
+    """Authorize only explicitly enumerated canonical positive prefix forms."""
+    normalized = _normalized_prefix_token(prefix)
     if not normalized:
         return not markers
-
+    allowed: set[str] = set()
     for marker in markers:
-        token = _normalize_policy_symbols(marker).casefold()
-        span: tuple[int, int] | None
-        if token.isascii():
-            span = _ascii_marker_prefix(normalized, token)
-        else:
-            span = (0, len(token)) if normalized.startswith(token) else None
-        if span is None:
-            continue
-
-        remainder = normalized[span[1]:].strip()
-        if remainder.startswith((":","：")):
-            remainder = remainder[1:].strip()
-        if remainder.endswith((":","：")):
-            remainder = remainder[:-1].strip()
-        if any(character in remainder for character in "-_/\|,，;；()[]{}<>"):
-            continue
-        remainder = re.sub(r"\s+", " ", remainder).strip()
-        if remainder in CANONICAL_POLICY_DIRECTIVES:
-            return True
-    return False
+        allowed.update(_canonical_policy_prefix_forms(marker))
+    return normalized in allowed
 
 
 def _policy_class_marker_matches(prefix: str, markers: tuple[str, ...]) -> bool:

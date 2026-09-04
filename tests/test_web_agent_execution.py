@@ -1320,6 +1320,12 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             "frontend - default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
             "frontend/default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
             "frontend (default) provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend default: provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend:: provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend：：默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。",
+            "frontend:default: provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend : : default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend default ： provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
         ]
         route = {
             "decision": "default",
@@ -1344,8 +1350,10 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
 
         good_lines = [
             "frontend: default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
-            "frontend default: provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
             "前端：默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。",
+            "frontend:default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend: provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "前端默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。",
         ]
         for index, line in enumerate(good_lines):
             with self.subTest(active=line):
