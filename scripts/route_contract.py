@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -121,9 +122,19 @@ POLICY_FIELD_PATTERN = re.compile(
 )
 
 
+UNICODE_DASH_EQUIVALENTS = "‐‑‒–—―−﹘﹣－"
+
+
+def _normalize_policy_symbols(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    return normalized.translate(
+        str.maketrans({character: "-" for character in UNICODE_DASH_EQUIVALENTS})
+    )
+
+
 def _normalized_policy_text(value: str) -> str:
-    lowered = value.casefold()
-    lowered = re.sub(r"[-_‐‑‒–—−]+", " ", lowered)
+    lowered = _normalize_policy_symbols(value).casefold()
+    lowered = re.sub(r"[-_]+", " ", lowered)
     return re.sub(r"\s+", " ", lowered).strip()
 
 
@@ -147,9 +158,10 @@ def _active_policy_line(line: str) -> bool:
 
 
 def _policy_field_assignments(line: str) -> tuple[dict[str, str], int | None]:
+    normalized_line = _normalize_policy_symbols(line)
     values: dict[str, str] = {}
     first_start: int | None = None
-    for match in POLICY_FIELD_PATTERN.finditer(line):
+    for match in POLICY_FIELD_PATTERN.finditer(normalized_line):
         field = match.group("field").casefold()
         value = match.group("value").strip().rstrip(".")
         if first_start is None:
@@ -163,7 +175,7 @@ def _policy_field_assignments(line: str) -> tuple[dict[str, str], int | None]:
 def _policy_class_marker_matches(prefix: str, markers: tuple[str, ...]) -> bool:
     if not markers:
         return True
-    lowered = prefix.casefold()
+    lowered = _normalize_policy_symbols(prefix).casefold()
     for marker in markers:
         token = marker.casefold()
         if token.isascii():

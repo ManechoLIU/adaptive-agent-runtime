@@ -1179,6 +1179,10 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             "frontend may-not use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
             "frontend never use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
             "frontend backup-provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend must－not use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend must−not use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend backup－provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend backup–provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
         ]
         route = {
             "decision": "default",
@@ -1200,6 +1204,34 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
                     route_policy_errors(f"T-INACTIVE-{index}", candidate),
                     [f"T-INACTIVE-{index} route is not declared by policy source"],
                 )
+
+    def test_route_policy_normalizes_unicode_dash_variants_before_authorization(self):
+        from scripts.route_contract import UNICODE_DASH_EQUIVALENTS, route_policy_errors
+
+        route = {
+            "decision": "default",
+            "policy_class": "frontend",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "auth_mode": "host",
+        }
+        for index, dash in enumerate(UNICODE_DASH_EQUIVALENTS):
+            for variant, line in (
+                ("negative", f"frontend must{dash}not use provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host."),
+                ("prefixed", f"frontend backup{dash}provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host."),
+            ):
+                with self.subTest(dash=ord(dash), variant=variant):
+                    policy = Path(self.tmp.name) / f"unicode-dash-{index}-{variant}.md"
+                    policy.write_text(line + chr(10), encoding="utf-8")
+                    candidate = dict(route)
+                    candidate["policy_source"] = {
+                        "path": str(policy.resolve()),
+                        "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+                    }
+                    self.assertEqual(
+                        route_policy_errors(f"T-DASH-{index}-{variant}", candidate),
+                        [f"T-DASH-{index}-{variant} route is not declared by policy source"],
+                    )
 
     def test_route_policy_rejects_tilde_fenced_route_examples(self):
         from scripts.route_contract import route_policy_errors
