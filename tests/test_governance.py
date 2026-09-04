@@ -4174,3 +4174,27 @@ class PendingLifecycleWakeDispatchTests(unittest.TestCase):
         self.assertEqual(output, {})
         self.assertFalse(next_state["pending_control_event"])
         self.assertIsNone(lifecycle_hook.pending_wake_request(next_state))
+
+class WebDispatchRuntimeGateTests(unittest.TestCase):
+    def test_web_delegated_assignment_requires_machine_verified_bound_runtime_dispatch(self) -> None:
+        from scripts.control_event_guard import canonical_web_dispatch_errors
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            snapshot = {
+                "new_assignments": [{
+                    "task_id": "WEB-1",
+                    "assignment_id": "A-WEB-1",
+                    "execution_mode": "delegated",
+                    "execution_transport": "web",
+                    "runtime_dispatch": {
+                        "dispatch_id": "missing-ticket",
+                        "state": "bound",
+                        "conversation_id": "child-1",
+                        "lease_id": "lease-1",
+                    },
+                }]
+            }
+            errors = canonical_web_dispatch_errors(repo, snapshot)
+        self.assertTrue(any("canonical Runtime dispatch" in error for error in errors))

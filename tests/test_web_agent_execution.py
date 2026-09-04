@@ -13,6 +13,49 @@ UTC = timezone.utc
 T0 = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
 
 
+def bind_recovery_attempt(
+    *, repo, registry, controller_id, assignment, conversation_id, task_name, at,
+    observed_model="gpt-5.6-sol", observed_agent_type="default",
+):
+    from scripts.web_agent_execution import prepare_web_assignment_dispatch, bind_web_assignment_dispatch
+    prepared_at = at - timedelta(seconds=1)
+    prepared = prepare_web_assignment_dispatch(
+        repo=repo, registry_path=registry, controller_id=controller_id,
+        task_name=task_name, assignment=assignment, now=prepared_at,
+        health_probe=lambda: True,
+    )
+    event_path = Path(registry).parent / f"{task_name}-{conversation_id}.jsonl"
+    call_id = f"spawn-{task_name}-{conversation_id}"
+    records = [
+        {
+            "timestamp": prepared_at.isoformat(),
+            "type": "response_item",
+            "payload": {
+                "type": "function_call", "namespace": "collaboration", "name": "spawn_agent",
+                "call_id": call_id,
+                "arguments": json.dumps({"task_name": task_name, "agent_type": observed_agent_type, "model": observed_model}),
+            },
+        },
+        {
+            "timestamp": at.isoformat(),
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "SubAgentActivity", "kind": "started", "id": call_id,
+                    "agent_thread_id": conversation_id, "agent_path": f"/root/{task_name}",
+                },
+            },
+        },
+    ]
+    event_path.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
+    return bind_web_assignment_dispatch(
+        repo=repo, registry_path=registry, controller_id=controller_id,
+        dispatch_id=prepared["dispatch_id"], event_paths=[event_path], now=at,
+        health_probe=lambda: True,
+    )
+
+
 class WebAgentExecutionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -50,6 +93,8 @@ class WebAgentExecutionTests(unittest.TestCase):
             "task_id": "T-1",
             "agent_id": "web-writer-1",
             "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "agent_type": "default",
             "worktree": str(self.repo),
             "primary_goal": "finish bounded runtime task",
             "success_criteria": ["tests pass"],
@@ -163,11 +208,10 @@ class WebAgentExecutionTests(unittest.TestCase):
     def test_late_old_attempt_cannot_overwrite_recovery_attempt(self):
         from scripts.web_agent_execution import recover_web_assignment
         self.start()
-        recover_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            assignment_id="A-1", conversation_id="conv-2", now=T0 + timedelta(minutes=46),
-            watchdog_launcher=lambda **_: {"launched": False},
-            lease_id_factory=lambda assignment_id, attempt: f"{assignment_id}:web:attempt:{attempt}",
+        bind_recovery_attempt(
+            repo=self.repo, registry=self.registry, controller_id="controller-1",
+            assignment=self.assignment(), conversation_id="conv-2", task_name="recover-a1-attempt-2",
+            at=T0 + timedelta(minutes=46),
         )
         with self.assertRaisesRegex(ValueError, "stale runtime attempt|execution identity"):
             self.event(
@@ -237,18 +281,16 @@ class WebAgentExecutionTests(unittest.TestCase):
     def test_web_recovery_budget_exhaustion_blocks_fourth_attempt(self):
         from scripts.web_agent_execution import recover_web_assignment
         self.start()
-        recover = lambda conversation, at: recover_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            assignment_id="A-1", conversation_id=conversation, now=at,
-            watchdog_launcher=lambda **_: {"launched": False},
-            lease_id_factory=lambda assignment_id, attempt: f"{assignment_id}:web:attempt:{attempt}",
+        recover = lambda conversation, task_name, at: bind_recovery_attempt(
+            repo=self.repo, registry=self.registry, controller_id="controller-1",
+            assignment=self.assignment(), conversation_id=conversation, task_name=task_name, at=at,
         )
-        recover("conv-2", T0 + timedelta(minutes=46))
-        recover("conv-3", T0 + timedelta(minutes=92))
+        recover("conv-2", "recover-budget-2", T0 + timedelta(minutes=46))
+        recover("conv-3", "recover-budget-3", T0 + timedelta(minutes=92))
         lease = load_runtime_state(self.repo)["leases"]["A-1"]
         self.assertEqual(evaluate_lease(lease, now=T0 + timedelta(minutes=138))["state"], "budget_exhausted")
         with self.assertRaisesRegex(ValueError, "recovery budget exhausted"):
-            recover("conv-4", T0 + timedelta(minutes=138))
+            recover("conv-4", "recover-budget-4", T0 + timedelta(minutes=138))
     def test_reviewer_pass_accepts_only_exact_candidate_revision(self):
         self.start(role="reviewer", candidate_revision=self.head, agent_id="web-reviewer-1")
         result = self.event(
@@ -365,6 +407,8 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             "task_id": "T-RUNTIME",
             "agent_id": "web-writer-runtime",
             "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "agent_type": "default",
             "worktree": str(self.repo),
             "primary_goal": "finish bounded runtime task",
             "success_criteria": ["tests pass"],
@@ -399,6 +443,26 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         self.assertEqual(lease["health_mode"], "progress_watchdog")
         self.assertIsNone(lease.get("host_attestation_id"))
         self.assertEqual(len(self.launched), 1)
+
+    def test_runtime_records_exact_web_agent_model_and_type(self):
+        from scripts.web_agent_execution import start_web_assignment
+        start_web_assignment(
+            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
+            conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
+            watchdog_launcher=self._launch,
+        )
+        lease = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]
+        self.assertEqual(lease["model"], "gpt-5.6-sol")
+        self.assertEqual(lease["agent_type"], "default")
+
+    def test_machine_observed_spawn_must_match_prepared_model_and_agent_type(self):
+        with self.assertRaisesRegex(PermissionError, "model does not match"):
+            bind_recovery_attempt(
+                repo=self.repo, registry=self.registry, controller_id="controller-1",
+                assignment=self.assignment(), conversation_id="conv-runtime-mismatch",
+                task_name="runtime-mismatch", at=T0 + timedelta(seconds=2),
+                observed_model="gpt-5.6-luna",
+            )
 
     def test_watchdog_observes_git_progress_without_any_host_event(self):
         from scripts.web_agent_execution import start_web_assignment, watch_web_assignment_once
@@ -459,17 +523,16 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             conversation_id="conv-runtime-1", assignment=self.assignment(), now=T0,
             watchdog_launcher=self._launch,
         )
-        result = recover_web_assignment(
-            repo=self.repo, registry_path=self.registry, controller_id="controller-1",
-            assignment_id="A-RUNTIME", conversation_id="conv-runtime-2", now=T0 + timedelta(minutes=26),
-            watchdog_launcher=self._launch,
-            lease_id_factory=lambda assignment_id, attempt: f"{assignment_id}:web:auto:{attempt}",
+        result = bind_recovery_attempt(
+            repo=self.repo, registry=self.registry, controller_id="controller-1",
+            assignment=self.assignment(), conversation_id="conv-runtime-2",
+            task_name="runtime-recover-2", at=T0 + timedelta(minutes=26),
         )
         lease = load_runtime_state(self.repo)["leases"]["A-RUNTIME"]
         self.assertEqual(result["attempt"], 2)
         self.assertEqual(lease["attempt"], 2)
         self.assertEqual(lease["session_id"], "conv-runtime-2")
-        self.assertEqual(lease["lease_id"], "A-RUNTIME:web:auto:2")
+        self.assertNotEqual(lease["lease_id"], "A-RUNTIME:web:attempt:1")
         self.assertEqual(lease["recovery_count"], 1)
 
     def test_unknown_side_effect_timeout_fails_closed_even_with_stable_key(self):
@@ -544,3 +607,131 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StructuredCollaborationTerminalTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)], check=True)
+        (self.repo / "README.md").write_text("runtime\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "README.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "init"],
+            check=True,
+        )
+        self.registry = root / "controllers.json"
+        self.registry.write_text(json.dumps({"controller-1": str(self.repo.resolve())}), encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def assignment(self, **extra):
+        value = {
+            "assignment_id": "A-COLLAB",
+            "task_id": "T-COLLAB",
+            "agent_id": "writer-collab",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "agent_type": "default",
+            "worktree": str(self.repo),
+            "primary_goal": "finish child task",
+            "success_criteria": ["child completes"],
+            "owned_scope": ["README.md"],
+            "strategy": "collaboration:gpt-5.6-sol",
+            "assignment_contract_version": 2,
+            "side_effect": False,
+            "role": "writer",
+        }
+        value.update(extra)
+        return value
+
+    def start(self, **extra):
+        from scripts.web_agent_execution import start_web_assignment
+        return start_web_assignment(
+            repo=self.repo,
+            registry_path=self.registry,
+            controller_id="controller-1",
+            conversation_id="child-thread-1",
+            assignment=self.assignment(**extra),
+            now=T0,
+            watchdog_launcher=lambda **_: {"launched": True, "pid": 123},
+        )
+
+    def observation(self, kind="completed", **extra):
+        value = {
+            "source": "collaboration_session_event",
+            "kind": kind,
+            "conversation_id": "child-thread-1",
+            "observation_id": f"terminal-{kind}-1",
+            "timestamp": (T0 + timedelta(minutes=2)).isoformat(),
+        }
+        value.update(extra)
+        return value
+
+    def test_structured_completed_closes_canonical_attempt_and_writes_durable_terminal_receipt(self):
+        from scripts.web_agent_execution import ingest_structured_subagent_terminal
+        self.start()
+        result = ingest_structured_subagent_terminal(
+            repo=self.repo,
+            assignment_id="A-COLLAB",
+            observation=self.observation(),
+            now=T0 + timedelta(minutes=2),
+        )
+        lease = load_runtime_state(self.repo)["leases"]["A-COLLAB"]
+        self.assertEqual(lease["terminal_state"], "completed")
+        self.assertEqual(lease["transport_outcome"], "completed")
+        self.assertEqual(lease["delivery_outcome"], "unresolved")
+        receipt = json.loads(Path(result["terminal_receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["event_type"], "external_agent_terminal")
+        self.assertEqual(receipt["assignment_id"], "A-COLLAB")
+        self.assertEqual(receipt["session_id"], "child-thread-1")
+        self.assertEqual(receipt["attempt"], 1)
+        self.assertEqual(receipt["lease_id"], lease["lease_id"])
+        self.assertEqual(receipt["machine_terminal_observation_id"], "terminal-completed-1")
+        self.assertEqual(receipt["model"], "gpt-5.6-sol")
+        self.assertEqual(receipt["agent_type"], "default")
+
+    def test_duplicate_structured_terminal_reuses_same_receipt_without_reopening_attempt(self):
+        from scripts.web_agent_execution import ingest_structured_subagent_terminal
+        self.start()
+        first = ingest_structured_subagent_terminal(
+            repo=self.repo, assignment_id="A-COLLAB",
+            observation=self.observation(), now=T0 + timedelta(minutes=2),
+        )
+        second = ingest_structured_subagent_terminal(
+            repo=self.repo, assignment_id="A-COLLAB",
+            observation=self.observation(observation_id="terminal-refresh-2"),
+            now=T0 + timedelta(minutes=3),
+        )
+        lease = load_runtime_state(self.repo)["leases"]["A-COLLAB"]
+        self.assertEqual(first["terminal_receipt"], second["terminal_receipt"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(lease["attempt"], 1)
+        self.assertEqual(lease["terminal_state"], "completed")
+
+    def test_structured_terminal_must_match_machine_observed_child_session(self):
+        from scripts.web_agent_execution import ingest_structured_subagent_terminal
+        self.start()
+        with self.assertRaisesRegex(ValueError, "session"):
+            ingest_structured_subagent_terminal(
+                repo=self.repo, assignment_id="A-COLLAB",
+                observation=self.observation(conversation_id="other-child"),
+                now=T0 + timedelta(minutes=2),
+            )
+        self.assertIsNone(load_runtime_state(self.repo)["leases"]["A-COLLAB"]["terminal_state"])
+
+    def test_structured_disconnected_is_terminal_but_ui_interruption_text_is_not_used(self):
+        from scripts.web_agent_execution import ingest_structured_subagent_terminal
+        self.start()
+        result = ingest_structured_subagent_terminal(
+            repo=self.repo, assignment_id="A-COLLAB",
+            observation=self.observation(kind="disconnected"),
+            now=T0 + timedelta(minutes=2),
+        )
+        lease = load_runtime_state(self.repo)["leases"]["A-COLLAB"]
+        self.assertEqual(lease["terminal_state"], "disconnected")
+        self.assertEqual(lease["transport_outcome"], "failed")
+        self.assertIn("terminal_receipt", result)

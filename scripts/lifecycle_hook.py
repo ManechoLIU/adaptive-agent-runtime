@@ -586,7 +586,10 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
     if ledger is None:
         return None
     text = ledger.read_text(encoding="utf-8")
-    from ledger_consistency_guard import validate_ledger
+    try:
+        from ledger_consistency_guard import validate_ledger
+    except ModuleNotFoundError:
+        from scripts.ledger_consistency_guard import validate_ledger
 
     ledger_errors = validate_ledger(text)
     ready_ids = sorted(
@@ -597,7 +600,10 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
     runnable_projection = derive_runnable_tasks(task_records(text))
     runnable_ids = list(runnable_projection["runnable_task_ids"])
     status = run_git(root, "status", "--porcelain=v1", "--untracked-files=no")
-    from control_event_guard import unmerged_worktree_candidates
+    try:
+        from control_event_guard import unmerged_worktree_candidates
+    except ModuleNotFoundError:
+        from scripts.control_event_guard import unmerged_worktree_candidates
 
     candidates = unmerged_worktree_candidates(root)
     try:
@@ -1015,7 +1021,10 @@ def evaluate_event(
         }, state
 
     if event_name == "SubagentStop":
-        triggers = set(state.get("triggers", []))
+        # A child terminal is a new controller scheduling boundary. Recompute the full
+        # current actionable snapshot rather than only carrying triggers that were
+        # already pending before the child finished.
+        triggers = set(state.get("triggers", [])) | set(lifecycle_triggers(snapshot, None))
         agent_id = str(event.get("agent_id", "unknown"))
         trigger = f"subagent_stopped:{agent_id}"
         triggers.add(trigger)
@@ -1674,6 +1683,26 @@ def run_hook() -> int:
     outbound_lease_acquired = False
     post_outbound_request: tuple[str, str] | None = None
     if normalized_event.get("hook_event_name") == "PreToolUse":
+        try:
+            spawn_task_name = target_guard.collaboration_spawn_task_name(
+                tool_name=normalized_event.get("tool_name"),
+                tool_input=normalized_event.get("tool_input"),
+            )
+            if spawn_task_name is not None:
+                try:
+                    from scripts.web_agent_execution import require_prepared_web_dispatch
+                except ModuleNotFoundError:
+                    from web_agent_execution import require_prepared_web_dispatch
+                require_prepared_web_dispatch(
+                    repo=expected_root,
+                    controller_id=controller_id,
+                    task_name=spawn_task_name,
+                )
+        except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
+            print(json.dumps(_pre_tool_denial(
+                f"Web Agent dispatch gate rejected collaboration.spawn_agent: {exc}"
+            ), ensure_ascii=False))
+            return 0
         try:
             outbound_request = target_guard.codex_app_outbound_request(
                 tool_name=normalized_event.get("tool_name"),

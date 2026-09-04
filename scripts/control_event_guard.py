@@ -1334,6 +1334,63 @@ def validate_snapshot(
     return errors
 
 
+
+def canonical_web_dispatch_errors(repo: Path, snapshot: dict[str, Any]) -> list[str]:
+    """Require delegated Web spawns to be bound to a real child session in canonical Runtime state."""
+    assignments = snapshot.get("new_assignments", [])
+    if not isinstance(assignments, list):
+        return []
+    try:
+        from scripts.project_state import adaptive_delivery_state_dir
+        from scripts.assignment_runtime import load_runtime_state
+    except ModuleNotFoundError:
+        from project_state import adaptive_delivery_state_dir
+        from assignment_runtime import load_runtime_state
+    dispatch_path = adaptive_delivery_state_dir(repo) / "web-agent-dispatches.json"
+    try:
+        dispatch_doc = json.loads(dispatch_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        dispatch_doc = {}
+    dispatches = dispatch_doc.get("dispatches", {}) if isinstance(dispatch_doc, dict) else {}
+    if not isinstance(dispatches, dict):
+        dispatches = {}
+    runtime = load_runtime_state(repo)
+    leases = runtime.get("leases", {}) if isinstance(runtime, dict) else {}
+    errors: list[str] = []
+    for index, assignment in enumerate(assignments):
+        if not isinstance(assignment, dict):
+            continue
+        route = assignment.get("route")
+        provider = str(route.get("provider") or "").strip().lower() if isinstance(route, dict) else ""
+        transport = str(assignment.get("execution_transport") or "").strip().lower()
+        if transport != "web" and provider not in {"chatgpt_web", "chatgpt-web", "web"}:
+            continue
+        task_id = str(assignment.get("task_id") or f"new_assignments[{index}]").strip()
+        assignment_id = str(assignment.get("assignment_id") or "").strip()
+        declared = assignment.get("runtime_dispatch")
+        if not assignment_id or not isinstance(declared, dict):
+            errors.append(f"{task_id} Web delegated assignment requires machine-verified canonical Runtime dispatch")
+            continue
+        dispatch_id = str(declared.get("dispatch_id") or "").strip()
+        ticket = dispatches.get(dispatch_id)
+        lease = leases.get(assignment_id) if isinstance(leases, dict) else None
+        if (
+            not dispatch_id
+            or not isinstance(ticket, dict)
+            or ticket.get("state") != "bound"
+            or ticket.get("assignment_id") != assignment_id
+            or not isinstance(lease, dict)
+            or lease.get("task_id") != assignment.get("task_id")
+            or lease.get("execution_transport") != "web"
+            or str(lease.get("session_id") or "") != str(ticket.get("conversation_id") or "")
+            or str(lease.get("lease_id") or "") != str(declared.get("lease_id") or "")
+            or str(ticket.get("conversation_id") or "") != str(declared.get("conversation_id") or "")
+            or declared.get("state") != "bound"
+        ):
+            errors.append(f"{task_id} Web delegated assignment lacks matching canonical Runtime dispatch/lease evidence")
+    return errors
+
+
 def canonical_rule_handshake_errors(
     repo: Path,
     ledger: Path,
@@ -1540,6 +1597,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if repo_root is not None:
         errors.extend(canonical_rule_handshake_errors(repo_root, ledger, snapshot=snapshot))
+        errors.extend(canonical_web_dispatch_errors(repo_root, snapshot))
     from ledger_consistency_guard import validate_ledger
 
     errors.extend(

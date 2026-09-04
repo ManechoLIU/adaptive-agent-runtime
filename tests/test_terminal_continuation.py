@@ -194,15 +194,27 @@ class TerminalContinuationTests(unittest.TestCase):
         self.assertTrue(popen.called)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
-    def test_wake_child_deferred_result_does_not_fail_completed_agent(self) -> None:
-        spec = importlib.util.spec_from_file_location("terminal_continuation_wake_child_test", SCRIPT)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        with patch.dict(module.os.environ, {"AD_TERMINAL_CONTINUATION_WAKE_CHILD": "1"}), patch.object(
-            module, "consume_terminal_receipt", return_value={"wake_result": {"result": "DEFERRED"}}
-        ) as consume:
-            self.assertEqual(module.main(["consume", "--repo", "/tmp/repo", "--receipt", "/tmp/receipt.json"]), 0)
-        self.assertTrue(consume.call_args.kwargs["dispatch_wake"])
+    def test_deferred_terminal_wake_handoffs_to_existing_continuation_supervisor(self) -> None:
+        module = self._load_module("terminal_continuation_supervisor_handoff_test")
+        lifecycle_state = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 5,
+            "triggers": ["subagent_stopped:writer-1"],
+        }
+        with patch.object(module.web_bridge, "ensure_continuation_supervisor", return_value=True) as ensure:
+            armed = module._handoff_unconfirmed_wake_to_existing_supervisor(
+                lifecycle_state=lifecycle_state,
+                wake_receipt={"result": "DEFERRED"},
+                controller_id="controller-1",
+                controller_repo=Path("/tmp/repo"),
+                registry_path=Path("/tmp/controllers.json"),
+                codex="codex",
+            )
+        self.assertTrue(armed)
+        ensure.assert_called_once()
+        self.assertEqual(ensure.call_args.kwargs["session_id"], "controller-1")
 
 
 class AssignmentBoundTerminalReceiptIdentityTests(unittest.TestCase):

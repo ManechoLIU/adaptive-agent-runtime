@@ -68,6 +68,30 @@ def _verify_assignment_bound_receipt(repo: Path, receipt: dict[str, Any]) -> Non
         raise PermissionError("assignment-bound terminal receipt requires a canonical runtime terminal state")
 
 
+def _handoff_unconfirmed_wake_to_existing_supervisor(
+    *,
+    lifecycle_state: dict[str, Any],
+    wake_receipt: dict[str, Any] | None,
+    controller_id: str,
+    controller_repo: Path,
+    registry_path: Path,
+    codex: str,
+) -> bool:
+    if lifecycle_state.get("pending_control_event") is not True:
+        return False
+    if lifecycle_state.get("requires_user") is True:
+        return False
+    if web_bridge.wake_receipt_confirmed(wake_receipt):
+        return False
+    return bool(web_bridge.ensure_continuation_supervisor(
+        lifecycle_state=lifecycle_state,
+        session_id=controller_id,
+        repo=controller_repo,
+        registry=registry_path,
+        codex=codex,
+    ))
+
+
 def consume_terminal_receipt(
     *,
     repo: Path,
@@ -122,6 +146,7 @@ def consume_terminal_receipt(
     )
 
     wake_receipt = None
+    supervisor_armed = False
     if dispatch_wake:
         dispatcher = wake_dispatcher or web_bridge.dispatch_pending_lifecycle_wake
         wake_receipt = dispatcher(
@@ -131,11 +156,21 @@ def consume_terminal_receipt(
             registry=registry_path,
             codex=codex,
         )
+        supervisor_armed = _handoff_unconfirmed_wake_to_existing_supervisor(
+            lifecycle_state=lifecycle_state,
+            wake_receipt=wake_receipt,
+            controller_id=controller_id,
+            controller_repo=controller_repo,
+            registry_path=registry_path,
+            codex=codex,
+        )
     return {
         "controller_id": controller_id,
         "terminal_receipt": str(receipt_path),
         "lifecycle_state_path": str(state_path),
         "wake_result": wake_receipt,
+        "pending_control_event": bool(lifecycle_state.get("pending_control_event")),
+        "supervisor_armed": supervisor_armed,
     }
 
 
@@ -172,17 +207,27 @@ def notify_runtime_change(
         state_path, event, snapshot, preserve_controller_host=True
     )
     wake_receipt = None
+    supervisor_armed = False
     if lifecycle_state.get("pending_control_event") is True:
         dispatcher = wake_dispatcher or web_bridge.dispatch_pending_lifecycle_wake
         wake_receipt = dispatcher(
             lifecycle_state=lifecycle_state, session_id=controller_id, repo=controller_repo,
             registry=registry_path, codex=codex,
         )
+        supervisor_armed = _handoff_unconfirmed_wake_to_existing_supervisor(
+            lifecycle_state=lifecycle_state,
+            wake_receipt=wake_receipt,
+            controller_id=controller_id,
+            controller_repo=controller_repo,
+            registry_path=registry_path,
+            codex=codex,
+        )
     return {
         "controller_id": controller_id,
         "lifecycle_state_path": str(state_path),
         "wake_result": wake_receipt,
         "pending_control_event": bool(lifecycle_state.get("pending_control_event")),
+        "supervisor_armed": supervisor_armed,
     }
 
 
@@ -215,8 +260,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 78
     print(json.dumps(result, ensure_ascii=False))
     if wake_child:
-        # The durable receipt + lifecycle pending state already exist. A legitimate
-        # DEFERRED/NOOP wake must not rewrite the external Agent's completed outcome.
+        # The durable terminal result is already staged. The first wake either succeeded
+        # or was handed to the existing lifecycle continuation supervisor.
         return 0
     env = dict(os.environ)
     env["AD_TERMINAL_CONTINUATION_WAKE_CHILD"] = "1"

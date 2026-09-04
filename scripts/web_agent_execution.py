@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
+import os
+import tempfile
 import re
 import subprocess
 import sys
@@ -20,12 +23,14 @@ try:
     from scripts import web_lifecycle_bridge
     from scripts.reviewer_supervisor import validate_verdict
     from scripts.project_state import adaptive_delivery_state_dir
+    from scripts.web_agent_events import structured_subagent_events
 except ModuleNotFoundError:
     from assignment_runtime import apply_runtime_receipt, apply_observed_progress, evaluate_lease, load_runtime_state
     import terminal_continuation
     import web_lifecycle_bridge
     from reviewer_supervisor import validate_verdict
     from project_state import adaptive_delivery_state_dir
+    from web_agent_events import structured_subagent_events
 
 UTC = timezone.utc
 STRONG_HOST_SOURCES = {"chatgpt_host_event"}
@@ -103,7 +108,7 @@ def _start_receipt(repo: Path, event: dict[str, Any], now: datetime) -> dict[str
     assignment = event.get("assignment")
     if not isinstance(assignment, dict):
         raise ValueError("Web execution start requires Assignment contract")
-    required = ("assignment_id", "task_id", "agent_id", "provider", "worktree", "primary_goal", "success_criteria", "owned_scope", "strategy")
+    required = ("assignment_id", "task_id", "agent_id", "provider", "model", "agent_type", "worktree", "primary_goal", "success_criteria", "owned_scope", "strategy")
     missing = [key for key in required if assignment.get(key) in (None, "", [])]
     if missing:
         raise ValueError("Web execution Assignment missing contract: " + ", ".join(missing))
@@ -123,6 +128,8 @@ def _start_receipt(repo: Path, event: dict[str, Any], now: datetime) -> dict[str
         "task_id": assignment["task_id"],
         "agent_id": assignment["agent_id"],
         "provider": assignment["provider"],
+        "model": assignment["model"],
+        "agent_type": assignment["agent_type"],
         "session_id": conversation_id,
         "worktree": assignment["worktree"],
         "issued_at": _iso(now),
@@ -218,8 +225,8 @@ def _dispatch_start_receipt(
     now: datetime, attempt: int, lease_id: str,
 ) -> dict[str, Any]:
     required = (
-        "assignment_id", "task_id", "agent_id", "provider", "worktree", "primary_goal",
-        "success_criteria", "owned_scope", "strategy",
+        "assignment_id", "task_id", "agent_id", "provider", "model", "agent_type",
+        "worktree", "primary_goal", "success_criteria", "owned_scope", "strategy",
     )
     missing = [key for key in required if assignment.get(key) in (None, "", [])]
     if missing:
@@ -237,6 +244,7 @@ def _dispatch_start_receipt(
         "event_type": "assignment_started",
         "assignment_id": assignment["assignment_id"], "task_id": assignment["task_id"],
         "agent_id": assignment["agent_id"], "provider": assignment["provider"],
+        "model": assignment["model"], "agent_type": assignment["agent_type"],
         "session_id": conversation_id, "worktree": assignment["worktree"],
         "issued_at": _iso(now), "attempt": attempt, "lease_id": lease_id, "event_seq": 1,
         "receipt_id": f"web-runtime:{assignment['assignment_id']}:{attempt}:1",
@@ -255,16 +263,314 @@ def _dispatch_start_receipt(
     return receipt
 
 
+
+def _dispatch_state_path(repo: Path) -> Path:
+    return adaptive_delivery_state_dir(repo) / "web-agent-dispatches.json"
+
+
+def _load_dispatch_state(repo: Path) -> dict[str, Any]:
+    path = _dispatch_state_path(repo)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"schema_version": 1, "dispatches": {}}
+    if not isinstance(value, dict) or not isinstance(value.get("dispatches"), dict):
+        return {"schema_version": 1, "dispatches": {}}
+    return value
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def _mutate_dispatch_state(repo: Path, mutation: Callable[[dict[str, Any]], Any]) -> Any:
+    path = _dispatch_state_path(repo)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = _load_dispatch_state(repo)
+            result = mutation(state)
+            _atomic_write_json(path, state)
+            return result
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _health_supervisor_is_ready(
+    probe: Callable[[], bool] | None = None,
+    *,
+    watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
+) -> bool:
+    if probe is not None:
+        return bool(probe())
+    if watchdog_launcher is not None:
+        # Backward-compatible/injected execution owner for tests and embedding. The
+        # production CLI never injects this and therefore requires the global service.
+        return True
+    try:
+        from scripts.web_agent_health_supervisor import health_supervisor_ready
+    except ModuleNotFoundError:
+        from web_agent_health_supervisor import health_supervisor_ready
+    return bool(health_supervisor_ready())
+
+
+def prepare_web_assignment_dispatch(
+    *, repo: str | Path, registry_path: str | Path, controller_id: str, task_name: str,
+    assignment: dict[str, Any], now: datetime | None = None,
+    health_probe: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Create a durable pre-spawn ticket; no child execution may be represented before a real started event."""
+    repo_path = Path(repo).expanduser().resolve()
+    registry = Path(registry_path).expanduser().resolve()
+    now = now or datetime.now(UTC)
+    _registered_controller(repo_path, registry, controller_id)
+    if not _health_supervisor_is_ready(health_probe):
+        raise RuntimeError("Web Assignment health supervisor is not ready; dispatch fails closed")
+    task_name = str(task_name or "").strip()
+    if not task_name:
+        raise ValueError("Web dispatch requires a non-empty task_name")
+    # Validate the complete contract before a host spawn is allowed.
+    _dispatch_start_receipt(
+        repo=repo_path, controller_id=controller_id, conversation_id="__pending_web_child__",
+        assignment=assignment, now=now, attempt=int(assignment.get("attempt", 1)),
+        lease_id=str(assignment.get("lease_id") or f"{assignment.get('assignment_id')}:web:attempt:{int(assignment.get('attempt', 1))}"),
+    )
+    dispatch_id = uuid.uuid4().hex
+
+    def mutate(state: dict[str, Any]) -> dict[str, Any]:
+        dispatches = state.setdefault("dispatches", {})
+        assignment_id = str(assignment.get("assignment_id") or "").strip()
+        for record in dispatches.values():
+            if not isinstance(record, dict):
+                continue
+            if record.get("state") == "pending" and (
+                record.get("assignment_id") == assignment_id or record.get("task_name") == task_name
+            ):
+                raise ValueError("Web dispatch already has a pending Runtime ticket")
+        ticket = {
+            "dispatch_id": dispatch_id,
+            "state": "pending",
+            "controller_id": controller_id,
+            "task_name": task_name,
+            "assignment_id": assignment_id,
+            "assignment": json.loads(json.dumps(assignment)),
+            "prepared_at": _iso(now),
+        }
+        dispatches[dispatch_id] = ticket
+        return dict(ticket)
+
+    return _mutate_dispatch_state(repo_path, mutate)
+
+
+def require_prepared_web_dispatch(
+    *, repo: str | Path, controller_id: str, task_name: str,
+    health_probe: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    repo_path = Path(repo).expanduser().resolve()
+    if not _health_supervisor_is_ready(health_probe):
+        raise PermissionError("Web Assignment health supervisor is not ready")
+    task_name = str(task_name or "").strip()
+    candidates = [
+        record for record in _load_dispatch_state(repo_path).get("dispatches", {}).values()
+        if isinstance(record, dict)
+        and record.get("state") == "pending"
+        and record.get("controller_id") == controller_id
+        and record.get("task_name") == task_name
+    ]
+    if len(candidates) != 1:
+        raise PermissionError("collaboration.spawn_agent requires exactly one prepared canonical Web Runtime dispatch ticket")
+    return dict(candidates[0])
+
+
+
+def _persist_observed_dispatch(
+    *, repo: Path, dispatch_id: str, controller_id: str, assignment_id: str,
+    observed: dict[str, Any], now: datetime,
+) -> dict[str, Any]:
+    conversation_id = str(observed.get("conversation_id") or "").strip()
+    observation_id = str(observed.get("observation_id") or "").strip()
+    if not conversation_id or not observation_id:
+        raise ValueError("machine-observed Web dispatch is missing child session identity")
+    def mutate(state: dict[str, Any]) -> dict[str, Any]:
+        record = state.setdefault("dispatches", {}).get(dispatch_id)
+        if not isinstance(record, dict) or record.get("state") not in {"pending", "observed"}:
+            raise ValueError("Web dispatch ticket is not available for machine observation")
+        if record.get("controller_id") != controller_id or record.get("assignment_id") != assignment_id:
+            raise PermissionError("machine-observed Web dispatch does not match its Runtime ticket")
+        if record.get("state") == "observed":
+            if (
+                record.get("conversation_id") != conversation_id
+                or record.get("observation_id") != observation_id
+            ):
+                raise ValueError("Web dispatch ticket has conflicting machine observation")
+            return dict(record)
+        record.update({
+            "state": "observed",
+            "conversation_id": conversation_id,
+            "observation_id": observation_id,
+            "call_id": observed.get("call_id"),
+            "observed_at": _iso(now),
+            "observation_source": "collaboration_session_event",
+        })
+        return dict(record)
+    return _mutate_dispatch_state(repo, mutate)
+
+
+def _verify_persisted_replacement_session_proof(
+    *, repo: Path, controller_id: str, assignment_id: str,
+    conversation_id: str, proof: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(proof, dict):
+        raise ValueError("replacement execution session requires persisted machine-observed dispatch proof")
+    dispatch_id = str(proof.get("dispatch_id") or "").strip()
+    observation_id = str(proof.get("observation_id") or "").strip()
+    if proof.get("source") != "collaboration_session_event" or not dispatch_id or not observation_id:
+        raise ValueError("replacement execution session proof must identify a persisted machine-observed dispatch")
+    ticket = _load_dispatch_state(repo).get("dispatches", {}).get(dispatch_id)
+    if (
+        not isinstance(ticket, dict)
+        or ticket.get("state") != "observed"
+        or ticket.get("controller_id") != controller_id
+        or ticket.get("assignment_id") != assignment_id
+        or ticket.get("observation_source") != "collaboration_session_event"
+        or str(ticket.get("conversation_id") or "") != conversation_id
+        or str(ticket.get("observation_id") or "") != observation_id
+        or str(proof.get("conversation_id") or "") != conversation_id
+    ):
+        raise ValueError("replacement execution session proof does not match persisted machine-observed dispatch")
+    return dict(ticket)
+
+
+def _event_time(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _structured_started_for_ticket(ticket: dict[str, Any], event_paths: list[str | Path]) -> dict[str, Any]:
+    prepared_at = _event_time(ticket.get("prepared_at"))
+    if prepared_at is None:
+        raise ValueError("Web dispatch ticket has no valid prepared_at timestamp")
+    candidates = []
+    for event in structured_subagent_events(event_paths):
+        if event.get("kind") != "started" or event.get("task_name") != ticket.get("task_name"):
+            continue
+        observed_at = _event_time(event.get("timestamp"))
+        if observed_at is None or observed_at < prepared_at:
+            continue
+        candidates.append(event)
+    if len(candidates) != 1:
+        raise ValueError("Web dispatch requires exactly one structured machine started observation newer than the Runtime ticket")
+    return candidates[0]
+
+
+def bind_web_assignment_dispatch(
+    *, repo: str | Path, registry_path: str | Path, controller_id: str, dispatch_id: str,
+    event_paths: list[str | Path], now: datetime | None = None,
+    watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
+    health_probe: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Bind a pre-spawn ticket to the machine-observed child thread and create its canonical lease."""
+    repo_path = Path(repo).expanduser().resolve()
+    registry = Path(registry_path).expanduser().resolve()
+    now = now or datetime.now(UTC)
+    _registered_controller(repo_path, registry, controller_id)
+    if not _health_supervisor_is_ready(health_probe, watchdog_launcher=watchdog_launcher):
+        raise RuntimeError("Web Assignment health supervisor is not ready; binding fails closed")
+
+    state = _load_dispatch_state(repo_path)
+    ticket = state.get("dispatches", {}).get(dispatch_id)
+    if not isinstance(ticket, dict) or ticket.get("state") != "pending":
+        raise ValueError("Web dispatch ticket is missing, consumed, or not pending")
+    if ticket.get("controller_id") != controller_id:
+        raise PermissionError("Web dispatch ticket belongs to a different logical Controller")
+    observed = _structured_started_for_ticket(ticket, event_paths)
+    conversation_id = str(observed.get("conversation_id") or "").strip()
+    assignment = ticket.get("assignment")
+    if not isinstance(assignment, dict):
+        raise ValueError("Web dispatch ticket lost its Assignment contract")
+    assignment_id = str(ticket.get("assignment_id") or "")
+    observed_model = str(observed.get("model") or "").strip()
+    observed_agent_type = str(observed.get("agent_type") or "").strip()
+    if observed_model != str(assignment.get("model") or "").strip():
+        raise PermissionError("machine-observed Web Agent model does not match the prepared Runtime Assignment")
+    if observed_agent_type != str(assignment.get("agent_type") or "").strip():
+        raise PermissionError("machine-observed Web Agent type does not match the prepared Runtime Assignment")
+    _persist_observed_dispatch(
+        repo=repo_path, dispatch_id=dispatch_id, controller_id=controller_id,
+        assignment_id=assignment_id, observed=observed, now=now,
+    )
+
+    existing = load_runtime_state(repo_path).get("leases", {}).get(assignment_id)
+    if isinstance(existing, dict):
+        result = recover_web_assignment(
+            repo=repo_path, registry_path=registry, controller_id=controller_id,
+            assignment_id=assignment_id, conversation_id=conversation_id,
+            now=now,
+            watchdog_launcher=watchdog_launcher,
+            health_probe=health_probe,
+            replacement_session_proof={
+                "source": "collaboration_session_event",
+                "dispatch_id": dispatch_id,
+                "observation_id": observed.get("observation_id"),
+                "conversation_id": conversation_id,
+            },
+        )
+    else:
+        result = start_web_assignment(
+            repo=repo_path, registry_path=registry, controller_id=controller_id,
+            conversation_id=conversation_id, assignment=assignment, now=now,
+            watchdog_launcher=watchdog_launcher,
+            health_probe=health_probe,
+        )
+
+    def mutate(current: dict[str, Any]) -> None:
+        record = current.setdefault("dispatches", {}).get(dispatch_id)
+        if not isinstance(record, dict) or record.get("state") != "observed":
+            raise ValueError("Web dispatch ticket changed while binding")
+        record.update({
+            "state": "bound", "conversation_id": conversation_id,
+            "observation_id": observed.get("observation_id"),
+            "call_id": observed.get("call_id"), "bound_at": _iso(now),
+        })
+
+    _mutate_dispatch_state(repo_path, mutate)
+    return {**result, "dispatch_id": dispatch_id, "conversation_id": conversation_id, "observation": observed}
+
+
 def start_web_assignment(
     *, repo: str | Path, registry_path: str | Path, controller_id: str, conversation_id: str,
     assignment: dict[str, Any], now: datetime | None = None,
     watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
+    health_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Record a Controller-dispatched Web attempt without claiming Host generation liveness."""
     repo_path = Path(repo).expanduser().resolve()
     registry = Path(registry_path).expanduser().resolve()
     now = now or datetime.now(UTC)
     _registered_controller(repo_path, registry, controller_id)
+    if not _health_supervisor_is_ready(health_probe, watchdog_launcher=watchdog_launcher):
+        raise RuntimeError("Web Assignment health supervisor is not ready; active lease was not created")
     attempt = int(assignment.get("attempt", 1))
     assignment_id = str(assignment.get("assignment_id") or "").strip()
     if not assignment_id:
@@ -375,16 +681,23 @@ def recover_web_assignment(
     conversation_id: str, now: datetime | None = None,
     watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
     lease_id_factory: Callable[[str, int], str] | None = None,
+    replacement_session_proof: dict[str, Any] | None = None,
+    health_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Create the next fenced attempt when the woken Controller has a replacement execution session."""
     repo_path = Path(repo).expanduser().resolve()
     registry = Path(registry_path).expanduser().resolve()
     now = now or datetime.now(UTC)
     _registered_controller(repo_path, registry, controller_id)
+    if not _health_supervisor_is_ready(health_probe, watchdog_launcher=watchdog_launcher):
+        raise RuntimeError("Web Assignment health supervisor is not ready; recovery fails closed")
     state = load_runtime_state(repo_path)
     current = state.get("leases", {}).get(assignment_id)
     if not isinstance(current, dict):
         raise ValueError("Web recovery requires a canonical Assignment lease")
+    conversation_id = str(conversation_id or "").strip()
+    if not conversation_id or conversation_id == str(current.get("session_id") or ""):
+        raise ValueError("replacement execution session must differ from the previous Assignment session")
     health = evaluate_lease(current, now=now)
     decision = _automatic_recovery_decision(current, health)
     if not decision["eligible"]:
@@ -393,12 +706,17 @@ def recover_web_assignment(
         if decision["reason"] == "recovery_budget_exhausted":
             raise ValueError("recovery budget exhausted; strategy change requires a new execution lineage")
         raise ValueError(f"Web recovery is not allowed: {decision['reason']}")
+    _verify_persisted_replacement_session_proof(
+        repo=repo_path, controller_id=controller_id, assignment_id=assignment_id,
+        conversation_id=conversation_id, proof=replacement_session_proof,
+    )
     next_attempt = int(current.get("attempt", 1)) + 1
     factory = lease_id_factory or (lambda aid, attempt: f"{aid}:web:attempt:{attempt}:{uuid.uuid4().hex}")
     new_lease_id = factory(assignment_id, next_attempt)
     assignment = {
         "assignment_id": assignment_id, "task_id": current["task_id"], "agent_id": current["agent_id"],
-        "provider": current["provider"], "worktree": current["worktree"],
+        "provider": current["provider"], "model": current["model"], "agent_type": current["agent_type"],
+        "worktree": current["worktree"],
         "primary_goal": current["primary_goal"], "success_criteria": current["success_criteria"],
         "owned_scope": current["owned_scope"], "strategy": current["strategy"],
         "assignment_contract_version": int(current.get("side_effect_contract_version", 2)),
@@ -440,8 +758,147 @@ def watch_web_assignment(
         if result.get("superseded"):
             return result
         if result.get("runtime_state") in {"terminal", "unhealthy", "budget_exhausted"} and not result.get("wake_error"):
-            return result
+            continuation = result.get("runtime_continuation")
+            wake_receipt = continuation.get("wake_result") if isinstance(continuation, dict) else None
+            if web_lifecycle_bridge.wake_receipt_confirmed(wake_receipt):
+                return result
         time.sleep(poll_seconds)
+
+
+
+def _structured_terminal_projection(kind: str) -> tuple[str, str, str]:
+    normalized = str(kind or "").strip().lower()
+    if normalized == "completed":
+        return "completed", "completed", "none"
+    if normalized in {"cancelled", "interrupted"}:
+        return "cancelled", "cancelled", "none"
+    if normalized == "disconnected":
+        return "disconnected", "failed", "transport_error"
+    if normalized == "failed":
+        return "failed", "failed", "transport_error"
+    raise ValueError(f"unsupported structured SubAgentActivity terminal: {normalized}")
+
+
+def _structured_terminal_receipt_path(repo: Path, lease: dict[str, Any]) -> Path:
+    key = f"{lease['assignment_id']}:{int(lease['attempt'])}:{lease['lease_id']}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return adaptive_delivery_state_dir(repo) / "web-agent-terminal" / f"{digest}.json"
+
+
+def _external_terminal_receipt(
+    *, repo: Path, lease: dict[str, Any], observation: dict[str, Any]
+) -> dict[str, Any]:
+    terminal = str(lease.get("terminal_state") or "")
+    return {
+        "schema_version": 1,
+        "event_type": "external_agent_terminal",
+        "engine": "collaboration",
+        "repo": str(repo),
+        "cwd": str(lease["worktree"]),
+        "exit_code": 0 if terminal == "completed" else 1,
+        "summary": str(lease.get("summary") or f"structured collaboration child {terminal}"),
+        "delivery_outcome": str(lease.get("delivery_outcome") or "unresolved"),
+        "assignment_id": lease["assignment_id"],
+        "task_id": lease["task_id"],
+        "agent_id": lease["agent_id"],
+        "provider": lease["provider"],
+        "model": lease.get("model"),
+        "agent_type": lease.get("agent_type"),
+        "session_id": lease["session_id"],
+        "attempt": int(lease["attempt"]),
+        "lease_id": lease["lease_id"],
+        "completed_at": str(lease.get("terminal_at") or ""),
+        "machine_terminal_observation_id": str(observation.get("observation_id") or ""),
+        "machine_terminal_source": "collaboration_session_event",
+    }
+
+
+def ingest_structured_subagent_terminal(
+    *,
+    repo: str | Path,
+    assignment_id: str,
+    observation: dict[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Persist one machine-structured collaboration terminal; continuation is handled elsewhere."""
+    repo_path = Path(repo).expanduser().resolve()
+    now = now or datetime.now(UTC)
+    if not isinstance(observation, dict) or observation.get("source") != "collaboration_session_event":
+        raise ValueError("structured Web terminal requires a collaboration session observation")
+    conversation_id = str(observation.get("conversation_id") or "").strip()
+    observation_id = str(observation.get("observation_id") or "").strip()
+    if not conversation_id or not observation_id:
+        raise ValueError("structured Web terminal requires machine session and observation identity")
+    state = load_runtime_state(repo_path)
+    lease = state.get("leases", {}).get(assignment_id)
+    if not isinstance(lease, dict):
+        raise ValueError("structured Web terminal has no canonical Assignment lease")
+    if lease.get("execution_transport") != "web":
+        raise ValueError("structured Web terminal requires a canonical Web Assignment lease")
+    if conversation_id != str(lease.get("session_id") or ""):
+        raise ValueError("structured Web terminal session does not match the canonical Assignment session")
+    terminal_state, transport_outcome, retry_class = _structured_terminal_projection(
+        str(observation.get("kind") or "")
+    )
+    duplicate = bool(lease.get("terminal_state"))
+    if duplicate:
+        if str(lease.get("terminal_state") or "") != terminal_state:
+            raise ValueError("structured Web terminal conflicts with immutable canonical terminal state")
+    else:
+        event_seq = int(lease.get("last_event_seq", 0)) + 1
+        result_unknown = (
+            int(lease.get("side_effect_contract_version", 1)) < 2
+            or lease.get("side_effect") is not False
+        )
+        receipt = {
+            "event_type": "assignment_terminal",
+            "assignment_id": assignment_id,
+            "task_id": lease["task_id"],
+            "agent_id": lease["agent_id"],
+            "provider": lease["provider"],
+            "session_id": lease["session_id"],
+            "worktree": lease["worktree"],
+            "issued_at": _iso(now),
+            "attempt": int(lease["attempt"]),
+            "lease_id": lease["lease_id"],
+            "event_seq": event_seq,
+            "receipt_id": f"collaboration-terminal:{assignment_id}:{lease['attempt']}:{event_seq}",
+            "terminal_state": terminal_state,
+            "transport_outcome": transport_outcome,
+            "delivery_outcome": "unresolved",
+            "summary": f"machine structured SubAgentActivity {str(observation.get('kind') or '').lower()}",
+            "evidence": [],
+            "artifacts": [],
+            "next_action": "wake same Controller to reconcile child result and recompute runnable work",
+            "retry_class": retry_class,
+            "result_unknown": result_unknown,
+        }
+        if int(lease.get("side_effect_contract_version", 1)) >= 2:
+            receipt["side_effect"] = bool(lease.get("side_effect"))
+            receipt["idempotency_key"] = lease.get("idempotency_key")
+        state = apply_runtime_receipt(repo_path, receipt, now=now)
+        lease = state["leases"][assignment_id]
+
+    receipt_path = _structured_terminal_receipt_path(repo_path, lease)
+    payload = _external_terminal_receipt(repo=repo_path, lease=lease, observation=observation)
+    if receipt_path.exists():
+        try:
+            existing = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"existing structured terminal receipt is unreadable: {exc}") from exc
+        for field in ("assignment_id", "task_id", "agent_id", "provider", "model", "agent_type", "session_id", "attempt", "lease_id"):
+            if existing.get(field) != payload.get(field):
+                raise ValueError("existing structured terminal receipt conflicts with canonical Assignment attempt")
+    else:
+        _atomic_write_json(receipt_path, payload)
+    return {
+        "assignment_id": assignment_id,
+        "attempt": int(lease["attempt"]),
+        "lease_id": lease["lease_id"],
+        "terminal_state": lease["terminal_state"],
+        "terminal_receipt": str(receipt_path),
+        "duplicate": duplicate,
+    }
 
 
 def apply_web_execution_event(
@@ -551,7 +1008,7 @@ def apply_web_execution_event(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Runtime-owned Web Agent execution recovery adapter.")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("start", "recover"):
+    for name in ("prepare", "start", "recover", "bind"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--repo", required=True); cmd.add_argument("--registry", required=True)
     watch = sub.add_parser("watch")
@@ -571,7 +1028,14 @@ def main(argv: list[str] | None = None) -> int:
             event = json.load(sys.stdin)
             if not isinstance(event, dict):
                 raise ValueError("Web execution input must be an object")
-            if args.command == "start":
+            if args.command == "prepare":
+                result = prepare_web_assignment_dispatch(
+                    repo=args.repo, registry_path=args.registry,
+                    controller_id=str(event.get("controller_id") or ""),
+                    task_name=str(event.get("task_name") or ""),
+                    assignment=event.get("assignment") if isinstance(event.get("assignment"), dict) else {},
+                )
+            elif args.command == "start":
                 result = start_web_assignment(
                     repo=args.repo, registry_path=args.registry,
                     controller_id=str(event.get("controller_id") or ""),
@@ -584,6 +1048,16 @@ def main(argv: list[str] | None = None) -> int:
                     controller_id=str(event.get("controller_id") or ""),
                     assignment_id=str(event.get("assignment_id") or ""),
                     conversation_id=str(event.get("conversation_id") or ""),
+                )
+            elif args.command == "bind":
+                paths = event.get("event_paths")
+                if not isinstance(paths, list) or not all(isinstance(item, str) and item for item in paths):
+                    raise ValueError("Web bind requires event_paths")
+                result = bind_web_assignment_dispatch(
+                    repo=args.repo, registry_path=args.registry,
+                    controller_id=str(event.get("controller_id") or ""),
+                    dispatch_id=str(event.get("dispatch_id") or ""),
+                    event_paths=paths,
                 )
             else:
                 result = apply_web_execution_event(repo=args.repo, registry_path=args.registry, event=event)

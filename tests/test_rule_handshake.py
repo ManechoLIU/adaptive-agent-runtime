@@ -54,7 +54,11 @@ class RuleHandshakeTests(unittest.TestCase):
     def test_install_manifest_records_exact_revision_and_hashes(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
-            source, revision = make_source(base)
+            source, previous_revision = make_source(base)
+            (source / "scripts" / "x.py").write_text("print('next')\n", encoding="utf-8")
+            git(source, "add", "scripts/x.py")
+            git(source, "commit", "-m", "next runtime revision")
+            revision = git(source, "rev-parse", "HEAD")
             target = base / "installed"
             manifest = install_skill(
                 source,
@@ -62,11 +66,12 @@ class RuleHandshakeTests(unittest.TestCase):
                 summary="runtime governance",
                 impact="live_assignments",
                 stop_condition="load exact revision before launch",
-                previous_revision="deadbeef",
+                previous_revision=previous_revision,
                 now=NOW,
             )
             self.assertEqual(manifest["revision"], revision)
-            self.assertEqual(manifest["previous_revision"], "deadbeef")
+            self.assertEqual(manifest["previous_revision"], previous_revision)
+            self.assertEqual(manifest["upgrade_lineage"]["status"], "linear")
             self.assertEqual(manifest["impact"], "live_assignments")
             self.assertEqual(manifest["product_name"], "Adaptive Agent Runtime")
             self.assertEqual(manifest["skill_id"], "adaptive-agent-runtime")

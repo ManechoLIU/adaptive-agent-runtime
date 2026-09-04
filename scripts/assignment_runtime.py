@@ -288,6 +288,8 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "runtime_receipt_id": receipt.get("receipt_id"),
             "execution_transport": str(receipt.get("execution_transport") or "").strip() or None,
             "execution_role": str(receipt.get("execution_role") or "").strip() or None,
+            "model": str(receipt.get("model") or "").strip() or None,
+            "agent_type": str(receipt.get("agent_type") or "").strip() or None,
             "candidate_revision": str(receipt.get("candidate_revision") or "").strip() or None,
             "exclusive_execution_key": exclusive_key,
             "host_attestation_id": str(receipt.get("host_attestation_id") or "").strip() or None,

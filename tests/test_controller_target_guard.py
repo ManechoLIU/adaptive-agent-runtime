@@ -610,3 +610,19 @@ class ControllerTargetGuardTests(unittest.TestCase):
                     generation=3, host_receipt_reference="r" * 1025, reason="host terminal",
                     registry_path=registry,
                 )
+
+    def test_collaboration_spawn_agent_is_recognized_as_runtime_managed_dispatch(self) -> None:
+        guard = load_guard()
+        for tool_name in ("spawn_agent", "collaboration.spawn_agent", "mcp__collaboration__spawn_agent"):
+            with self.subTest(tool_name=tool_name):
+                self.assertEqual(
+                    guard.collaboration_spawn_task_name(
+                        tool_name=tool_name, tool_input={"task_name": "WEB-WRITER-1"}
+                    ),
+                    "WEB-WRITER-1",
+                )
+        self.assertIsNone(
+            guard.collaboration_spawn_task_name(
+                tool_name="send_message", tool_input={"task_name": "WEB-WRITER-1"}
+            )
+        )

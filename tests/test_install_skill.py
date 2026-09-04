@@ -363,7 +363,10 @@ class InstallMigrationContractTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
         (source / "SKILL.md").write_text("---\nname: adaptive-agent-runtime\n---\n# Adaptive Agent Runtime\n", encoding="utf-8")
         (source / "scripts").mkdir()
-        for name in ("web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py"):
+        for name in (
+            "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
+            "web_agent_health_supervisor.py",
+        ):
             script = source / "scripts" / name
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             script.chmod(0o755)
@@ -399,6 +402,98 @@ class InstallMigrationContractTests(unittest.TestCase):
             self.assertEqual(manifest["capabilities"]["core"]["status"], "enabled")
             self.assertFalse((target.parent / "adaptive-agent-runtime").exists())
 
+    def test_install_blocks_upgrade_when_installed_revision_is_absent_from_candidate_history(self):
+        import json
+        from scripts.install_skill import MANIFEST_NAME, install_skill
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            target = root / "installed" / "adaptive-delivery"
+            target.mkdir(parents=True)
+            missing_revision = "a" * 40
+            (target / MANIFEST_NAME).write_text(
+                json.dumps({"schema_version": 1, "revision": missing_revision, "files": {}}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "absent from candidate source history"):
+                install_skill(
+                    source,
+                    target,
+                    summary="must not forget installed hotfix lineage",
+                    impact="none",
+                    stop_condition="lineage preserved",
+                )
+
+    def test_install_blocks_non_ancestor_runtime_upgrade(self):
+        import subprocess
+        from scripts.install_skill import install_skill
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            base = subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+            ).strip()
+            subprocess.run(["git", "-C", str(source), "checkout", "-b", "hotfix"], check=True, capture_output=True)
+            (source / "scripts" / "web_lifecycle_bridge.py").write_text(
+                "#!/usr/bin/env python3\n# installed hotfix\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "hotfix"], check=True, capture_output=True)
+            hotfix = subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+            ).strip()
+            target = root / "installed" / "adaptive-delivery"
+            first = install_skill(
+                source, target, summary="install hotfix", impact="none", stop_condition="hotfix active"
+            )
+            self.assertEqual(first["revision"], hotfix)
+
+            subprocess.run(["git", "-C", str(source), "checkout", "-B", "main", base], check=True, capture_output=True)
+            (source / "SKILL.md").write_text(
+                "---\nname: adaptive-agent-runtime\n---\n# Adaptive Agent Runtime\n# unrelated mainline work\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "mainline"], check=True, capture_output=True)
+
+            with self.assertRaisesRegex(ValueError, "does not descend from the installed revision"):
+                install_skill(
+                    source,
+                    target,
+                    summary="must not replace hotfix from divergent main",
+                    impact="none",
+                    stop_condition="linear history only",
+                )
+
+    def test_install_records_verified_linear_upgrade_lineage(self):
+        import subprocess
+        from scripts.install_skill import install_skill
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+            target = root / "installed" / "adaptive-delivery"
+            first = install_skill(
+                source, target, summary="base", impact="none", stop_condition="base installed"
+            )
+            (source / "SKILL.md").write_text(
+                "---\nname: adaptive-agent-runtime\n---\n# Adaptive Agent Runtime\n# next\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "next"], check=True, capture_output=True)
+            second = install_skill(
+                source, target, summary="next", impact="none", stop_condition="linear upgrade"
+            )
+
+            self.assertEqual(second["previous_revision"], first["revision"])
+            self.assertEqual(second["upgrade_lineage"]["status"], "linear")
+            self.assertEqual(second["upgrade_lineage"]["previous_revision"], first["revision"])
+            self.assertEqual(second["upgrade_lineage"]["revision"], second["revision"])
+
     def test_fresh_install_manifest_reports_product_and_host_capabilities_without_new_state_identity(self):
         from scripts.install_skill import install_skill
         with tempfile.TemporaryDirectory() as d:
@@ -415,8 +510,9 @@ class InstallMigrationContractTests(unittest.TestCase):
             self.assertEqual(set(manifest["capabilities"]), {"core", "desktop_adapter", "web_local_adapter", "web_agent_execution"})
             web_execution = manifest["capabilities"]["web_agent_execution"]
             self.assertEqual(web_execution["status"], "host_limited")
-            self.assertTrue(web_execution["configured"])
-            self.assertEqual(web_execution["recovery_mode"], "runtime_progress_watchdog")
+            self.assertFalse(web_execution["configured"])
+            self.assertEqual(web_execution["health_supervisor"], "not_configured")
+            self.assertEqual(web_execution["recovery_mode"], "canonical_progress_health_supervisor")
             self.assertEqual(web_execution["host_terminal"], "unavailable")
 
 
@@ -648,7 +744,8 @@ class HostAdapterInstallationTests(unittest.TestCase):
                     code = main([
                         "--source", str(source), "--target", str(target),
                         "--summary", "partial adapter failure", "--impact", "none",
-                        "--stop-condition", "ready", "--codex", str(codex),
+                        "--stop-condition", "ready", "--no-configure-runtime-services",
+                        "--codex", str(codex),
                         "--ai-bridge", str(bridge), "--hooks-file", str(hooks),
                         "--zshenv-file", str(zshenv),
                     ])
@@ -684,6 +781,7 @@ class HostAdapterInstallationTests(unittest.TestCase):
             installer = Path(__file__).resolve().parents[1] / "scripts" / "install_skill.py"
             result = subprocess.run([sys.executable, str(installer), "--source", str(source), "--target", str(target2),
                 "--summary", "shared lock", "--impact", "none", "--stop-condition", "blocked",
+                "--no-configure-runtime-services",
                 "--hooks-file", str(hooks), "--zshenv-file", str(zshenv),
                 "--ai-bridge", str(root / "missing-bridge"), "--codex", str(root / "missing-codex")],
                 text=True, capture_output=True)
@@ -713,7 +811,8 @@ class HostAdapterInstallationTests(unittest.TestCase):
             installer = Path(__file__).resolve().parents[1] / "scripts" / "install_skill.py"
             result = subprocess.run([sys.executable, str(installer),
                 "--source", str(source), "--target", str(target), "--summary", "concurrent",
-                "--impact", "none", "--stop-condition", "blocked", "--no-configure-host-adapters"],
+                "--impact", "none", "--stop-condition", "blocked", "--no-configure-host-adapters",
+                "--no-configure-runtime-services"],
                 text=True, capture_output=True)
             holder.wait(timeout=3)
             self.assertNotEqual(result.returncode, 0)
@@ -739,7 +838,8 @@ class HostAdapterInstallationTests(unittest.TestCase):
                 code = main([
                     "--source", str(source), "--target", str(target),
                     "--summary", "productized install", "--impact", "none",
-                    "--stop-condition", "ready", "--codex", str(codex),
+                    "--stop-condition", "ready", "--no-configure-runtime-services",
+                    "--codex", str(codex),
                     "--ai-bridge", str(bridge), "--hooks-file", str(hooks),
                     "--zshenv-file", str(zshenv),
                 ])
@@ -752,3 +852,80 @@ class HostAdapterInstallationTests(unittest.TestCase):
         self.assertEqual(payload["capabilities"]["web_local_adapter"]["status"], "enabled")
         self.assertTrue(hooks_created)
         self.assertTrue(zshenv_created)
+
+
+class WebAgentHealthServiceInstallationTests(unittest.TestCase):
+    def test_health_service_plist_is_keepalive_and_runs_installed_health_only_supervisor(self):
+        import plistlib
+        from scripts.install_skill import install_web_agent_health_service_plist
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / "adaptive-delivery"
+            (target / "scripts").mkdir(parents=True)
+            script = target / "scripts" / "web_agent_health_supervisor.py"
+            script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            plist = root / "LaunchAgents" / "web-agent-health.plist"
+            install_web_agent_health_service_plist(
+                plist, target, python_executable="/usr/bin/python3",
+                registry_path=root / "controllers.json",
+            )
+            payload = plistlib.loads(plist.read_bytes())
+        self.assertTrue(payload["RunAtLoad"])
+        self.assertTrue(payload["KeepAlive"])
+        self.assertIn(str(script.resolve()), payload["ProgramArguments"])
+        self.assertIn("--registry", payload["ProgramArguments"])
+        self.assertNotIn("web_reentry_adapter.py", " ".join(payload["ProgramArguments"]))
+
+    def test_web_agent_execution_capability_requires_matching_health_service(self):
+        from scripts.install_skill import (
+            detect_host_capabilities, install_web_agent_health_service_plist,
+        )
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / "adaptive-delivery"
+            (target / "scripts").mkdir(parents=True)
+            script = target / "scripts" / "web_agent_health_supervisor.py"
+            script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            plist = root / "health.plist"
+            before = detect_host_capabilities(
+                skill_root=target,
+                ai_bridge_executable=root / "missing-bridge",
+                hooks_file=root / "hooks.json", zshenv_file=root / ".zshenv",
+                health_service_plist=plist,
+            )
+            install_web_agent_health_service_plist(
+                plist, target, python_executable="/usr/bin/python3",
+                registry_path=root / "controllers.json",
+            )
+            after = detect_host_capabilities(
+                skill_root=target,
+                ai_bridge_executable=root / "missing-bridge",
+                hooks_file=root / "hooks.json", zshenv_file=root / ".zshenv",
+                health_service_plist=plist,
+            )
+        self.assertFalse(before["web_agent_execution"]["configured"])
+        self.assertTrue(after["web_agent_execution"]["configured"])
+        self.assertEqual(after["web_agent_execution"]["health_supervisor"], "launchd_keepalive")
+        self.assertEqual(after["web_agent_execution"]["continuation"], "existing_web_reentry_supervisor")
+
+    def test_configure_runtime_health_service_activates_keepalive_without_host_adapter_changes(self):
+        from scripts.install_skill import configure_runtime_services
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / "adaptive-delivery"
+            (target / "scripts").mkdir(parents=True)
+            (target / "scripts" / "web_agent_health_supervisor.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            plist = root / "LaunchAgents" / "health.plist"
+            loaded = []
+            report = configure_runtime_services(
+                target,
+                health_service_plist=plist,
+                registry_path=root / "controllers.json",
+                python_executable="/usr/bin/python3",
+                service_loader=lambda path: loaded.append(path) or {"state": "loaded"},
+            )
+        self.assertEqual(loaded, [plist.resolve()])
+        self.assertEqual(report["state"], "loaded")
+        self.assertTrue(report["configured"])

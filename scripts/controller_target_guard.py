@@ -62,6 +62,18 @@ def _bounded_string(value: object, *, label: str, maximum: int) -> str:
     return normalized
 
 
+COLLABORATION_SPAWN_TOOLS = {"spawn_agent", "collaboration.spawn_agent", "mcp__collaboration__spawn_agent"}
+
+
+def collaboration_spawn_task_name(*, tool_name: object, tool_input: object) -> str | None:
+    normalized_tool = str(tool_name or "").strip()
+    if normalized_tool not in COLLABORATION_SPAWN_TOOLS:
+        return None
+    if not isinstance(tool_input, dict):
+        raise ValueError(f"{normalized_tool} requires structured tool input")
+    return _bounded_string(tool_input.get("task_name"), label="collaboration spawn task_name", maximum=256)
+
+
 def codex_app_outbound_request(
     *, tool_name: object, tool_input: object
 ) -> tuple[str, str] | None:

@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -25,6 +26,12 @@ LEGACY_SKILL_IDS = ("adaptive-delivery",)
 DEFAULT_AI_BRIDGE_EXECUTABLE = Path("/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge")
 DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
 DEFAULT_ZSHENV = Path.home() / ".zshenv"
+DEFAULT_CONTROLLER_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
+DEFAULT_WEB_AGENT_HEALTH_PLIST = (
+    Path.home() / "Library" / "LaunchAgents"
+    / "com.openai.adaptive-agent-runtime.web-agent-health.plist"
+)
+WEB_AGENT_HEALTH_LABEL = "com.openai.adaptive-agent-runtime.web-agent-health"
 DEFAULT_DESKTOP_CANARY = (
     Path.home() / ".codex" / "state" / "adaptive-delivery-desktop-canary.json"
 )
@@ -219,6 +226,144 @@ def _zshenv_has_web_bridge(
     return True
 
 
+
+def install_web_agent_health_service_plist(
+    plist_file: str | Path,
+    target: str | Path,
+    *,
+    python_executable: str | None = None,
+    registry_path: str | Path = DEFAULT_CONTROLLER_REGISTRY,
+) -> Path:
+    path = Path(plist_file).expanduser().resolve(strict=False)
+    target_path = Path(target).expanduser().resolve()
+    script = (target_path / "scripts" / "web_agent_health_supervisor.py").resolve()
+    if not script.is_file():
+        raise ValueError("installed Web Agent health supervisor script is missing")
+    python = str(Path(python_executable or sys.executable).expanduser().resolve())
+    log_root = Path.home() / ".codex" / "state" / "adaptive-delivery-web-agent-health"
+    log_root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "Label": WEB_AGENT_HEALTH_LABEL,
+        "ProgramArguments": [
+            python,
+            str(script),
+            "--registry",
+            str(Path(registry_path).expanduser().resolve(strict=False)),
+            "--poll-seconds",
+            "15",
+        ],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ProcessType": "Background",
+        "StandardOutPath": str(log_root / "launchd.stdout.log"),
+        "StandardErrorPath": str(log_root / "launchd.stderr.log"),
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            plistlib.dump(payload, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return path
+
+
+def _health_service_plist_matches(
+    path: Path, *, skill_root: Path | None,
+) -> bool:
+    if skill_root is None:
+        return False
+    expected = (skill_root / "scripts" / "web_agent_health_supervisor.py").resolve()
+    if not expected.is_file():
+        return False
+    try:
+        payload = plistlib.loads(path.read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    args = payload.get("ProgramArguments") if isinstance(payload, dict) else None
+    return (
+        payload.get("Label") == WEB_AGENT_HEALTH_LABEL
+        and payload.get("RunAtLoad") is True
+        and payload.get("KeepAlive") is True
+        and isinstance(args, list)
+        and str(expected) in [str(item) for item in args]
+    )
+
+
+
+def _load_web_agent_health_service(plist_path: Path) -> dict[str, Any]:
+    launchctl = Path("/bin/launchctl")
+    if not launchctl.is_file():
+        raise OSError("launchctl is unavailable; Runtime health service cannot be activated")
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(
+        [str(launchctl), "bootout", domain, str(plist_path)],
+        capture_output=True, text=True, check=False,
+    )
+    bootstrap = subprocess.run(
+        [str(launchctl), "bootstrap", domain, str(plist_path)],
+        capture_output=True, text=True, check=False,
+    )
+    if bootstrap.returncode != 0:
+        raise OSError(
+            f"launchctl bootstrap failed: {(bootstrap.stderr or bootstrap.stdout).strip()}"
+        )
+    kick = subprocess.run(
+        [str(launchctl), "kickstart", "-k", f"{domain}/{WEB_AGENT_HEALTH_LABEL}"],
+        capture_output=True, text=True, check=False,
+    )
+    if kick.returncode != 0:
+        raise OSError(
+            f"launchctl kickstart failed: {(kick.stderr or kick.stdout).strip()}"
+        )
+    return {"state": "loaded", "domain": domain, "label": WEB_AGENT_HEALTH_LABEL}
+
+
+def _unload_web_agent_health_service(plist_path: Path) -> None:
+    launchctl = Path("/bin/launchctl")
+    if not launchctl.is_file():
+        return
+    subprocess.run(
+        [str(launchctl), "bootout", f"gui/{os.getuid()}", str(plist_path)],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def configure_runtime_services(
+    target: str | Path,
+    *,
+    health_service_plist: str | Path = DEFAULT_WEB_AGENT_HEALTH_PLIST,
+    registry_path: str | Path = DEFAULT_CONTROLLER_REGISTRY,
+    python_executable: str | None = None,
+    service_loader: Any | None = None,
+) -> dict[str, Any]:
+    target_path = Path(target).expanduser().resolve()
+    plist_path = install_web_agent_health_service_plist(
+        health_service_plist,
+        target_path,
+        python_executable=python_executable,
+        registry_path=registry_path,
+    )
+    loader = service_loader or _load_web_agent_health_service
+    result = loader(plist_path)
+    if not isinstance(result, dict):
+        result = {"state": "loaded"}
+    return {
+        **result,
+        "configured": _health_service_plist_matches(
+            plist_path, skill_root=target_path
+        ),
+        "plist": str(plist_path),
+    }
+
+
 def detect_host_capabilities(
     *,
     codex_executable: str | Path | None = None,
@@ -227,6 +372,7 @@ def detect_host_capabilities(
     zshenv_file: str | Path = DEFAULT_ZSHENV,
     skill_root: str | Path | None = None,
     desktop_canary_file: str | Path = DEFAULT_DESKTOP_CANARY,
+    health_service_plist: str | Path = DEFAULT_WEB_AGENT_HEALTH_PLIST,
 ) -> dict[str, dict[str, Any]]:
     codex_path = Path(codex_executable).expanduser() if codex_executable else None
     if codex_path is None:
@@ -237,6 +383,10 @@ def detect_host_capabilities(
     zshenv_path = Path(zshenv_file).expanduser()
     desktop_canary_path = Path(desktop_canary_file).expanduser()
     skill_root_path = Path(skill_root).expanduser().resolve() if skill_root is not None else None
+    health_service_path = Path(health_service_plist).expanduser().resolve(strict=False)
+    health_service_configured = _health_service_plist_matches(
+        health_service_path, skill_root=skill_root_path
+    )
 
     codex_available = bool(codex_path and codex_path.is_file() and os.access(codex_path, os.X_OK))
     lifecycle_events = {
@@ -309,10 +459,17 @@ def detect_host_capabilities(
         "web_agent_execution": {
             "status": "host_limited",
             "adapter": "web-agent-execution",
-            "configured": True,
-            "recovery_mode": "runtime_progress_watchdog",
+            "configured": health_service_configured,
+            "health_supervisor": "launchd_keepalive" if health_service_configured else "not_configured",
+            "continuation": "existing_web_reentry_supervisor",
+            "recovery_mode": "canonical_progress_health_supervisor",
             "host_terminal": "unavailable",
-            "reason": "runtime-owned canonical lease/progress watchdog is installed; trusted ChatGPT Host terminal events remain unavailable and are not required for stale-execution recovery",
+            "structured_terminal": "collaboration_subagent_activity",
+            "reason": (
+                "Runtime health-only supervisor is installed; terminal/health continuation reuses the existing Web reentry supervisor"
+                if health_service_configured
+                else "Web execution code is installed but the Runtime health supervisor service is not configured"
+            ),
         },
     }
 
@@ -542,6 +699,37 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
+def _verify_upgrade_lineage(source: Path, previous_revision: str | None, revision: str) -> dict[str, Any]:
+    """Fail closed when an installed Runtime revision is not in the candidate's Git ancestry."""
+    if not previous_revision:
+        return {"status": "fresh_install", "previous_revision": None, "revision": revision}
+
+    exists = subprocess.run(
+        ["git", "-C", str(source), "cat-file", "-e", f"{previous_revision}^{{commit}}"],
+        capture_output=True,
+    )
+    if exists.returncode != 0:
+        raise ValueError(
+            "installed previous revision is absent from candidate source history: "
+            f"{previous_revision}; integrate/adopt the installed Runtime lineage before upgrading"
+        )
+
+    ancestry = subprocess.run(
+        ["git", "-C", str(source), "merge-base", "--is-ancestor", previous_revision, revision],
+        capture_output=True,
+    )
+    if ancestry.returncode != 0:
+        raise ValueError(
+            "candidate Runtime revision does not descend from the installed revision: "
+            f"{previous_revision} -> {revision}; nonlinear upgrade is blocked"
+        )
+    return {
+        "status": "linear",
+        "previous_revision": previous_revision,
+        "revision": revision,
+    }
+
+
 def _changed_files(source: Path, previous_revision: str | None, revision: str, tracked: list[str]) -> list[str]:
     if not previous_revision:
         return tracked
@@ -646,6 +834,7 @@ def install_skill(
     prior_manifest = _read_manifest(target_path / MANIFEST_NAME)
     prior_files = prior_manifest.get("files", {}) if isinstance(prior_manifest.get("files"), dict) else {}
     prior_revision = previous_revision or str(prior_manifest.get("revision", "")).strip() or None
+    upgrade_lineage = _verify_upgrade_lineage(source_path, prior_revision, revision)
 
     stage = Path(tempfile.mkdtemp(prefix=f".{target_path.name}.stage-", dir=target_path.parent))
     try:
@@ -662,6 +851,7 @@ def install_skill(
             "legacy_skill_ids": list(LEGACY_SKILL_IDS),
             "revision": revision,
             "previous_revision": prior_revision,
+            "upgrade_lineage": upgrade_lineage,
             "installed_at": installed_at,
             "source_root": str(source_path),
             "summary": summary.strip(),
@@ -734,12 +924,19 @@ def _rollback_install_transaction(states: list[dict[str, Any]]) -> list[str]:
     return errors
 
 
-def _install_resource_lock_paths(target: Path, hooks: Path, zshenv: Path) -> list[Path]:
+def _install_resource_lock_paths(
+    target: Path, hooks: Path, zshenv: Path, health_service_plist: Path | None = None
+) -> list[Path]:
     paths = [
         target.parent / f".{target.name}.install.lock",
         hooks.parent / f".{hooks.name}.adaptive-agent-runtime.lock",
         zshenv.parent / f".{zshenv.name}.adaptive-agent-runtime.lock",
     ]
+    if health_service_plist is not None:
+        paths.append(
+            health_service_plist.parent
+            / f".{health_service_plist.name}.adaptive-agent-runtime.lock"
+        )
     return sorted(set(path.resolve(strict=False) for path in paths), key=lambda item: str(item))
 
 
@@ -786,6 +983,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--ai-bridge", default=str(DEFAULT_AI_BRIDGE_EXECUTABLE))
     parser.add_argument("--hooks-file", default=str(DEFAULT_CODEX_HOOKS))
     parser.add_argument("--zshenv-file", default=str(DEFAULT_ZSHENV))
+    parser.add_argument("--health-service-plist", default=str(DEFAULT_WEB_AGENT_HEALTH_PLIST))
+    parser.add_argument("--controller-registry", default=str(DEFAULT_CONTROLLER_REGISTRY))
+    parser.add_argument("--no-configure-runtime-services", action="store_true")
     args = parser.parse_args(argv)
 
     try:
@@ -796,14 +996,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     target_path = selected_target.resolve(strict=False)
     hooks_path = Path(args.hooks_file).expanduser().resolve(strict=False)
     zshenv_path = Path(args.zshenv_file).expanduser().resolve(strict=False)
-    lock_paths = _install_resource_lock_paths(target_path, hooks_path, zshenv_path)
+    health_service_path = Path(args.health_service_plist).expanduser().resolve(strict=False)
+    lock_paths = _install_resource_lock_paths(
+        target_path,
+        hooks_path,
+        zshenv_path,
+        None if args.no_configure_runtime_services else health_service_path,
+    )
     try:
         try:
             install_locks = _acquire_install_resource_locks(lock_paths)
         except BlockingIOError:
             print(f"adaptive-agent-runtime-install: blocked: another installer is active for shared install resources: {target_path}")
             return 1
-        if args.no_configure_host_adapters:
+        if args.no_configure_host_adapters and args.no_configure_runtime_services:
             try:
                 manifest = install_skill(
                     args.source, target_path, summary=args.summary, impact=args.impact,
@@ -814,35 +1020,78 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 1
             print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
             return 0
-        return _run_install_transaction(args, target_path, hooks_path, zshenv_path)
+        return _run_install_transaction(
+            args, target_path, hooks_path, zshenv_path, health_service_path
+        )
     finally:
         if 'install_locks' in locals():
             _release_install_resource_locks(install_locks)
 
 
-def _run_install_transaction(args, target_path: Path, hooks_path: Path, zshenv_path: Path) -> int:
+def _run_install_transaction(
+    args,
+    target_path: Path,
+    hooks_path: Path,
+    zshenv_path: Path,
+    health_service_path: Path,
+) -> int:
     with tempfile.TemporaryDirectory(prefix="adaptive-agent-runtime-install-rollback-") as backup_dir:
         backup_root = Path(backup_dir)
-        snapshots = [
-            _snapshot_path(target_path, backup_root, "target"),
-            _snapshot_path(hooks_path, backup_root, "hooks"),
-            _snapshot_path(zshenv_path, backup_root, "zshenv"),
-        ]
+        snapshots = [_snapshot_path(target_path, backup_root, "target")]
+        if not args.no_configure_host_adapters:
+            snapshots.extend([
+                _snapshot_path(hooks_path, backup_root, "hooks"),
+                _snapshot_path(zshenv_path, backup_root, "zshenv"),
+            ])
+        prior_health_snapshot = None
+        if not args.no_configure_runtime_services:
+            prior_health_snapshot = _snapshot_path(
+                health_service_path, backup_root, "web-agent-health-plist"
+            )
+            snapshots.append(prior_health_snapshot)
+        service_loaded = False
         try:
             manifest = install_skill(
                 args.source, target_path, summary=args.summary, impact=args.impact,
                 stop_condition=args.stop_condition, previous_revision=args.previous_revision,
             )
-            manifest["capabilities"] = configure_host_adapters(
-                target_path,
+            if not args.no_configure_runtime_services:
+                service = configure_runtime_services(
+                    target_path,
+                    health_service_plist=health_service_path,
+                    registry_path=args.controller_registry,
+                )
+                service_loaded = service.get("configured") is True
+            if not args.no_configure_host_adapters:
+                configure_host_adapters(
+                    target_path,
+                    codex_executable=args.codex,
+                    ai_bridge_executable=args.ai_bridge,
+                    hooks_file=hooks_path,
+                    zshenv_file=zshenv_path,
+                )
+            manifest["capabilities"] = detect_host_capabilities(
                 codex_executable=args.codex,
                 ai_bridge_executable=args.ai_bridge,
                 hooks_file=hooks_path,
                 zshenv_file=zshenv_path,
+                skill_root=target_path,
+                health_service_plist=health_service_path,
             )
             _write_json_atomic(target_path / MANIFEST_NAME, manifest)
         except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
+            if service_loaded:
+                _unload_web_agent_health_service(health_service_path)
             rollback_errors = _rollback_install_transaction(snapshots)
+            if (
+                isinstance(prior_health_snapshot, dict)
+                and prior_health_snapshot.get("exists")
+                and health_service_path.is_file()
+            ):
+                try:
+                    _load_web_agent_health_service(health_service_path)
+                except OSError as reload_error:
+                    rollback_errors.append(f"health service reload: {reload_error}")
             suffix = f"; rollback errors: {'; '.join(rollback_errors)}" if rollback_errors else ""
             print(f"adaptive-agent-runtime-install: blocked and rolled back: {error}{suffix}")
             return 1

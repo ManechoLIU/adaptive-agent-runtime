@@ -23,6 +23,11 @@ try:
 except ModuleNotFoundError:
     from scripts import controller_target_guard as target_guard
 
+try:
+    from web_reentry_adapter import execute_web_reentry, resolve_reentry_session
+except ModuleNotFoundError:
+    from scripts.web_reentry_adapter import execute_web_reentry, resolve_reentry_session
+
 
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 DEFAULT_MANUAL_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
@@ -43,6 +48,7 @@ LAUNCHER_LOG_LIMIT = 262144
 RESTORE_STATIC_DOCUMENT_NAMES = ("AGENTS.md", "MEMORY.md", "WIKI_INDEX.md")
 AUTHORITATIVE_DOCUMENT_NAMES = ("SKILL.md", "SPEC.md", "DESIGN.md", "TECHNICAL.md", "EVOLUTION.md")
 RESTORE_DOCUMENT_LIMIT = 32768
+AUTO_CONTINUATION_STALL_LIMIT = 3
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -428,6 +434,19 @@ def classify_native_resume_failure(returncode: int, stdout: str, stderr: str) ->
             "fallback_eligible": False,
             "error_code": "WEB_LIFECYCLE_ACTIVE_WRITER",
         }
+    if (
+        "failed to deserialize stored thread item" in combined
+        and ("unknown variant" in combined or "functioncalloutput" in combined)
+    ):
+        return {
+            "state": "RESUME_TARGET_INCOMPATIBLE",
+            "pending_control_event": True,
+            "failure_class": "target_schema_incompatible",
+            "fallback_eligible": False,
+            "replacement_eligible": True,
+            "error_code": "WEB_LIFECYCLE_TARGET_INCOMPATIBLE",
+            "returncode": returncode,
+        }
     failure_patterns = (
         ("usage_limit_exceeded", ("usage limit", "usage_limit_exceeded")),
         ("quota_exhausted", ("quota exhausted", "quota_exhausted")),
@@ -483,6 +502,259 @@ def audit_records_from_cursor(audit_log: Path, cursor_path: Path) -> tuple[list[
             if isinstance(value, dict):
                 records.append((value, next_offset))
     return records, stat.st_ino
+
+
+
+def _web_assignment_reconcile_state_path(repo: Path) -> Path:
+    return _git_common_dir(repo) / "adaptive-delivery" / "web-assignment-reconcile.json"
+
+
+def _load_web_assignment_reconcile_state(repo: Path) -> dict[str, Any]:
+    state = load_json(_web_assignment_reconcile_state_path(repo))
+    if not isinstance(state.get("attempts"), dict):
+        state["attempts"] = {}
+    state.setdefault("schema_version", 1)
+    return state
+
+
+def _write_web_assignment_reconcile_state(repo: Path, state: dict[str, Any]) -> None:
+    _write_json_atomic_file(_web_assignment_reconcile_state_path(repo), state)
+
+
+def _web_attempt_key(assignment_id: str, lease: dict[str, Any]) -> str:
+    return f"{assignment_id}:{int(lease.get('attempt', 0))}:{str(lease.get('lease_id') or '')}"
+
+
+def _wake_state_from_continuation(result: dict[str, Any] | None) -> str:
+    if not isinstance(result, dict):
+        return "pending"
+    if wake_receipt_confirmed(result.get("wake_result")):
+        return "confirmed"
+    if result.get("pending_control_event") is False:
+        return "confirmed"
+    if result.get("supervisor_armed") is True:
+        return "delegated"
+    return "pending"
+
+
+def reconcile_managed_web_assignments(
+    *,
+    repo: Path,
+    controller_id: str,
+    registry: Path,
+    event_paths: Sequence[str | Path] | None = None,
+    now: Any | None = None,
+    terminal_consumer: Callable[..., dict[str, Any]] | None = None,
+    runtime_change_consumer: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Bridge managed collaboration child lifecycle into the existing Runtime continuation path."""
+    from datetime import datetime, timezone
+    try:
+        from scripts.assignment_runtime import load_runtime_state
+        from scripts import terminal_continuation
+        from scripts.web_agent_events import structured_subagent_events, discover_recent_session_paths
+        from scripts.web_agent_execution import (
+            _load_dispatch_state,
+            bind_web_assignment_dispatch,
+            ingest_structured_subagent_terminal,
+            watch_web_assignment_once,
+        )
+    except ModuleNotFoundError:
+        from assignment_runtime import load_runtime_state
+        import terminal_continuation
+        from web_agent_events import structured_subagent_events, discover_recent_session_paths
+        from web_agent_execution import (
+            _load_dispatch_state,
+            bind_web_assignment_dispatch,
+            ingest_structured_subagent_terminal,
+            watch_web_assignment_once,
+        )
+
+    repo = Path(repo).expanduser().resolve()
+    registry = Path(registry).expanduser()
+    actual_controller = _registered_controller_for_common_dir(repo, registry)
+    if actual_controller != controller_id:
+        raise PermissionError("managed Web Assignment reconciliation requires the registered logical Controller")
+    now = now or datetime.now(timezone.utc)
+
+    dispatch_state = _load_dispatch_state(repo)
+    pending_dispatches = [
+        record for record in dispatch_state.get("dispatches", {}).values()
+        if isinstance(record, dict) and record.get("state") == "pending"
+        and record.get("controller_id") == controller_id
+    ]
+    runtime = load_runtime_state(repo)
+    web_leases = {
+        assignment_id: lease
+        for assignment_id, lease in runtime.get("leases", {}).items()
+        if isinstance(lease, dict) and lease.get("execution_transport") == "web"
+    }
+
+    paths: list[Path]
+    if event_paths is None:
+        timestamps = [
+            str(record.get("prepared_at") or "")
+            for record in pending_dispatches
+            if str(record.get("prepared_at") or "").strip()
+        ]
+        timestamps.extend(
+            str(lease.get("started_at") or "")
+            for lease in web_leases.values()
+            if str(lease.get("started_at") or "").strip()
+        )
+        paths = discover_recent_session_paths(since_values=timestamps, now=now)
+    else:
+        paths = [Path(value).expanduser() for value in event_paths]
+    events = structured_subagent_events(paths)
+
+    bound_dispatches: list[dict[str, Any]] = []
+    binding_errors: list[dict[str, Any]] = []
+    for ticket in pending_dispatches:
+        dispatch_id = str(ticket.get("dispatch_id") or "")
+        if not dispatch_id:
+            continue
+        if not any(
+            event.get("kind") == "started"
+            and event.get("task_name") == ticket.get("task_name")
+            for event in events
+        ):
+            continue
+        try:
+            bound_dispatches.append(bind_web_assignment_dispatch(
+                repo=repo,
+                registry_path=registry,
+                controller_id=controller_id,
+                dispatch_id=dispatch_id,
+                event_paths=paths,
+                now=now,
+                health_probe=lambda: True,
+                watchdog_launcher=lambda **_: {
+                    "launched": False,
+                    "reason": "global_health_supervisor_owns_periodic_observation",
+                },
+            ))
+        except (OSError, ValueError, PermissionError) as exc:
+            binding_errors.append({"dispatch_id": dispatch_id, "error": f"{type(exc).__name__}: {exc}"})
+
+    runtime = load_runtime_state(repo)
+    web_leases = {
+        assignment_id: lease
+        for assignment_id, lease in runtime.get("leases", {}).items()
+        if isinstance(lease, dict) and lease.get("execution_transport") == "web"
+    }
+    terminal_by_session: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event.get("kind") not in {"completed", "failed", "cancelled", "interrupted", "disconnected"}:
+            continue
+        session_id = str(event.get("conversation_id") or "")
+        if session_id:
+            terminal_by_session[session_id] = event
+
+    state_path = _web_assignment_reconcile_state_path(repo)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    terminal_continuations: list[dict[str, Any]] = []
+    health_results: list[dict[str, Any]] = []
+
+    with lock_path.open("a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            reconcile_state = _load_web_assignment_reconcile_state(repo)
+            attempts = reconcile_state.setdefault("attempts", {})
+            for assignment_id, lease in list(web_leases.items()):
+                key = _web_attempt_key(assignment_id, lease)
+                record = attempts.setdefault(key, {
+                    "assignment_id": assignment_id,
+                    "attempt": int(lease.get("attempt", 0)),
+                    "lease_id": str(lease.get("lease_id") or ""),
+                })
+                observation = terminal_by_session.get(str(lease.get("session_id") or ""))
+                terminal_receipt: Path | None = None
+                if observation is not None:
+                    terminal_result = ingest_structured_subagent_terminal(
+                        repo=repo,
+                        assignment_id=assignment_id,
+                        observation=observation,
+                        now=now,
+                    )
+                    lease = load_runtime_state(repo)["leases"][assignment_id]
+                    terminal_receipt = Path(terminal_result["terminal_receipt"])
+                    record["terminal_receipt"] = str(terminal_receipt)
+                    record["terminal_observation_id"] = str(observation.get("observation_id") or "")
+                elif str(record.get("terminal_receipt") or ""):
+                    terminal_receipt = Path(str(record["terminal_receipt"]))
+
+                if lease.get("terminal_state") and terminal_receipt is not None:
+                    if record.get("terminal_wake_state") in {"confirmed", "delegated"}:
+                        continue
+                    consumer = terminal_consumer or terminal_continuation.consume_terminal_receipt
+                    try:
+                        continuation = consumer(
+                            repo=repo,
+                            receipt_path=terminal_receipt,
+                            registry_path=registry,
+                        )
+                        wake_state = _wake_state_from_continuation(continuation)
+                        error = None
+                    except (OSError, ValueError, PermissionError, RuntimeError, subprocess.SubprocessError) as exc:
+                        continuation = None
+                        wake_state = "pending"
+                        error = f"{type(exc).__name__}: {exc}"
+                    record["terminal_wake_state"] = wake_state
+                    record["terminal_wake_error"] = error
+                    terminal_continuations.append({
+                        "assignment_id": assignment_id,
+                        "controller_id": (
+                            str(continuation.get("controller_id") or controller_id)
+                            if isinstance(continuation, dict) else controller_id
+                        ),
+                        "wake_state": wake_state,
+                        "terminal_receipt": str(terminal_receipt),
+                        "error": error,
+                    })
+                    continue
+
+                if lease.get("terminal_state"):
+                    continue
+                if record.get("health_wake_state") in {"confirmed", "delegated"}:
+                    continue
+                health = watch_web_assignment_once(
+                    repo=repo,
+                    registry_path=registry,
+                    assignment_id=assignment_id,
+                    expected_attempt=int(lease["attempt"]),
+                    expected_lease_id=str(lease["lease_id"]),
+                    now=now,
+                    runtime_change_consumer=runtime_change_consumer,
+                )
+                wake_state = None
+                if health.get("runtime_state") in {"unhealthy", "budget_exhausted"}:
+                    continuation = health.get("runtime_continuation")
+                    wake_state = _wake_state_from_continuation(
+                        continuation if isinstance(continuation, dict) else None
+                    )
+                    record["health_wake_state"] = wake_state
+                    record["health_reason"] = health.get("reason")
+                health["wake_state"] = wake_state
+                health_results.append(health)
+
+            reconcile_state["last_observed_at"] = (
+                now if getattr(now, "tzinfo", None) else now.replace(tzinfo=timezone.utc)
+            ).astimezone(timezone.utc).isoformat()
+            reconcile_state["controller_id"] = controller_id
+            _write_web_assignment_reconcile_state(repo, reconcile_state)
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    return {
+        "controller_id": controller_id,
+        "event_paths": [str(path) for path in paths],
+        "bound_dispatches": bound_dispatches,
+        "binding_errors": binding_errors,
+        "terminal_continuations": terminal_continuations,
+        "health": health_results,
+        "reconcile_state_path": str(state_path),
+    }
 
 
 def audit_receipts_from_cursor(audit_log: Path, cursor_path: Path) -> list[dict[str, Any]]:
@@ -887,6 +1159,150 @@ def execute_native_resume(
     return attempt
 
 
+
+def _thread_id_from_json_lines(output: str) -> str | None:
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        for key in ("thread_id", "session_id", "threadId", "sessionId"):
+            value = event.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        payload = event.get("payload")
+        if isinstance(payload, dict):
+            for key in ("thread_id", "session_id", "threadId", "sessionId"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return None
+
+
+def replace_desktop_execution_target(
+    *, controller_id: str, desktop_session_id: str, repo: Path,
+    expected_generation: int, registry: Path,
+) -> dict[str, Any]:
+    lifecycle = _lifecycle_module()
+    return lifecycle.replace_desktop_session(
+        controller_id=controller_id,
+        desktop_session_id=desktop_session_id,
+        repo=repo,
+        expected_generation=expected_generation,
+        registry_path=registry,
+    )
+
+
+def recover_incompatible_native_target(
+    *, session_id: str, repo: Path, registry: Path, codex: str,
+    failed_target_session_id: str, expected_generation: int,
+    runtime_path: str | None = None,
+    terminal_receipts: Sequence[str] | None = None,
+    next_action: str | None = None,
+) -> dict[str, Any]:
+    """Replace an unreadable desktop execution target, never the logical Controller."""
+    try:
+        ok, preflight_error, env = preflight_native_resume(
+            session_id=session_id, repo=repo, registry=registry, codex=codex,
+            runtime_path=runtime_path,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        ok, preflight_error, env = False, f"native target recovery preflight error: {exc}", native_runtime_env(runtime_path)
+    if not ok:
+        return {
+            "operation": "native_target_recovery", "controller_id": session_id,
+            "result": "FAILED", "state": "RESUME_TARGET_RECOVERY_FAILED",
+            "pending_control_event": True, "returncode": 78,
+            "stderr_tail": bounded_tail(preflight_error),
+            "failure_class": "target_recovery_failed",
+            "error_code": "WEB_LIFECYCLE_TARGET_RECOVERY_FAILED",
+            "recovered_from_execution_target_session_id": failed_target_session_id,
+        }
+    bootstrap_prompt = (
+        "Adaptive Agent Runtime execution-target recovery bootstrap for existing logical Controller "
+        f"{session_id}. Do not create, appoint, or claim another logical Controller. Do not modify "
+        "project files and do not start project work in this bootstrap turn. Reply exactly TARGET_READY."
+    )
+    bootstrap_command = [codex, "exec", "--json", "-C", str(repo.resolve()), bootstrap_prompt]
+    try:
+        completed = subprocess.run(
+            bootstrap_command, check=False, capture_output=True, text=True, env=env, timeout=120
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "operation": "native_target_recovery", "controller_id": session_id,
+            "command": bootstrap_command, "result": "FAILED",
+            "state": "RESUME_TARGET_RECOVERY_FAILED", "pending_control_event": True,
+            "returncode": 78, "stderr_tail": bounded_tail(str(exc)),
+            "failure_class": "target_recovery_failed",
+            "error_code": "WEB_LIFECYCLE_TARGET_RECOVERY_FAILED",
+            "recovered_from_execution_target_session_id": failed_target_session_id,
+        }
+    new_target = _thread_id_from_json_lines(completed.stdout)
+    if completed.returncode != 0 or not new_target:
+        return {
+            "operation": "native_target_recovery", "controller_id": session_id,
+            "command": bootstrap_command, "result": "FAILED",
+            "state": "RESUME_TARGET_RECOVERY_FAILED", "pending_control_event": True,
+            "returncode": completed.returncode or 78,
+            "stdout_tail": bounded_tail(completed.stdout), "stderr_tail": bounded_tail(completed.stderr),
+            "failure_class": "target_recovery_failed",
+            "error_code": "WEB_LIFECYCLE_TARGET_RECOVERY_FAILED",
+            "recovered_from_execution_target_session_id": failed_target_session_id,
+        }
+    if new_target in {session_id, failed_target_session_id}:
+        return {
+            "operation": "native_target_recovery", "controller_id": session_id,
+            "command": bootstrap_command, "result": "FAILED",
+            "state": "RESUME_TARGET_RECOVERY_FAILED", "pending_control_event": True,
+            "returncode": 78,
+            "stderr_tail": "replacement bootstrap did not produce a distinct execution target",
+            "failure_class": "target_recovery_failed",
+            "error_code": "WEB_LIFECYCLE_TARGET_RECOVERY_FAILED",
+            "recovered_from_execution_target_session_id": failed_target_session_id,
+        }
+    try:
+        replacement = replace_desktop_execution_target(
+            controller_id=session_id, desktop_session_id=new_target, repo=repo,
+            expected_generation=expected_generation, registry=registry,
+        )
+    except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
+        return {
+            "operation": "native_target_recovery", "controller_id": session_id,
+            "command": bootstrap_command, "result": "FAILED",
+            "state": "RESUME_TARGET_RECOVERY_FAILED", "pending_control_event": True,
+            "returncode": 78, "stderr_tail": bounded_tail(f"target replacement rejected: {exc}"),
+            "failure_class": "target_recovery_failed",
+            "error_code": "WEB_LIFECYCLE_TARGET_RECOVERY_FAILED",
+            "recovered_from_execution_target_session_id": failed_target_session_id,
+            "candidate_execution_target_session_id": new_target,
+        }
+    resumed = execute_native_resume(
+        session_id=session_id, repo=repo, registry=registry, codex=codex,
+        runtime_path=runtime_path, terminal_receipts=terminal_receipts,
+        next_action=next_action,
+    )
+    resumed = dict(resumed)
+    resumed["operation"] = "native_target_recovery"
+    resumed["recovered_from_execution_target_session_id"] = failed_target_session_id
+    resumed["replacement_execution_target_session_id"] = new_target
+    resumed["target_generation"] = replacement.get("generation", resumed.get("target_generation"))
+    return resumed
+
+
+def wake_receipt_needs_auto_native_stop(receipt: object) -> bool:
+    if not isinstance(receipt, dict):
+        return False
+    if receipt.get("result") == "DEFERRED":
+        return True
+    return (
+        receipt.get("result") == "FAILED"
+        and receipt.get("failure_class") == "target_schema_incompatible"
+        and receipt.get("replacement_eligible") is True
+    )
+
 def controller_wake_lock_path(repo: Path) -> Path:
     return _git_common_dir(repo) / "adaptive-delivery" / "controller-wake.lock"
 
@@ -926,6 +1342,9 @@ def _wake_event_fingerprint(lifecycle_state: dict[str, Any]) -> str:
         "triggers": lifecycle_state.get("triggers", []),
         "wake_generation": int(lifecycle_state.get("wake_generation", 0) or 0),
         "event_generation": generation,
+        "next_action": str(lifecycle_state.get("next_action") or "").strip(),
+        "requires_user": lifecycle_state.get("requires_user") is True,
+        "pending_terminal_receipts": lifecycle_state.get("pending_terminal_receipts", []),
     }
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return __import__("hashlib").sha256(encoded).hexdigest()
@@ -1109,12 +1528,62 @@ def wake_existing_controller(
             )
         else:
             if selected_host == health.get("controller_host"):
-                attempt = execute_native_resume(
-                    session_id=session_id, repo=repo, registry=registry, codex=codex,
-                    runtime_path=runtime_path,
-                    terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []),
-                    next_action=str(lifecycle_state.get("next_action") or "").strip() or None,
-                )
+                if selected_host == "desktop_codex":
+                    attempt = execute_native_resume(
+                        session_id=session_id, repo=repo, registry=registry, codex=codex,
+                        runtime_path=runtime_path,
+                        terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []),
+                        next_action=str(lifecycle_state.get("next_action") or "").strip() or None,
+                    )
+                elif selected_host == "web":
+                    adapter = (resume_adapters or {}).get("web")
+                    try:
+                        if adapter is None:
+                            attempt = execute_web_reentry(
+                                controller_id=session_id,
+                                repo=repo,
+                                registry_path=registry,
+                                lease_path=DEFAULT_MANUAL_WEB_LEASES,
+                                lifecycle_state=lifecycle_state,
+                            )
+                        else:
+                            attempt = adapter(
+                                controller_id=session_id,
+                                session_id=session_id,
+                                repo=repo,
+                                registry=registry,
+                                lifecycle_state=lifecycle_state,
+                                runtime_path=runtime_path,
+                            )
+                    except Exception as exc:
+                        attempt = {
+                            "operation": "web_reentry",
+                            "result": "DEFERRED",
+                            "state": "WEB_REENTRY_PENDING",
+                            "returncode": 78,
+                            "stderr_tail": f"web host adapter failed: {exc}",
+                            "error_code": "WEB_HOST_REENTRY_ADAPTER_FAILED",
+                            "failure_class": "web_reentry_unavailable",
+                        }
+                    if not isinstance(attempt, dict):
+                        attempt = {
+                            "operation": "web_reentry",
+                            "result": "DEFERRED",
+                            "state": "WEB_REENTRY_PENDING",
+                            "returncode": 78,
+                            "stderr_tail": "web host adapter returned a non-object execution receipt",
+                            "error_code": "WEB_HOST_REENTRY_ADAPTER_INVALID",
+                            "failure_class": "web_reentry_unavailable",
+                        }
+                else:
+                    attempt = {
+                        "operation": None,
+                        "result": "FAILED",
+                        "state": "RESUME_FAILED",
+                        "returncode": 1,
+                        "stderr_tail": f"unsupported controller host {selected_host}",
+                        "error_code": "CONTROLLER_HOST_UNSUPPORTED",
+                    }
             else:
                 adapter = (resume_adapters or {}).get(str(selected_host))
                 verifier = _registered_peer_attestation_verifier(str(selected_host))
@@ -1304,20 +1773,41 @@ def dispatch_pending_lifecycle_wake(
         target_receipt = receipt_path
     fingerprint = _wake_event_fingerprint(lifecycle_state)
     prior = load_json(target_receipt)
+    facts = dict(host_facts) if isinstance(host_facts, dict) else {}
+    controller_host = resolve_controller_host(
+        lifecycle_state, facts, load_json(registry), session_id
+    )
+    facts.setdefault("controller_host", controller_host)
     try:
         current_common_dir = str(_git_common_dir(repo))
         current_registered = _registered_controller_for_common_dir(repo, registry)
     except (OSError, subprocess.SubprocessError):
         current_common_dir = None
         current_registered = None
-    try:
-        current_target = resolve_native_resume_target(
-            session_id=session_id,
-            repo=repo,
-            registry=registry,
-        )
-    except (OSError, ValueError, PermissionError, subprocess.SubprocessError):
-        current_target = None
+    current_target = None
+    if controller_host == "web":
+        try:
+            current_web_session = resolve_reentry_session(
+                controller_id=session_id, repo=repo, registry_path=registry,
+                lease_path=DEFAULT_MANUAL_WEB_LEASES,
+            )
+        except (OSError, ValueError, PermissionError):
+            current_web_session = None
+        if current_web_session:
+            current_target = {
+                "execution_target_session_id": current_web_session,
+                "generation": 0,
+                "target_mode": "web_lease",
+            }
+    else:
+        try:
+            current_target = resolve_native_resume_target(
+                session_id=session_id,
+                repo=repo,
+                registry=registry,
+            )
+        except (OSError, ValueError, PermissionError, subprocess.SubprocessError):
+            current_target = None
     target_matches_prior = False
     if current_target is not None:
         current_target_id = current_target.get("execution_target_session_id")
@@ -1331,6 +1821,7 @@ def dispatch_pending_lifecycle_wake(
         target_matches_prior = (
             prior_target_id == current_target_id
             and prior_generation == current_generation
+            and prior.get("target_mode", current_target.get("target_mode")) == current_target.get("target_mode")
         )
     if (
         prior.get("event_fingerprint") == fingerprint
@@ -1345,11 +1836,6 @@ def dispatch_pending_lifecycle_wake(
         debounced["debounced"] = True
         return debounced
 
-    facts = dict(host_facts) if isinstance(host_facts, dict) else {}
-    controller_host = str(lifecycle_state.get("controller_host") or facts.get("controller_host") or "web").strip()
-    if controller_host not in {"web", "desktop_codex"}:
-        controller_host = "web"
-    facts.setdefault("controller_host", controller_host)
     if (
         "resume_actionable" not in facts
         and "resume_state" not in facts
@@ -1369,6 +1855,27 @@ def dispatch_pending_lifecycle_wake(
         runtime_path=runtime_path,
     )
 
+
+
+def resolve_controller_host(
+    lifecycle_state: dict[str, Any],
+    host_facts: dict[str, Any],
+    registry_data: dict[str, Any],
+    session_id: str,
+) -> str:
+    for value in (lifecycle_state.get("controller_host"), host_facts.get("controller_host")):
+        host = str(value or "").strip()
+        if host in {"web", "desktop_codex"}:
+            return host
+    sessions = registry_data.get("__controller_sessions__", {}) if isinstance(registry_data, dict) else {}
+    controller_sessions = sessions.get(session_id, {}) if isinstance(sessions, dict) else {}
+    if not isinstance(controller_sessions, dict):
+        controller_sessions = {}
+    web_bound = isinstance(controller_sessions.get("web"), list) and any(str(x).strip() for x in controller_sessions.get("web", []))
+    desktop_bound = isinstance(controller_sessions.get("desktop_codex"), list) and any(str(x).strip() for x in controller_sessions.get("desktop_codex", []))
+    if desktop_bound and not web_bound:
+        return "desktop_codex"
+    return "web"
 
 
 def wake_receipt_confirmed(receipt: dict[str, Any] | None) -> bool:
@@ -1505,6 +2012,51 @@ def default_auto_stop_state_path(session_id: str) -> Path:
     )
 
 
+def continuation_supervisor_needs_bootstrap(
+    lifecycle_state: dict[str, Any], supervisor_state: dict[str, Any]
+) -> bool:
+    if lifecycle_state.get("pending_control_event") is not True:
+        return False
+    if lifecycle_state.get("requires_user") is True:
+        return False
+    active_states = {
+        "RESUME_PENDING",
+        "RESUME_REARMED",
+        "RESUME_DEFERRED_ACTIVE_WRITER",
+        "WEB_REENTRY_SUBMITTED",
+        "WEB_REENTRY_DEFERRED_ACTIVE",
+    }
+    return str(supervisor_state.get("state") or "") not in active_states
+
+
+def ensure_continuation_supervisor(
+    *,
+    lifecycle_state: dict[str, Any],
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    codex: str,
+    runtime_path: str | None = None,
+    delay_seconds: float = 1.0,
+) -> bool:
+    state_path = default_auto_stop_state_path(session_id)
+    supervisor_state = load_json(state_path)
+    if not continuation_supervisor_needs_bootstrap(lifecycle_state, supervisor_state):
+        return False
+    generation = int(lifecycle_state.get("wake_generation", 0) or 0)
+    schedule_auto_native_stop(
+        session_id=session_id,
+        repo=repo,
+        receipt_id=f"bootstrap:{generation}",
+        registry=registry,
+        codex=codex,
+        delay_seconds=delay_seconds,
+        state_path=state_path,
+        runtime_path=runtime_path,
+    )
+    return True
+
+
 def schedule_auto_native_stop(
     *,
     session_id: str,
@@ -1527,10 +2079,24 @@ def schedule_auto_native_stop(
         "state": "RESUME_PENDING",
         "pending_control_event": True,
         "retry_count": int(prior.get("retry_count", 0) or 0) if same_receipt else 0,
+        "continuation_count": int(prior.get("continuation_count", 0) or 0) if same_receipt else 0,
+        "unchanged_continuation_count": int(prior.get("unchanged_continuation_count", 0) or 0) if same_receipt else 0,
     }
+    if same_receipt and prior.get("last_lifecycle_fingerprint"):
+        value["last_lifecycle_fingerprint"] = str(prior["last_lifecycle_fingerprint"])
+    if same_receipt and prior.get("approval_id"):
+        value["approval_id"] = str(prior["approval_id"])
+    if same_receipt and isinstance(prior.get("approval_expires_at_unix"), int):
+        value["approval_expires_at_unix"] = int(prior["approval_expires_at_unix"])
+    if same_receipt:
+        value["approval_retry_count"] = int(prior.get("approval_retry_count", 0) or 0)
     if same_receipt and prior.get("failure_class") == "active_writer_present":
         value["last_deferred_state"] = "RESUME_DEFERRED_ACTIVE_WRITER"
         value["failure_class"] = "active_writer_present"
+        value["stderr_tail"] = bounded_tail(str(prior.get("stderr_tail", "")))
+    elif same_receipt and prior.get("failure_class") == "web_reentry_unavailable":
+        value["failure_class"] = "web_reentry_unavailable"
+        value["error_code"] = str(prior.get("error_code") or "WEB_REENTRY_UNAVAILABLE")
         value["stderr_tail"] = bounded_tail(str(prior.get("stderr_tail", "")))
     write_auto_stop_state(state_path, value)
     command = [
@@ -1608,12 +2174,154 @@ def run_auto_native_stop(
         latest.pop(stale_key, None)
     write_auto_stop_state(state_path, latest)
     lifecycle_state = _load_lifecycle_state(session_id)
+    lifecycle_state = lifecycle_state if isinstance(lifecycle_state, dict) else {}
+    controller_host = resolve_controller_host(
+        lifecycle_state, {}, load_json(registry), session_id
+    )
+    if controller_host == "web":
+        current = load_json(state_path)
+        if lifecycle_state.get("pending_control_event") is not True:
+            if current.get("receipt_id") == receipt_id:
+                current.update({"state": "CONTINUATION_CLOSED", "pending_control_event": False})
+                current.pop("failure_class", None)
+                current.pop("error_code", None)
+                write_auto_stop_state(state_path, current)
+            return 0
+        if lifecycle_state.get("requires_user") is True:
+            if current.get("receipt_id") == receipt_id:
+                current.update({
+                    "state": "WAITING_USER", "pending_control_event": True,
+                    "failure_class": "user_decision_required",
+                })
+                current.pop("error_code", None)
+                write_auto_stop_state(state_path, current)
+            return 0
+        fingerprint = _wake_event_fingerprint(lifecycle_state)
+        attempt = execute_web_reentry(
+            controller_id=session_id, repo=repo, registry_path=registry,
+            lease_path=DEFAULT_MANUAL_WEB_LEASES, lifecycle_state=lifecycle_state,
+            approval_id=str(current.get("approval_id") or "").strip() or None,
+        )
+        current = load_json(state_path)
+        if current.get("receipt_id") != receipt_id:
+            return 0
+        for evidence_key in (
+            "execution_target_session_id", "target_generation", "target_mode",
+        ):
+            if evidence_key in attempt:
+                current[evidence_key] = attempt[evidence_key]
+        if attempt.get("state") == "WEB_REENTRY_WAITING_LOCAL_APPROVAL":
+            retry_count = int(current.get("approval_retry_count", 0) or 0) + 1
+            current.update({
+                "state": "WEB_REENTRY_WAITING_LOCAL_APPROVAL",
+                "pending_control_event": True,
+                "failure_class": "local_approval_required",
+                "approval_retry_count": retry_count,
+                "completed_at_unix_ms": int(time.time() * 1000),
+            })
+            if isinstance(attempt.get("approval_id"), str) and attempt.get("approval_id"):
+                current["approval_id"] = attempt["approval_id"]
+            if isinstance(attempt.get("approval_expires_at_unix"), int):
+                current["approval_expires_at_unix"] = attempt["approval_expires_at_unix"]
+            write_auto_stop_state(state_path, current)
+            expires_at = current.get("approval_expires_at_unix")
+            if (not isinstance(expires_at, int) or expires_at > int(time.time())) and retry_count < 24:
+                schedule_auto_native_stop(
+                    session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+                    codex=codex, delay_seconds=5.0, state_path=state_path, runtime_path=runtime_path,
+                )
+                return 0
+            current["state"] = "WAITING_USER"
+            current["failure_class"] = "local_approval_required"
+            write_auto_stop_state(state_path, current)
+            return 0
+        if attempt.get("state") == "WEB_REENTRY_DEFERRED_ACTIVE":
+            current.update({
+                "state": "WEB_REENTRY_DEFERRED_ACTIVE",
+                "pending_control_event": True,
+                "failure_class": "web_host_active",
+                "completed_at_unix_ms": int(time.time() * 1000),
+            })
+            write_auto_stop_state(state_path, current)
+            schedule_auto_native_stop(
+                session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+                codex=codex, delay_seconds=5.0, state_path=state_path, runtime_path=runtime_path,
+            )
+            return 0
+        if attempt.get("result") == "CONFIRMED":
+            previous_fingerprint = str(current.get("last_lifecycle_fingerprint") or "")
+            unchanged = int(current.get("unchanged_continuation_count", 0) or 0)
+            unchanged = unchanged + 1 if previous_fingerprint == fingerprint else 0
+            continuation_count = int(current.get("continuation_count", 0) or 0) + 1
+            current.update({
+                "state": "WEB_REENTRY_SUBMITTED",
+                "pending_control_event": True,
+                "continuation_count": continuation_count,
+                "unchanged_continuation_count": unchanged,
+                "last_lifecycle_fingerprint": fingerprint,
+                "completed_at_unix_ms": int(time.time() * 1000),
+                "returncode": 0,
+            })
+            current.pop("failure_class", None)
+            current.pop("error_code", None)
+            if unchanged >= AUTO_CONTINUATION_STALL_LIMIT:
+                current.update({
+                    "state": "RESUME_STALLED_NO_PROGRESS",
+                    "failure_class": "confirmed_web_reentry_without_machine_progress",
+                    "error_code": "WEB_LIFECYCLE_CONTINUATION_STALLED",
+                })
+                write_auto_stop_state(state_path, current)
+                return 78
+            write_auto_stop_state(state_path, current)
+            schedule_auto_native_stop(
+                session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+                codex=codex, delay_seconds=10.0, state_path=state_path, runtime_path=runtime_path,
+            )
+            return 0
+        failure_class = str(attempt.get("failure_class") or "web_reentry_unavailable")
+        retry_count = int(current.get("retry_count", 0) or 0)
+        if failure_class == "web_reentry_unavailable":
+            retry_count += 1
+        current.update({
+            "state": str(attempt.get("state") or "WEB_REENTRY_PENDING"),
+            "pending_control_event": True,
+            "completed_at_unix_ms": int(time.time() * 1000),
+            "returncode": int(attempt.get("returncode", 78) or 78),
+            "failure_class": failure_class,
+            "error_code": str(attempt.get("error_code") or "WEB_REENTRY_UNAVAILABLE"),
+            "stderr_tail": bounded_tail(str(attempt.get("stderr_tail", ""))),
+            "retry_count": retry_count,
+        })
+        write_auto_stop_state(state_path, current)
+        if failure_class == "web_reentry_unavailable":
+            retry_delay = min(60.0, float(2 ** min(max(retry_count - 1, 0), 5)))
+            schedule_auto_native_stop(
+                session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+                codex=codex, delay_seconds=max(1.0, retry_delay), state_path=state_path,
+                runtime_path=runtime_path,
+            )
+            return 0
+        return int(attempt.get("returncode", 78) or 78)
     attempt = execute_native_resume(
         session_id=session_id, repo=repo, registry=registry, codex=codex,
         runtime_path=runtime_path,
         terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
         next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
     )
+    if (
+        attempt.get("state") == "RESUME_TARGET_INCOMPATIBLE"
+        and attempt.get("replacement_eligible") is True
+    ):
+        failed_target = str(attempt.get("execution_target_session_id") or "").strip()
+        failed_generation = attempt.get("target_generation")
+        if failed_target and isinstance(failed_generation, int) and not isinstance(failed_generation, bool):
+            attempt = recover_incompatible_native_target(
+                session_id=session_id, repo=repo, registry=registry, codex=codex,
+                failed_target_session_id=failed_target, expected_generation=failed_generation,
+                runtime_path=runtime_path,
+                terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
+                next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
+            )
     latest = load_json(state_path)
     if latest.get("receipt_id") == receipt_id:
         for evidence_key in (
@@ -1645,7 +2353,7 @@ def run_auto_native_stop(
                 "stdout_tail": attempt.get("stdout_tail", ""),
                 "stderr_tail": attempt.get("stderr_tail", ""),
             })
-            for key in ("error_code", "failure_class", "fallback_eligible"):
+            for key in ("error_code", "failure_class", "fallback_eligible", "replacement_eligible"):
                 if key in attempt:
                     latest[key] = attempt[key]
         write_auto_stop_state(state_path, latest)
@@ -1662,6 +2370,61 @@ def run_auto_native_stop(
                 session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                 codex=codex, delay_seconds=retry_delay, state_path=state_path, runtime_path=runtime_path,
             )
+        return 0
+    if attempt.get("result") == "CONFIRMED":
+        fresh_lifecycle = _load_lifecycle_state(session_id)
+        current = load_json(state_path)
+        if current.get("receipt_id") != receipt_id:
+            return 0
+        if not fresh_lifecycle:
+            # No authoritative lifecycle state means there is nothing safe to re-arm from.
+            # Keep the successful receipt, preserve pending evidence, and fail closed against spinning.
+            current["state"] = "RESUME_CONFIRMED"
+            current["pending_control_event"] = True
+            current["lifecycle_rearm"] = "unavailable"
+            write_auto_stop_state(state_path, current)
+            return 0
+        pending = fresh_lifecycle.get("pending_control_event") is True
+        requires_user = fresh_lifecycle.get("requires_user") is True
+        current["pending_control_event"] = pending
+        if not pending:
+            current["state"] = "CONTINUATION_CLOSED"
+            current.pop("failure_class", None)
+            write_auto_stop_state(state_path, current)
+            return 0
+        if requires_user:
+            current["state"] = "WAITING_USER"
+            current["failure_class"] = "user_decision_required"
+            write_auto_stop_state(state_path, current)
+            return 0
+        fingerprint = _wake_event_fingerprint(fresh_lifecycle)
+        previous_fingerprint = str(current.get("last_lifecycle_fingerprint") or "")
+        unchanged = int(current.get("unchanged_continuation_count", 0) or 0)
+        unchanged = unchanged + 1 if previous_fingerprint == fingerprint else 0
+        continuation_count = int(current.get("continuation_count", 0) or 0) + 1
+        current.update({
+            "state": "RESUME_REARMED",
+            "pending_control_event": True,
+            "continuation_count": continuation_count,
+            "unchanged_continuation_count": unchanged,
+            "last_lifecycle_fingerprint": fingerprint,
+        })
+        if unchanged >= AUTO_CONTINUATION_STALL_LIMIT:
+            current.update({
+                "state": "RESUME_STALLED_NO_PROGRESS",
+                "failure_class": "confirmed_resume_without_machine_progress",
+                "error_code": "WEB_LIFECYCLE_CONTINUATION_STALLED",
+            })
+            write_auto_stop_state(state_path, current)
+            return 78
+        current.pop("failure_class", None)
+        current.pop("error_code", None)
+        write_auto_stop_state(state_path, current)
+        schedule_auto_native_stop(
+            session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+            codex=codex, delay_seconds=min(5.0, 1.0 + unchanged), state_path=state_path,
+            runtime_path=runtime_path,
+        )
         return 0
     return int(attempt["returncode"])
 
@@ -1947,7 +2710,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             codex="/opt/homebrew/bin/codex",
         )
         if lifecycle_state.get("pending_control_event") is True and not wake_receipt_confirmed(wake_receipt):
+            if wake_receipt_needs_auto_native_stop(wake_receipt):
+                schedule_auto_native_stop(
+                    session_id=session_id, repo=repo,
+                    receipt_id=f"post-shell:{lifecycle_state.get('wake_generation', 0)}",
+                    registry=registry_path, codex="/opt/homebrew/bin/codex",
+                    delay_seconds=1.0, state_path=default_auto_stop_state_path(session_id),
+                )
             return 78
+        ensure_continuation_supervisor(
+            lifecycle_state=lifecycle_state,
+            session_id=session_id,
+            repo=repo,
+            registry=registry_path,
+            codex="/opt/homebrew/bin/codex",
+        )
         return 0
 
     if args.command_name == "audit-once":
@@ -2024,7 +2801,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         )
                         if not wake_receipt_confirmed(wake_receipt):
                             result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
-                            if args.auto_native_stop and result == "DEFERRED":
+                            if args.auto_native_stop and wake_receipt_needs_auto_native_stop(wake_receipt):
                                 state_path = Path(args.auto_stop_state).expanduser() if args.auto_stop_state else default_auto_stop_state_path(args.session_id)
                                 schedule_auto_native_stop(
                                     session_id=args.session_id, repo=repo,
@@ -2088,7 +2865,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             )
                             if not wake_receipt_confirmed(wake_receipt):
                                 result = wake_receipt.get("result") if isinstance(wake_receipt, dict) else "MISSING_RECEIPT"
-                                if args.auto_native_stop and result == "DEFERRED":
+                                if args.auto_native_stop and wake_receipt_needs_auto_native_stop(wake_receipt):
                                     state_path = Path(args.auto_stop_state).expanduser() if args.auto_stop_state else default_auto_stop_state_path(args.session_id)
                                     schedule_auto_native_stop(
                                         session_id=args.session_id, repo=repo,
