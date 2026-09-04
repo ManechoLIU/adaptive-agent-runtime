@@ -1308,6 +1308,56 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
                 }
                 self.assertEqual(route_policy_errors(f"T-CANON-POS-{index}", candidate), [])
 
+    def test_route_policy_requires_class_marker_as_first_nonspace_token(self):
+        from scripts.route_contract import route_policy_errors
+
+        bad_lines = [
+            "- frontend default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            ": frontend default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "* frontend default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "1. frontend default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "• frontend default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend - default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend/default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend (default) provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+        ]
+        route = {
+            "decision": "default",
+            "policy_class": "frontend",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "auth_mode": "host",
+        }
+        for index, line in enumerate(bad_lines):
+            with self.subTest(line=line):
+                policy = Path(self.tmp.name) / f"leading-punctuation-{index}.md"
+                policy.write_text(line + chr(10), encoding="utf-8")
+                candidate = dict(route)
+                candidate["policy_source"] = {
+                    "path": str(policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+                }
+                self.assertEqual(
+                    route_policy_errors(f"T-LEAD-{index}", candidate),
+                    [f"T-LEAD-{index} route is not declared by policy source"],
+                )
+
+        good_lines = [
+            "frontend: default provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "frontend default: provider=chatgpt_web, model=gpt-5.6-sol, auth_mode=host.",
+            "前端：默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。",
+        ]
+        for index, line in enumerate(good_lines):
+            with self.subTest(active=line):
+                policy = Path(self.tmp.name) / f"leading-punctuation-good-{index}.md"
+                policy.write_text(line + chr(10), encoding="utf-8")
+                candidate = dict(route)
+                candidate["policy_source"] = {
+                    "path": str(policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(policy.read_bytes()).hexdigest(),
+                }
+                self.assertEqual(route_policy_errors(f"T-LEAD-POS-{index}", candidate), [])
+
     def test_route_policy_full_line_grammar_rejects_intervening_and_trailing_semantics(self):
         from scripts.route_contract import route_policy_errors
 

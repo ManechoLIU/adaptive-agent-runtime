@@ -188,10 +188,8 @@ def _ascii_marker_prefix(text: str, marker: str) -> tuple[int, int] | None:
 
 
 def _policy_prefix_is_positive(prefix: str, markers: tuple[str, ...]) -> bool:
-    """Require one canonical class marker first, then at most one formal directive."""
+    """Require class marker first and one exact optional directive grammar."""
     normalized = _normalize_policy_symbols(prefix).casefold().strip()
-    normalized = re.sub(r"^[\s:：,，;；/\|()\[\]{}<>]+", "", normalized)
-    normalized = re.sub(r"[\s:：,，;；/\|()\[\]{}<>]+$", "", normalized)
     if not normalized:
         return not markers
 
@@ -204,10 +202,14 @@ def _policy_prefix_is_positive(prefix: str, markers: tuple[str, ...]) -> bool:
             span = (0, len(token)) if normalized.startswith(token) else None
         if span is None:
             continue
-        remainder = normalized[span[1]:]
-        remainder = re.sub(r"^[\s:：,，;；/\|()\[\]{}<>-]+", "", remainder)
-        remainder = re.sub(r"[\s:：,，;；/\|()\[\]{}<>-]+$", "", remainder)
-        remainder = re.sub(r"[-_]+", " ", remainder)
+
+        remainder = normalized[span[1]:].strip()
+        if remainder.startswith((":","：")):
+            remainder = remainder[1:].strip()
+        if remainder.endswith((":","：")):
+            remainder = remainder[:-1].strip()
+        if any(character in remainder for character in "-_/\|,，;；()[]{}<>"):
+            continue
         remainder = re.sub(r"\s+", " ", remainder).strip()
         if remainder in CANONICAL_POLICY_DIRECTIVES:
             return True
