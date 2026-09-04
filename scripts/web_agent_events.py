@@ -26,7 +26,6 @@ def machine_event_source_status(
     path: str | Path = DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT,
     now: Any | None = None,
     max_age_seconds: float = MACHINE_EVENT_SOURCE_MAX_AGE_SECONDS,
-    verifier: Any | None = None,
 ) -> dict[str, Any]:
     """Authorize machine events only with independent Host provenance.
 
@@ -36,7 +35,7 @@ def machine_event_source_status(
     UTC = timezone.utc
     now = now or datetime.now(UTC)
     receipt_path = Path(path).expanduser().resolve(strict=False)
-    verifier = verifier or _trusted_machine_event_source_verifier()
+    verifier = _trusted_machine_event_source_verifier()
     if verifier is None:
         return {
             "ready": False,

@@ -7,11 +7,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.assignment_runtime import RuntimePolicy, evaluate_lease, load_runtime_state
-from scripts.web_agent_execution import apply_web_execution_event
+from scripts.web_agent_execution import (
+    _apply_verified_web_execution_event,
+    apply_web_execution_event,
+)
 
 
 UTC = timezone.utc
 T0 = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
+
+
+def verified_web_execution_event(*, host_verifier, **kwargs):
+    with patch(
+        "scripts.web_agent_execution._trusted_host_execution_verifier",
+        return_value=host_verifier,
+    ):
+        return _apply_verified_web_execution_event(**kwargs)
 
 
 def bind_recovery_attempt(
@@ -152,7 +163,7 @@ class WebAgentExecutionTests(unittest.TestCase):
                 now=T0 - timedelta(seconds=1),
                 health_probe=lambda: True,
             )
-        return apply_web_execution_event(
+        return verified_web_execution_event(
             repo=self.repo,
             registry_path=self.registry,
             event={
@@ -192,7 +203,7 @@ class WebAgentExecutionTests(unittest.TestCase):
             "attestation": self.attestation(state if state != "heartbeat" else "running", conversation=conversation),
         }
         payload.update(extra)
-        return apply_web_execution_event(
+        return verified_web_execution_event(
             repo=self.repo, registry_path=self.registry, event=payload, now=at,
             runtime_change_consumer=self._runtime_change, host_verifier=self._verify_host,
         )
@@ -215,7 +226,7 @@ class WebAgentExecutionTests(unittest.TestCase):
 
     def test_verified_host_started_event_still_requires_prepared_dispatch_ticket(self):
         with self.assertRaisesRegex(PermissionError, "prepared dispatch|dispatch ticket"):
-            apply_web_execution_event(
+            verified_web_execution_event(
                 repo=self.repo,
                 registry_path=self.registry,
                 event={
@@ -267,7 +278,7 @@ class WebAgentExecutionTests(unittest.TestCase):
     def test_browser_tab_absence_is_not_strong_enough_to_claim_disconnect(self):
         self.start()
         with self.assertRaisesRegex(ValueError, "weak browser UI evidence"):
-            apply_web_execution_event(
+            verified_web_execution_event(
                 repo=self.repo, registry_path=self.registry,
                 event={
                     "controller_id": "controller-1", "conversation_id": "conv-1", "assignment_id": "A-1",
@@ -439,7 +450,16 @@ class WebAgentExecutionTests(unittest.TestCase):
         self.assertEqual(lease["lease_id"], "A-1:web:attempt:1")
 
     def test_public_web_adapter_rejects_self_asserted_strong_attestation(self):
-        with self.assertRaisesRegex(ValueError, "verified host provenance"):
+        import inspect
+        self.assertNotIn("host_verifier", inspect.signature(apply_web_execution_event).parameters)
+        with self.assertRaises(TypeError):
+            apply_web_execution_event(
+                repo=self.repo,
+                registry_path=self.registry,
+                event={},
+                host_verifier=self._verify_host,
+            )
+        with self.assertRaisesRegex(PermissionError, "direct Web Host event ingest is disabled"):
             apply_web_execution_event(
                 repo=self.repo, registry_path=self.registry,
                 event={
@@ -447,6 +467,8 @@ class WebAgentExecutionTests(unittest.TestCase):
                     "assignment": self.assignment(), "attestation": self.attestation("running"),
                 }, now=T0,
             )
+        self.assertNotIn("A-1", load_runtime_state(self.repo).get("leases", {}))
+
 
     def test_verified_host_observation_is_required_to_start_execution(self):
         result = self.start()
@@ -466,7 +488,7 @@ class WebAgentExecutionTests(unittest.TestCase):
         self.start()
         lease_before = load_runtime_state(self.repo)["leases"]["A-1"]
         with self.assertRaisesRegex(ValueError, "progress requires observed running state"):
-            apply_web_execution_event(
+            verified_web_execution_event(
                 repo=self.repo, registry_path=self.registry,
                 event={
                     "controller_id": "controller-1", "conversation_id": "conv-1",
@@ -743,6 +765,24 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
             else:
                 receipt.write_bytes(original)
 
+    def test_machine_event_source_public_status_cannot_accept_caller_verifier(self):
+        import inspect
+        from scripts.web_agent_events import machine_event_source_status
+        self.assertNotIn("verifier", inspect.signature(machine_event_source_status).parameters)
+        with self.assertRaises(TypeError):
+            machine_event_source_status(verifier=lambda *_: {"verified": True})
+        receipt = Path(self.tmp.name) / "forged-event-source.json"
+        receipt.write_text(json.dumps({
+            "schema_version": 1,
+            "state": "ready",
+            "source": "chatgpt_subagent_machine_events",
+            "events": ["started", "completed", "failed", "interrupted", "cancelled", "disconnected"],
+            "observed_at": T0.isoformat(),
+        }), encoding="utf-8")
+        status = machine_event_source_status(path=receipt, now=T0)
+        self.assertFalse(status["ready"])
+        self.assertEqual(status["reason"], "trusted_machine_event_source_verifier_unavailable")
+
     def test_production_prepare_fails_closed_without_machine_web_event_source(self):
         from scripts.web_agent_execution import prepare_web_assignment_dispatch
         with patch(
@@ -942,14 +982,13 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         self.assertIsNone(lease["terminal_state"])
 
     def test_connection_interrupted_text_is_not_a_runtime_terminal(self):
-        from scripts.web_agent_execution import apply_web_execution_event
         bind_recovery_attempt(
             repo=self.repo, registry=self.registry, controller_id="controller-1",
             assignment=self.assignment(), conversation_id="conv-runtime-1",
             task_name="runtime-ui-interruption", at=T0,
         )
         with self.assertRaisesRegex(ValueError, "not authoritative terminal"):
-            apply_web_execution_event(
+            verified_web_execution_event(
                 repo=self.repo, registry_path=self.registry,
                 event={
                     "controller_id": "controller-1", "conversation_id": "conv-runtime-1",

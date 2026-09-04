@@ -39,6 +39,11 @@ TERMINAL_STATES = {"completed", "interrupted", "missing", "failed"}
 WEB_EXECUTION_PROVIDERS = {"chatgpt_web"}
 
 
+def _trusted_host_execution_verifier():
+    """Return a Host-owned execution verifier when one is installed; absent by default."""
+    return None
+
+
 def _iso(now: datetime) -> str:
     return (now if now.tzinfo else now.replace(tzinfo=UTC)).astimezone(UTC).isoformat()
 
@@ -49,11 +54,7 @@ def _registered_controller(repo: Path, registry_path: Path, controller_id: str) 
         raise PermissionError("Web execution event must target the existing registered logical Controller")
 
 
-def _attestation(
-    event: dict[str, Any],
-    *,
-    host_verifier: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] | None] | None,
-) -> dict[str, Any]:
+def _attestation(event: dict[str, Any]) -> dict[str, Any]:
     att = event.get("attestation")
     if not isinstance(att, dict) or att.get("kind") != "web_execution_state":
         raise ValueError("machine Web execution attestation is required")
@@ -68,6 +69,7 @@ def _attestation(
         raise ValueError("weak browser UI evidence cannot establish or renew a canonical Web execution lease")
     if source not in STRONG_HOST_SOURCES:
         raise ValueError("untrusted Web execution attestation source")
+    host_verifier = _trusted_host_execution_verifier()
     if host_verifier is None:
         raise ValueError("verified host provenance is required; self-asserted host attestation fails closed")
     verified = host_verifier(dict(att), dict(event))
@@ -1094,9 +1096,23 @@ def apply_web_execution_event(
     event: dict[str, Any],
     now: datetime | None = None,
     runtime_change_consumer: Callable[..., dict[str, Any]] | None = None,
-    host_verifier: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
-    """Translate one trusted Web-host observation into the existing runtime state machine."""
+    """Compatibility entry point: caller-supplied Web Host events are fail-closed."""
+    raise PermissionError(
+        "direct Web Host event ingest is disabled; only the installed Host verifier adapter may "
+        "invoke the private verified-event path"
+    )
+
+
+def _apply_verified_web_execution_event(
+    *,
+    repo: str | Path,
+    registry_path: str | Path,
+    event: dict[str, Any],
+    now: datetime | None = None,
+    runtime_change_consumer: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Translate one independently Host-verified observation into canonical runtime."""
     if not isinstance(event, dict):
         raise ValueError("Web execution event must be an object")
     repo = Path(repo).expanduser().resolve(); registry = Path(registry_path).expanduser().resolve()
@@ -1108,7 +1124,7 @@ def apply_web_execution_event(
     _registered_controller(repo, registry, controller_id)
     state = str(event.get("state") or "").strip().lower()
     terminal = state in TERMINAL_STATES
-    att = _attestation(event, host_verifier=host_verifier)
+    att = _attestation(event)
 
     if state == "started":
         if att.get("state") != "running":

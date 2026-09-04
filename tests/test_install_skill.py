@@ -650,7 +650,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "import unittest\n"
                 "class WebAgentExecutionTests(unittest.TestCase):\n"
                 "    def test_direct_start_web_assignment_is_rejected_even_with_forged_readiness_probe(self): self.assertTrue(True)\n"
+                "    def test_public_web_adapter_rejects_self_asserted_strong_attestation(self): self.assertTrue(True)\n"
                 "class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):\n"
+                "    def test_machine_event_source_public_status_cannot_accept_caller_verifier(self): self.assertTrue(True)\n"
                 "    def test_forged_local_machine_event_receipt_cannot_enable_production_prepare(self): self.assertTrue(True)\n"
                 "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
                 "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n",
@@ -728,7 +730,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "import unittest\n"
                 "class WebAgentExecutionTests(unittest.TestCase):\n"
                 "    def test_direct_start_web_assignment_is_rejected_even_with_forged_readiness_probe(self): self.assertTrue(True)\n"
+                "    def test_public_web_adapter_rejects_self_asserted_strong_attestation(self): self.assertTrue(True)\n"
                 "class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):\n"
+                "    def test_machine_event_source_public_status_cannot_accept_caller_verifier(self): self.assertTrue(True)\n"
                 "    def test_forged_local_machine_event_receipt_cannot_enable_production_prepare(self): self.assertTrue(True)\n"
                 "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
                 "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n",
