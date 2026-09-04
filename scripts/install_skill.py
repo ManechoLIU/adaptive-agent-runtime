@@ -127,6 +127,26 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_public_structured_terminal_ingest_rejects_caller_supplied_observation",
     "tests.test_web_agent_execution.StructuredCollaborationTerminalTests."
     "test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path",
+    "tests.test_controller_scoring_hook.ControllerScoringEvaluationTransactionTests."
+    "test_current_re_evaluation_does_not_inject_or_accept_historical_score_as_new_result",
+    "tests.test_controller_scoring_hook.ControllerScoringEvaluationTransactionTests."
+    "test_computed_current_score_requires_exact_transaction_metadata_and_persists_it",
+    "tests.test_controller_scoring_hook.ControllerScoringEvaluationTransactionTests."
+    "test_fact_change_before_stop_forces_same_flow_re_evaluation_refresh",
+    "tests.test_evaluation_transaction.EvaluationTransactionTests."
+    "test_historical_72_8_cannot_satisfy_re_evaluate_current_capability",
+    "tests.test_evaluation_transaction.EvaluationTransactionTests."
+    "test_read_as_computed_violation_starts_same_flow_correction_with_new_evidence",
+    "tests.test_project_context_guard.ProjectContextGuardTests."
+    "test_new_session_project_governance_question_requires_initialized_current_rules",
+    "tests.test_project_context_guard.ProjectContextGuardTests."
+    "test_existing_scoring_model_request_must_resolve_real_current_definition",
+    "tests.test_project_context_guard.ProjectContextGuardTests."
+    "test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction",
+    "tests.test_web_agent_events.WebAgentMachineEventSourceTests."
+    "test_caller_created_file_inside_codex_session_root_cannot_self_attest",
+    "tests.test_web_agent_events.WebAgentMachineEventSourceTests."
+    "test_health_supervisor_publishes_diagnostic_source_without_authorizing_it",
 )
 RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors",
@@ -139,11 +159,14 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/web_agent_execution.py",
     "scripts/web_agent_events.py",
+    "scripts/web_agent_health_supervisor.py",
     "scripts/web_lifecycle_bridge.py",
     "scripts/web_reentry_adapter.py",
     "scripts/lifecycle_hook.py",
     "scripts/control_event_guard.py",
     "scripts/controller_state.py",
+    "scripts/controller_scoring_guard.py",
+    "scripts/controller_scoring_hook.py",
     "scripts/project_context_guard.py",
     "scripts/evaluation_transaction.py",
     "scripts/route_contract.py",
@@ -153,7 +176,9 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_web_reentry_adapter.py",
     "tests/test_web_collaboration_continuation.py",
     "tests/test_governance.py",
+    "tests/test_controller_scoring_hook.py",
     "tests/test_project_context_guard.py",
+    "tests/test_web_agent_events.py",
     "tests/test_evaluation_transaction.py",
     "tests/external-agent-routing.test.mjs",
 )

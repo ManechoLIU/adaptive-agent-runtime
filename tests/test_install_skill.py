@@ -24,6 +24,7 @@ class InstallCapabilityTests(unittest.TestCase):
                 "lifecycle_hook.py",
                 "controller_target_guard.py",
                 "controller_scoring_hook.py",
+                "project_context_guard.py",
             ):
                 script = skill_root / "scripts" / name
                 script.write_text(f"#!/usr/bin/env python3\n# {name}\n", encoding="utf-8")
@@ -117,6 +118,7 @@ class InstallCapabilityTests(unittest.TestCase):
                 "lifecycle_hook.py",
                 "controller_target_guard.py",
                 "controller_scoring_hook.py",
+                "project_context_guard.py",
             ):
                 script = skill_root / "scripts" / name
                 script.write_text(f"#!/usr/bin/env python3\n# {name}\n", encoding="utf-8")
@@ -367,6 +369,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
             "web_agent_health_supervisor.py", "web_agent_events.py", "route_contract.py",
             "control_event_guard.py", "controller_state.py", "assignment_lease_guard.py",
+            "controller_scoring_guard.py", "project_context_guard.py", "evaluation_transaction.py",
         ):
             script = source / "scripts" / name
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
@@ -632,6 +635,36 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_duplicate_terminal_observation_after_confirmed_continuation_does_not_wake_twice(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
+            (tests_dir / "test_project_context_guard.py").write_text(
+                "import unittest\n"
+                "class ProjectContextGuardTests(unittest.TestCase):\n"
+                "    def test_new_session_project_governance_question_requires_initialized_current_rules(self): self.assertTrue(True)\n"
+                "    def test_existing_scoring_model_request_must_resolve_real_current_definition(self): self.assertTrue(True)\n"
+                "    def test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_evaluation_transaction.py").write_text(
+                "import unittest\n"
+                "class EvaluationTransactionTests(unittest.TestCase):\n"
+                "    def test_historical_72_8_cannot_satisfy_re_evaluate_current_capability(self): self.assertTrue(True)\n"
+                "    def test_read_as_computed_violation_starts_same_flow_correction_with_new_evidence(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_controller_scoring_hook.py").write_text(
+                "import unittest\n"
+                "class ControllerScoringEvaluationTransactionTests(unittest.TestCase):\n"
+                "    def test_current_re_evaluation_does_not_inject_or_accept_historical_score_as_new_result(self): self.assertTrue(True)\n"
+                "    def test_computed_current_score_requires_exact_transaction_metadata_and_persists_it(self): self.assertTrue(True)\n"
+                "    def test_fact_change_before_stop_forces_same_flow_re_evaluation_refresh(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_web_agent_events.py").write_text(
+                "import unittest\n"
+                "class WebAgentMachineEventSourceTests(unittest.TestCase):\n"
+                "    def test_caller_created_file_inside_codex_session_root_cannot_self_attest(self): self.assertTrue(True)\n"
+                "    def test_health_supervisor_publishes_diagnostic_source_without_authorizing_it(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_governance.py").write_text(
                 "import unittest\n"
                 "class GovernanceTests(unittest.TestCase):\n"
@@ -733,6 +766,36 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_completed_reviewer_uses_same_terminal_continuation_path(self): self.assertTrue(True)\n"
                 "    def test_stale_child_is_second_observed_by_existing_audit_and_wakes_same_controller(self): self.assertTrue(True)\n"
                 "    def test_duplicate_terminal_observation_after_confirmed_continuation_does_not_wake_twice(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_project_context_guard.py").write_text(
+                "import unittest\n"
+                "class ProjectContextGuardTests(unittest.TestCase):\n"
+                "    def test_new_session_project_governance_question_requires_initialized_current_rules(self): self.assertTrue(True)\n"
+                "    def test_existing_scoring_model_request_must_resolve_real_current_definition(self): self.assertTrue(True)\n"
+                "    def test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_evaluation_transaction.py").write_text(
+                "import unittest\n"
+                "class EvaluationTransactionTests(unittest.TestCase):\n"
+                "    def test_historical_72_8_cannot_satisfy_re_evaluate_current_capability(self): self.assertTrue(True)\n"
+                "    def test_read_as_computed_violation_starts_same_flow_correction_with_new_evidence(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_controller_scoring_hook.py").write_text(
+                "import unittest\n"
+                "class ControllerScoringEvaluationTransactionTests(unittest.TestCase):\n"
+                "    def test_current_re_evaluation_does_not_inject_or_accept_historical_score_as_new_result(self): self.assertTrue(True)\n"
+                "    def test_computed_current_score_requires_exact_transaction_metadata_and_persists_it(self): self.assertTrue(True)\n"
+                "    def test_fact_change_before_stop_forces_same_flow_re_evaluation_refresh(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_web_agent_events.py").write_text(
+                "import unittest\n"
+                "class WebAgentMachineEventSourceTests(unittest.TestCase):\n"
+                "    def test_caller_created_file_inside_codex_session_root_cannot_self_attest(self): self.assertTrue(True)\n"
+                "    def test_health_supervisor_publishes_diagnostic_source_without_authorizing_it(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_governance.py").write_text(
@@ -904,6 +967,7 @@ class ProjectContextHookInstallationTests(unittest.TestCase):
                 "project_context_guard.py",
                 "lifecycle_hook.py",
                 "controller_scoring_hook.py",
+                "project_context_guard.py",
             ):
                 (target / "scripts" / name).write_text("# hook" + chr(10), encoding="utf-8")
             hooks = root / "hooks.json"
@@ -1030,7 +1094,7 @@ class HostAdapterInstallationTests(unittest.TestCase):
             root = Path(d)
             target = root / "adaptive-delivery"
             (target / "scripts").mkdir(parents=True)
-            for name in ("web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py"):
+            for name in ("web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py", "project_context_guard.py"):
                 script = target / "scripts" / name
                 script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
                 script.chmod(0o755)

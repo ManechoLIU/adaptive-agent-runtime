@@ -18,10 +18,18 @@ from typing import Any, Callable, Iterable
 
 try:
     from scripts import web_lifecycle_bridge
-    from scripts.web_agent_events import machine_event_source_ready
+    from scripts.web_agent_events import (
+        DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT,
+        machine_event_source_ready,
+        write_machine_event_source_receipt,
+    )
 except ModuleNotFoundError:
     import web_lifecycle_bridge
-    from web_agent_events import machine_event_source_ready
+    from web_agent_events import (
+        DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT,
+        machine_event_source_ready,
+        write_machine_event_source_receipt,
+    )
 
 UTC = timezone.utc
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
@@ -121,6 +129,7 @@ def reconcile_web_agent_health_once(
 def reconcile_all_web_agent_health_once(
     *,
     registry_path: str | Path = DEFAULT_REGISTRY,
+    event_source_path: str | Path = DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     registry = Path(registry_path).expanduser().resolve()
@@ -150,7 +159,7 @@ def reconcile_all_web_agent_health_once(
                 repo=repo,
                 registry_path=registry,
                 controller_id=controller_id,
-                event_paths=None if machine_event_source_ready(now=now) else [],
+                event_paths=None if machine_event_source_ready(path=event_source_path, now=now) else [],
                 now=now,
             ))
         except (OSError, ValueError, PermissionError, RuntimeError):
@@ -164,13 +173,17 @@ def run_health_supervisor(
     registry_path: str | Path = DEFAULT_REGISTRY,
     poll_seconds: float = 15.0,
     heartbeat_path: str | Path = DEFAULT_HEARTBEAT,
+    event_source_path: str | Path = DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT,
 ) -> None:
     if poll_seconds < 1.0:
         raise ValueError("Web Agent health supervisor poll interval must be at least one second")
     while True:
         now = datetime.now(UTC)
         write_health_heartbeat(path=heartbeat_path, now=now)
-        reconcile_all_web_agent_health_once(registry_path=registry_path, now=now)
+        write_machine_event_source_receipt(path=event_source_path, now=now)
+        reconcile_all_web_agent_health_once(
+            registry_path=registry_path, event_source_path=event_source_path, now=now
+        )
         write_health_heartbeat(path=heartbeat_path, now=datetime.now(UTC))
         time.sleep(poll_seconds)
 
@@ -183,13 +196,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--registry", default=str(DEFAULT_REGISTRY))
     parser.add_argument("--heartbeat", default=str(DEFAULT_HEARTBEAT))
     parser.add_argument("--poll-seconds", type=float, default=15.0)
+    parser.add_argument("--event-source", default=str(DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT))
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args(argv)
     if args.once:
         now = datetime.now(UTC)
         write_health_heartbeat(path=args.heartbeat, now=now)
+        write_machine_event_source_receipt(path=args.event_source, now=now)
         print(json.dumps(
-            reconcile_all_web_agent_health_once(registry_path=args.registry, now=now),
+            reconcile_all_web_agent_health_once(
+                registry_path=args.registry, event_source_path=args.event_source, now=now
+            ),
             ensure_ascii=False,
         ))
         return 0
@@ -197,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         registry_path=args.registry,
         poll_seconds=args.poll_seconds,
         heartbeat_path=args.heartbeat,
+        event_source_path=args.event_source,
     )
     return 0
 

@@ -504,6 +504,7 @@ def finalize_score(
     window_summary: str | None,
     message_sha256: str | None,
     receipt_id: str | None = None,
+    evaluation_transaction: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     controller = stable_logical_controller_id(repo, controller_session_id)
     performance = float(performance_score)
@@ -566,6 +567,20 @@ def finalize_score(
         "model_sha256": model_sha256,
         "message_sha256": message_sha256,
     }
+    if isinstance(evaluation_transaction, dict):
+        record.update({
+            "evaluation_id": evaluation_transaction.get("evaluation_id"),
+            "evaluation_begun_at": evaluation_transaction.get("evaluation_begun_at"),
+            "evidence_cutoff_at": evaluation_transaction.get("evidence_cutoff_at"),
+            "evidence_snapshot_sha256": evaluation_transaction.get("evidence_snapshot_sha256"),
+            "result_provenance": "COMPUTED",
+            "field_provenance": {
+                "performance_score": "COMPUTED",
+                "governance_risk_status": "DERIVED",
+                "risk_constrained_score": "DERIVED",
+                "cycle_extremes": "READ",
+            },
+        })
     return append_score_history(repo, record)
 
 

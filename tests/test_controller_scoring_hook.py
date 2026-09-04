@@ -1029,5 +1029,244 @@ class ControllerScoringOutputGateTests(unittest.TestCase):
             )
 
 
+class ControllerScoringEvaluationTransactionTests(unittest.TestCase):
+    def computed_message(self, state, *, performance=80.0, constrained=None, risk_status="GREEN"):
+        tx = state["evaluation_transaction"]
+        constrained = performance if constrained is None else constrained
+        return (
+            formal_message(
+                performance,
+                constrained,
+                risk_status=risk_status,
+                risk_summary="current machine evidence",
+            )
+            + chr(10)
+            + "本次评估来源：COMPUTED"
+            + chr(10)
+            + "事实截止时间：" + tx["evidence_cutoff_at"]
+            + chr(10)
+            + "证据快照 SHA256：" + tx["evidence_snapshot_sha256"]
+            + chr(10)
+            + "评分模型 SHA256：" + tx["model"]["sha256"]
+        )
+
+    def test_current_re_evaluation_does_not_inject_or_accept_historical_score_as_new_result(self):
+        import subprocess
+        hook = load_module()
+        guard = load_guard_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            guard.append_score_history(repo, {
+                "schema_version": 1,
+                "record_kind": "formal",
+                "controller_session_id": "controller-1",
+                "recorded_at": "2026-09-04T09:59:00+00:00",
+                "score": 72.8,
+                "performance_score": 72.8,
+                "risk_constrained_score": 72.8,
+                "model_sha256": hook.scoring_model_sha256(ROOT),
+            })
+            output, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "controller-1",
+                    "turn_id": "reeval-1",
+                    "cwd": str(repo),
+                    "prompt": "按照治理体系现有评分模型重新评估当前 Controller 的现在真实能力",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            context = output["hookSpecificOutput"]["additionalContext"]
+            self.assertEqual("COMPUTE", state["evaluation_transaction"]["intent"])
+            self.assertNotIn("72.8", context)
+            bad = formal_message(72.8) + chr(10) + "本次评估来源：READ"
+            blocked, corrected = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "controller-1",
+                    "turn_id": "reeval-1",
+                    "cwd": str(repo),
+                    "last_assistant_message": bad,
+                },
+                skill_root=ROOT,
+                prior_state=state,
+            )
+            self.assertEqual("block", blocked["decision"])
+            self.assertIn("TASK NOT SATISFIED", blocked["reason"])
+            self.assertEqual(
+                state["evaluation_transaction"]["evaluation_id"],
+                corrected["evaluation_transaction"]["supersedes_evaluation_id"],
+            )
+            latest = hook.latest_score_history(repo, controller_session_id="controller-1")
+            self.assertEqual(72.8, latest["score"])
+
+    def test_latest_record_query_is_read_only_and_does_not_finalize_new_score(self):
+        import subprocess
+        hook = load_module()
+        guard = load_guard_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            guard.append_score_history(repo, {
+                "schema_version": 1,
+                "record_kind": "formal",
+                "controller_session_id": "controller-1",
+                "recorded_at": "2026-09-04T09:59:00+00:00",
+                "score": 72.8,
+                "performance_score": 80.0,
+                "risk_constrained_score": 72.8,
+                "model_sha256": hook.scoring_model_sha256(ROOT),
+            })
+            output, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "controller-1",
+                    "turn_id": "read-1",
+                    "cwd": str(repo),
+                    "prompt": "系统最新记录的 Controller 分数是多少？",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            self.assertEqual("READ", state["evaluation_intent"])
+            self.assertFalse(state.get("pending_scoring", False))
+            self.assertIn("72.8", output["hookSpecificOutput"]["additionalContext"])
+            allowed, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "controller-1",
+                    "turn_id": "read-1",
+                    "cwd": str(repo),
+                    "last_assistant_message": "系统最新记录：72.8/100（READ）。",
+                },
+                skill_root=ROOT,
+                prior_state=state,
+            )
+            self.assertEqual({}, allowed)
+            latest = hook.latest_score_history(repo, controller_session_id="controller-1")
+            self.assertEqual("2026-09-04T09:59:00+00:00", latest["recorded_at"])
+
+    def test_computed_current_score_requires_exact_transaction_metadata_and_persists_it(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "controller-1",
+                    "turn_id": "compute-1",
+                    "cwd": str(repo),
+                    "prompt": "重新评估现在总控真实能力并评分",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            message = self.computed_message(state, performance=80.0)
+            output, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "controller-1",
+                    "turn_id": "compute-1",
+                    "cwd": str(repo),
+                    "last_assistant_message": message,
+                },
+                skill_root=ROOT,
+                prior_state=state,
+            )
+            self.assertEqual({}, output)
+            history = hook.latest_score_history(repo, controller_session_id="controller-1")
+            self.assertEqual("COMPUTED", history["result_provenance"])
+            self.assertEqual(
+                state["completed_evaluation"]["evaluation_id"],
+                history["evaluation_id"],
+            )
+            self.assertEqual(
+                state["completed_evaluation"]["evidence_cutoff_at"],
+                history["evidence_cutoff_at"],
+            )
+            self.assertEqual(80.0, history["performance_score"])
+
+    def test_old_cutoff_in_output_is_rejected_for_current_evaluation(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            _, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "controller-1",
+                    "turn_id": "cutoff-1",
+                    "cwd": str(repo),
+                    "prompt": "按现有评分模型重新评分当前能力",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            message = self.computed_message(state).replace(
+                state["evaluation_transaction"]["evidence_cutoff_at"],
+                "2026-01-01T00:00:00+00:00",
+            )
+            output, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "controller-1",
+                    "turn_id": "cutoff-1",
+                    "cwd": str(repo),
+                    "last_assistant_message": message,
+                },
+                skill_root=ROOT,
+                prior_state=state,
+            )
+            self.assertEqual("block", output["decision"])
+            self.assertIn("evidence cutoff", output["reason"].lower())
+
+    def test_fact_change_before_stop_forces_same_flow_re_evaluation_refresh(self):
+        import subprocess
+        hook = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / "TASK_LEDGER.md").write_text("READY" + chr(10), encoding="utf-8")
+            _, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "controller-1",
+                    "turn_id": "refresh-1",
+                    "cwd": str(repo),
+                    "prompt": "重新评估当前总控能力",
+                },
+                skill_root=ROOT,
+                prior_state={},
+            )
+            old_tx = state["evaluation_transaction"]
+            (repo / "TASK_LEDGER.md").write_text("ACTIVE" + chr(10), encoding="utf-8")
+            output, state = hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "controller-1",
+                    "turn_id": "refresh-1",
+                    "cwd": str(repo),
+                    "last_assistant_message": self.computed_message({"evaluation_transaction": old_tx}),
+                },
+                skill_root=ROOT,
+                prior_state=state,
+            )
+            self.assertEqual("block", output["decision"])
+            self.assertIn("current evidence changed", output["reason"])
+            self.assertEqual(
+                old_tx["evaluation_id"],
+                state["evaluation_transaction"]["supersedes_evaluation_id"],
+            )
+            self.assertNotEqual(
+                old_tx["evidence_snapshot_sha256"],
+                state["evaluation_transaction"]["evidence_snapshot_sha256"],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3218,6 +3218,43 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
         self.assertIn("adaptive-delivery", payload["runtime_state_path"])
         self.assertNotIn("adaptive-agent-runtime", payload["runtime_state_path"])
 
+    def test_restore_payload_includes_project_skill_immediately_after_agents_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            for name, text in (
+                ("AGENTS.md", "agent rules"),
+                ("SKILL.md", "project workflow"),
+                ("TASK_LEDGER.md", "task ledger"),
+            ):
+                (repo / name).write_text(text + chr(10), encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-m", "init"],
+                check=True,
+                capture_output=True,
+            )
+            registry = root / "controllers.json"
+            registry.write_text(
+                json.dumps({"controller-1": str(repo.resolve())}),
+                encoding="utf-8",
+            )
+
+            payload = web_bridge.web_session_restore_payload(repo, registry)
+
+        self.assertEqual(
+            payload["restore_order"][:3],
+            ["AGENTS.md", "SKILL.md", "TASK_LEDGER.md"],
+        )
+        self.assertEqual(
+            [item["name"] for item in payload["documents"]][:3],
+            ["AGENTS.md", "SKILL.md", "TASK_LEDGER.md"],
+        )
+
     def test_restore_payload_contains_bounded_dirty_git_and_runtime_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

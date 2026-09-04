@@ -378,6 +378,11 @@ def _bounded_runtime_state(path: Path) -> dict[str, Any]:
         "sha256": __import__("hashlib").sha256(path.read_bytes()).hexdigest(),
     }
 
+try:
+    from scripts.project_context_guard import initialize_project_context
+except ModuleNotFoundError:
+    from project_context_guard import initialize_project_context
+
 
 def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, Any]:
     root = canonical_root(repo)
@@ -385,7 +390,7 @@ def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, An
     if controller is None:
         raise ValueError(f"no registered controller for {root}")
     ledger_name = "TASK_LEDGER.md" if (root / "TASK_LEDGER.md").is_file() else ("PROJECT_STATUS.md" if (root / "PROJECT_STATUS.md").is_file() else "TASK_LEDGER.md")
-    restore_names = ("AGENTS.md", ledger_name, "MEMORY.md", "WIKI_INDEX.md")
+    restore_names = ("AGENTS.md", "SKILL.md", ledger_name, "MEMORY.md", "WIKI_INDEX.md")
     documents = [item for name in restore_names if (item := _restore_document(root / name)) is not None]
     authoritative_documents = [
         item for name in AUTHORITATIVE_DOCUMENT_NAMES
@@ -404,11 +409,15 @@ def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, An
     ).stdout.strip()
     runtime_state = _git_common_dir(root) / "adaptive-delivery" / "runtime-assignments.json"
     runtime = _bounded_runtime_state(runtime_state)
+    project_context = initialize_project_context(
+        root,
+        skill_root=Path(__file__).resolve().parents[1],
+    )
     return {
         "product": "Adaptive Agent Runtime",
         "project_root": str(root),
         "controller_id": controller,
-        "restore_order": ["AGENTS.md", ledger_name, "MEMORY.md", "WIKI_INDEX.md", "git_runtime"],
+        "restore_order": [item["name"] for item in documents] + ["git_runtime"],
         "documents": documents,
         "authoritative_documents": authoritative_documents,
         "git": {
@@ -419,6 +428,7 @@ def web_session_restore_payload(repo: Path, registry_path: Path) -> dict[str, An
             "status_sha256": __import__("hashlib").sha256(status.encode("utf-8")).hexdigest(),
         },
         "runtime": runtime,
+        "project_context": project_context,
         "runtime_state_path": str(runtime_state),
         "compact": "not restored unless an explicit handoff/compact is available",
     }

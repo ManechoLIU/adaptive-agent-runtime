@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -16,9 +18,88 @@ REQUIRED_MACHINE_WEB_EVENTS = {
 TRUSTED_MACHINE_WEB_EVENT_SOURCES = {"chatgpt_subagent_machine_events"}
 
 
+def _codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+
+
+def _trusted_session_roots() -> tuple[Path, ...]:
+    home = _codex_home()
+    return (
+        (home / "sessions").resolve(strict=False),
+        (home / "archived_sessions").resolve(strict=False),
+    )
+
+
+def _verified_codex_session_path(value: str | Path) -> Path | None:
+    raw = Path(value).expanduser()
+    try:
+        if raw.is_symlink():
+            return None
+        path = raw.resolve(strict=True)
+        if not path.is_file():
+            return None
+        if not any(path.is_relative_to(root) for root in _trusted_session_roots()):
+            return None
+        with path.open("rb") as handle:
+            first = handle.readline(65536)
+        record = json.loads(first)
+        if (
+            not isinstance(record, dict)
+            or record.get("type") != "session_meta"
+            or not isinstance(record.get("payload"), dict)
+            or not str(record["payload"].get("id") or "").strip()
+        ):
+            return None
+        return path
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
 def _trusted_machine_event_source_verifier():
-    """Return a Host-owned verifier when one is installed; absent by default."""
+    """Return only an independently Host-owned verifier; unavailable in this Runtime build."""
     return None
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def write_machine_event_source_receipt(
+    *,
+    path: str | Path = DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT,
+    now: Any | None = None,
+) -> dict[str, Any]:
+    from datetime import datetime, timezone
+    UTC = timezone.utc
+    now = now or datetime.now(UTC)
+    candidates = discover_recent_session_paths(since_values=[], now=now)
+    verified = [
+        checked
+        for candidate in candidates
+        if (checked := _verified_codex_session_path(candidate)) is not None
+    ]
+    payload = {
+        "schema_version": 1,
+        "state": "observed_unverified" if verified else "unavailable",
+        "source": "chatgpt_subagent_machine_events",
+        "events": sorted(REQUIRED_MACHINE_WEB_EVENTS),
+        "observed_at": now.astimezone(UTC).isoformat(),
+        "event_paths": sorted({str(item) for item in verified}),
+        "provenance": "runtime_observed_local_session_files_not_authorization",
+    }
+    _atomic_json(Path(path).expanduser(), payload)
+    return payload
 
 
 def machine_event_source_status(
@@ -214,10 +295,7 @@ def discover_recent_session_paths(
             dt = dt.replace(tzinfo=UTC)
         parsed.append(dt.astimezone(UTC))
     floor = min(parsed) - timedelta(minutes=5) if parsed else now.astimezone(UTC) - timedelta(hours=24)
-    session_roots = tuple(roots) if roots is not None else (
-        Path.home() / ".codex" / "sessions",
-        Path.home() / ".codex" / "archived_sessions",
-    )
+    session_roots = tuple(roots) if roots is not None else _trusted_session_roots()
     floor_ts = floor.timestamp()
     for raw_root in session_roots:
         root = Path(raw_root).expanduser()

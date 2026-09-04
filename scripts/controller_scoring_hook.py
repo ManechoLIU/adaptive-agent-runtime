@@ -13,9 +13,17 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from controller_scoring_guard import consume_score_guard, cycle_score_extremes, finalize_attested_cycle_score, finalize_cycle_candidate, finalize_score, latest_score_history, read_and_record_model, receipt_path
+    from controller_scoring_guard import consume_score_guard, cycle_score_extremes, finalize_attested_cycle_score, finalize_cycle_candidate, finalize_score, governance_risk_projection, latest_score_history, read_and_record_model, receipt_path
 except ModuleNotFoundError:
-    from scripts.controller_scoring_guard import consume_score_guard, cycle_score_extremes, finalize_attested_cycle_score, finalize_cycle_candidate, finalize_score, latest_score_history, read_and_record_model, receipt_path
+    from scripts.controller_scoring_guard import consume_score_guard, cycle_score_extremes, finalize_attested_cycle_score, finalize_cycle_candidate, finalize_score, governance_risk_projection, latest_score_history, read_and_record_model, receipt_path
+try:
+    from evaluation_transaction import COMPUTE, COMPUTED, READ, begin_evaluation, classify_evaluation_intent, correct_evaluation, evidence_snapshot_sha256
+except ModuleNotFoundError:
+    from scripts.evaluation_transaction import COMPUTE, COMPUTED, READ, begin_evaluation, classify_evaluation_intent, correct_evaluation, evidence_snapshot_sha256
+try:
+    from project_context_guard import initialize_project_context
+except ModuleNotFoundError:
+    from scripts.project_context_guard import initialize_project_context
 
 MODEL_RELATIVE_PATH = Path("references/controller-performance-scoring.md")
 CONTROLLER_REGISTRY_PATH = Path(
@@ -61,11 +69,11 @@ _ANY_SCORE_SHAPE = re.compile(
 )
 
 _SCORE_TERMS = re.compile(
-    r"(?:评分|打分|分数|多少分|履职评估|履职评分|performance\s+(?:score|scoring|evaluation)|score\s+(?:the\s+)?(?:controller|orchestrator)|rate\s+(?:the\s+)?(?:controller|orchestrator))",
+    r"(?:评分|打分|分数|多少分|评估|评价|履职评估|履职评分|performance\s+(?:score|scoring|evaluation)|score\s+(?:the\s+)?(?:controller|orchestrator)|rate\s+(?:the\s+)?(?:controller|orchestrator)|evaluate|assess)",
     re.IGNORECASE,
 )
 _SCORING_MODEL_REQUEST = re.compile(
-    r"(?:调用|使用|让|call|use).{0,8}(?:评分模型|scoring\s+model).{0,12}(?:评分|打分|评估|score|rate)",
+    r"(?:(?:调用|使用|让|按|按照|基于|根据|call|use).{0,12})?(?:现有|当前|治理体系.{0,6})?(?:评分模型|scoring\s+model).{0,16}(?:重新)?(?:评分|打分|评估|评价|score|rate|evaluate|assess)",
     re.IGNORECASE,
 )
 _SCORING_FAILURE_RETRY = re.compile(
@@ -315,6 +323,124 @@ def _model_context(skill_root: str | Path, digest: str) -> str:
     )
 
 
+def _scoring_evidence_snapshot(
+    repo: Path,
+    *,
+    skill_root: str | Path,
+    controller_id: str,
+) -> dict[str, Any]:
+    context = initialize_project_context(repo, skill_root=skill_root)
+    compact_sources: dict[str, Any] = {}
+    for name, value in context.get("sources", {}).items():
+        if not isinstance(value, dict):
+            continue
+        if name == "git":
+            compact_sources[name] = {
+                key: value.get(key)
+                for key in ("status", "head", "branch", "worktree_status_sha256")
+            }
+        else:
+            compact_sources[name] = {
+                key: value.get(key)
+                for key in ("status", "path", "sha256", "bytes")
+            }
+    return {
+        "project_root": context.get("project_root"),
+        "context_state": context.get("state"),
+        "verified_facts": context.get("verified_facts", []),
+        "unknown_facts": context.get("unknown_facts", []),
+        "sources": compact_sources,
+        "controller_id": controller_id,
+        "governance_risk_projection": governance_risk_projection(
+            repo,
+            controller_session_id=controller_id,
+        ),
+    }
+
+
+def _evaluation_context(transaction: dict[str, Any]) -> str:
+    return (
+        "Adaptive Agent Runtime current-evaluation transaction is active."
+        + chr(10)
+        + "Existing Result != New Evaluation; READ history cannot satisfy this COMPUTE task."
+        + chr(10)
+        + "Do not use any historical total score as the basis for the new capability score before current evidence is evaluated."
+        + chr(10)
+        + "evaluation_id=" + str(transaction.get("evaluation_id", ""))
+        + chr(10)
+        + "evaluation_intent=" + str(transaction.get("intent", ""))
+        + chr(10)
+        + "evaluation_begun_at=" + str(transaction.get("evaluation_begun_at", ""))
+        + chr(10)
+        + "evidence_cutoff_at=" + str(transaction.get("evidence_cutoff_at", ""))
+        + chr(10)
+        + "evidence_snapshot_sha256=" + str(transaction.get("evidence_snapshot_sha256", ""))
+        + chr(10)
+        + "evaluation_model_sha256=" + str(transaction.get("model", {}).get("sha256", ""))
+        + chr(10)
+        + "For the core new result, output provenance must be COMPUTED. Risk/cap results remain separate DERIVED layers."
+    )
+
+
+def _evaluation_metadata_errors(
+    message: str,
+    transaction: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    provenance = _extract_labeled_value(
+        message,
+        (r"本次评估来源", r"evaluation provenance", r"result provenance"),
+    )
+    cutoff = _extract_labeled_value(
+        message,
+        (r"事实截止时间", r"evidence cutoff"),
+    )
+    evidence_sha = _extract_labeled_value(
+        message,
+        (r"证据快照\s*SHA256", r"evidence snapshot\s*sha256"),
+    )
+    model_sha = _extract_labeled_value(
+        message,
+        (r"评分模型\s*SHA256", r"model\s*sha256"),
+    )
+    if str(provenance or "").strip().upper() != COMPUTED:
+        errors.append("core result provenance must be COMPUTED")
+    if str(cutoff or "").strip() != str(transaction.get("evidence_cutoff_at", "")):
+        errors.append("evidence cutoff does not match the current evaluation transaction")
+    if str(evidence_sha or "").strip().lower() != str(transaction.get("evidence_snapshot_sha256", "")).lower():
+        errors.append("evidence snapshot sha256 does not match the current evaluation transaction")
+    expected_model = str(transaction.get("model", {}).get("sha256", "")).lower()
+    if str(model_sha or "").strip().lower() != expected_model:
+        errors.append("model sha256 does not match the current evaluation transaction")
+    return errors
+
+
+def _correct_current_evaluation(
+    state: dict[str, Any],
+    *,
+    repo: Path,
+    skill_root: str | Path,
+    controller_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    previous = state.get("evaluation_transaction")
+    if not isinstance(previous, dict):
+        return state
+    corrected = correct_evaluation(
+        previous,
+        reason=reason,
+        evidence_provider=lambda: _scoring_evidence_snapshot(
+            repo,
+            skill_root=skill_root,
+            controller_id=controller_id,
+        ),
+    )
+    state["evaluation_transaction"] = corrected
+    state["evaluation_correction_required"] = True
+    state["retry_after_block"] = True
+    return state
+
+
 def evaluate_event(
     event: dict[str, Any],
     *,
@@ -329,14 +455,66 @@ def evaluate_event(
         if not is_controller_scoring_request(prompt):
             current_turn = str(event.get("turn_id", ""))
             if state.get("pending_scoring") and str(state.get("turn_id", "")) != current_turn:
-                state.update({"pending_scoring": False, "reinject_required": False, "turn_id": current_turn})
+                state.update({
+                    "pending_scoring": False,
+                    "reinject_required": False,
+                    "turn_id": current_turn,
+                })
             return {}, state
+
         try:
             repo = _repo_root(str(event.get("cwd", "") or Path.cwd()))
             source_session_id = str(event.get("session_id", "")).strip()
             controller_id = _logical_controller_id(repo, source_session_id)
+            evaluation_intent = classify_evaluation_intent(prompt)
+
+            if evaluation_intent == READ:
+                latest = latest_score_history(
+                    repo,
+                    controller_session_id=controller_id,
+                )
+                read_context = (
+                    "Adaptive Agent Runtime scoring query intent=READ."
+                    + chr(10)
+                    + "This request asks for an existing machine record, not a new evaluation."
+                    + chr(10)
+                    + "recorded_result_provenance=READ"
+                    + chr(10)
+                    + "latest_record="
+                    + (
+                        json.dumps(
+                            latest,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if isinstance(latest, dict)
+                        else "UNKNOWN"
+                    )
+                )
+                state.update({
+                    "evaluation_intent": READ,
+                    "pending_scoring": False,
+                    "pending_scoring_read": True,
+                    "repo_root": str(repo),
+                    "controller_id": controller_id,
+                    "source_session_id": source_session_id,
+                    "turn_id": str(event.get("turn_id", "")),
+                    "retry_after_block": False,
+                })
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": read_context,
+                    }
+                }, state
+
             prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-            receipt_id = ":".join((source_session_id, str(event.get("turn_id", "")), prompt_sha256))
+            receipt_id = ":".join((
+                source_session_id,
+                str(event.get("turn_id", "")),
+                prompt_sha256,
+            ))
             model = scoring_model_path(skill_root)
             content, receipt = read_and_record_model(
                 repo,
@@ -348,43 +526,77 @@ def evaluate_event(
             context = (
                 "Adaptive Agent Runtime controller-scoring machine gate is active. "
                 "The following is the exact installed scoring model and is authoritative for this scoring turn. "
-                "Do not substitute another rubric. The Stop gate will fail closed if this exact model changes before the response completes.\n"
-                f"installed_scoring_model_sha256={digest}\n"
-                f"installed_scoring_model_path={model}\n\n"
-                f"stable_logical_controller_id={controller_id}\n"
-                "machine_governance_risk_projection="
+                "Do not substitute another rubric. The Stop gate will fail closed if this exact model changes before the response completes."
+                + chr(10)
+                + f"installed_scoring_model_sha256={digest}"
+                + chr(10)
+                + f"installed_scoring_model_path={model}"
+                + chr(10)
+                + chr(10)
+                + f"stable_logical_controller_id={controller_id}"
+                + chr(10)
+                + "machine_governance_risk_projection="
                 + json.dumps(
                     receipt.get("governance_risk_projection", {}),
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
                 )
-                + "\n\n"
+                + chr(10)
+                + chr(10)
                 + content.decode("utf-8")
             )
+            evaluation_transaction = None
+            if evaluation_intent == COMPUTE:
+                evaluation_transaction = begin_evaluation(
+                    prompt=prompt,
+                    subject={"kind": "controller", "id": controller_id},
+                    model={
+                        "state": "found",
+                        "path": str(model),
+                        "sha256": digest,
+                    },
+                    evidence_provider=lambda: _scoring_evidence_snapshot(
+                        repo,
+                        skill_root=skill_root,
+                        controller_id=controller_id,
+                    ),
+                )
+                context = (
+                    _evaluation_context(evaluation_transaction)
+                    + chr(10)
+                    + chr(10)
+                    + context
+                )
         except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as error:
             return {
                 "decision": "block",
-                "reason": f"controller scoring blocked: score-guard could not load and record the exact installed scoring model read: {error}",
+                "reason": (
+                    "controller scoring blocked: score-guard could not initialize "
+                    f"the current scoring transaction: {error}"
+                ),
             }, state
-        state.update(
-            {
-                "pending_scoring": True,
-                "model_path": str(model),
-                "model_sha256": digest,
-                "prompt_sha256": prompt_sha256,
-                "repo_root": str(repo),
-                "controller_id": controller_id,
-                "source_session_id": source_session_id,
-                "receipt_id": receipt_id,
-                "receipt_path": str(receipt_path(repo, receipt_id=receipt_id)),
-                "receipt_sha256": str(receipt.get("model_sha256", "")),
-                "reinject_required": False,
-                "retry_after_block": False,
-                "turn_id": str(event.get("turn_id", "")),
-                "scoring_mode": _scoring_mode(prompt),
-            }
-        )
+
+        state.update({
+            "pending_scoring": True,
+            "model_path": str(model),
+            "model_sha256": digest,
+            "prompt_sha256": prompt_sha256,
+            "repo_root": str(repo),
+            "controller_id": controller_id,
+            "source_session_id": source_session_id,
+            "receipt_id": receipt_id,
+            "receipt_path": str(receipt_path(repo, receipt_id=receipt_id)),
+            "receipt_sha256": str(receipt.get("model_sha256", "")),
+            "reinject_required": False,
+            "retry_after_block": False,
+            "turn_id": str(event.get("turn_id", "")),
+            "scoring_mode": _scoring_mode(prompt),
+            "evaluation_intent": evaluation_intent,
+            "evaluation_transaction": evaluation_transaction,
+            "evaluation_correction_required": False,
+            "pending_scoring_read": False,
+        })
         return {
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
@@ -437,6 +649,67 @@ def evaluate_event(
                     "当前评分正文不再有效。本回合只能说明阻塞，不能输出分数；请用户重新提交总控评分/审计请求，让新的 UserPromptSubmit 完整注入当前安装评分模型。"
                 ),
             }, state
+        evaluation_transaction = state.get("evaluation_transaction")
+        if (
+            str(state.get("evaluation_intent", "")).upper() == COMPUTE
+            and isinstance(evaluation_transaction, dict)
+        ):
+            try:
+                current_evidence = _scoring_evidence_snapshot(
+                    Path(repo_text),
+                    skill_root=skill_root,
+                    controller_id=controller_id,
+                )
+            except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as error:
+                state["retry_after_block"] = True
+                return {
+                    "decision": "block",
+                    "reason": (
+                        "controller scoring blocked: current evaluation evidence "
+                        f"could not be refreshed safely: {error}"
+                    ),
+                }, state
+            current_evidence_sha = evidence_snapshot_sha256(current_evidence)
+            if (
+                current_evidence_sha
+                != str(evaluation_transaction.get("evidence_snapshot_sha256", ""))
+            ):
+                state = _correct_current_evaluation(
+                    state,
+                    repo=Path(repo_text),
+                    skill_root=skill_root,
+                    controller_id=controller_id,
+                    reason="current evidence changed before evaluation completion",
+                )
+                return {
+                    "decision": "block",
+                    "reason": (
+                        "controller scoring blocked: current evidence changed during "
+                        "the evaluation; TASK NOT SATISFIED. Recompute from the refreshed "
+                        "evaluation transaction before finalizing a score."
+                    ),
+                }, state
+
+            metadata_errors = _evaluation_metadata_errors(
+                message,
+                evaluation_transaction,
+            )
+            if metadata_errors:
+                state = _correct_current_evaluation(
+                    state,
+                    repo=Path(repo_text),
+                    skill_root=skill_root,
+                    controller_id=controller_id,
+                    reason="; ".join(metadata_errors),
+                )
+                return {
+                    "decision": "block",
+                    "reason": (
+                        "controller scoring blocked: TASK NOT SATISFIED: "
+                        + "; ".join(metadata_errors)
+                    ),
+                }, state
+
         scoring_mode = str(state.get("scoring_mode", "formal"))
         receipt_id = str(state.get("receipt_id", "")).strip() or None
         cycle_score = _extract_cycle_score_value(message)
@@ -514,7 +787,7 @@ def evaluate_event(
                         model_sha256=installed_digest,
                     )
                     _validate_cycle_extrema_claim(message, expected=expected_extremes)
-                    finalize_score(
+                    finalized = finalize_score(
                         Path(repo_text), skill_root=skill_root,
                         controller_session_id=controller_id,
                         turn_id=current_turn, score=constrained_score, performance_score=performance_score,
@@ -522,7 +795,22 @@ def evaluate_event(
                         window_summary=_extract_window_summary(message),
                         message_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
                         receipt_id=receipt_id,
+                        evaluation_transaction=(
+                            evaluation_transaction
+                            if isinstance(evaluation_transaction, dict)
+                            and str(evaluation_transaction.get("intent", "")).upper() == COMPUTE
+                            else None
+                        ),
                     )
+                    if (
+                        isinstance(evaluation_transaction, dict)
+                        and str(evaluation_transaction.get("intent", "")).upper() == COMPUTE
+                    ):
+                        completed_evaluation = dict(evaluation_transaction)
+                        completed_evaluation["state"] = "CLOSED"
+                        completed_evaluation["result_provenance"] = COMPUTED
+                        completed_evaluation["history_recorded_at"] = finalized.get("recorded_at")
+                        state["completed_evaluation"] = completed_evaluation
                 else:
                     errors = consume_score_guard(Path(repo_text), skill_root=skill_root, receipt_id=receipt_id)
                     if errors:
