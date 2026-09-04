@@ -144,6 +144,8 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/lifecycle_hook.py",
     "scripts/control_event_guard.py",
     "scripts/controller_state.py",
+    "scripts/project_context_guard.py",
+    "scripts/evaluation_transaction.py",
     "scripts/route_contract.py",
     "scripts/assignment_lease_guard.py",
     "scripts/run_external_agent.mjs",
@@ -151,6 +153,8 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_web_reentry_adapter.py",
     "tests/test_web_collaboration_continuation.py",
     "tests/test_governance.py",
+    "tests/test_project_context_guard.py",
+    "tests/test_evaluation_transaction.py",
     "tests/external-agent-routing.test.mjs",
 )
 
@@ -534,6 +538,20 @@ def detect_host_capabilities(
         )
         for event_name in {"UserPromptSubmit", "Stop"}
     )
+    project_context_script = (
+        skill_root_path / "scripts" / "project_context_guard.py"
+        if skill_root_path is not None else None
+    )
+    project_context_configured = bool(
+        project_context_script
+        and project_context_script.is_file()
+        and all(
+            _hook_event_contains(
+                hooks_path, event_name, "project_context_guard.py", skill_root=skill_root_path
+            )
+            for event_name in {"SessionStart", "UserPromptSubmit", "Stop"}
+        )
+    )
     canary_valid = _valid_desktop_canary(
         desktop_canary_path, hooks_path=hooks_path, skill_root=skill_root_path
     )
@@ -542,12 +560,12 @@ def detect_host_capabilities(
             "status": "blocked", "adapter": "codex-native", "configured": False,
             "reason": "codex executable not detected",
         }
-    elif lifecycle_configured and scoring_configured and canary_valid:
+    elif lifecycle_configured and scoring_configured and project_context_configured and canary_valid:
         desktop = {
             "status": "enabled", "adapter": "codex-native", "configured": True,
             "reason": "hooks configured and exact live canary receipt verified",
         }
-    elif lifecycle_configured and scoring_configured:
+    elif lifecycle_configured and scoring_configured and project_context_configured:
         desktop = {
             "status": "degraded", "adapter": "codex-native", "configured": True,
             "reason": "hooks configured; exact live canary receipt is missing or stale",
@@ -555,7 +573,7 @@ def detect_host_capabilities(
     else:
         desktop = {
             "status": "degraded", "adapter": "codex-native", "configured": False,
-            "reason": "codex detected; lifecycle/scoring hooks are not fully configured",
+            "reason": "codex detected; lifecycle/scoring/project-context hooks are not fully configured",
         }
 
     bridge_available = bridge_path.is_file() and os.access(bridge_path, os.X_OK)
@@ -663,6 +681,30 @@ def install_codex_hooks(
     python = python_executable or sys.executable
     lifecycle_command = f"{shlex.quote(str(python))} {shlex.quote(str(target_path / 'scripts' / 'lifecycle_hook.py'))}"
     scoring_command = f"{shlex.quote(str(python))} {shlex.quote(str(target_path / 'scripts' / 'controller_scoring_hook.py'))}"
+    project_context_command = f"{shlex.quote(str(python))} {shlex.quote(str(target_path / 'scripts' / 'project_context_guard.py'))}"
+
+    project_context_specs = {
+        "SessionStart": ("startup|resume|clear|compact", True),
+        "UserPromptSubmit": (None, True),
+        "Stop": (None, False),
+    }
+    for event_name, (matcher, inject_context) in project_context_specs.items():
+        entries = hooks.setdefault(event_name, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"{event_name} hooks must be a list")
+        entries[:] = _remove_matching_handlers(entries, "project_context_guard.py")
+        handler: dict[str, Any] = {
+            "type": "command",
+            "command": project_context_command,
+            "timeout": 5,
+            "statusMessage": "Loading Adaptive Agent Runtime current project facts",
+        }
+        if inject_context:
+            handler["additionalContextLimit"] = 0
+        group: dict[str, Any] = {"hooks": [handler]}
+        if matcher is not None:
+            group["matcher"] = matcher
+        entries.insert(0, group)
 
     lifecycle_specs = {
         "SessionStart": ("startup|resume|clear|compact", "Loading Adaptive Agent Runtime controller state", True),

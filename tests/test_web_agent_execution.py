@@ -1040,7 +1040,7 @@ class RuntimeOwnedWebRecoveryContractTests(unittest.TestCase):
         }), encoding="utf-8")
         status = machine_event_source_status(path=receipt, now=T0)
         self.assertFalse(status["ready"])
-        self.assertEqual(status["reason"], "trusted_machine_event_source_verifier_unavailable")
+        self.assertEqual(status["reason"], "machine_event_source_provenance_rejected")
 
     def test_production_prepare_fails_closed_without_machine_web_event_source(self):
         from scripts.web_agent_execution import prepare_web_assignment_dispatch

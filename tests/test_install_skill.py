@@ -892,6 +892,44 @@ class InstallPromotionSafetyTests(unittest.TestCase):
             self.assertEqual((legacy_real / "old.txt").read_text(encoding="utf-8"), "old")
 
 
+class ProjectContextHookInstallationTests(unittest.TestCase):
+    def test_project_context_hooks_are_installed_before_lifecycle_and_scoring(self):
+        import json
+        from scripts.install_skill import install_codex_hooks
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / "adaptive-delivery"
+            (target / "scripts").mkdir(parents=True)
+            for name in (
+                "project_context_guard.py",
+                "lifecycle_hook.py",
+                "controller_scoring_hook.py",
+            ):
+                (target / "scripts" / name).write_text("# hook" + chr(10), encoding="utf-8")
+            hooks = root / "hooks.json"
+            install_codex_hooks(hooks, target, python_executable="/usr/bin/python3")
+            value = json.loads(hooks.read_text(encoding="utf-8"))
+            for event in ("SessionStart", "UserPromptSubmit", "Stop"):
+                entries = value["hooks"][event]
+                self.assertEqual(
+                    1,
+                    sum("project_context_guard.py" in str(item) for item in entries),
+                )
+                self.assertIn("project_context_guard.py", str(entries[0]))
+            self.assertLess(
+                next(i for i,x in enumerate(value["hooks"]["UserPromptSubmit"]) if "project_context_guard.py" in str(x)),
+                next(i for i,x in enumerate(value["hooks"]["UserPromptSubmit"]) if "controller_scoring_hook.py" in str(x)),
+            )
+            self.assertEqual(
+                "startup|resume|clear|compact",
+                value["hooks"]["SessionStart"][0]["matcher"],
+            )
+            self.assertEqual(
+                0,
+                value["hooks"]["UserPromptSubmit"][0]["hooks"][0]["additionalContextLimit"],
+            )
+
+
 class HostAdapterInstallationTests(unittest.TestCase):
     def test_codex_hook_install_preserves_existing_hooks_and_is_idempotent(self):
         import json
@@ -911,6 +949,7 @@ class HostAdapterInstallationTests(unittest.TestCase):
             self.assertEqual(len([x for x in config["hooks"]["Stop"] if "echo keep" in str(x)]), 1)
             self.assertEqual(len([x for x in config["hooks"]["Stop"] if "lifecycle_hook.py" in str(x)]), 1)
             self.assertEqual(len([x for x in config["hooks"]["Stop"] if "controller_scoring_hook.py" in str(x)]), 1)
+            self.assertEqual(len([x for x in config["hooks"]["Stop"] if "project_context_guard.py" in str(x)]), 1)
             for event in ("SessionStart", "PreToolUse", "PostToolUse", "SubagentStop", "UserPromptSubmit"):
                 self.assertIn(event, config["hooks"])
             self.assertEqual(
