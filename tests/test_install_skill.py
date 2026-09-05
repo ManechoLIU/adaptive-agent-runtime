@@ -713,6 +713,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_web_reentry(self): self.assertTrue(True)\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume(self): self.assertTrue(True)\n"
+                "    def test_superseded_supervisor_cannot_replace_native_target_after_recovery_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_same_receipt_live_supervisor_is_coalesced(self): self.assertTrue(True)\n"
                 "    def test_current_token_web_rearm_hands_off_with_force_rearm_proof(self): self.assertTrue(True)\n"
                 "    def test_stale_supervisor_token_exits_without_running_impl(self): self.assertTrue(True)\n"

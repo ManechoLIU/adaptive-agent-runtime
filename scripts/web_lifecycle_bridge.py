@@ -1658,6 +1658,9 @@ def recover_incompatible_native_target(
     runtime_path: str | None = None,
     terminal_receipts: Sequence[str] | None = None,
     next_action: str | None = None,
+    supervisor_state_path: Path | None = None,
+    supervisor_receipt_id: str | None = None,
+    supervisor_token: str | None = None,
 ) -> dict[str, Any]:
     """Replace an unreadable desktop execution target, never the logical Controller."""
     try:
@@ -1721,10 +1724,30 @@ def recover_incompatible_native_target(
             "recovered_from_execution_target_session_id": failed_target_session_id,
         }
     try:
-        replacement = replace_desktop_execution_target(
-            controller_id=session_id, desktop_session_id=new_target, repo=repo,
-            expected_generation=expected_generation, registry=registry,
-        )
+        if supervisor_token is not None and supervisor_state_path is not None and supervisor_receipt_id is not None:
+            with _owned_supervisor_state(
+                supervisor_state_path,
+                receipt_id=supervisor_receipt_id,
+                supervisor_token=supervisor_token,
+            ) as owner:
+                if owner is None:
+                    return {
+                        "operation": "native_target_recovery", "controller_id": session_id,
+                        "result": "DEFERRED", "state": "RESUME_SUPERSEDED",
+                        "pending_control_event": True, "returncode": 0,
+                        "failure_class": "supervisor_superseded",
+                        "recovered_from_execution_target_session_id": failed_target_session_id,
+                        "candidate_execution_target_session_id": new_target,
+                    }
+                replacement = replace_desktop_execution_target(
+                    controller_id=session_id, desktop_session_id=new_target, repo=repo,
+                    expected_generation=expected_generation, registry=registry,
+                )
+        else:
+            replacement = replace_desktop_execution_target(
+                controller_id=session_id, desktop_session_id=new_target, repo=repo,
+                expected_generation=expected_generation, registry=registry,
+            )
     except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
         return {
             "operation": "native_target_recovery", "controller_id": session_id,
@@ -3006,6 +3029,9 @@ def _run_auto_native_stop_impl(
                 runtime_path=runtime_path,
                 terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
                 next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
+                supervisor_state_path=state_path,
+                supervisor_receipt_id=receipt_id,
+                supervisor_token=supervisor_token,
             )
 
     # Revalidate the token before committing any external result or rearming.

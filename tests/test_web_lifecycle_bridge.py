@@ -2373,6 +2373,76 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
             self.assertEqual(final["supervisor_pid"], 2222)
             self.assertEqual(final["state"], "RESUME_PENDING")
 
+    def test_superseded_supervisor_cannot_replace_native_target_after_recovery_bootstrap(self) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp)); old_token = "old-token"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-bad"]}},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-bad", "generation": 1,
+                }}},
+            }), encoding="utf-8")
+            state.write_text(json.dumps({
+                "receipt_id": "r1", "supervisor_receipt_id": "r1",
+                "supervisor_token": old_token, "supervisor_pid": 1111,
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            bootstrap_entered = threading.Event(); release_bootstrap = threading.Event(); old_done = threading.Event()
+            incompatible = {
+                "operation": "native_resume", "result": "FAILED",
+                "state": "RESUME_TARGET_INCOMPATIBLE", "pending_control_event": True,
+                "returncode": 78, "stderr_tail": "bad target",
+                "replacement_eligible": True,
+                "execution_target_session_id": "desktop-bad", "target_generation": 1,
+            }
+
+            def bootstrap(*_args, **_kwargs):
+                bootstrap_entered.set(); release_bootstrap.wait(2)
+                return Mock(returncode=0, stdout='{"type":"thread.started","thread_id":"desktop-new"}\n', stderr="")
+
+            def old() -> None:
+                try:
+                    web_bridge.run_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                        codex="codex", delay_seconds=0, state_path=state, supervisor_token=old_token,
+                    )
+                finally:
+                    old_done.set()
+
+            old_thread = threading.Thread(target=old)
+            replace_target = Mock(return_value={
+                "controller_id": "controller-1", "execution_target_session_id": "desktop-new",
+                "status": "active", "generation": 2,
+            })
+            try:
+                with patch.object(web_bridge, "_load_lifecycle_state", return_value={
+                    "pending_control_event": True, "requires_user": False,
+                    "controller_host": "desktop_codex", "wake_generation": 1,
+                }), patch.object(web_bridge, "execute_native_resume", return_value=incompatible), patch.object(
+                    web_bridge, "preflight_native_resume", return_value=(True, "", {})
+                ), patch.object(web_bridge.subprocess, "run", side_effect=bootstrap), patch.object(
+                    web_bridge, "replace_desktop_execution_target", replace_target
+                ), patch.object(web_bridge.subprocess, "Popen", return_value=Mock(pid=2222)), patch.object(
+                    web_bridge, "_pid_is_alive", return_value=True
+                ):
+                    old_thread.start(); self.assertTrue(bootstrap_entered.wait(1))
+                    self.assertTrue(web_bridge.schedule_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                        codex="codex", delay_seconds=1, state_path=state, force_rearm=True,
+                        replace_supervisor_token=old_token,
+                    ))
+                    new_token = json.loads(state.read_text())["supervisor_token"]
+                    release_bootstrap.set(); self.assertTrue(old_done.wait(2))
+            finally:
+                release_bootstrap.set(); old_thread.join(2)
+            replace_target.assert_not_called()
+            final = json.loads(state.read_text())
+            self.assertEqual(final["supervisor_token"], new_token)
+            self.assertEqual(final["supervisor_pid"], 2222)
+
     def test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume(self) -> None:
         import threading
         from unittest.mock import Mock, patch

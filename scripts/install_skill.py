@@ -237,6 +237,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_replacement_can_supersede_while_old_supervisor_waits_in_web_reentry",
     "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
     "test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume",
+    "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
+    "test_superseded_supervisor_cannot_replace_native_target_after_recovery_bootstrap",
     "tests.test_web_agent_events.WebAgentMachineEventSourceTests."
     "test_caller_created_file_inside_codex_session_root_cannot_self_attest",
     "tests.test_web_agent_events.WebAgentMachineEventSourceTests."
