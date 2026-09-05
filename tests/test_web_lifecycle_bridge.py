@@ -2285,6 +2285,69 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
             self.assertEqual(final["coalesced_schedule_count"], 1)
             self.assertEqual(final["supervisor_pid"], 1111)
 
+    def test_execute_native_resume_stale_supervisor_token_blocks_process_launch(self) -> None:
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-good"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-good",
+                            "generation": 2,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+            state.write_text(json.dumps({
+                "receipt_id": "r1",
+                "supervisor_receipt_id": "r1",
+                "supervisor_token": "new-token",
+                "supervisor_pid": 2222,
+                "pending_control_event": True,
+            }), encoding="utf-8")
+
+            real_popen = subprocess.Popen
+            native_launches = []
+
+            def guarded_popen(command, *args, **kwargs):
+                if isinstance(command, (list, tuple)) and command and str(command[0]).endswith("git"):
+                    return real_popen(command, *args, **kwargs)
+                native_launches.append(command)
+                raise AssertionError(
+                    "stale supervisor token must not cross the native process launch boundary"
+                )
+
+            with patch.object(
+                web_bridge, "preflight_native_resume", return_value=(True, "", {})
+            ), patch.object(web_bridge.subprocess, "Popen", side_effect=guarded_popen):
+                result = web_bridge.execute_native_resume(
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex="codex",
+                    runtime_path="/usr/bin:/bin",
+                    terminal_receipts=["terminal.json"],
+                    next_action="continue",
+                    supervisor_state_path=state,
+                    supervisor_receipt_id="r1",
+                    supervisor_token="old-token",
+                )
+
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(result["state"], "RESUME_SUPERSEDED")
+            self.assertEqual(result["failure_class"], "supervisor_superseded")
+            self.assertEqual(result["returncode"], 0)
+            self.assertEqual(result["execution_target_session_id"], "desktop-good")
+            self.assertEqual(result["target_generation"], 2)
+            self.assertEqual(native_launches, [])
+
     def test_stale_supervisor_cannot_native_wake_after_supersession(self) -> None:
         import threading
         from unittest.mock import Mock, patch
