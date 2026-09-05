@@ -2834,38 +2834,45 @@ def _run_auto_native_stop_impl(
         lifecycle_state, {}, load_json(registry), session_id
     )
     if controller_host == "web":
+        # Read the current supervisor-owned inputs under lock, but never hold the
+        # lock while Host/Web re-entry performs external work. Superseding a
+        # stuck generation must stay possible.
+        with _owned_supervisor_state(
+            state_path, receipt_id=receipt_id, supervisor_token=supervisor_token
+        ) as current:
+            if current is None:
+                return 0
+            if lifecycle_state.get("pending_control_event") is not True:
+                current.update({"state": "CONTINUATION_CLOSED", "pending_control_event": False})
+                current.pop("failure_class", None)
+                current.pop("error_code", None)
+                write_auto_stop_state(state_path, current)
+                return 0
+            if lifecycle_state.get("requires_user") is True:
+                current.update({
+                    "state": "WAITING_USER", "pending_control_event": True,
+                    "failure_class": "user_decision_required",
+                })
+                current.pop("error_code", None)
+                write_auto_stop_state(state_path, current)
+                return 0
+            approval_id = str(current.get("approval_id") or "").strip() or None
+
+        fingerprint = _wake_event_fingerprint(lifecycle_state)
+        attempt = execute_web_reentry(
+            controller_id=session_id, repo=repo, registry_path=registry,
+            lease_path=DEFAULT_MANUAL_WEB_LEASES, lifecycle_state=lifecycle_state,
+            approval_id=approval_id,
+        )
+
+        # External work completed; only the still-current generation may commit
+        # its result or schedule its successor.
         with _owned_supervisor_state(
             state_path, receipt_id=receipt_id, supervisor_token=supervisor_token
         ) as current:
             if current is None:
                 return 0
             owned_lock_held = supervisor_token is not None
-            current = load_json(state_path)
-            if lifecycle_state.get("pending_control_event") is not True:
-                if current.get("receipt_id") == receipt_id:
-                    current.update({"state": "CONTINUATION_CLOSED", "pending_control_event": False})
-                    current.pop("failure_class", None)
-                    current.pop("error_code", None)
-                    write_auto_stop_state(state_path, current)
-                return 0
-            if lifecycle_state.get("requires_user") is True:
-                if current.get("receipt_id") == receipt_id:
-                    current.update({
-                        "state": "WAITING_USER", "pending_control_event": True,
-                        "failure_class": "user_decision_required",
-                    })
-                    current.pop("error_code", None)
-                    write_auto_stop_state(state_path, current)
-                return 0
-            fingerprint = _wake_event_fingerprint(lifecycle_state)
-            attempt = execute_web_reentry(
-                controller_id=session_id, repo=repo, registry_path=registry,
-                lease_path=DEFAULT_MANUAL_WEB_LEASES, lifecycle_state=lifecycle_state,
-                approval_id=str(current.get("approval_id") or "").strip() or None,
-            )
-            current = load_json(state_path)
-            if current.get("receipt_id") != receipt_id:
-                return 0
             for evidence_key in (
                 "execution_target_session_id", "target_generation", "target_mode",
             ):
@@ -2890,8 +2897,8 @@ def _run_auto_native_stop_impl(
                     _rearm_auto_native_stop(
                         session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                         codex=codex, delay_seconds=5.0, state_path=state_path, runtime_path=runtime_path,
-                    supervisor_token=supervisor_token,
-                    supervisor_lock_held=owned_lock_held,
+                        supervisor_token=supervisor_token,
+                        supervisor_lock_held=owned_lock_held,
                     )
                     return 0
                 current["state"] = "WAITING_USER"
@@ -2909,8 +2916,8 @@ def _run_auto_native_stop_impl(
                 _rearm_auto_native_stop(
                     session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                     codex=codex, delay_seconds=5.0, state_path=state_path, runtime_path=runtime_path,
-                supervisor_token=supervisor_token,
-                supervisor_lock_held=owned_lock_held,
+                    supervisor_token=supervisor_token,
+                    supervisor_lock_held=owned_lock_held,
                 )
                 return 0
             if attempt.get("result") == "CONFIRMED":
@@ -2941,8 +2948,8 @@ def _run_auto_native_stop_impl(
                 _rearm_auto_native_stop(
                     session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                     codex=codex, delay_seconds=10.0, state_path=state_path, runtime_path=runtime_path,
-                supervisor_token=supervisor_token,
-                supervisor_lock_held=owned_lock_held,
+                    supervisor_token=supervisor_token,
+                    supervisor_lock_held=owned_lock_held,
                 )
                 return 0
             failure_class = str(attempt.get("failure_class") or "web_reentry_unavailable")
@@ -2966,87 +2973,95 @@ def _run_auto_native_stop_impl(
                     session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                     codex=codex, delay_seconds=max(1.0, retry_delay), state_path=state_path,
                     runtime_path=runtime_path,
-                supervisor_token=supervisor_token,
-                supervisor_lock_held=owned_lock_held,
+                    supervisor_token=supervisor_token,
+                    supervisor_lock_held=owned_lock_held,
                 )
                 return 0
             return int(attempt.get("returncode", 78) or 78)
+    # Validate ownership under the supervisor lock, then release it before the
+    # potentially long external resume. A newer supervisor generation must be
+    # able to supersede this worker while the external command is in flight.
     with _owned_supervisor_state(
         state_path, receipt_id=receipt_id, supervisor_token=supervisor_token
     ) as latest:
         if latest is None:
             return 0
-        native_lock_held = supervisor_token is not None
-        attempt = execute_native_resume(
-            session_id=session_id, repo=repo, registry=registry, codex=codex,
-            runtime_path=runtime_path,
-            terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
-            next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
-        )
-        if (
-            attempt.get("state") == "RESUME_TARGET_INCOMPATIBLE"
-            and attempt.get("replacement_eligible") is True
-        ):
-            failed_target = str(attempt.get("execution_target_session_id") or "").strip()
-            failed_generation = attempt.get("target_generation")
-            if failed_target and isinstance(failed_generation, int) and not isinstance(failed_generation, bool):
-                attempt = recover_incompatible_native_target(
-                    session_id=session_id, repo=repo, registry=registry, codex=codex,
-                    failed_target_session_id=failed_target, expected_generation=failed_generation,
-                    runtime_path=runtime_path,
-                    terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
-                    next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
-                )
-        if latest.get("receipt_id") == receipt_id:
-            for evidence_key in (
-                "command",
-                "execution_target_session_id",
-                "target_generation",
-                "target_mode",
-            ):
-                if evidence_key in attempt:
-                    latest[evidence_key] = attempt[evidence_key]
-            if attempt["result"] == "CONFIRMED":
-                latest.update({
-                    "state": "RESUME_CONFIRMED",
-                    "pending_control_event": True,
-                    "completed_at_unix_ms": int(time.time() * 1000),
-                    "returncode": attempt["returncode"],
-                    "stdout_tail": attempt.get("stdout_tail", ""),
-                    "stderr_tail": attempt.get("stderr_tail", ""),
-                })
-                latest.pop("error_code", None)
-                latest.pop("failure_class", None)
-                latest.pop("fallback_eligible", None)
-            else:
-                latest.update({
-                    "state": attempt["state"],
-                    "pending_control_event": True,
-                    "completed_at_unix_ms": int(time.time() * 1000),
-                    "returncode": attempt["returncode"],
-                    "stdout_tail": attempt.get("stdout_tail", ""),
-                    "stderr_tail": attempt.get("stderr_tail", ""),
-                })
-                for key in ("error_code", "failure_class", "fallback_eligible", "replacement_eligible"):
-                    if key in attempt:
-                        latest[key] = attempt[key]
-            write_auto_stop_state(state_path, latest)
-        stderr_tail = str(attempt.get("stderr_tail", ""))
-        if stderr_tail:
-            print(stderr_tail, file=sys.stderr, end="" if stderr_tail.endswith("\n") else "\n")
-        if attempt.get("state") == "RESUME_DEFERRED_ACTIVE_WRITER":
-            current = load_json(state_path)
-            if current.get("receipt_id") == receipt_id:
-                current["retry_count"] = int(current.get("retry_count", 0) or 0) + 1
-                write_auto_stop_state(state_path, current)
-                retry_delay = min(30.0, max(1.0, 2.0 ** min(current["retry_count"], 4)))
-                _rearm_auto_native_stop(
-                    session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
-                    codex=codex, delay_seconds=retry_delay, state_path=state_path, runtime_path=runtime_path,
-                supervisor_token=supervisor_token,
-                supervisor_lock_held=native_lock_held,
-                )
+
+    attempt = execute_native_resume(
+        session_id=session_id, repo=repo, registry=registry, codex=codex,
+        runtime_path=runtime_path,
+        terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
+        next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
+    )
+    if (
+        attempt.get("state") == "RESUME_TARGET_INCOMPATIBLE"
+        and attempt.get("replacement_eligible") is True
+    ):
+        failed_target = str(attempt.get("execution_target_session_id") or "").strip()
+        failed_generation = attempt.get("target_generation")
+        if failed_target and isinstance(failed_generation, int) and not isinstance(failed_generation, bool):
+            attempt = recover_incompatible_native_target(
+                session_id=session_id, repo=repo, registry=registry, codex=codex,
+                failed_target_session_id=failed_target, expected_generation=failed_generation,
+                runtime_path=runtime_path,
+                terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
+                next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
+            )
+
+    # Revalidate the token before committing any external result or rearming.
+    with _owned_supervisor_state(
+        state_path, receipt_id=receipt_id, supervisor_token=supervisor_token
+    ) as latest:
+        if latest is None:
             return 0
+        for evidence_key in (
+            "command",
+            "execution_target_session_id",
+            "target_generation",
+            "target_mode",
+        ):
+            if evidence_key in attempt:
+                latest[evidence_key] = attempt[evidence_key]
+        if attempt["result"] == "CONFIRMED":
+            latest.update({
+                "state": "RESUME_CONFIRMED",
+                "pending_control_event": True,
+                "completed_at_unix_ms": int(time.time() * 1000),
+                "returncode": attempt["returncode"],
+                "stdout_tail": attempt.get("stdout_tail", ""),
+                "stderr_tail": attempt.get("stderr_tail", ""),
+            })
+            latest.pop("error_code", None)
+            latest.pop("failure_class", None)
+            latest.pop("fallback_eligible", None)
+        else:
+            latest.update({
+                "state": attempt["state"],
+                "pending_control_event": True,
+                "completed_at_unix_ms": int(time.time() * 1000),
+                "returncode": attempt["returncode"],
+                "stdout_tail": attempt.get("stdout_tail", ""),
+                "stderr_tail": attempt.get("stderr_tail", ""),
+            })
+            for key in ("error_code", "failure_class", "fallback_eligible", "replacement_eligible"):
+                if key in attempt:
+                    latest[key] = attempt[key]
+        write_auto_stop_state(state_path, latest)
+        if attempt.get("state") == "RESUME_DEFERRED_ACTIVE_WRITER":
+            latest["retry_count"] = int(latest.get("retry_count", 0) or 0) + 1
+            write_auto_stop_state(state_path, latest)
+            retry_delay = min(30.0, max(1.0, 2.0 ** min(latest["retry_count"], 4)))
+            _rearm_auto_native_stop(
+                session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+                codex=codex, delay_seconds=retry_delay, state_path=state_path, runtime_path=runtime_path,
+                supervisor_token=supervisor_token,
+                supervisor_lock_held=supervisor_token is not None,
+            )
+            return 0
+
+    stderr_tail = str(attempt.get("stderr_tail", ""))
+    if stderr_tail:
+        print(stderr_tail, file=sys.stderr, end="" if stderr_tail.endswith("\n") else "\n")
     if attempt.get("result") == "CONFIRMED":
         fresh_lifecycle = _load_lifecycle_state(session_id)
         with _owned_supervisor_state(

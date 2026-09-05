@@ -2304,6 +2304,140 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
             finally: release.set(); t.join(2)
             execute.assert_not_called(); final=json.loads(state.read_text()); self.assertEqual(final["receipt_id"],"r2"); self.assertEqual(final["supervisor_pid"],2222)
 
+    def test_replacement_can_supersede_while_old_supervisor_waits_in_web_reentry(self) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp)); old_token = "old-token"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-1"]}},
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-1", "generation": 1,
+                }}},
+            }), encoding="utf-8")
+            state.write_text(json.dumps({
+                "receipt_id": "r1", "supervisor_receipt_id": "r1",
+                "supervisor_token": old_token, "supervisor_pid": 1111,
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            reentry_entered = threading.Event(); release_reentry = threading.Event()
+            replacement_done = threading.Event(); old_done = threading.Event()
+
+            def web_reentry(**_kwargs):
+                reentry_entered.set(); release_reentry.wait(2)
+                return {"result": "CONFIRMED", "state": "WEB_REENTRY_SUBMITTED", "returncode": 0}
+
+            def old() -> None:
+                try:
+                    web_bridge.run_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                        codex="codex", delay_seconds=0, state_path=state, supervisor_token=old_token,
+                    )
+                finally:
+                    old_done.set()
+
+            replacement_result: list[bool] = []
+            def replace() -> None:
+                try:
+                    replacement_result.append(web_bridge.schedule_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                        codex="codex", delay_seconds=1, state_path=state, force_rearm=True,
+                        replace_supervisor_token=old_token,
+                    ))
+                finally:
+                    replacement_done.set()
+
+            old_thread = threading.Thread(target=old); replacement_thread = threading.Thread(target=replace)
+            try:
+                with patch.object(web_bridge, "_load_lifecycle_state", return_value={
+                    "pending_control_event": True, "requires_user": False,
+                    "controller_host": "web", "wake_generation": 1,
+                }), patch.object(web_bridge, "execute_web_reentry", side_effect=web_reentry), patch.object(
+                    web_bridge.subprocess, "Popen", return_value=Mock(pid=2222)
+                ), patch.object(web_bridge, "_pid_is_alive", return_value=True):
+                    old_thread.start(); self.assertTrue(reentry_entered.wait(1))
+                    replacement_thread.start()
+                    self.assertTrue(
+                        replacement_done.wait(0.3),
+                        "replacement must not wait for the old supervisor's external web re-entry",
+                    )
+                    self.assertEqual(replacement_result, [True])
+                    new_token = json.loads(state.read_text())["supervisor_token"]
+                    self.assertNotEqual(new_token, old_token)
+                    release_reentry.set(); self.assertTrue(old_done.wait(2))
+            finally:
+                release_reentry.set(); old_thread.join(2); replacement_thread.join(2)
+            final = json.loads(state.read_text())
+            self.assertEqual(final["supervisor_token"], new_token)
+            self.assertEqual(final["supervisor_pid"], 2222)
+            self.assertEqual(final["state"], "RESUME_PENDING")
+
+    def test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume(self) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp)); old_token = "old-token"
+            state.write_text(json.dumps({
+                "receipt_id": "r1", "supervisor_receipt_id": "r1",
+                "supervisor_token": old_token, "supervisor_pid": 1111,
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            resume_entered = threading.Event(); release_resume = threading.Event()
+            replacement_done = threading.Event(); old_done = threading.Event()
+            confirmed = {
+                "result": "CONFIRMED", "state": "RESUME_CONFIRMED", "returncode": 0,
+                "stdout_tail": "", "stderr_tail": "",
+            }
+
+            def native_resume(**_kwargs):
+                resume_entered.set(); release_resume.wait(2); return confirmed
+
+            def old() -> None:
+                try:
+                    web_bridge.run_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                        codex="codex", delay_seconds=0, state_path=state, supervisor_token=old_token,
+                    )
+                finally:
+                    old_done.set()
+
+            replacement_result: list[bool] = []
+            def replace() -> None:
+                try:
+                    replacement_result.append(web_bridge.schedule_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                        codex="codex", delay_seconds=1, state_path=state, force_rearm=True,
+                        replace_supervisor_token=old_token,
+                    ))
+                finally:
+                    replacement_done.set()
+
+            old_thread = threading.Thread(target=old); replacement_thread = threading.Thread(target=replace)
+            try:
+                with patch.object(web_bridge, "_load_lifecycle_state", return_value={
+                    "pending_control_event": True, "requires_user": False,
+                    "controller_host": "desktop_codex", "wake_generation": 1,
+                }), patch.object(web_bridge, "execute_native_resume", side_effect=native_resume), patch.object(
+                    web_bridge.subprocess, "Popen", return_value=Mock(pid=2222)
+                ), patch.object(web_bridge, "_pid_is_alive", return_value=True):
+                    old_thread.start(); self.assertTrue(resume_entered.wait(1))
+                    replacement_thread.start()
+                    self.assertTrue(
+                        replacement_done.wait(0.3),
+                        "replacement must not wait for the old supervisor's external native resume",
+                    )
+                    self.assertEqual(replacement_result, [True])
+                    new_token = json.loads(state.read_text())["supervisor_token"]
+                    self.assertNotEqual(new_token, old_token)
+                    release_resume.set(); self.assertTrue(old_done.wait(2))
+            finally:
+                release_resume.set(); old_thread.join(2); replacement_thread.join(2)
+            final = json.loads(state.read_text())
+            self.assertEqual(final["supervisor_token"], new_token)
+            self.assertEqual(final["supervisor_pid"], 2222)
+            self.assertEqual(final["state"], "RESUME_PENDING")
+
     def test_confirmed_old_supervisor_cannot_restore_state_after_replacement_during_fresh_read(self) -> None:
         import threading
         from unittest.mock import Mock, patch
