@@ -83,6 +83,57 @@ class ControllerTargetGuardTests(unittest.TestCase):
             self.assertTrue(identity["same_controller_recovery_allowed"])
             self.assertFalse(identity["create_new_controller_allowed"])
 
+
+    def test_identity_projection_marks_unique_controller_with_missing_host_session_as_degraded(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+
+            identity = guard.controller_identity_projection(
+                repo=repo, host="web", source_session_id=None, registry_path=registry
+            )
+
+            self.assertEqual(identity["identity_state"], "DEGRADED")
+            self.assertEqual(identity["project_controller_state"]["controller_id"], "controller-1")
+            self.assertFalse(identity["controller_actions_allowed"])
+            self.assertTrue(identity["same_controller_recovery_allowed"])
+            self.assertFalse(identity["create_new_controller_allowed"])
+
+    def test_identity_projection_marks_real_controller_conflict_as_conflicted(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "controller-2": str(repo.resolve()),
+            }), encoding="utf-8")
+
+            identity = guard.controller_identity_projection(
+                repo=repo, host="web", source_session_id="web-current", registry_path=registry
+            )
+
+            self.assertEqual(identity["identity_state"], "CONFLICTED")
+            self.assertFalse(identity["controller_actions_allowed"])
+            self.assertFalse(identity["same_controller_recovery_allowed"])
+            self.assertFalse(identity["create_new_controller_allowed"])
+
+    def test_identity_capability_contract_exposes_canonical_projection_and_cli(self) -> None:
+        guard = load_guard()
+        capabilities = guard.controller_identity_capabilities()
+        self.assertEqual(capabilities["schema_version"], 1)
+        self.assertEqual(capabilities["canonical_identity_cli"], "controller_target_guard.py identity")
+        self.assertEqual(set(capabilities["capabilities"]), {
+            "controller_identity_projection",
+            "same_controller_recovery",
+            "web_session_binding",
+            "target_generation_fence",
+        })
+
     def test_multiple_web_aliases_without_current_target_are_stale_not_verified(self) -> None:
         guard = load_guard()
         with tempfile.TemporaryDirectory() as tmp:

@@ -10,6 +10,9 @@ import unittest
 from pathlib import Path
 
 
+_TEST_LIFECYCLE_STATE = tempfile.TemporaryDirectory(prefix="adaptive-runtime-lifecycle-test-")
+os.environ["AD_LIFECYCLE_STATE_DIR"] = _TEST_LIFECYCLE_STATE.name
+
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "scripts" / "web_lifecycle_bridge.py"
 GUARD_COMMAND = (
@@ -383,6 +386,8 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 )
 
             self.assertEqual(recovered["result"], "RECOVERED")
+            self.assertEqual(recovered["state"], "VERIFIED")
+            self.assertEqual(recovered["identity"]["identity_state"], "VERIFIED")
             self.assertEqual(recovered["controller_id"], "controller-1")
             self.assertEqual(recovered["target_generation"], 4)
             self.assertEqual(
@@ -464,7 +469,9 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 )
 
             self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(result["state"], "CONTROLLER_IDENTITY_DEGRADED")
             self.assertEqual(result["reason"], "HOST_IDENTITY_UNAVAILABLE")
+            self.assertTrue(result["safe_control_actions_allowed"])
             identity = result["identity"]
             self.assertEqual(
                 identity["project_controller_state"]["project_controller"],
@@ -486,6 +493,34 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertFalse(identity["create_new_controller_allowed"])
             self.assertEqual(registry.read_text(encoding="utf-8"), before_registry)
             self.assertEqual(lifecycle.read_text(encoding="utf-8"), before_lifecycle)
+
+    def test_same_controller_web_recovery_verifier_exception_degrades_without_revoking_controller(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            before = registry.read_text(encoding="utf-8")
+
+            def unavailable(**_kwargs: object) -> bool:
+                raise RuntimeError("verifier temporarily unavailable")
+
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=unavailable):
+                result = web_bridge.recover_same_controller_web_session(
+                    repo=repo, web_session_id="web-new", registry_path=registry,
+                    host_identity_receipt={"host": "web", "session_id": "web-new"},
+                )
+
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(result["state"], "CONTROLLER_IDENTITY_DEGRADED")
+            self.assertEqual(result["reason"], "HOST_IDENTITY_VERIFIER_UNAVAILABLE")
+            self.assertEqual(result["controller_id"], "controller-1")
+            self.assertTrue(result["safe_control_actions_allowed"])
+            self.assertFalse(result["identity"]["create_new_controller_allowed"])
+            self.assertEqual(registry.read_text(encoding="utf-8"), before)
 
     def test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership(self) -> None:
         from unittest.mock import patch
@@ -979,7 +1014,9 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 fcntl.flock(holder.fileno(), fcntl.LOCK_UN); holder.close(); released.append(True)
             thread = threading.Thread(target=release_later); thread.start()
             started = time.monotonic()
-            with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch:
+            with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch, patch.object(
+                web_bridge, "_load_lifecycle_state", return_value={}
+            ):
                 code = web_bridge.main(["audit-once", "--session-id", "controller-1", "--repo", str(repo),
                     "--registry", str(registry), "--web-session-id", "web-session-1",
                     "--audit-log", str(audit), "--cursor", str(cursor)])
@@ -1777,7 +1814,7 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
             ), patch.object(
                 web_bridge, "execute_web_reentry", return_value=deferred
             ), patch.object(
-                web_bridge, "schedule_auto_native_stop"
+                web_bridge, "_schedule_auto_native_stop_locked", return_value=True
             ) as schedule:
                 code = web_bridge.run_auto_native_stop(
                     session_id="controller-1",
@@ -1796,6 +1833,463 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                 schedule.call_args.kwargs["replace_supervisor_token"], token
             )
 
+    def test_locked_supervisor_rearm_uses_locked_scheduler_without_recursive_lock(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            state = root / "state.json"
+            registry = root / "registry.json"
+            with (
+                patch.object(web_bridge, "_schedule_auto_native_stop_locked", return_value=True) as locked,
+                patch.object(
+                    web_bridge,
+                    "schedule_auto_native_stop",
+                    side_effect=AssertionError("locked rearm must not acquire supervisor lock again"),
+                ),
+            ):
+                result = web_bridge._rearm_auto_native_stop(
+                    session_id="web-1",
+                    repo=repo,
+                    receipt_id="r1",
+                    registry=registry,
+                    codex="codex",
+                    delay_seconds=1.0,
+                    state_path=state,
+                    runtime_path=None,
+                    supervisor_token="token-1",
+                    supervisor_lock_held=True,
+                )
+            self.assertTrue(result)
+            locked.assert_called_once()
+            kwargs = locked.call_args.kwargs
+            self.assertTrue(kwargs["force_rearm"])
+            self.assertEqual(kwargs["replace_supervisor_token"], "token-1")
+
+    def test_new_receipt_can_supersede_after_old_validation_before_old_wake(self) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            old_token = "old-token"
+            state.write_text(json.dumps({
+                "receipt_id": "r1",
+                "session_id": "controller-1",
+                "repo": str(repo.resolve()),
+                "state": "RESUME_PENDING",
+                "pending_control_event": True,
+                "supervisor_receipt_id": "r1",
+                "supervisor_token": old_token,
+                "supervisor_pid": 1111,
+            }), encoding="utf-8")
+            validated = threading.Event()
+            release_old = threading.Event()
+            scheduled = threading.Event()
+            old_result: list[int] = []
+            new_result: list[bool] = []
+
+            def paused_lifecycle(_session_id: str) -> dict[str, object]:
+                validated.set()
+                self.assertTrue(release_old.wait(2), "test did not release old supervisor")
+                return {
+                    "pending_control_event": True,
+                    "requires_user": False,
+                    "controller_host": "web",
+                    "wake_generation": 1,
+                }
+
+            def run_old() -> None:
+                old_result.append(web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state, supervisor_token=old_token,
+                ))
+
+            def install_new() -> None:
+                try:
+                    new_result.append(web_bridge.schedule_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r2", registry=registry,
+                        codex="codex", delay_seconds=1, state_path=state,
+                    ))
+                finally:
+                    scheduled.set()
+
+            old_thread = threading.Thread(target=run_old)
+            new_thread = threading.Thread(target=install_new)
+            try:
+                with patch.object(web_bridge, "_load_lifecycle_state", side_effect=paused_lifecycle), patch.object(
+                    web_bridge, "execute_web_reentry", side_effect=AssertionError("superseded old supervisor must not wake")
+                ), patch.object(web_bridge.subprocess, "Popen", return_value=Mock(pid=2222)), patch.object(
+                    web_bridge, "_pid_is_alive", return_value=True
+                ):
+                    old_thread.start()
+                    self.assertTrue(validated.wait(1), "old supervisor never reached post-validation pause")
+                    new_thread.start()
+                    self.assertTrue(
+                        scheduled.wait(0.5),
+                        "new receipt must be installable while old supervisor is paused after validation",
+                    )
+                    saved_after_supersede = json.loads(state.read_text(encoding="utf-8"))
+                    self.assertEqual(saved_after_supersede["receipt_id"], "r2")
+                    self.assertEqual(saved_after_supersede["supervisor_receipt_id"], "r2")
+                    new_token = saved_after_supersede["supervisor_token"]
+            finally:
+                release_old.set()
+                if old_thread.ident is not None:
+                    old_thread.join(2)
+                if new_thread.ident is not None:
+                    new_thread.join(2)
+
+            self.assertEqual(old_result, [0])
+            self.assertEqual(new_result, [True])
+            final = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(final["receipt_id"], "r2")
+            self.assertEqual(final["supervisor_receipt_id"], "r2")
+            self.assertEqual(final["supervisor_token"], new_token)
+            self.assertEqual(final["supervisor_pid"], 2222)
+
+    def test_same_receipt_new_token_can_supersede_after_old_validation_before_old_wake(self) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            old_token = "old-token"
+            state.write_text(json.dumps({
+                "receipt_id": "r1",
+                "session_id": "controller-1",
+                "repo": str(repo.resolve()),
+                "state": "RESUME_PENDING",
+                "pending_control_event": True,
+                "supervisor_receipt_id": "r1",
+                "supervisor_token": old_token,
+                "supervisor_pid": 1111,
+            }), encoding="utf-8")
+            validated = threading.Event()
+            release_old = threading.Event()
+            scheduled = threading.Event()
+
+            def paused_lifecycle(_session_id: str) -> dict[str, object]:
+                validated.set()
+                self.assertTrue(release_old.wait(2), "test did not release old supervisor")
+                return {
+                    "pending_control_event": True,
+                    "requires_user": False,
+                    "controller_host": "web",
+                    "wake_generation": 1,
+                }
+
+            old_result: list[int] = []
+            new_result: list[bool] = []
+            def run_old() -> None:
+                old_result.append(web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state, supervisor_token=old_token,
+                ))
+            def replace_token() -> None:
+                try:
+                    new_result.append(web_bridge.schedule_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                        codex="codex", delay_seconds=1, state_path=state, force_rearm=True,
+                        replace_supervisor_token=old_token,
+                    ))
+                finally:
+                    scheduled.set()
+
+            old_thread = threading.Thread(target=run_old)
+            new_thread = threading.Thread(target=replace_token)
+            try:
+                with patch.object(web_bridge, "_load_lifecycle_state", side_effect=paused_lifecycle), patch.object(
+                    web_bridge, "execute_web_reentry", side_effect=AssertionError("superseded old token must not wake")
+                ), patch.object(web_bridge.subprocess, "Popen", return_value=Mock(pid=3333)), patch.object(
+                    web_bridge, "_pid_is_alive", return_value=True
+                ):
+                    old_thread.start()
+                    self.assertTrue(validated.wait(1))
+                    new_thread.start()
+                    self.assertTrue(
+                        scheduled.wait(0.5),
+                        "replacement token must be installable while old supervisor is paused after validation",
+                    )
+                    superseded = json.loads(state.read_text(encoding="utf-8"))
+                    self.assertEqual(superseded["receipt_id"], "r1")
+                    self.assertNotEqual(superseded["supervisor_token"], old_token)
+                    new_token = superseded["supervisor_token"]
+            finally:
+                release_old.set()
+                if old_thread.ident is not None:
+                    old_thread.join(2)
+                if new_thread.ident is not None:
+                    new_thread.join(2)
+
+            self.assertEqual(old_result, [0])
+            self.assertEqual(new_result, [True])
+            final = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(final["receipt_id"], "r1")
+            self.assertEqual(final["supervisor_token"], new_token)
+            self.assertEqual(final["supervisor_pid"], 3333)
+
+    def _assert_web_supersession_prevents_stale_attempt_and_rearm(self, attempted_result: dict[str, object]) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            old_token = "old-token"
+            state.write_text(json.dumps({
+                "receipt_id": "r1", "session_id": "controller-1", "repo": str(repo.resolve()),
+                "state": "RESUME_PENDING", "pending_control_event": True,
+                "supervisor_receipt_id": "r1", "supervisor_token": old_token, "supervisor_pid": 1111,
+            }), encoding="utf-8")
+            validated = threading.Event()
+            release_old = threading.Event()
+            old_done = threading.Event()
+
+            def paused_lifecycle(_session_id: str) -> dict[str, object]:
+                validated.set()
+                release_old.wait(2)
+                return {
+                    "pending_control_event": True, "requires_user": False,
+                    "controller_host": "web", "wake_generation": 1,
+                }
+
+            execute = Mock(return_value=attempted_result)
+            rearm = Mock(side_effect=AssertionError("superseded supervisor must not rearm"))
+            old_result: list[int] = []
+
+            def run_old() -> None:
+                try:
+                    old_result.append(web_bridge.run_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                        codex="codex", delay_seconds=0, state_path=state, supervisor_token=old_token,
+                    ))
+                finally:
+                    old_done.set()
+
+            old_thread = threading.Thread(target=run_old)
+            try:
+                with patch.object(web_bridge, "_load_lifecycle_state", side_effect=paused_lifecycle), patch.object(
+                    web_bridge, "execute_web_reentry", execute
+                ), patch.object(web_bridge, "_rearm_auto_native_stop", rearm), patch.object(
+                    web_bridge.subprocess, "Popen", return_value=Mock(pid=2222)
+                ), patch.object(web_bridge, "_pid_is_alive", return_value=True):
+                    old_thread.start()
+                    self.assertTrue(validated.wait(1))
+                    self.assertTrue(web_bridge.schedule_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                        codex="codex", delay_seconds=1, state_path=state, force_rearm=True,
+                        replace_supervisor_token=old_token,
+                    ))
+                    superseded = json.loads(state.read_text(encoding="utf-8"))
+                    new_token = superseded["supervisor_token"]
+                    release_old.set()
+                    self.assertTrue(old_done.wait(2))
+            finally:
+                release_old.set()
+                old_thread.join(2)
+            self.assertEqual(old_result, [0])
+            execute.assert_not_called()
+            rearm.assert_not_called()
+            final = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(final["supervisor_token"], new_token)
+            self.assertEqual(final["supervisor_pid"], 2222)
+
+    def test_transient_web_reentry_retry_does_not_rearm_after_supersession(self) -> None:
+        self._assert_web_supersession_prevents_stale_attempt_and_rearm({
+            "result": "FAILED", "state": "WEB_REENTRY_PENDING", "returncode": 78,
+            "failure_class": "web_reentry_unavailable", "error_code": "WEB_REENTRY_UNAVAILABLE",
+        })
+
+    def test_approval_waiting_does_not_rearm_after_supersession(self) -> None:
+        self._assert_web_supersession_prevents_stale_attempt_and_rearm({
+            "result": "DEFERRED", "state": "WEB_REENTRY_WAITING_LOCAL_APPROVAL", "returncode": 0,
+            "failure_class": "local_approval_required", "approval_id": "approval-1",
+        })
+
+    def test_active_writer_defer_does_not_rearm_after_supersession(self) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            old_token = "old-token"
+            state.write_text(json.dumps({
+                "receipt_id": "r1", "session_id": "controller-1", "repo": str(repo.resolve()),
+                "state": "RESUME_PENDING", "pending_control_event": True,
+                "supervisor_receipt_id": "r1", "supervisor_token": old_token, "supervisor_pid": 1111,
+            }), encoding="utf-8")
+            validated = threading.Event()
+            release_old = threading.Event()
+            old_done = threading.Event()
+            execute = Mock(return_value={
+                "result": "DEFERRED", "state": "RESUME_DEFERRED_ACTIVE_WRITER", "returncode": 0,
+                "failure_class": "active_writer_present",
+            })
+            rearm = Mock(side_effect=AssertionError("superseded active-writer supervisor must not rearm"))
+
+            def paused_lifecycle(_session_id: str) -> dict[str, object]:
+                validated.set(); release_old.wait(2)
+                return {"pending_control_event": True, "requires_user": False, "controller_host": "desktop"}
+
+            def run_old() -> None:
+                try:
+                    web_bridge.run_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                        codex="codex", delay_seconds=0, state_path=state, supervisor_token=old_token,
+                    )
+                finally:
+                    old_done.set()
+
+            old_thread = threading.Thread(target=run_old)
+            try:
+                with patch.object(web_bridge, "_load_lifecycle_state", side_effect=paused_lifecycle), patch.object(
+                    web_bridge, "execute_native_resume", execute
+                ), patch.object(web_bridge, "_rearm_auto_native_stop", rearm), patch.object(
+                    web_bridge.subprocess, "Popen", return_value=Mock(pid=2222)
+                ), patch.object(web_bridge, "_pid_is_alive", return_value=True):
+                    old_thread.start(); self.assertTrue(validated.wait(1))
+                    self.assertTrue(web_bridge.schedule_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry, codex="codex",
+                        delay_seconds=1, state_path=state, force_rearm=True, replace_supervisor_token=old_token,
+                    ))
+                    new_token = json.loads(state.read_text())["supervisor_token"]
+                    release_old.set(); self.assertTrue(old_done.wait(2))
+            finally:
+                release_old.set(); old_thread.join(2)
+            execute.assert_not_called(); rearm.assert_not_called()
+            final = json.loads(state.read_text())
+            self.assertEqual(final["supervisor_token"], new_token)
+            self.assertEqual(final["supervisor_pid"], 2222)
+
+    def test_pid_persistence_cannot_overwrite_replacement_generation(self) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            popen_entered = threading.Event(); release_first = threading.Event(); second_done = threading.Event()
+            calls = 0
+            calls_lock = threading.Lock()
+
+            def popen(*_args, **_kwargs):
+                nonlocal calls
+                with calls_lock:
+                    calls += 1; call = calls
+                if call == 1:
+                    popen_entered.set(); release_first.wait(2); return Mock(pid=1111)
+                return Mock(pid=2222)
+
+            def first() -> None:
+                web_bridge.schedule_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=1, state_path=state,
+                )
+
+            def second() -> None:
+                try:
+                    web_bridge.schedule_auto_native_stop(
+                        session_id="controller-1", repo=repo, receipt_id="r2", registry=registry,
+                        codex="codex", delay_seconds=1, state_path=state,
+                    )
+                finally:
+                    second_done.set()
+
+            t1=threading.Thread(target=first); t2=threading.Thread(target=second)
+            try:
+                with patch.object(web_bridge.subprocess, "Popen", side_effect=popen), patch.object(
+                    web_bridge, "_pid_is_alive", return_value=True
+                ):
+                    t1.start(); self.assertTrue(popen_entered.wait(1)); t2.start()
+                    self.assertFalse(second_done.wait(0.1), "replacement must wait for atomic first PID persistence")
+                    release_first.set(); t1.join(2); t2.join(2)
+            finally:
+                release_first.set(); t1.join(2); t2.join(2)
+            final=json.loads(state.read_text())
+            self.assertEqual(final["receipt_id"], "r2")
+            self.assertEqual(final["supervisor_receipt_id"], "r2")
+            self.assertEqual(final["supervisor_pid"], 2222)
+
+    def test_duplicate_scheduling_concurrently_coalesces_to_single_owner(self) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            gate=threading.Barrier(3); results: list[bool]=[]
+            def schedule() -> None:
+                gate.wait(); results.append(web_bridge.schedule_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=1, state_path=state,
+                ))
+            t1=threading.Thread(target=schedule); t2=threading.Thread(target=schedule)
+            with patch.object(web_bridge.subprocess, "Popen", return_value=Mock(pid=1111)) as popen, patch.object(
+                web_bridge, "_pid_is_alive", return_value=True
+            ):
+                t1.start(); t2.start(); gate.wait(); t1.join(2); t2.join(2)
+            self.assertCountEqual(results, [True, False])
+            self.assertEqual(popen.call_count, 1)
+            final=json.loads(state.read_text())
+            self.assertEqual(final["coalesced_schedule_count"], 1)
+            self.assertEqual(final["supervisor_pid"], 1111)
+
+    def test_stale_supervisor_cannot_native_wake_after_supersession(self) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state=self.make_paths(Path(tmp)); old_token="old-token"
+            state.write_text(json.dumps({"receipt_id":"r1","supervisor_receipt_id":"r1","supervisor_token":old_token,"supervisor_pid":1111}), encoding="utf-8")
+            paused=threading.Event(); release=threading.Event(); done=threading.Event()
+            def lifecycle(_sid): paused.set(); release.wait(2); return {"pending_control_event":True,"requires_user":False,"controller_host":"desktop_codex"}
+            execute=Mock(side_effect=AssertionError("superseded supervisor must not native wake"))
+            def old():
+                try: web_bridge.run_auto_native_stop(session_id="controller-1",repo=repo,receipt_id="r1",registry=registry,codex="codex",delay_seconds=0,state_path=state,supervisor_token=old_token)
+                finally: done.set()
+            t=threading.Thread(target=old)
+            try:
+                with patch.object(web_bridge,"_load_lifecycle_state",side_effect=lifecycle), patch.object(web_bridge,"execute_native_resume",execute), patch.object(web_bridge.subprocess,"Popen",return_value=Mock(pid=2222)), patch.object(web_bridge,"_pid_is_alive",return_value=True):
+                    t.start(); self.assertTrue(paused.wait(1)); web_bridge.schedule_auto_native_stop(session_id="controller-1",repo=repo,receipt_id="r2",registry=registry,codex="codex",delay_seconds=1,state_path=state); release.set(); self.assertTrue(done.wait(2))
+            finally: release.set(); t.join(2)
+            execute.assert_not_called(); final=json.loads(state.read_text()); self.assertEqual(final["receipt_id"],"r2"); self.assertEqual(final["supervisor_pid"],2222)
+
+    def test_confirmed_old_supervisor_cannot_restore_state_after_replacement_during_fresh_read(self) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state=self.make_paths(Path(tmp)); old_token="old-token"
+            state.write_text(json.dumps({"receipt_id":"r1","supervisor_receipt_id":"r1","supervisor_token":old_token,"supervisor_pid":1111,"pending_control_event":True}), encoding="utf-8")
+            second_read=threading.Event(); release=threading.Event(); calls=0
+            def lifecycle(_sid):
+                nonlocal calls
+                calls += 1
+                if calls == 1: return {"pending_control_event":True,"requires_user":False,"controller_host":"desktop_codex","wake_generation":1}
+                second_read.set(); release.wait(2); return {"pending_control_event":True,"requires_user":False,"controller_host":"desktop_codex","wake_generation":2}
+            confirmed={"result":"CONFIRMED","state":"RESUME_CONFIRMED","returncode":0,"stdout_tail":"","stderr_tail":""}
+            done=threading.Event()
+            def old():
+                try: web_bridge.run_auto_native_stop(session_id="controller-1",repo=repo,receipt_id="r1",registry=registry,codex="codex",delay_seconds=0,state_path=state,supervisor_token=old_token)
+                finally: done.set()
+            t=threading.Thread(target=old)
+            try:
+                with patch.object(web_bridge,"_load_lifecycle_state",side_effect=lifecycle), patch.object(web_bridge,"execute_native_resume",return_value=confirmed), patch.object(web_bridge.subprocess,"Popen",return_value=Mock(pid=2222)), patch.object(web_bridge,"_pid_is_alive",return_value=True):
+                    t.start(); self.assertTrue(second_read.wait(1)); self.assertTrue(web_bridge.schedule_auto_native_stop(session_id="controller-1",repo=repo,receipt_id="r1",registry=registry,codex="codex",delay_seconds=1,state_path=state,force_rearm=True,replace_supervisor_token=old_token)); new_token=json.loads(state.read_text())["supervisor_token"]; release.set(); self.assertTrue(done.wait(2))
+            finally: release.set(); t.join(2)
+            final=json.loads(state.read_text()); self.assertEqual(final["supervisor_token"],new_token); self.assertEqual(final["supervisor_pid"],2222); self.assertEqual(final["state"],"RESUME_PENDING")
+
+    def test_bootstrap_and_replacement_generation_concurrently_keep_one_owner(self) -> None:
+        import threading
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state=self.make_paths(Path(tmp)); lifecycle={"pending_control_event":True,"requires_user":False,"wake_generation":7}
+            gate=threading.Barrier(3); results: list[bool]=[]
+            def ensure(): gate.wait(); results.append(web_bridge.ensure_continuation_supervisor(lifecycle_state=lifecycle,session_id="controller-1",repo=repo,registry=registry,codex="codex",delay_seconds=1))
+            t1=threading.Thread(target=ensure); t2=threading.Thread(target=ensure)
+            with patch.object(web_bridge,"default_auto_stop_state_path",return_value=state), patch.object(web_bridge.subprocess,"Popen",return_value=Mock(pid=1111)) as popen, patch.object(web_bridge,"_pid_is_alive",return_value=True):
+                t1.start(); t2.start(); gate.wait(); t1.join(2); t2.join(2)
+            self.assertEqual(popen.call_count,1); self.assertEqual(sum(bool(x) for x in results),2)
+            final=json.loads(state.read_text()); self.assertEqual(final["receipt_id"],"bootstrap:7"); self.assertEqual(final["supervisor_pid"],1111); self.assertTrue(final["supervisor_token"])
+
     def test_stale_supervisor_token_exits_without_running_impl(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
@@ -1809,12 +2303,15 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                 web_bridge, "_run_auto_native_stop_impl",
                 side_effect=AssertionError("stale supervisor must not execute"),
             ):
+                started = __import__("time").monotonic()
                 code = web_bridge.run_auto_native_stop(
                     session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
-                    codex="codex", delay_seconds=32, state_path=state,
+                    codex="codex", delay_seconds=1.0, state_path=state,
                     supervisor_token="stale-token",
                 )
+                elapsed = __import__("time").monotonic() - started
             self.assertEqual(code, 0)
+            self.assertLess(elapsed, 0.25, "already-stale supervisor must exit before delay sleep")
 
 
 class WebContinuationSupervisorBootstrapTests(unittest.TestCase):
@@ -1824,9 +2321,39 @@ class WebContinuationSupervisorBootstrapTests(unittest.TestCase):
             {"state": "RESUME_CONFIRMED", "pending_control_event": True},
         ))
 
-    def test_active_supervisor_does_not_need_duplicate_bootstrap(self) -> None:
-        self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
-            {"pending_control_event": True, "requires_user": False},
+    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self) -> None:
+        from unittest.mock import patch
+
+        with patch.object(web_bridge, "_pid_is_alive", return_value=True):
+            self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+                {"pending_control_event": True, "requires_user": False},
+                {
+                    "state": "RESUME_PENDING",
+                    "pending_control_event": True,
+                    "receipt_id": "bootstrap:7",
+                    "supervisor_pid": 1234,
+                    "supervisor_token": "token-1",
+                    "supervisor_receipt_id": "bootstrap:7",
+                },
+            ))
+
+    def test_dead_or_untracked_active_supervisor_requires_bootstrap(self) -> None:
+        from unittest.mock import patch
+
+        lifecycle = {"pending_control_event": True, "requires_user": False}
+        with patch.object(web_bridge, "_pid_is_alive", return_value=False):
+            self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+                lifecycle,
+                {
+                    "state": "RESUME_PENDING",
+                    "pending_control_event": True,
+                    "supervisor_pid": 999,
+                    "supervisor_token": "token-dead",
+                    "supervisor_receipt_id": "bootstrap:7",
+                },
+            ))
+        self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle,
             {"state": "RESUME_PENDING", "pending_control_event": True},
         ))
 
@@ -3226,7 +3753,10 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                     "hook_event_name": "PostToolUse",
                     "session_id": "controller-1",
                     "tool_input": {
-                        "command": "python3 scripts/control_event_guard.py receipt.json --ledger TASK_LEDGER.md"
+                        "command": (
+                            f"{sys.executable} {ROOT / 'scripts' / 'control_event_guard.py'} "
+                            "receipt.json --ledger TASK_LEDGER.md"
+                        )
                     },
                     "tool_response": {"output": "control-event: allowed", "exit_code": 0},
                 },
@@ -3912,7 +4442,15 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 "pending_control_event": True, "returncode": 0, "stdout_tail": "continued", "stderr_tail": "",
                 "execution_target_session_id": "desktop-good", "target_generation": 2,
             }
-            with patch.object(web_bridge, "execute_native_resume", return_value=incompatible), patch.object(
+            with patch.object(web_bridge, "_load_lifecycle_state", side_effect=[{
+                "pending_control_event": True,
+                "requires_user": False,
+                "controller_host": "desktop_codex",
+            }, {
+                "pending_control_event": False,
+                "requires_user": False,
+                "controller_host": "desktop_codex",
+            }]), patch.object(web_bridge, "execute_native_resume", return_value=incompatible), patch.object(
                 web_bridge, "recover_incompatible_native_target", return_value=recovered
             ) as recover, patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
                 code = web_bridge.run_auto_native_stop(
@@ -3924,10 +4462,10 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
             recover.assert_called_once()
             schedule.assert_not_called()
             saved = json.loads(state.read_text())
-            self.assertEqual(saved["state"], "RESUME_CONFIRMED")
+            self.assertEqual(saved["state"], "CONTINUATION_CLOSED")
             self.assertEqual(saved["execution_target_session_id"], "desktop-good")
             self.assertEqual(saved["target_generation"], 2)
-            self.assertTrue(saved["pending_control_event"])
+            self.assertFalse(saved["pending_control_event"])
 
     def test_recover_incompatible_target_replaces_only_execution_target_then_resumes(self) -> None:
         from unittest.mock import patch

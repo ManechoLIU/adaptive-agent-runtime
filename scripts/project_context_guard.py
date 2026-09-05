@@ -220,6 +220,39 @@ def _runtime_state_source(repo: Path) -> dict[str, Any]:
     return result
 
 
+def _runtime_identity_contract_projection(sources: dict[str, Any]) -> dict[str, Any]:
+    agents = sources.get("agents") if isinstance(sources, dict) else None
+    content = str(agents.get("content") or "") if isinstance(agents, dict) else ""
+    available_contract = target_guard.controller_identity_capabilities()
+    available = {
+        str(value).strip()
+        for value in available_contract.get("capabilities", [])
+        if str(value).strip()
+    }
+    required: set[str] = set()
+    for match in re.finditer(
+        r"(?mi)^\s*adaptive_agent_runtime_required_capabilities\s*:\s*([^\n#]+)",
+        content,
+    ):
+        required.update(
+            value.strip()
+            for value in re.split(r"[,\s]+", match.group(1))
+            if value.strip()
+        )
+    legacy_identity_cli_required = "web_lifecycle_bridge.py controller-identity" in content
+    if legacy_identity_cli_required:
+        required.add("legacy_web_lifecycle_controller_identity_cli")
+    missing = sorted(required - available)
+    return {
+        "state": "RUNTIME_CONTRACT_DRIFT" if missing else "CURRENT",
+        "required_identity_capabilities": sorted(required),
+        "available_identity_capabilities": sorted(available),
+        "missing_identity_capabilities": missing,
+        "canonical_identity_cli": available_contract.get("canonical_identity_cli"),
+        "legacy_identity_cli_required": legacy_identity_cli_required,
+    }
+
+
 def _controller_context_identity(
     root: Path,
     *,
@@ -355,6 +388,26 @@ def initialize_project_context(
         host=controller_host,
         source_session_id=source_session_id,
     )
+    runtime_contract = _runtime_identity_contract_projection(sources)
+    identity_state = str(controller_identity.get("identity_state") or "UNVERIFIED")
+    project_state = controller_identity.get("project_controller_state", {})
+    unique_existing_controller = (
+        isinstance(project_state, dict)
+        and project_state.get("project_controller") == "EXISTING"
+        and project_state.get("uniqueness") == "UNIQUE"
+    )
+    if (
+        runtime_contract["state"] == "RUNTIME_CONTRACT_DRIFT"
+        and unique_existing_controller
+        and identity_state != "CONFLICTED"
+    ):
+        identity_state = "DEGRADED"
+    controller_actions_allowed = bool(controller_identity["controller_actions_allowed"])
+    if identity_state == "DEGRADED":
+        controller_actions_allowed = False
+    safe_control_actions_allowed = bool(
+        unique_existing_controller and identity_state in {"VERIFIED", "DEGRADED"}
+    )
     return {
         "schema_version": 2,
         "state": state,
@@ -365,9 +418,16 @@ def initialize_project_context(
         "verified_facts": verified,
         "unknown_facts": unknown,
         "required_failures": required_bad,
+        "identity_state": identity_state,
         "project_controller_state": controller_identity["project_controller_state"],
         "session_binding_state": controller_identity["session_binding_state"],
-        "controller_actions_allowed": controller_identity["controller_actions_allowed"],
+        "controller_actions_allowed": controller_actions_allowed,
+        "safe_control_actions_allowed": safe_control_actions_allowed,
+        "runtime_contract_state": runtime_contract["state"],
+        "required_identity_capabilities": runtime_contract["required_identity_capabilities"],
+        "available_identity_capabilities": runtime_contract["available_identity_capabilities"],
+        "missing_identity_capabilities": runtime_contract["missing_identity_capabilities"],
+        "canonical_identity_cli": runtime_contract["canonical_identity_cli"],
         "same_controller_recovery_allowed": controller_identity[
             "same_controller_recovery_allowed"
         ],
@@ -496,6 +556,24 @@ def _context_text(receipt: dict[str, Any], *, mechanism: dict[str, Any] | None =
         "verified_facts=" + json.dumps(receipt.get("verified_facts", []), ensure_ascii=False),
         "unknown_facts=" + json.dumps(receipt.get("unknown_facts", []), ensure_ascii=False),
     ]
+    lines.extend([
+        "identity_state=" + str(receipt.get("identity_state") or "UNVERIFIED"),
+        "runtime_contract_state=" + str(receipt.get("runtime_contract_state") or "UNKNOWN"),
+        "safe_control_actions_allowed=" + json.dumps(bool(receipt.get("safe_control_actions_allowed"))),
+    ])
+    missing_identity = receipt.get("missing_identity_capabilities")
+    if isinstance(missing_identity, list) and missing_identity:
+        lines.append(
+            "missing_identity_capabilities="
+            + json.dumps(missing_identity, ensure_ascii=False, sort_keys=True)
+        )
+        lines.append(
+            "Runtime contract semantics: missing identity capability is RUNTIME_CONTRACT_DRIFT, "
+            "not proof that the existing logical Controller is absent. Keep safe control-plane work "
+            "running when the project Controller is unique and no identity conflict exists; keep "
+            "Controller-exclusive irreversible mutations fail closed."
+        )
+
     project_controller = receipt.get("project_controller_state")
     if isinstance(project_controller, dict):
         lines.append(

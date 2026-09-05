@@ -256,6 +256,20 @@ def _session_owners(
     return owners
 
 
+def controller_identity_capabilities() -> dict[str, Any]:
+    """Machine-readable capability contract for the canonical Controller identity layer."""
+    return {
+        "schema_version": 1,
+        "canonical_identity_cli": "controller_target_guard.py identity",
+        "capabilities": [
+            "controller_identity_projection",
+            "same_controller_recovery",
+            "web_session_binding",
+            "target_generation_fence",
+        ],
+    }
+
+
 def controller_identity_projection(
     *,
     repo: Path,
@@ -433,7 +447,25 @@ def controller_identity_projection(
         "registry": str(registry_path.resolve()),
         "registry_sha256": _registry_sha256(registry_path),
     }
+    verification = str(binding.get("verification") or "").strip()
+    if verification == "CONFLICT":
+        identity_state = "CONFLICTED"
+    elif verification == "VERIFIED":
+        identity_state = "VERIFIED"
+    elif (
+        project.get("project_controller") == "EXISTING"
+        and project.get("uniqueness") == "UNIQUE"
+        and str(binding.get("reason") or "") in {
+            "HOST_SESSION_ID_UNAVAILABLE",
+            "HOST_IDENTITY_UNAVAILABLE",
+        }
+    ):
+        identity_state = "DEGRADED"
+    else:
+        identity_state = "UNVERIFIED"
+
     return {
+        "identity_state": identity_state,
         "project_controller_state": project,
         "session_binding_state": binding,
         "controller_actions_allowed": bool(
@@ -931,6 +963,7 @@ def build_parser() -> argparse.ArgumentParser:
     check = subparsers.add_parser("check")
     reconcile = subparsers.add_parser("reconcile")
     identity = subparsers.add_parser("identity")
+    subparsers.add_parser("capabilities")
     for command in (resolve, check, reconcile, identity):
         command.add_argument("--repo", required=True)
         command.add_argument("--host", choices=SUPPORTED_HOSTS, required=True)
@@ -951,7 +984,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "resolve":
+        if args.command == "capabilities":
+            receipt = controller_identity_capabilities()
+        elif args.command == "resolve":
             receipt = resolve_execution_target(
                 repo=Path(args.repo),
                 host=args.host,

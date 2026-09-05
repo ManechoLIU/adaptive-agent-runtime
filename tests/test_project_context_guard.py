@@ -119,6 +119,76 @@ class ProjectContextGuardTests(unittest.TestCase):
         self.assertIn('"verification": "UNVERIFIED"', context)
         self.assertIn("do not create, reappoint, replace", context)
 
+    def test_missing_required_identity_capability_reports_contract_drift_without_revoking_controller(self):
+        module = self.hook()
+        registry = Path(self.tmp.name) / "controllers.json"
+        registry.write_text(json.dumps({"controller-1": str(self.repo.resolve())}), encoding="utf-8")
+        (self.repo / "AGENTS.md").write_text(
+            "# Project Rules\n\nadaptive_agent_runtime_required_capabilities: controller_identity_projection,missing_identity_v99\n",
+            encoding="utf-8",
+        )
+
+        receipt = module.initialize_project_context(
+            self.repo,
+            skill_root=self.skill,
+            controller_registry_path=registry,
+            controller_host="web",
+            source_session_id=None,
+        )
+
+        self.assertEqual(receipt["runtime_contract_state"], "RUNTIME_CONTRACT_DRIFT")
+        self.assertEqual(receipt["missing_identity_capabilities"], ["missing_identity_v99"])
+        self.assertEqual(receipt["identity_state"], "DEGRADED")
+        self.assertEqual(receipt["project_controller_state"]["controller_id"], "controller-1")
+        self.assertFalse(receipt["create_new_controller_allowed"])
+        self.assertFalse(receipt["controller_actions_allowed"])
+        context = module._context_text(receipt)
+        self.assertIn("identity_state=DEGRADED", context)
+        self.assertIn("runtime_contract_state=RUNTIME_CONTRACT_DRIFT", context)
+        self.assertIn("safe_control_actions_allowed=true", context)
+        self.assertIn("missing_identity_v99", context)
+
+    def test_legacy_missing_web_controller_identity_cli_is_reported_as_contract_drift(self):
+        module = self.hook()
+        registry = Path(self.tmp.name) / "controllers.json"
+        registry.write_text(json.dumps({"controller-1": str(self.repo.resolve())}), encoding="utf-8")
+        (self.repo / "AGENTS.md").write_text(
+            "# Project Rules\n\nBefore Controller actions run: python3 scripts/web_lifecycle_bridge.py controller-identity --repo <repo> --web-session-id <trusted-id>\n",
+            encoding="utf-8",
+        )
+        receipt = module.initialize_project_context(
+            self.repo, skill_root=self.skill, controller_registry_path=registry,
+            controller_host="web", source_session_id=None,
+        )
+        self.assertEqual(receipt["runtime_contract_state"], "RUNTIME_CONTRACT_DRIFT")
+        self.assertIn("legacy_web_lifecycle_controller_identity_cli", receipt["missing_identity_capabilities"])
+        self.assertEqual(receipt["canonical_identity_cli"], "controller_target_guard.py identity")
+        self.assertEqual(receipt["identity_state"], "DEGRADED")
+        self.assertEqual(receipt["project_controller_state"]["controller_id"], "controller-1")
+        self.assertFalse(receipt["create_new_controller_allowed"])
+
+    def test_current_identity_capability_contract_reports_current(self):
+        module = self.hook()
+        registry = Path(self.tmp.name) / "controllers.json"
+        registry.write_text(json.dumps({
+            "controller-1": str(self.repo.resolve()),
+            "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+        }), encoding="utf-8")
+        (self.repo / "AGENTS.md").write_text(
+            "# Project Rules\n\nadaptive_agent_runtime_required_capabilities: controller_identity_projection,web_session_binding,target_generation_fence\n",
+            encoding="utf-8",
+        )
+
+        receipt = module.initialize_project_context(
+            self.repo, skill_root=self.skill, controller_registry_path=registry,
+            controller_host="web", source_session_id="web-current",
+        )
+
+        self.assertEqual(receipt["runtime_contract_state"], "CURRENT")
+        self.assertEqual(receipt["missing_identity_capabilities"], [])
+        self.assertEqual(receipt["identity_state"], "VERIFIED")
+        self.assertTrue(receipt["controller_actions_allowed"])
+
     def test_session_start_infers_native_codex_as_desktop_binding(self):
         module = self.hook()
         registry = Path(self.tmp.name) / "controllers.json"

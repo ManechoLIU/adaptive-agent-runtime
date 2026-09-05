@@ -51,6 +51,14 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_current_token_web_rearm_hands_off_with_force_rearm_proof",
     "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
     "test_stale_supervisor_token_exits_without_running_impl",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_dead_or_untracked_active_supervisor_requires_bootstrap",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_live_active_supervisor_does_not_need_duplicate_bootstrap",
+    "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
+    "test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message",
+    "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
+    "test_no_canonical_work_does_not_reopen_after_observation_only_turn",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
     "test_regression_parent_already_yielded_then_writer_completed_wakes_same_controller_with_next_runnable",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
@@ -59,6 +67,16 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_stale_child_is_second_observed_by_existing_audit_and_wakes_same_controller",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
     "test_duplicate_terminal_observation_after_confirmed_continuation_does_not_wake_twice",
+    "tests.test_governance.GovernanceTests."
+    "test_runtime_terminal_active_row_does_not_consume_dispatch_capacity",
+    "tests.test_governance.GovernanceTests."
+    "test_runnable_hard_defer_requires_machine_evidence_and_checkpoint",
+    "tests.test_governance.GovernanceTests."
+    "test_local_hard_defer_still_fills_other_nonconflicting_capacity",
+    "tests.test_governance.GovernanceTests."
+    "test_identity_degraded_cannot_authorize_stop_while_project_runnable_exists",
+    "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
+    "test_canonical_runnable_reopens_continuation_without_user_message",
     "tests.test_governance.GovernanceTests."
     "test_project_wide_projection_web_active_verify_do_not_starve_mini_runnables",
     "tests.test_governance.GovernanceTests."
@@ -184,6 +202,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain",
     "tests.test_controller_target_guard.ControllerTargetGuardTests."
+    "test_identity_projection_marks_unique_controller_with_missing_host_session_as_degraded",
+    "tests.test_controller_target_guard.ControllerTargetGuardTests."
+    "test_identity_capability_contract_exposes_canonical_projection_and_cli",
+    "tests.test_controller_target_guard.ControllerTargetGuardTests."
     "test_identity_projection_keeps_unique_project_controller_when_session_id_unavailable",
     "tests.test_controller_target_guard.ControllerTargetGuardTests."
     "test_identity_projection_verifies_current_desktop_target_without_changing_controller_id",
@@ -192,6 +214,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_controller_target_guard.ControllerTargetGuardTests."
     "test_identity_projection_reports_project_controller_conflict_without_silent_selection",
     "tests.test_project_context_guard.ProjectContextGuardTests."
+    "test_missing_required_identity_capability_reports_contract_drift_without_revoking_controller",
+    "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_project_context_separates_unique_controller_from_unverified_web_session",
     "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_project_context_reports_verified_bound_web_session_without_changing_ownership",
@@ -199,6 +223,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_session_start_without_host_session_id_reports_existing_controller_not_new_controller",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_same_controller_web_recovery_verifier_exception_degrades_without_revoking_controller",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
@@ -580,6 +606,64 @@ def _machine_web_event_source_ready(path: Path) -> bool:
     return bool(machine_event_source_ready(path=path))
 
 
+def _installed_controller_identity_capability(skill_root: Path | None) -> dict[str, Any]:
+    script = (
+        skill_root / "scripts" / "controller_target_guard.py"
+        if skill_root is not None
+        else Path(__file__).resolve().parent / "controller_target_guard.py"
+    )
+    if not script.is_file():
+        return {
+            "status": "degraded",
+            "configured": False,
+            "state": "RUNTIME_CONTRACT_DRIFT",
+            "reason": "canonical Controller identity guard is missing",
+            "capabilities": [],
+            "canonical_identity_cli": "controller_target_guard.py identity",
+        }
+    completed = subprocess.run(
+        [sys.executable, str(script), "capabilities"],
+        check=False, capture_output=True, text=True, timeout=5,
+    )
+    if completed.returncode != 0:
+        return {
+            "status": "degraded",
+            "configured": False,
+            "state": "RUNTIME_CONTRACT_DRIFT",
+            "reason": "canonical Controller identity capability probe failed",
+            "capabilities": [],
+            "canonical_identity_cli": "controller_target_guard.py identity",
+        }
+    try:
+        contract = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        contract = {}
+    capabilities = contract.get("capabilities") if isinstance(contract, dict) else None
+    canonical_cli = contract.get("canonical_identity_cli") if isinstance(contract, dict) else None
+    if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
+        capabilities = []
+    required = {
+        "controller_identity_projection",
+        "same_controller_recovery",
+        "web_session_binding",
+        "target_generation_fence",
+    }
+    missing = sorted(required - set(capabilities))
+    current = not missing and canonical_cli == "controller_target_guard.py identity"
+    return {
+        "status": "enabled" if current else "degraded",
+        "configured": current,
+        "state": "CURRENT" if current else "RUNTIME_CONTRACT_DRIFT",
+        "reason": (
+            "canonical Controller identity capability contract verified"
+            if current else "installed Controller identity capability contract is incomplete"
+        ),
+        "capabilities": sorted(set(capabilities)),
+        "missing_capabilities": missing,
+        "canonical_identity_cli": canonical_cli or "controller_target_guard.py identity",
+    }
+
+
 def detect_host_capabilities(
     *,
     codex_executable: str | Path | None = None,
@@ -687,6 +771,7 @@ def detect_host_capabilities(
         }
     return {
         "core": {"status": "enabled", "adapter": "adaptive-agent-runtime", "configured": True, "reason": "core governance is host-neutral"},
+        "controller_identity": _installed_controller_identity_capability(skill_root_path),
         "desktop_adapter": desktop,
         "web_local_adapter": web,
         "web_agent_execution": {
@@ -1205,6 +1290,8 @@ def install_skill(
         tracked = _materialize_revision(source_path, revision, stage)
         hashes = {relative: _sha256(stage / relative) for relative in tracked}
         installed_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        staged_capabilities = detect_host_capabilities(skill_root=target_path)
+        staged_capabilities["controller_identity"] = _installed_controller_identity_capability(stage)
         manifest: dict[str, Any] = {
             "schema_version": 1,
             "product_name": PRODUCT_NAME,
@@ -1221,7 +1308,7 @@ def install_skill(
             "impact": impact,
             "stop_condition": stop_condition.strip(),
             "changed_files": _changed_files(source_path, prior_revision, revision, tracked),
-            "capabilities": detect_host_capabilities(skill_root=target_path),
+            "capabilities": staged_capabilities,
             "files": hashes,
         }
         _write_json_atomic(stage / MANIFEST_NAME, manifest)

@@ -46,7 +46,7 @@ class DesktopLifecycleTurnGateTests(unittest.TestCase):
                 "tool_use_id": "receipt-call",
                 "tool_input": {
                     "command": (
-                        "python3 scripts/control_event_guard.py receipt.json "
+                        f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} receipt.json "
                         "--ledger TASK_LEDGER.md --repo . "
                         "--controller-session controller-1"
                     )
@@ -422,7 +422,7 @@ class DesktopLifecycleTurnGateTests(unittest.TestCase):
                 "tool_use_id": "receipt-call",
                 "tool_input": {
                     "command": (
-                        "python3 scripts/control_event_guard.py receipt.json "
+                        f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} receipt.json "
                         "--ledger TASK_LEDGER.md --repo . "
                         "--controller-session controller-1"
                     )
@@ -447,7 +447,7 @@ class DesktopLifecycleTurnGateTests(unittest.TestCase):
             "tool_use_id": "receipt-call",
             "tool_input": {
                 "command": (
-                    "python3 scripts/control_event_guard.py receipt.json "
+                    f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} receipt.json "
                     "--ledger TASK_LEDGER.md --repo . "
                     "--controller-session controller-1"
                 )

@@ -104,6 +104,28 @@ def work_in_flight_ledger_packages(ledger: Path) -> dict[str, str]:
     }
 
 
+def runtime_occupied_task_ids(repo: Path, work_in_flight: dict[str, str]) -> set[str]:
+    """Return ledger WIP tasks that still have a canonical nonterminal Runtime lease."""
+    try:
+        from scripts.assignment_runtime import load_runtime_state
+    except ModuleNotFoundError:
+        from assignment_runtime import load_runtime_state
+
+    runtime = load_runtime_state(Path(repo).expanduser().resolve())
+    leases = runtime.get("leases", {}) if isinstance(runtime, dict) else {}
+    if not isinstance(leases, dict):
+        return set()
+    occupied: set[str] = set()
+    tracked = set(work_in_flight)
+    for lease in leases.values():
+        if not isinstance(lease, dict) or lease.get("terminal_state"):
+            continue
+        task_id = str(lease.get("task_id", "")).strip()
+        if task_id in tracked:
+            occupied.add(task_id)
+    return occupied
+
+
 def project_wide_dispatch_projection(ledger: Path) -> dict[str, Any]:
     """Derive one control-event scheduling view from the entire canonical TASK_LEDGER."""
     text = ledger.read_text(encoding="utf-8")
@@ -1688,6 +1710,7 @@ def validate_snapshot(
     ledger_task_states: dict[str, str] | None = None,
     derived_runnable_ids: set[str] | None = None,
     expected_machine_trace: dict[str, Any] | None = None,
+    expected_runtime_occupied_task_ids: set[str] | None = None,
     expected_candidate_revisions: set[str] | None = None,
     expected_controller_action_ids: set[str] | None = None,
     expected_corrections: Sequence[dict[str, Any]] | None = None,
@@ -1792,10 +1815,14 @@ def validate_snapshot(
                     errors.append(
                         "capacity_projection.occupied_task_ids must contain unique non-empty task IDs"
                     )
-                expected_occupied = set(ledger_work_in_flight)
+                expected_occupied = (
+                    set(expected_runtime_occupied_task_ids)
+                    if expected_runtime_occupied_task_ids is not None
+                    else set(ledger_work_in_flight)
+                )
                 if occupied_ids != expected_occupied:
                     errors.append(
-                        "capacity_projection occupied tasks do not match machine work-in-flight projection"
+                        "capacity_projection occupied tasks do not match canonical Runtime nonterminal assignments"
                     )
             if isinstance(total_slots, int) and not isinstance(total_slots, bool) and total_slots >= 0:
                 projected_slots = max(0, total_slots - len(occupied_ids))
@@ -1841,7 +1868,16 @@ def validate_snapshot(
                     f"{package_id} {decision} decision requires reason_code: "
                     + ", ".join(sorted(DEFER_REASON_CODES))
                 )
-            if reason_code not in HARD_DEFER_REASON_CODES:
+            if reason_code in HARD_DEFER_REASON_CODES:
+                if not traceable_runtime_evidence(package.get("evidence")):
+                    errors.append(
+                        f"{package_id} {decision} decision requires traceable evidence"
+                    )
+                if decision == "deferred" and not str(package.get("next_checkpoint", "")).strip():
+                    errors.append(
+                        f"{package_id} deferred decision requires next_checkpoint"
+                    )
+            else:
                 deferred_without_hard_constraint.append(package_id)
 
     if isinstance(slots, int) and active_decisions > slots:
@@ -2293,6 +2329,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             else []
         )
         expected_candidate_revisions = set((candidates or {}).values())
+        expected_runtime_occupied = (
+            runtime_occupied_task_ids(repo_root, work_in_flight)
+            if repo_root is not None
+            else None
+        )
         expected_controller_actions = (
             canonical_controller_action_projection(
                 repo_root,
@@ -2327,6 +2368,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ledger_task_states=ledger_task_states,
         derived_runnable_ids=derived_runnable_ids,
         expected_machine_trace=expected_machine_trace,
+        expected_runtime_occupied_task_ids=expected_runtime_occupied,
         expected_candidate_revisions=expected_candidate_revisions,
         expected_controller_action_ids=set(expected_controller_actions),
         expected_corrections=expected_corrections,

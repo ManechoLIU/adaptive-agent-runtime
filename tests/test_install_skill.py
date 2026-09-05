@@ -288,6 +288,27 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertEqual(report["web_local_adapter"]["adapter"], "ai-bridge")
         self.assertFalse(report["web_local_adapter"]["configured"])
 
+    def test_identity_capability_report_surfaces_missing_installed_guard_as_contract_drift(self):
+        from scripts.install_skill import detect_host_capabilities
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "scripts").mkdir()
+            report = detect_host_capabilities(
+                skill_root=root,
+                codex_executable=root / "missing-codex",
+                ai_bridge_executable=root / "missing-bridge",
+                hooks_file=root / "hooks.json",
+                zshenv_file=root / ".zshenv",
+                desktop_canary_file=root / "canary.json",
+                health_service_plist=root / "health.plist",
+                web_event_source_receipt=root / "event-source.json",
+            )
+        identity = report["controller_identity"]
+        self.assertEqual(identity["state"], "RUNTIME_CONTRACT_DRIFT")
+        self.assertEqual(identity["status"], "degraded")
+        self.assertFalse(identity["configured"])
+
+
 class InstallMigrationContractTests(unittest.TestCase):
     def test_cli_reports_default_target_conflict_without_traceback(self):
         import contextlib
@@ -372,7 +393,18 @@ class InstallMigrationContractTests(unittest.TestCase):
             "controller_scoring_guard.py", "project_context_guard.py", "evaluation_transaction.py",
         ):
             script = source / "scripts" / name
-            script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            if name == "controller_target_guard.py":
+                script.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json, sys\n"
+                    "if len(sys.argv) > 1 and sys.argv[1] == 'capabilities':\n"
+                    "    print(json.dumps({'schema_version': 1, 'canonical_identity_cli': 'controller_target_guard.py identity', 'capabilities': ['controller_identity_projection', 'same_controller_recovery', 'web_session_binding', 'target_generation_fence']}))\n"
+                    "    raise SystemExit(0)\n"
+                    "raise SystemExit(0)\n",
+                    encoding="utf-8",
+                )
+            else:
+                script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             script.chmod(0o755)
         subprocess.run(["git", "-C", str(source), "add", "."], check=True)
         subprocess.run(["git", "-C", str(source), "commit", "-m", "initial"], check=True, capture_output=True)
@@ -635,6 +667,14 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_duplicate_terminal_observation_after_confirmed_continuation_does_not_wake_twice(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
+            (tests_dir / "test_web_agent_health_supervisor.py").write_text(
+                "import unittest\n"
+                "class WebAgentHealthSupervisorTests(unittest.TestCase):\n"
+                "    def test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message(self): self.assertTrue(True)\n"
+                "    def test_canonical_runnable_reopens_continuation_without_user_message(self): self.assertTrue(True)\n"
+                "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_project_context_guard.py").write_text(
                 "import unittest\n"
                 "class ProjectContextGuardTests(unittest.TestCase):\n"
@@ -644,6 +684,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_not_found_unknown_token_does_not_authorize_fabricated_definitive_mechanism(self): self.assertTrue(True)\n"
                 "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n"
                 "    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self): self.assertTrue(True)\n"
+                "    def test_missing_required_identity_capability_reports_contract_drift_without_revoking_controller(self): self.assertTrue(True)\n"
                 "    def test_project_context_separates_unique_controller_from_unverified_web_session(self): self.assertTrue(True)\n"
                 "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n",
                 encoding="utf-8",
@@ -651,6 +692,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             (tests_dir / "test_controller_target_guard.py").write_text(
                 "import unittest\n"
                 "class ControllerTargetGuardTests(unittest.TestCase):\n"
+                "    def test_identity_projection_marks_unique_controller_with_missing_host_session_as_degraded(self): self.assertTrue(True)\n"
+                "    def test_identity_capability_contract_exposes_canonical_projection_and_cli(self): self.assertTrue(True)\n"
                 "    def test_identity_projection_keeps_unique_project_controller_when_session_id_unavailable(self): self.assertTrue(True)\n"
                 "    def test_identity_projection_verifies_current_desktop_target_without_changing_controller_id(self): self.assertTrue(True)\n"
                 "    def test_identity_projection_marks_old_target_stale_but_keeps_project_ownership(self): self.assertTrue(True)\n"
@@ -662,12 +705,16 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
+                "    def test_same_controller_web_recovery_verifier_exception_degrades_without_revoking_controller(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership(self): self.assertTrue(True)\n"
                 "    def test_web_recovery_preserves_desktop_target_and_only_advances_web_generation(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_same_receipt_live_supervisor_is_coalesced(self): self.assertTrue(True)\n"
                 "    def test_current_token_web_rearm_hands_off_with_force_rearm_proof(self): self.assertTrue(True)\n"
-                "    def test_stale_supervisor_token_exits_without_running_impl(self): self.assertTrue(True)\n",
+                "    def test_stale_supervisor_token_exits_without_running_impl(self): self.assertTrue(True)\n"
+                "class WebContinuationSupervisorBootstrapTests(unittest.TestCase):\n"
+                "    def test_dead_or_untracked_active_supervisor_requires_bootstrap(self): self.assertTrue(True)\n"
+                "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(
@@ -697,6 +744,10 @@ class InstallMigrationContractTests(unittest.TestCase):
             (tests_dir / "test_governance.py").write_text(
                 "import unittest\n"
                 "class GovernanceTests(unittest.TestCase):\n"
+                "    def test_runtime_terminal_active_row_does_not_consume_dispatch_capacity(self): self.assertTrue(True)\n"
+                "    def test_runnable_hard_defer_requires_machine_evidence_and_checkpoint(self): self.assertTrue(True)\n"
+                "    def test_local_hard_defer_still_fills_other_nonconflicting_capacity(self): self.assertTrue(True)\n"
+                "    def test_identity_degraded_cannot_authorize_stop_while_project_runnable_exists(self): self.assertTrue(True)\n"
                 "    def test_project_wide_projection_web_active_verify_do_not_starve_mini_runnables(self): self.assertTrue(True)\n"
                 "    def test_project_wide_projection_mini_active_does_not_starve_server_or_web(self): self.assertTrue(True)\n"
                 "    def test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists(self): self.assertTrue(True)\n"
@@ -814,6 +865,13 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_duplicate_terminal_observation_after_confirmed_continuation_does_not_wake_twice(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
+            (tests_dir / "test_web_agent_health_supervisor.py").write_text(
+                "import unittest\n"
+                "class WebAgentHealthSupervisorTests(unittest.TestCase):\n"
+                "    def test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message(self): self.assertTrue(True)\n"
+                "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_project_context_guard.py").write_text(
                 "import unittest\n"
                 "class ProjectContextGuardTests(unittest.TestCase):\n"
@@ -846,7 +904,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_same_receipt_live_supervisor_is_coalesced(self): self.assertTrue(True)\n"
                 "    def test_current_token_web_rearm_hands_off_with_force_rearm_proof(self): self.assertTrue(True)\n"
-                "    def test_stale_supervisor_token_exits_without_running_impl(self): self.assertTrue(True)\n",
+                "    def test_stale_supervisor_token_exits_without_running_impl(self): self.assertTrue(True)\n"
+                "class WebContinuationSupervisorBootstrapTests(unittest.TestCase):\n"
+                "    def test_dead_or_untracked_active_supervisor_requires_bootstrap(self): self.assertTrue(True)\n"
+                "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(
@@ -959,7 +1020,12 @@ class InstallMigrationContractTests(unittest.TestCase):
             self.assertEqual(manifest["product_name"], "Adaptive Agent Runtime")
             self.assertEqual(manifest["skill_id"], "adaptive-agent-runtime")
             self.assertIn("capabilities", manifest)
-            self.assertEqual(set(manifest["capabilities"]), {"core", "desktop_adapter", "web_local_adapter", "web_agent_execution"})
+            self.assertEqual(set(manifest["capabilities"]), {"core", "desktop_adapter", "web_local_adapter", "web_agent_execution", "controller_identity"})
+            identity = manifest["capabilities"]["controller_identity"]
+            self.assertEqual(identity["status"], "enabled")
+            self.assertEqual(identity["canonical_identity_cli"], "controller_target_guard.py identity")
+            self.assertIn("controller_identity_projection", identity["capabilities"])
+            self.assertIn("same_controller_recovery", identity["capabilities"])
             web_execution = manifest["capabilities"]["web_agent_execution"]
             self.assertEqual(web_execution["status"], "host_limited")
             self.assertFalse(web_execution["configured"])

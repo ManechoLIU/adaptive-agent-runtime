@@ -938,7 +938,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         }
         event = {
             "hook_event_name": "PostToolUse", "session_id": "controller-1",
-            "tool_input": {"command": "python3 scripts/control_event_guard.py event.json --ledger TASK_LEDGER.md --repo ."},
+            "tool_input": {"command": f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} event.json --ledger TASK_LEDGER.md --repo ."},
             "tool_response": {"exit_code": 0, "output": "control-event: allowed"},
         }
         output, state = lifecycle_hook.evaluate_event(
@@ -987,7 +987,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             {
                 "hook_event_name": "PostToolUse",
                 "session_id": "controller-1",
-                "tool_input": {"command": "python3 scripts/control_event_guard.py receipt.json --ledger TASK_LEDGER.md --repo ."},
+                "tool_input": {"command": f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} receipt.json --ledger TASK_LEDGER.md --repo ."},
                 "tool_response": {"output": "control-event: allowed", "exit_code": 0},
             },
             snapshot=snapshot,
@@ -1038,7 +1038,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         _, closed = lifecycle_hook.evaluate_event(
             {
                 "hook_event_name": "PostToolUse", "session_id": "controller-1",
-                "tool_input": {"command": "python3 scripts/control_event_guard.py receipt.json --ledger TASK_LEDGER.md --repo ."},
+                "tool_input": {"command": f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} receipt.json --ledger TASK_LEDGER.md --repo ."},
                 "tool_response": {"output": "control-event: allowed", "exit_code": 0},
             }, snapshot=snapshot, prior_state=pending,
         )
@@ -1499,7 +1499,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 "turn_id": "turn-1",
                 "tool_name": "Bash",
                 "tool_input": {
-                    "command": "python3 scripts/control_event_guard.py receipt.json --ledger TASK_LEDGER.md"
+                    "command": f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} receipt.json --ledger TASK_LEDGER.md"
                 },
                 "tool_response": {"output": "control-event: allowed", "exit_code": 0},
             },
@@ -1537,7 +1537,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 "tool_name": "Bash",
                 "tool_input": {
                     "command": (
-                        "python3 scripts/control_event_guard.py receipt.json "
+                        f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} receipt.json "
                         "--ledger TASK_LEDGER.md --repo ."
                     )
                 },
@@ -2233,6 +2233,35 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             snapshot, ledger_ready_ids=set(), expected_candidates={"/repo/wt": "candidate-1"}
         ), [])
 
+    def test_runnable_hard_defer_requires_machine_evidence_and_checkpoint(self) -> None:
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 1,
+            "ready_packages": [{
+                "id": "F1",
+                "decision": "deferred",
+                "reason": "writer owns the same output files",
+                "reason_code": "file_conflict",
+            }],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids={"F1"}, derived_runnable_ids={"F1"}
+        )
+        self.assertTrue(any("requires traceable evidence" in error for error in errors), errors)
+        self.assertTrue(any("requires next_checkpoint" in error for error in errors), errors)
+
+        snapshot["ready_packages"][0].update({
+            "evidence": "receipt:file-lease-conflict",
+            "next_checkpoint": "conflicting assignment terminal receipt",
+        })
+        self.assertEqual(
+            control_event_guard.validate_snapshot(
+                snapshot, ledger_ready_ids={"F1"}, derived_runnable_ids={"F1"}
+            ),
+            [],
+        )
+
     def test_control_event_guard_allows_complete_event(self) -> None:
         snapshot = {
             **self.complete_event_receipt(),
@@ -2250,6 +2279,8 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                     "decision": "deferred",
                     "reason": "shares the same output directory as F1",
                     "reason_code": "file_conflict",
+                    "evidence": "receipt:file-conflict-f1-f2",
+                    "next_checkpoint": "F1 assignment terminal receipt",
                 },
             ],
             "required_reviews": [
@@ -3705,6 +3736,61 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             errors,
         )
 
+    def test_runtime_terminal_active_row_does_not_consume_dispatch_capacity(self) -> None:
+        from unittest.mock import patch
+
+        ledger = self._fairness_ledger([
+            ("STALE-ACTIVE", "ACTIVE", "recover stale assignment"),
+            ("SERVER-READY", "READY", "dispatch server writer"),
+        ])
+        projection = control_event_guard.project_wide_dispatch_projection(ledger)
+        with patch("scripts.assignment_runtime.load_runtime_state", return_value={
+            "leases": {
+                "A-OLD": {
+                    "task_id": "STALE-ACTIVE",
+                    "attempt": 1,
+                    "terminal_state": "failed",
+                }
+            }
+        }):
+            occupied = control_event_guard.runtime_occupied_task_ids(
+                ledger.parent, dict(projection["work_in_flight"])
+            )
+        self.assertEqual(occupied, set())
+
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 1,
+            "capacity_projection": {
+                "source": "host_runtime",
+                "evidence": "receipt:capacity-runtime",
+                "total_slots": 1,
+                "occupied_task_ids": [],
+            },
+            "ready_packages": [{
+                "id": "SERVER-READY",
+                "decision": "deferred",
+                "reason": "capacity is full",
+                "reason_code": "capacity",
+            }],
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot,
+            ledger_ready_ids=set(projection["ready_ids"]),
+            derived_runnable_ids=set(projection["derived_runnable_ids"]),
+            ledger_work_in_flight=dict(projection["work_in_flight"]),
+            expected_runtime_occupied_task_ids=occupied,
+        )
+        self.assertTrue(
+            any("idle dispatch capacity remains" in error for error in errors),
+            errors,
+        )
+        self.assertFalse(
+            any("occupied tasks do not match" in error for error in errors),
+            errors,
+        )
+
     def test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists(self) -> None:
         runnable = {"WEB-READY", "MINI-READY", "SERVER-READY"}
         snapshot = {
@@ -3744,6 +3830,47 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 snapshot, ledger_ready_ids=runnable, derived_runnable_ids=runnable
             ),
             [],
+        )
+
+    def test_local_hard_defer_still_fills_other_nonconflicting_capacity(self) -> None:
+        runnable = {"WEB-REVIEW-WAIT", "MINI-READY"}
+        snapshot = {
+            **self.complete_event_receipt(),
+            "ledger_sha256": "abc123",
+            "available_slots": 2,
+            "ready_packages": [{
+                "id": "WEB-REVIEW-WAIT",
+                "decision": "deferred",
+                "reason": "candidate must integrate in review order before this writer can touch shared files",
+                "reason_code": "ordered_integration",
+                "evidence": "receipt:review-order-web",
+                "next_checkpoint": "review integration terminal receipt",
+            }, {
+                "id": "MINI-READY",
+                "decision": "active",
+                "task_id": "MINI-READY-A1",
+                "delivered_ack": True,
+            }],
+        }
+        self.assertEqual(
+            control_event_guard.validate_snapshot(
+                snapshot, ledger_ready_ids=runnable, derived_runnable_ids=runnable
+            ),
+            [],
+        )
+
+        snapshot["ready_packages"][1] = {
+            "id": "MINI-READY",
+            "decision": "deferred",
+            "reason": "leave mini idle while web waits",
+            "reason_code": "capacity",
+        }
+        errors = control_event_guard.validate_snapshot(
+            snapshot, ledger_ready_ids=runnable, derived_runnable_ids=runnable
+        )
+        self.assertTrue(
+            any("idle dispatch capacity remains" in error and "MINI-READY" in error for error in errors),
+            errors,
         )
 
     def test_pending_dependency_closure_dynamically_enters_project_wide_runnable_projection(self) -> None:
@@ -4219,7 +4346,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         }
         event = {
             "hook_event_name": "PostToolUse", "session_id": "s", "turn_id": "turn-1",
-            "tool_input": {"command": "python3 control_event_guard.py receipt --ledger TASK_LEDGER.md"},
+            "tool_input": {"command": f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} receipt --ledger TASK_LEDGER.md"},
             "tool_response": {"exit_code": 0, "stdout": "control-event: allowed"},
         }
         _, state = lifecycle_hook.evaluate_event(
@@ -4626,6 +4753,37 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         )
         self.assertEqual(output["decision"], "block")
         self.assertIn("PENDING-RUNNABLE", output["reason"])
+        self.assertTrue(state["pending_control_event"])
+
+    def test_identity_degraded_cannot_authorize_stop_while_project_runnable_exists(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": ["MINI-READY"],
+            "candidate_revisions": [],
+            "identity_state": "DEGRADED",
+            "runtime_contract_state": "RUNTIME_CONTRACT_DRIFT",
+            "project_controller_state": {
+                "project_controller": "EXISTING",
+                "controller_id": "controller-1",
+                "uniqueness": "UNIQUE",
+            },
+            "safe_control_actions_allowed": True,
+            "controller_actions_allowed": False,
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-1"},
+            snapshot=snapshot,
+            prior_state={
+                "pending_control_event": True,
+                "triggers": ["RUNNABLE:MINI-READY"],
+                "stop_continuations": 0,
+            },
+        )
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("MINI-READY", output["reason"])
         self.assertTrue(state["pending_control_event"])
 
     def test_preblock_guard_rejects_ready_work_outside_current_goal(self) -> None:
@@ -5328,7 +5486,7 @@ class PendingLifecycleWakeDispatchTests(unittest.TestCase):
                 "hook_event_name": "PostToolUse",
                 "session_id": "controller-1",
                 "tool_input": {
-                    "command": "python3 scripts/control_event_guard.py receipt.json --ledger TASK_LEDGER.md"
+                    "command": f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} receipt.json --ledger TASK_LEDGER.md"
                 },
                 "tool_response": {"output": "control-event: allowed", "exit_code": 0},
             },
