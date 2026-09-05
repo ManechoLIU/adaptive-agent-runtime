@@ -620,6 +620,14 @@ class InstallMigrationContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "required files are missing"):
                 _verify_runtime_release_regressions(source, revision)
 
+    def test_runtime_release_gate_includes_initial_native_supersession_fence(self):
+        from scripts.install_skill import RUNTIME_RELEASE_REGRESSION_TESTS
+
+        self.assertIn(
+            "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests.test_stale_supervisor_cannot_native_wake_after_supersession",
+            RUNTIME_RELEASE_REGRESSION_TESTS,
+        )
+
     def test_runtime_release_regression_gate_runs_required_tests_from_immutable_revision(self):
         import subprocess
         from scripts.install_skill import (
@@ -718,6 +726,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_same_receipt_live_supervisor_is_coalesced(self): self.assertTrue(True)\n"
                 "    def test_current_token_web_rearm_hands_off_with_force_rearm_proof(self): self.assertTrue(True)\n"
                 "    def test_stale_supervisor_token_exits_without_running_impl(self): self.assertTrue(True)\n"
+                "    def test_stale_supervisor_cannot_native_wake_after_supersession(self): self.assertTrue(True)\n"
                 "class WebContinuationSupervisorBootstrapTests(unittest.TestCase):\n"
                 "    def test_dead_or_untracked_active_supervisor_requires_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n",

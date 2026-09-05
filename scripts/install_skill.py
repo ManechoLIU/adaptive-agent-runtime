@@ -51,6 +51,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_current_token_web_rearm_hands_off_with_force_rearm_proof",
     "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
     "test_stale_supervisor_token_exits_without_running_impl",
+    "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
+    "test_stale_supervisor_cannot_native_wake_after_supersession",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_dead_or_untracked_active_supervisor_requires_bootstrap",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
