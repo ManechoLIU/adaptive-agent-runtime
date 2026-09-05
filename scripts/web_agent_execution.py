@@ -436,8 +436,8 @@ def _verified_machine_event_paths(requested: list[str | Path]) -> list[Path]:
 
 
 def prepare_web_assignment_dispatch(
-    *, repo: str | Path, registry_path: str | Path, controller_id: str, task_name: str,
-    assignment: dict[str, Any], now: datetime | None = None,
+    *, repo: str | Path, registry_path: str | Path, controller_id: str | None, task_name: str,
+    assignment: dict[str, Any], delegator_session_id: str | None = None, now: datetime | None = None,
     health_probe: Callable[[], bool] | None = None,
     event_source_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -445,7 +445,19 @@ def prepare_web_assignment_dispatch(
     repo_path = Path(repo).expanduser().resolve()
     registry = Path(registry_path).expanduser().resolve()
     now = now or datetime.now(UTC)
-    _registered_controller(repo_path, registry, controller_id)
+    controller = str(controller_id or "").strip() or None
+    delegator = str(delegator_session_id or "").strip() or None
+    if controller is not None and delegator is not None:
+        raise ValueError("Web dispatch must have exactly one delegation owner")
+    if controller is None and delegator is None:
+        raise ValueError("Web dispatch requires Controller or session delegation owner")
+    if controller is not None:
+        _registered_controller(repo_path, registry, controller)
+        delegation_owner_kind = "controller"
+        delegation_owner_id = controller
+    else:
+        delegation_owner_kind = "session"
+        delegation_owner_id = delegator
     if not _health_supervisor_is_ready(health_probe):
         raise RuntimeError("Web Assignment health supervisor is not ready; dispatch fails closed")
     if not _machine_event_source_is_ready(event_source_probe):
@@ -455,7 +467,7 @@ def prepare_web_assignment_dispatch(
         raise ValueError("Web dispatch requires a non-empty task_name")
     # Validate the complete contract before a host spawn is allowed.
     _dispatch_start_receipt(
-        repo=repo_path, controller_id=controller_id, conversation_id="__pending_web_child__",
+        repo=repo_path, controller_id=controller or delegation_owner_id, conversation_id="__pending_web_child__",
         assignment=assignment, now=now, attempt=int(assignment.get("attempt", 1)),
         lease_id=str(assignment.get("lease_id") or f"{assignment.get('assignment_id')}:web:attempt:{int(assignment.get('attempt', 1))}"),
     )
@@ -474,7 +486,9 @@ def prepare_web_assignment_dispatch(
         ticket = {
             "dispatch_id": dispatch_id,
             "state": "pending",
-            "controller_id": controller_id,
+            "controller_id": controller,
+            "delegation_owner_kind": delegation_owner_kind,
+            "delegation_owner_id": delegation_owner_id,
             "task_name": task_name,
             "assignment_id": assignment_id,
             "assignment": json.loads(json.dumps(assignment)),
@@ -487,8 +501,8 @@ def prepare_web_assignment_dispatch(
 
 
 def require_prepared_web_dispatch(
-    *, repo: str | Path, controller_id: str, task_name: str,
-    expected_model: str, expected_agent_type: str,
+    *, repo: str | Path, controller_id: str | None, task_name: str,
+    expected_model: str, expected_agent_type: str, delegator_session_id: str | None = None,
     health_probe: Callable[[], bool] | None = None,
     event_source_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -498,15 +512,24 @@ def require_prepared_web_dispatch(
     if not _machine_event_source_is_ready(event_source_probe):
         raise PermissionError("Web Assignment machine event source is not ready")
     task_name = str(task_name or "").strip()
+    controller = str(controller_id or "").strip() or None
+    delegator = str(delegator_session_id or "").strip() or None
+    if controller is not None and delegator is not None:
+        raise PermissionError("collaboration.spawn_agent requires exactly one delegation owner")
+    owner_kind = "controller" if controller is not None else "session"
+    owner_id = controller or delegator
+    if owner_id is None:
+        raise PermissionError("collaboration.spawn_agent requires delegation owner")
     candidates = [
         record for record in _load_dispatch_state(repo_path).get("dispatches", {}).values()
         if isinstance(record, dict)
         and record.get("state") == "pending"
-        and record.get("controller_id") == controller_id
+        and record.get("delegation_owner_kind", "controller") == owner_kind
+        and record.get("delegation_owner_id", record.get("controller_id")) == owner_id
         and record.get("task_name") == task_name
     ]
     if len(candidates) != 1:
-        raise PermissionError("collaboration.spawn_agent requires exactly one prepared canonical Web Runtime dispatch ticket")
+        raise PermissionError("collaboration.spawn_agent requires exactly one prepared canonical Web Runtime dispatch ticket for this delegation owner")
     ticket = dict(candidates[0])
     assignment = ticket.get("assignment")
     if not isinstance(assignment, dict):
@@ -532,8 +555,8 @@ def require_prepared_web_dispatch(
 
 
 def _persist_observed_dispatch(
-    *, repo: Path, dispatch_id: str, controller_id: str, assignment_id: str,
-    observed: dict[str, Any], now: datetime,
+    *, repo: Path, dispatch_id: str, controller_id: str | None, assignment_id: str,
+    observed: dict[str, Any], now: datetime, delegator_session_id: str | None = None,
 ) -> dict[str, Any]:
     conversation_id = str(observed.get("conversation_id") or "").strip()
     observation_id = str(observed.get("observation_id") or "").strip()
@@ -544,7 +567,13 @@ def _persist_observed_dispatch(
         record = state.setdefault("dispatches", {}).get(dispatch_id)
         if not isinstance(record, dict) or record.get("state") not in {"pending", "observed"}:
             raise ValueError("Web dispatch ticket is not available for machine observation")
-        if record.get("controller_id") != controller_id or record.get("assignment_id") != assignment_id:
+        owner_kind = "controller" if controller_id else "session"
+        owner_id = controller_id or delegator_session_id
+        if (
+            record.get("delegation_owner_kind", "controller") != owner_kind
+            or record.get("delegation_owner_id", record.get("controller_id")) != owner_id
+            or record.get("assignment_id") != assignment_id
+        ):
             raise PermissionError("machine-observed Web dispatch does not match its Runtime ticket")
         if record.get("state") == "observed":
             if (
@@ -664,8 +693,9 @@ def _reverify_observed_dispatch_ticket(
 
 
 def _verify_persisted_replacement_session_proof(
-    *, repo: Path, controller_id: str, assignment_id: str,
+    *, repo: Path, controller_id: str | None, assignment_id: str,
     conversation_id: str, proof: dict[str, Any] | None,
+    delegator_session_id: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(proof, dict):
         raise ValueError("replacement execution session requires persisted machine-observed dispatch proof")
@@ -674,11 +704,14 @@ def _verify_persisted_replacement_session_proof(
     proof_source = str(proof.get("source") or "").strip()
     if proof_source not in {"collaboration_session_event", "chatgpt_host_event"} or not dispatch_id or not observation_id:
         raise ValueError("replacement execution session proof must identify a persisted machine-observed dispatch")
+    owner_kind = "controller" if controller_id else "session"
+    owner_id = controller_id or delegator_session_id
     ticket = _load_dispatch_state(repo).get("dispatches", {}).get(dispatch_id)
     if (
         not isinstance(ticket, dict)
         or ticket.get("state") != "observed"
-        or ticket.get("controller_id") != controller_id
+        or ticket.get("delegation_owner_kind", "controller") != owner_kind
+        or ticket.get("delegation_owner_id", ticket.get("controller_id")) != owner_id
         or ticket.get("assignment_id") != assignment_id
         or ticket.get("observation_source") != proof_source
         or str(ticket.get("conversation_id") or "") != conversation_id
@@ -721,8 +754,8 @@ def _structured_started_for_ticket(ticket: dict[str, Any], event_paths: list[str
 
 
 def bind_web_assignment_dispatch(
-    *, repo: str | Path, registry_path: str | Path, controller_id: str, dispatch_id: str,
-    event_paths: list[str | Path], now: datetime | None = None,
+    *, repo: str | Path, registry_path: str | Path, controller_id: str | None, dispatch_id: str,
+    event_paths: list[str | Path], delegator_session_id: str | None = None, now: datetime | None = None,
     watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
     health_probe: Callable[[], bool] | None = None,
     event_source_probe: Callable[[], bool] | None = None,
@@ -731,7 +764,16 @@ def bind_web_assignment_dispatch(
     repo_path = Path(repo).expanduser().resolve()
     registry = Path(registry_path).expanduser().resolve()
     now = now or datetime.now(UTC)
-    _registered_controller(repo_path, registry, controller_id)
+    controller = str(controller_id or "").strip() or None
+    delegator = str(delegator_session_id or "").strip() or None
+    if controller is not None and delegator is not None:
+        raise ValueError("Web dispatch bind must have exactly one delegation owner")
+    if controller is None and delegator is None:
+        raise ValueError("Web dispatch bind requires Controller or session delegation owner")
+    if controller is not None:
+        _registered_controller(repo_path, registry, controller)
+    owner_kind = "controller" if controller is not None else "session"
+    owner_id = controller or delegator
     if not _health_supervisor_is_ready(health_probe, watchdog_launcher=watchdog_launcher):
         raise RuntimeError("Web Assignment health supervisor is not ready; binding fails closed")
     paths = _verified_machine_event_paths(event_paths)
@@ -740,8 +782,11 @@ def bind_web_assignment_dispatch(
     ticket = state.get("dispatches", {}).get(dispatch_id)
     if not isinstance(ticket, dict) or ticket.get("state") != "pending":
         raise ValueError("Web dispatch ticket is missing, consumed, or not pending")
-    if ticket.get("controller_id") != controller_id:
-        raise PermissionError("Web dispatch ticket belongs to a different logical Controller")
+    if (
+        ticket.get("delegation_owner_kind", "controller") != owner_kind
+        or ticket.get("delegation_owner_id", ticket.get("controller_id")) != owner_id
+    ):
+        raise PermissionError("Web dispatch ticket belongs to a different delegation owner")
     observed = _structured_started_for_ticket(ticket, paths)
     execution_started_at = _event_time(observed.get("timestamp"))
     if execution_started_at is None:
@@ -760,16 +805,17 @@ def bind_web_assignment_dispatch(
     if observed_agent_type != str(assignment.get("agent_type") or "").strip():
         raise PermissionError("machine-observed Web Agent type does not match the prepared Runtime Assignment")
     _persist_observed_dispatch(
-        repo=repo_path, dispatch_id=dispatch_id, controller_id=controller_id,
+        repo=repo_path, dispatch_id=dispatch_id, controller_id=controller,
         assignment_id=assignment_id, observed=observed, now=execution_started_at,
+        delegator_session_id=delegator,
     )
 
     existing = load_runtime_state(repo_path).get("leases", {}).get(assignment_id)
     if isinstance(existing, dict):
         result = recover_web_assignment(
-            repo=repo_path, registry_path=registry, controller_id=controller_id,
+            repo=repo_path, registry_path=registry, controller_id=controller,
             assignment_id=assignment_id, conversation_id=conversation_id,
-            now=execution_started_at,
+            delegator_session_id=delegator, now=execution_started_at,
             watchdog_launcher=watchdog_launcher,
             health_probe=health_probe,
             event_source_probe=event_source_probe,
@@ -782,8 +828,9 @@ def bind_web_assignment_dispatch(
         )
     else:
         result = _start_bound_web_assignment(
-            repo=repo_path, registry_path=registry, controller_id=controller_id,
+            repo=repo_path, registry_path=registry, controller_id=controller,
             conversation_id=conversation_id, assignment=assignment, dispatch_id=dispatch_id,
+            delegator_session_id=delegator,
             now=execution_started_at,
             watchdog_launcher=watchdog_launcher,
             health_probe=health_probe,
@@ -797,12 +844,16 @@ def bind_web_assignment_dispatch(
         call_id=str(observed.get("call_id") or "") or None,
         now=now,
     )
-    return {**result, "dispatch_id": dispatch_id, "conversation_id": conversation_id, "observation": observed}
+    return {
+        **result, "dispatch_id": dispatch_id, "conversation_id": conversation_id,
+        "delegation_owner_kind": owner_kind, "delegation_owner_id": owner_id,
+        "observation": observed,
+    }
 
 
 def _start_bound_web_assignment(
-    *, repo: str | Path, registry_path: str | Path, controller_id: str, conversation_id: str,
-    assignment: dict[str, Any], dispatch_id: str, now: datetime | None = None,
+    *, repo: str | Path, registry_path: str | Path, controller_id: str | None, conversation_id: str,
+    assignment: dict[str, Any], dispatch_id: str, delegator_session_id: str | None = None, now: datetime | None = None,
     watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
     health_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -810,7 +861,16 @@ def _start_bound_web_assignment(
     repo_path = Path(repo).expanduser().resolve()
     registry = Path(registry_path).expanduser().resolve()
     now = now or datetime.now(UTC)
-    _registered_controller(repo_path, registry, controller_id)
+    controller = str(controller_id or "").strip() or None
+    delegator = str(delegator_session_id or "").strip() or None
+    if controller is not None and delegator is not None:
+        raise ValueError("Web Assignment start must have exactly one delegation owner")
+    if controller is None and delegator is None:
+        raise ValueError("Web Assignment start requires Controller or session delegation owner")
+    if controller is not None:
+        _registered_controller(repo_path, registry, controller)
+    owner_kind = "controller" if controller is not None else "session"
+    owner_id = controller or delegator
     if not _health_supervisor_is_ready(health_probe, watchdog_launcher=watchdog_launcher):
         raise RuntimeError("Web Assignment health supervisor is not ready; active lease was not created")
     assignment_id = str(assignment.get("assignment_id") or "").strip()
@@ -844,9 +904,11 @@ def _start_bound_web_assignment(
         raise ValueError("Web execution Assignment requires assignment_id")
     lease_id = str(assignment.get("lease_id") or f"{assignment_id}:web:attempt:{attempt}")
     receipt = _dispatch_start_receipt(
-        repo=repo_path, controller_id=controller_id, conversation_id=conversation_id,
+        repo=repo_path, controller_id=owner_id, conversation_id=conversation_id,
         assignment=assignment, now=execution_started_at, attempt=attempt, lease_id=lease_id,
     )
+    receipt["delegation_owner_kind"] = owner_kind
+    receipt["delegation_owner_id"] = owner_id
     runtime = apply_runtime_receipt(repo_path, receipt, now=execution_started_at)
     lease = runtime["leases"][assignment_id]
     launcher = watchdog_launcher or _default_watchdog_launcher
@@ -856,7 +918,8 @@ def _start_bound_web_assignment(
     )
     return {
         "assignment_id": assignment_id, "attempt": attempt, "lease_id": lease_id,
-        "controller_id": controller_id, "runtime_state": evaluate_lease(lease, now=now)["state"],
+        "controller_id": controller, "delegation_owner_kind": owner_kind,
+        "delegation_owner_id": owner_id, "runtime_state": evaluate_lease(lease, now=now)["state"],
         "watchdog": watchdog,
     }
 
@@ -928,11 +991,14 @@ def watch_web_assignment_once(
             "reason": health["reason"], "progress_observed": False,
             "auto_recovery_eligible": False,
         }
-        result.update(_runtime_continuation_result(
-            repo=repo_path, registry_path=registry,
-            event_source=f"web_assignment_terminal:{assignment_id}:attempt:{expected_attempt}",
-            consumer=runtime_change_consumer,
-        ))
+        if lease.get("delegation_owner_kind") == "session":
+            result["delegation_parent_session_id"] = str(lease.get("delegation_owner_id") or "")
+        else:
+            result.update(_runtime_continuation_result(
+                repo=repo_path, registry_path=registry,
+                event_source=f"web_assignment_terminal:{assignment_id}:attempt:{expected_attempt}",
+                consumer=runtime_change_consumer,
+            ))
         return result
     observed = _git_progress_snapshot(lease["worktree"])
     state, changed = apply_observed_progress(
@@ -957,8 +1023,8 @@ def watch_web_assignment_once(
 
 
 def recover_web_assignment(
-    *, repo: str | Path, registry_path: str | Path, controller_id: str, assignment_id: str,
-    conversation_id: str, now: datetime | None = None,
+    *, repo: str | Path, registry_path: str | Path, controller_id: str | None, assignment_id: str,
+    conversation_id: str, delegator_session_id: str | None = None, now: datetime | None = None,
     watchdog_launcher: Callable[..., dict[str, Any]] | None = None,
     lease_id_factory: Callable[[str, int], str] | None = None,
     replacement_session_proof: dict[str, Any] | None = None,
@@ -969,7 +1035,16 @@ def recover_web_assignment(
     repo_path = Path(repo).expanduser().resolve()
     registry = Path(registry_path).expanduser().resolve()
     now = now or datetime.now(UTC)
-    _registered_controller(repo_path, registry, controller_id)
+    controller = str(controller_id or "").strip() or None
+    delegator = str(delegator_session_id or "").strip() or None
+    if controller is not None and delegator is not None:
+        raise ValueError("Web recovery must have exactly one delegation owner")
+    if controller is None and delegator is None:
+        raise ValueError("Web recovery requires Controller or session delegation owner")
+    if controller is not None:
+        _registered_controller(repo_path, registry, controller)
+    owner_kind = "controller" if controller is not None else "session"
+    owner_id = controller or delegator
     if not _health_supervisor_is_ready(health_probe, watchdog_launcher=watchdog_launcher):
         raise RuntimeError("Web Assignment health supervisor is not ready; recovery fails closed")
     if not _machine_event_source_is_ready(event_source_probe):
@@ -978,6 +1053,9 @@ def recover_web_assignment(
     current = state.get("leases", {}).get(assignment_id)
     if not isinstance(current, dict):
         raise ValueError("Web recovery requires a canonical Assignment lease")
+    if (str(current.get("delegation_owner_kind") or "controller") != owner_kind
+            or str(current.get("delegation_owner_id") or "") != str(owner_id)):
+        raise PermissionError("Web recovery delegation owner does not match the canonical Assignment lineage")
     conversation_id = str(conversation_id or "").strip()
     if not conversation_id or conversation_id == str(current.get("session_id") or ""):
         raise ValueError("replacement execution session must differ from the previous Assignment session")
@@ -990,8 +1068,8 @@ def recover_web_assignment(
             raise ValueError("recovery budget exhausted; strategy change requires a new execution lineage")
         raise ValueError(f"Web recovery is not allowed: {decision['reason']}")
     _verify_persisted_replacement_session_proof(
-        repo=repo_path, controller_id=controller_id, assignment_id=assignment_id,
-        conversation_id=conversation_id, proof=replacement_session_proof,
+        repo=repo_path, controller_id=controller, assignment_id=assignment_id,
+        conversation_id=conversation_id, proof=replacement_session_proof, delegator_session_id=delegator,
     )
     next_attempt = int(current.get("attempt", 1)) + 1
     factory = lease_id_factory or (lambda aid, attempt: f"{aid}:web:attempt:{attempt}:{uuid.uuid4().hex}")
@@ -1009,9 +1087,11 @@ def recover_web_assignment(
         "route": json.loads(json.dumps(current.get("route_contract"))) if isinstance(current.get("route_contract"), dict) else None,
     }
     receipt = _dispatch_start_receipt(
-        repo=repo_path, controller_id=controller_id, conversation_id=conversation_id,
+        repo=repo_path, controller_id=owner_id, conversation_id=conversation_id,
         assignment=assignment, now=now, attempt=next_attempt, lease_id=new_lease_id,
     )
+    receipt["delegation_owner_kind"] = owner_kind
+    receipt["delegation_owner_id"] = owner_id
     runtime = apply_runtime_receipt(repo_path, receipt, now=now)
     lease = runtime["leases"][assignment_id]
     launcher = watchdog_launcher or _default_watchdog_launcher
@@ -1021,7 +1101,8 @@ def recover_web_assignment(
     )
     return {
         "assignment_id": assignment_id, "attempt": next_attempt, "lease_id": new_lease_id,
-        "controller_id": controller_id, "runtime_state": evaluate_lease(lease, now=now)["state"],
+        "controller_id": controller, "delegation_owner_kind": owner_kind,
+        "delegation_owner_id": owner_id, "runtime_state": evaluate_lease(lease, now=now)["state"],
         "watchdog": watchdog,
     }
 
@@ -1088,6 +1169,8 @@ def _external_terminal_receipt(
         "provider": lease["provider"],
         "model": lease.get("model"),
         "agent_type": lease.get("agent_type"),
+        "delegation_owner_kind": lease.get("delegation_owner_kind"),
+        "delegation_owner_id": lease.get("delegation_owner_id"),
         "session_id": lease["session_id"],
         "attempt": int(lease["attempt"]),
         "lease_id": lease["lease_id"],

@@ -1986,3 +1986,197 @@ class StructuredCollaborationTerminalTests(unittest.TestCase):
         self.assertEqual(lease["terminal_state"], "disconnected")
         self.assertEqual(lease["transport_outcome"], "failed")
         self.assertIn("terminal_receipt", result)
+
+class WebSessionDelegationAuthorityTests(WebAgentExecutionTests):
+    def test_non_controller_web_session_can_prepare_canonical_child_dispatch(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch
+        trusted = {
+            "ready": True,
+            "reason": "test_host_attested",
+            "event_paths": [str((Path(self.tmp.name) / "session-host-events.jsonl").resolve())],
+        }
+        with patch("scripts.web_agent_execution._machine_event_source_context", return_value=trusted):
+            prepared = prepare_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id=None,
+                delegator_session_id="ordinary-web-session-1",
+                task_name="ordinary-session-child",
+                assignment=self.assignment(assignment_id="A-SESSION", task_id="T-SESSION", lease_id="A-SESSION:web:attempt:1"),
+                now=T0,
+                health_probe=lambda: True,
+            )
+        self.assertEqual(prepared["delegation_owner_kind"], "session")
+        self.assertEqual(prepared["delegation_owner_id"], "ordinary-web-session-1")
+        self.assertIsNone(prepared.get("controller_id"))
+
+    def test_non_controller_session_can_bind_machine_observed_child_without_controller_identity(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch, bind_web_assignment_dispatch
+        event_path = Path(self.tmp.name) / "ordinary-session-bind.jsonl"
+        trusted = {"ready": True, "reason": "test_host_attested", "event_paths": [str(event_path.resolve())]}
+        with patch("scripts.web_agent_execution._machine_event_source_context", return_value=trusted):
+            prepared = prepare_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id=None,
+                delegator_session_id="ordinary-web-session-1", task_name="ordinary-bind",
+                assignment=self.assignment(), now=T0, health_probe=lambda: True,
+            )
+            event_path.write_text(chr(10).join([
+                json.dumps({"timestamp": T0.isoformat(), "type": "response_item", "payload": {
+                    "type": "function_call", "namespace": "collaboration", "name": "spawn_agent",
+                    "call_id": "spawn-ordinary", "arguments": json.dumps({"task_name": "ordinary-bind", "agent_type": "default", "model": "gpt-5.6-sol"})}}),
+                json.dumps({"timestamp": (T0 + timedelta(seconds=1)).isoformat(), "type": "event_msg", "payload": {
+                    "type": "item_completed", "item": {"type": "SubAgentActivity", "kind": "started",
+                    "id": "spawn-ordinary", "agent_thread_id": "ordinary-child-1", "agent_path": "/ordinary/child"}}})
+            ]) + chr(10), encoding="utf-8")
+            result = bind_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id=None,
+                delegator_session_id="ordinary-web-session-1", dispatch_id=prepared["dispatch_id"],
+                event_paths=[event_path], now=T0 + timedelta(seconds=1), health_probe=lambda: True,
+                watchdog_launcher=lambda **_: {"launched": False},
+            )
+        self.assertEqual(result["delegation_owner_kind"], "session")
+        self.assertEqual(result["delegation_owner_id"], "ordinary-web-session-1")
+        lease = load_runtime_state(self.repo)["leases"]["A-1"]
+        self.assertEqual(lease["delegation_owner_kind"], "session")
+        self.assertEqual(lease["delegation_owner_id"], "ordinary-web-session-1")
+
+    def test_session_delegation_spawn_requires_same_parent_session(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch, require_prepared_web_dispatch
+        trusted = {
+            "ready": True,
+            "reason": "test_host_attested",
+            "event_paths": [str((Path(self.tmp.name) / "session-host-events-2.jsonl").resolve())],
+        }
+        with patch("scripts.web_agent_execution._machine_event_source_context", return_value=trusted):
+            prepare_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id=None,
+                delegator_session_id="ordinary-web-session-1",
+                task_name="ordinary-session-child-2",
+                assignment=self.assignment(assignment_id="A-SESSION-2", task_id="T-SESSION-2", lease_id="A-SESSION-2:web:attempt:1"),
+                now=T0,
+                health_probe=lambda: True,
+            )
+        with patch("scripts.web_agent_execution._machine_event_source_context", return_value=trusted):
+            with self.assertRaisesRegex(PermissionError, "delegation owner"):
+                require_prepared_web_dispatch(
+                    repo=self.repo,
+                    controller_id=None,
+                    delegator_session_id="ordinary-web-session-2",
+                    task_name="ordinary-session-child-2",
+                    expected_model="gpt-5.6-sol",
+                    expected_agent_type="default",
+                    health_probe=lambda: True,
+                    event_source_probe=lambda: True,
+                )
+            allowed = require_prepared_web_dispatch(
+                repo=self.repo,
+                controller_id=None,
+                delegator_session_id="ordinary-web-session-1",
+                task_name="ordinary-session-child-2",
+                expected_model="gpt-5.6-sol",
+                expected_agent_type="default",
+                health_probe=lambda: True,
+                event_source_probe=lambda: True,
+            )
+        self.assertEqual(allowed["delegation_owner_id"], "ordinary-web-session-1")
+
+    def test_session_owned_terminal_returns_to_parent_without_controller_continuation(self):
+        from scripts.web_agent_execution import (
+            prepare_web_assignment_dispatch, bind_web_assignment_dispatch,
+            _ingest_verified_structured_subagent_terminal, watch_web_assignment_once,
+        )
+        event_path = Path(self.tmp.name) / "ordinary-session-terminal.jsonl"
+        trusted = {"ready": True, "reason": "test_host_attested", "event_paths": [str(event_path.resolve())]}
+        assignment = self.assignment()
+        with patch("scripts.web_agent_execution._machine_event_source_context", return_value=trusted):
+            prepared = prepare_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id=None,
+                delegator_session_id="ordinary-web-session-1", task_name="ordinary-terminal",
+                assignment=assignment, now=T0, health_probe=lambda: True,
+            )
+            started = {"timestamp": T0.isoformat(), "type": "response_item", "payload": {
+                "type": "function_call", "namespace": "collaboration", "name": "spawn_agent",
+                "call_id": "spawn-terminal", "arguments": json.dumps({"task_name": "ordinary-terminal", "agent_type": "default", "model": "gpt-5.6-sol"})}}
+            child_started = {"timestamp": (T0 + timedelta(seconds=1)).isoformat(), "type": "event_msg", "payload": {
+                "type": "item_completed", "item": {"type": "SubAgentActivity", "kind": "started",
+                "id": "spawn-terminal", "agent_thread_id": "ordinary-child-terminal", "agent_path": "/ordinary/terminal"}}}
+            event_path.write_text(json.dumps(started) + chr(10) + json.dumps(child_started) + chr(10), encoding="utf-8")
+            bound = bind_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id=None,
+                delegator_session_id="ordinary-web-session-1", dispatch_id=prepared["dispatch_id"],
+                event_paths=[event_path], now=T0 + timedelta(seconds=1), health_probe=lambda: True,
+                watchdog_launcher=lambda **_: {"launched": False},
+            )
+            terminal = {"timestamp": (T0 + timedelta(minutes=2)).isoformat(), "type": "event_msg", "payload": {
+                "type": "item_completed", "item": {"type": "SubAgentActivity", "kind": "completed",
+                "id": "terminal-ordinary", "agent_thread_id": "ordinary-child-terminal", "agent_path": "/ordinary/terminal"}}}
+            with event_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(terminal) + chr(10))
+            terminal_result = _ingest_verified_structured_subagent_terminal(
+                repo=self.repo, assignment_id="A-1", event_path=event_path,
+                observation_id="terminal-ordinary", now=T0 + timedelta(minutes=2),
+            )
+        receipt = json.loads(Path(terminal_result["terminal_receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["delegation_owner_kind"], "session")
+        self.assertEqual(receipt["delegation_owner_id"], "ordinary-web-session-1")
+        continuation_calls = []
+        watched = watch_web_assignment_once(
+            repo=self.repo, registry_path=self.registry, assignment_id="A-1",
+            expected_attempt=bound["attempt"], expected_lease_id=bound["lease_id"],
+            now=T0 + timedelta(minutes=3),
+            runtime_change_consumer=lambda **kwargs: continuation_calls.append(kwargs) or {"unexpected": True},
+        )
+        self.assertEqual(continuation_calls, [])
+        self.assertEqual(watched["delegation_parent_session_id"], "ordinary-web-session-1")
+        self.assertNotIn("runtime_continuation", watched)
+
+    def test_session_owned_recovery_keeps_same_delegation_lineage(self):
+        from scripts.web_agent_execution import prepare_web_assignment_dispatch, bind_web_assignment_dispatch
+        event_path = Path(self.tmp.name) / "ordinary-session-recovery.jsonl"
+        trusted = {"ready": True, "reason": "test_host_attested", "event_paths": [str(event_path.resolve())]}
+        assignment = self.assignment()
+
+        def write_started(task_name, call_id, child_id, at):
+            records = [
+                {"timestamp": at.isoformat(), "type": "response_item", "payload": {
+                    "type": "function_call", "namespace": "collaboration", "name": "spawn_agent",
+                    "call_id": call_id, "arguments": json.dumps({"task_name": task_name, "agent_type": "default", "model": "gpt-5.6-sol"})}},
+                {"timestamp": (at + timedelta(seconds=1)).isoformat(), "type": "event_msg", "payload": {
+                    "type": "item_completed", "item": {"type": "SubAgentActivity", "kind": "started",
+                    "id": call_id, "agent_thread_id": child_id, "agent_path": f"/ordinary/{child_id}"}}},
+            ]
+            event_path.write_text(chr(10).join(json.dumps(record) for record in records) + chr(10), encoding="utf-8")
+
+        with patch("scripts.web_agent_execution._machine_event_source_context", return_value=trusted):
+            first = prepare_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id=None,
+                delegator_session_id="ordinary-web-session-1", task_name="ordinary-recovery-1",
+                assignment=assignment, now=T0, health_probe=lambda: True,
+            )
+            write_started("ordinary-recovery-1", "spawn-recovery-1", "ordinary-child-r1", T0)
+            bind_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id=None,
+                delegator_session_id="ordinary-web-session-1", dispatch_id=first["dispatch_id"],
+                event_paths=[event_path], now=T0 + timedelta(seconds=1), health_probe=lambda: True,
+                watchdog_launcher=lambda **_: {"launched": False},
+            )
+            second_at = T0 + timedelta(minutes=46)
+            second = prepare_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id=None,
+                delegator_session_id="ordinary-web-session-1", task_name="ordinary-recovery-2",
+                assignment=assignment, now=second_at, health_probe=lambda: True,
+            )
+            write_started("ordinary-recovery-2", "spawn-recovery-2", "ordinary-child-r2", second_at)
+            recovered = bind_web_assignment_dispatch(
+                repo=self.repo, registry_path=self.registry, controller_id=None,
+                delegator_session_id="ordinary-web-session-1", dispatch_id=second["dispatch_id"],
+                event_paths=[event_path], now=second_at + timedelta(seconds=1), health_probe=lambda: True,
+                event_source_probe=lambda: True, watchdog_launcher=lambda **_: {"launched": False},
+            )
+        lease = load_runtime_state(self.repo)["leases"]["A-1"]
+        self.assertEqual(recovered["attempt"], 2)
+        self.assertEqual(lease["delegation_owner_kind"], "session")
+        self.assertEqual(lease["delegation_owner_id"], "ordinary-web-session-1")
+        self.assertEqual(recovered["delegation_owner_id"], "ordinary-web-session-1")

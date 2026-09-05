@@ -311,6 +311,8 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "runtime_receipt_id": receipt.get("receipt_id"),
             "execution_transport": str(receipt.get("execution_transport") or "").strip() or None,
             "execution_role": str(receipt.get("execution_role") or "").strip() or None,
+            "delegation_owner_kind": str(receipt.get("delegation_owner_kind") or "").strip() or None,
+            "delegation_owner_id": str(receipt.get("delegation_owner_id") or "").strip() or None,
             "model": str(receipt.get("model") or "").strip() or None,
             "agent_type": str(receipt.get("agent_type") or "").strip() or None,
             "candidate_revision": str(receipt.get("candidate_revision") or "").strip() or None,
