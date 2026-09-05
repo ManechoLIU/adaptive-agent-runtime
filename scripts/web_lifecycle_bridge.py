@@ -1698,6 +1698,27 @@ def recover_incompatible_native_target(
     supervisor_token: str | None = None,
 ) -> dict[str, Any]:
     """Replace an unreadable desktop execution target, never the logical Controller."""
+    if (
+        supervisor_token is not None
+        and supervisor_state_path is not None
+        and supervisor_receipt_id is not None
+    ):
+        with _owned_supervisor_state(
+            supervisor_state_path,
+            receipt_id=supervisor_receipt_id,
+            supervisor_token=supervisor_token,
+        ) as owner:
+            if owner is None:
+                return {
+                    "operation": "native_target_recovery",
+                    "controller_id": session_id,
+                    "result": "DEFERRED",
+                    "state": "RESUME_SUPERSEDED",
+                    "pending_control_event": True,
+                    "returncode": 0,
+                    "failure_class": "supervisor_superseded",
+                    "recovered_from_execution_target_session_id": failed_target_session_id,
+                }
     try:
         ok, preflight_error, env = preflight_native_resume(
             session_id=session_id, repo=repo, registry=registry, codex=codex,

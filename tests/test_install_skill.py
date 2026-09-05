@@ -631,6 +631,10 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests.test_execute_native_resume_stale_supervisor_token_blocks_process_launch",
             RUNTIME_RELEASE_REGRESSION_TESTS,
         )
+        self.assertIn(
+            "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests.test_superseded_supervisor_cannot_start_native_recovery_bootstrap_after_resume",
+            RUNTIME_RELEASE_REGRESSION_TESTS,
+        )
 
     def test_runtime_release_regression_gate_runs_required_tests_from_immutable_revision(self):
         import subprocess
@@ -725,6 +729,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_web_reentry(self): self.assertTrue(True)\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume(self): self.assertTrue(True)\n"
+                "    def test_superseded_supervisor_cannot_start_native_recovery_bootstrap_after_resume(self): self.assertTrue(True)\n"
                 "    def test_superseded_supervisor_cannot_replace_native_target_after_recovery_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_superseded_supervisor_cannot_launch_recovery_resume_after_target_replacement(self): self.assertTrue(True)\n"
                 "    def test_same_receipt_live_supervisor_is_coalesced(self): self.assertTrue(True)\n"

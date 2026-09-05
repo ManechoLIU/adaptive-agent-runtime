@@ -2436,6 +2436,62 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
             self.assertEqual(final["supervisor_pid"], 2222)
             self.assertEqual(final["state"], "RESUME_PENDING")
 
+    def test_superseded_supervisor_cannot_start_native_recovery_bootstrap_after_resume(self) -> None:
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            old_token = "old-token"
+            state.write_text(json.dumps({
+                "receipt_id": "r1",
+                "supervisor_receipt_id": "r1",
+                "supervisor_token": old_token,
+                "supervisor_pid": 1111,
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            incompatible = {
+                "operation": "native_resume",
+                "result": "FAILED",
+                "state": "RESUME_TARGET_INCOMPATIBLE",
+                "pending_control_event": True,
+                "returncode": 78,
+                "stderr_tail": "bad target",
+                "replacement_eligible": True,
+                "execution_target_session_id": "desktop-bad",
+                "target_generation": 1,
+            }
+
+            def resume_then_supersede(**_kwargs):
+                current = json.loads(state.read_text())
+                current["supervisor_token"] = "new-token"
+                current["supervisor_pid"] = 2222
+                state.write_text(json.dumps(current), encoding="utf-8")
+                return incompatible
+
+            bootstrap = Mock(side_effect=AssertionError(
+                "superseded supervisor must not start native recovery bootstrap"
+            ))
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value={
+                "pending_control_event": True,
+                "requires_user": False,
+                "controller_host": "desktop_codex",
+                "wake_generation": 1,
+            }), patch.object(
+                web_bridge, "execute_native_resume", side_effect=resume_then_supersede
+            ), patch.object(
+                web_bridge, "preflight_native_resume", return_value=(True, "", {})
+            ), patch.object(web_bridge.subprocess, "run", bootstrap):
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state, supervisor_token=old_token,
+                )
+
+            self.assertEqual(code, 0)
+            bootstrap.assert_not_called()
+            final = json.loads(state.read_text())
+            self.assertEqual(final["supervisor_token"], "new-token")
+            self.assertEqual(final["supervisor_pid"], 2222)
+
     def test_superseded_supervisor_cannot_replace_native_target_after_recovery_bootstrap(self) -> None:
         import threading
         from unittest.mock import Mock, patch
