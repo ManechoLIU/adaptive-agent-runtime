@@ -148,6 +148,31 @@ class ProjectContextGuardTests(unittest.TestCase):
         self.assertIn("safe_control_actions_allowed=true", context)
         self.assertIn("missing_identity_v99", context)
 
+    def test_contract_drift_does_not_upgrade_foreign_unverified_session_to_degraded(self):
+        module = self.hook()
+        registry = Path(self.tmp.name) / "controllers.json"
+        registry.write_text(json.dumps({
+            "controller-1": str(self.repo.resolve()),
+            "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+        }), encoding="utf-8")
+        (self.repo / "AGENTS.md").write_text(
+            "# Project Rules\n\nadaptive_agent_runtime_required_capabilities: missing_identity_v99\n",
+            encoding="utf-8",
+        )
+
+        receipt = module.initialize_project_context(
+            self.repo, skill_root=self.skill, controller_registry_path=registry,
+            controller_host="web", source_session_id="web-foreign",
+        )
+
+        self.assertEqual(receipt["runtime_contract_state"], "RUNTIME_CONTRACT_DRIFT")
+        self.assertEqual(receipt["session_binding_state"]["verification"], "UNVERIFIED")
+        self.assertEqual(receipt["session_binding_state"]["reason"], "SESSION_NOT_BOUND_TO_PROJECT_CONTROLLER")
+        self.assertEqual(receipt["identity_state"], "UNVERIFIED")
+        self.assertFalse(receipt["safe_control_actions_allowed"])
+        self.assertFalse(receipt["controller_actions_allowed"])
+        self.assertFalse(receipt["create_new_controller_allowed"])
+
     def test_legacy_missing_web_controller_identity_cli_is_reported_as_contract_drift(self):
         module = self.hook()
         registry = Path(self.tmp.name) / "controllers.json"

@@ -685,6 +685,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n"
                 "    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self): self.assertTrue(True)\n"
                 "    def test_missing_required_identity_capability_reports_contract_drift_without_revoking_controller(self): self.assertTrue(True)\n"
+                "    def test_contract_drift_does_not_upgrade_foreign_unverified_session_to_degraded(self): self.assertTrue(True)\n"
                 "    def test_project_context_separates_unique_controller_from_unverified_web_session(self): self.assertTrue(True)\n"
                 "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n",
                 encoding="utf-8",

@@ -216,6 +216,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_missing_required_identity_capability_reports_contract_drift_without_revoking_controller",
     "tests.test_project_context_guard.ProjectContextGuardTests."
+    "test_contract_drift_does_not_upgrade_foreign_unverified_session_to_degraded",
+    "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_project_context_separates_unique_controller_from_unverified_web_session",
     "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_project_context_reports_verified_bound_web_session_without_changing_ownership",

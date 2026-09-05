@@ -396,10 +396,19 @@ def initialize_project_context(
         and project_state.get("project_controller") == "EXISTING"
         and project_state.get("uniqueness") == "UNIQUE"
     )
+    binding_state = controller_identity.get("session_binding_state", {})
+    binding_reason = (
+        str(binding_state.get("reason") or "").strip()
+        if isinstance(binding_state, dict)
+        else ""
+    )
     if (
         runtime_contract["state"] == "RUNTIME_CONTRACT_DRIFT"
         and unique_existing_controller
-        and identity_state != "CONFLICTED"
+        and (
+            identity_state in {"VERIFIED", "DEGRADED"}
+            or binding_reason in {"HOST_SESSION_ID_UNAVAILABLE", "HOST_IDENTITY_UNAVAILABLE"}
+        )
     ):
         identity_state = "DEGRADED"
     controller_actions_allowed = bool(controller_identity["controller_actions_allowed"])
