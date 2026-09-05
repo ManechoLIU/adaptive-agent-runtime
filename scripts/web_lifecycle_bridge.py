@@ -414,6 +414,20 @@ def recover_same_controller_web_session(
             target_guard.require_no_active_outbound_lease(
                 registry, controller_id=controller_id, host="web"
             )
+            current_record = target_guard.target_record(
+                registry, controller_id=controller_id, host="web"
+            )
+            if current_record is None:
+                current_generation = 0
+            else:
+                _current_status, _current_target, current_generation = (
+                    target_guard.validate_target_record(current_record, host="web")
+                )
+            if current_generation != prior_generation:
+                raise PermissionError(
+                    "Web Controller target generation changed after identity attestation; "
+                    "stale generation cannot recover the session"
+                )
             owners = target_guard._session_owners(
                 registry, session_id=web_session_id, host="web"
             )

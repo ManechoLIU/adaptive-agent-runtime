@@ -431,6 +431,57 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "controller-1",
             )
 
+    def test_same_controller_web_recovery_rejects_attestation_if_target_generation_changes_before_lock(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-old", "web-concurrent"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "web": {
+                            "status": "active",
+                            "session_id": "web-old",
+                            "generation": 3,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+
+            def verifier(**kwargs: object) -> bool:
+                self.assertEqual(kwargs.get("expected_target_generation"), 3)
+                concurrent = json.loads(registry.read_text(encoding="utf-8"))
+                concurrent["__controller_targets__"]["controller-1"]["web"] = {
+                    "status": "active",
+                    "session_id": "web-concurrent",
+                    "generation": 4,
+                }
+                registry.write_text(json.dumps(concurrent), encoding="utf-8")
+                return True
+
+            with patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+            ):
+                with self.assertRaisesRegex(PermissionError, "generation.*changed|stale.*generation"):
+                    web_bridge.recover_same_controller_web_session(
+                        repo=repo, web_session_id="web-new", registry_path=registry,
+                        host_identity_receipt={"attested": True},
+                    )
+
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"],
+                {"status": "active", "session_id": "web-concurrent", "generation": 4},
+            )
+            self.assertNotIn("web-new", saved["__controller_sessions__"]["controller-1"]["web"])
+
     def test_same_controller_web_recovery_without_host_verifier_preserves_existing_controller_and_state(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:

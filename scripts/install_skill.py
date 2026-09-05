@@ -228,6 +228,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_same_controller_web_recovery_verifier_exception_degrades_without_revoking_controller",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_same_controller_web_recovery_rejects_attestation_if_target_generation_changes_before_lock",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_web_recovery_preserves_desktop_target_and_only_advances_web_generation",

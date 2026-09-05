@@ -707,6 +707,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_verifier_exception_degrades_without_revoking_controller(self): self.assertTrue(True)\n"
+                "    def test_same_controller_web_recovery_rejects_attestation_if_target_generation_changes_before_lock(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership(self): self.assertTrue(True)\n"
                 "    def test_web_recovery_preserves_desktop_target_and_only_advances_web_generation(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
