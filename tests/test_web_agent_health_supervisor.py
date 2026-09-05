@@ -48,6 +48,29 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
         )
         self._machine_source_patcher.start()
         self.addCleanup(self._machine_source_patcher.stop)
+        self._watchdog_launcher_patcher = patch(
+            "scripts.web_agent_execution._default_watchdog_launcher",
+            return_value={"launched": True, "pid": 4242, "log_path": "/tmp/test-watchdog.log"},
+        )
+        self._watchdog_launcher_patcher.start()
+        self.addCleanup(self._watchdog_launcher_patcher.stop)
+        self._runtime_continuation_patcher = patch(
+            "scripts.terminal_continuation.notify_runtime_change",
+            return_value={
+                "controller_id": "controller-1",
+                "pending_control_event": True,
+                "wake_result": {"result": "DEFERRED"},
+                "supervisor_armed": True,
+            },
+        )
+        self._runtime_continuation_patcher.start()
+        self.addCleanup(self._runtime_continuation_patcher.stop)
+        self._continuation_supervisor_patcher = patch(
+            "scripts.web_lifecycle_bridge.ensure_continuation_supervisor",
+            return_value=False,
+        )
+        self._continuation_supervisor_patcher.start()
+        self.addCleanup(self._continuation_supervisor_patcher.stop)
 
     def tearDown(self):
         self.tmp.cleanup()

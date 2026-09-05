@@ -70,6 +70,12 @@ class WebCollaborationContinuationRegressionTests(unittest.TestCase):
         )
         self._machine_source_patcher.start()
         self.addCleanup(self._machine_source_patcher.stop)
+        self._watchdog_launcher_patcher = patch(
+            "scripts.web_agent_execution._default_watchdog_launcher",
+            return_value={"launched": True, "pid": 4242, "log_path": "/tmp/test-watchdog.log"},
+        )
+        self._watchdog_launcher_patcher.start()
+        self.addCleanup(self._watchdog_launcher_patcher.stop)
         self._continuation_supervisor_patcher = patch(
             "scripts.web_lifecycle_bridge.ensure_continuation_supervisor",
             return_value=False,

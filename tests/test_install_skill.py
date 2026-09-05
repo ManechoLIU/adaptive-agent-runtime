@@ -390,7 +390,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
             "web_agent_health_supervisor.py", "web_agent_events.py", "route_contract.py", "reviewer_supervisor.py",
             "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "assignment_lease_guard.py",
-            "controller_scoring_guard.py", "project_context_guard.py", "evaluation_transaction.py",
+            "controller_scoring_guard.py", "project_context_guard.py", "rule_handshake.py", "evaluation_transaction.py",
         ):
             script = source / "scripts" / name
             if name == "controller_target_guard.py":
@@ -715,6 +715,17 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
+            (tests_dir / "test_rule_handshake.py").write_text(
+                "import unittest\n"
+                "class RuleHandshakeTests(unittest.TestCase):\n"
+                "    def test_critical_live_runtime_update_requires_real_e2e_after_ack_and_ledger_sync(self): self.assertTrue(True)\n"
+                "    def test_forged_live_e2e_acceptance_without_machine_evidence_stays_blocking(self): self.assertTrue(True)\n"
+                "    def test_real_confirmed_wake_followed_by_closed_cycle_can_finalize_live_e2e(self): self.assertTrue(True)\n"
+                "    def test_failed_live_e2e_does_not_freeze_invalid_wake_snapshot(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_debt_survives_later_nonimpacting_install_until_accepted(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_controller_target_guard.py").write_text(
                 "import unittest\n"
                 "class ControllerTargetGuardTests(unittest.TestCase):\n"
@@ -747,6 +758,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_stale_supervisor_token_exits_without_running_impl(self): self.assertTrue(True)\n"
                 "    def test_stale_supervisor_cannot_native_wake_after_supersession(self): self.assertTrue(True)\n"
                 "    def test_execute_native_resume_stale_supervisor_token_blocks_process_launch(self): self.assertTrue(True)\n"
+                "class WebHostNativeWakeIsolationTests(unittest.TestCase):\n"
+                "    def test_stale_web_host_with_only_desktop_current_target_resumes_same_controller_desktop(self): self.assertTrue(True)\n"
                 "class WebContinuationSupervisorBootstrapTests(unittest.TestCase):\n"
                 "    def test_dead_or_untracked_active_supervisor_requires_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n",
@@ -783,6 +796,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_runnable_hard_defer_requires_machine_evidence_and_checkpoint(self): self.assertTrue(True)\n"
                 "    def test_local_hard_defer_still_fills_other_nonconflicting_capacity(self): self.assertTrue(True)\n"
                 "    def test_identity_degraded_cannot_authorize_stop_while_project_runnable_exists(self): self.assertTrue(True)\n"
+                "    def test_pending_live_e2e_allows_safe_control_cycle_but_no_new_assignment(self): self.assertTrue(True)\n"
                 "    def test_project_wide_projection_web_active_verify_do_not_starve_mini_runnables(self): self.assertTrue(True)\n"
                 "    def test_project_wide_projection_mini_active_does_not_starve_server_or_web(self): self.assertTrue(True)\n"
                 "    def test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists(self): self.assertTrue(True)\n"
@@ -927,6 +941,17 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self): self.assertTrue(True)\n"
                 "    def test_project_context_separates_unique_controller_from_unverified_web_session(self): self.assertTrue(True)\n"
                 "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_rule_handshake.py").write_text(
+                "import unittest\n"
+                "class RuleHandshakeTests(unittest.TestCase):\n"
+                "    def test_critical_live_runtime_update_requires_real_e2e_after_ack_and_ledger_sync(self): self.assertTrue(True)\n"
+                "    def test_forged_live_e2e_acceptance_without_machine_evidence_stays_blocking(self): self.assertTrue(True)\n"
+                "    def test_real_confirmed_wake_followed_by_closed_cycle_can_finalize_live_e2e(self): self.assertTrue(True)\n"
+                "    def test_failed_live_e2e_does_not_freeze_invalid_wake_snapshot(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_debt_survives_later_nonimpacting_install_until_accepted(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_controller_target_guard.py").write_text(

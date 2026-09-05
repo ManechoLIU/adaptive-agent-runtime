@@ -6,9 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from scripts.install_skill import install_skill
+import scripts.rule_handshake as rule_handshake_module
 from scripts.rule_handshake import (
     acknowledge_rule_revision,
     evaluate_rule_handshake,
+    live_e2e_acceptance_path,
     rule_state_path,
 )
 
@@ -133,6 +135,339 @@ class RuleHandshakeTests(unittest.TestCase):
             self.assertFalse(current["blocking"])
             current_from_wt = evaluate_rule_handshake(wt, ledger=ledger, skill_root=target, registry_path=registry)
             self.assertEqual(current_from_wt["loaded_revision"], revision)
+
+    def test_critical_live_runtime_update_requires_real_e2e_after_ack_and_ledger_sync(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, previous_revision = make_source(base)
+            bridge = source / "scripts" / "web_lifecycle_bridge.py"
+            bridge.write_text("VALUE = 2\n", encoding="utf-8")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "change live continuation")
+            revision = git(source, "rev-parse", "HEAD")
+            target = base / "installed"
+            install_skill(
+                source, target, summary="live continuation", impact="live_assignments",
+                stop_condition="real continuation e2e", previous_revision=previous_revision, now=NOW,
+            )
+            repo = make_project(base)
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            acknowledge_rule_revision(
+                repo, "controller-1", revision, skill_root=target, registry_path=registry, now=NOW
+            )
+            ledger = repo / "TASK_LEDGER.md"
+            ledger.write_text(
+                ledger.read_text(encoding="utf-8").replace(
+                    "adaptive-delivery@old", f"adaptive-delivery@{revision}"
+                ),
+                encoding="utf-8",
+            )
+
+            status = evaluate_rule_handshake(
+                repo, skill_root=target, registry_path=registry
+            )
+
+            self.assertEqual(status["state"], "pending_live_e2e")
+            self.assertTrue(status["blocking"])
+            self.assertIn("scripts/web_lifecycle_bridge.py", status["live_e2e_changed_files"])
+
+    def test_forged_live_e2e_acceptance_without_machine_evidence_stays_blocking(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, previous_revision = make_source(base)
+            bridge = source / "scripts" / "web_lifecycle_bridge.py"
+            bridge.write_text("VALUE = 2\n", encoding="utf-8")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "change live continuation")
+            revision = git(source, "rev-parse", "HEAD")
+            target = base / "installed"
+            install_skill(
+                source, target, summary="live continuation", impact="live_assignments",
+                stop_condition="real continuation e2e", previous_revision=previous_revision, now=NOW,
+            )
+            repo = make_project(base)
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            acknowledge_rule_revision(
+                repo, "controller-1", revision, skill_root=target, registry_path=registry, now=NOW
+            )
+            ledger = repo / "TASK_LEDGER.md"
+            ledger.write_text(
+                ledger.read_text(encoding="utf-8").replace(
+                    "adaptive-delivery@old", f"adaptive-delivery@{revision}"
+                ), encoding="utf-8"
+            )
+            acceptance = live_e2e_acceptance_path(repo)
+            acceptance.parent.mkdir(parents=True, exist_ok=True)
+            acceptance.write_text(json.dumps({
+                "status": "accepted",
+                "installed_revision": revision,
+                "controller_session_id": "controller-1",
+            }), encoding="utf-8")
+
+            status = evaluate_rule_handshake(repo, skill_root=target, registry_path=registry)
+
+            self.assertEqual(status["state"], "pending_live_e2e")
+            self.assertTrue(status["blocking"])
+
+    def test_real_confirmed_wake_followed_by_closed_cycle_can_finalize_live_e2e(self):
+        self.assertTrue(
+            hasattr(rule_handshake_module, "accept_live_e2e"),
+            "rule handshake must expose a machine live-E2E finalizer",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, previous_revision = make_source(base)
+            bridge = source / "scripts" / "web_lifecycle_bridge.py"
+            bridge.write_text("VALUE = 2\n", encoding="utf-8")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "change live continuation")
+            revision = git(source, "rev-parse", "HEAD")
+            target = base / "installed"
+            install_skill(
+                source, target, summary="live continuation", impact="live_assignments",
+                stop_condition="real continuation e2e", previous_revision=previous_revision, now=NOW,
+            )
+            repo = make_project(base)
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-current"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-current",
+                            "generation": 2,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+            acknowledge_rule_revision(
+                repo, "controller-1", revision, skill_root=target, registry_path=registry, now=NOW
+            )
+            ledger = repo / "TASK_LEDGER.md"
+            ledger.write_text(
+                ledger.read_text(encoding="utf-8").replace(
+                    "adaptive-delivery@old", f"adaptive-delivery@{revision}"
+                ), encoding="utf-8"
+            )
+            state_dir = rule_state_path(repo).parent
+            wake = state_dir / "controller-wake-receipt.json"
+            wake.write_text(json.dumps({
+                "controller_id": "controller-1",
+                "selected_host": "desktop_codex",
+                "result": "CONFIRMED",
+                "execution_target_session_id": "desktop-current",
+                "target_generation": 2,
+                "completed_at_unix_ms": int(NOW.timestamp() * 1000) + 1000,
+            }), encoding="utf-8")
+            cycle_dir = state_dir / "controller-cycle-evidence"
+            cycle_dir.mkdir(parents=True, exist_ok=True)
+            cycle = cycle_dir / "closed.json"
+            cycle.write_text(json.dumps({
+                "record_kind": "controller_cycle_evidence",
+                "controller_id": "controller-1",
+                "terminal_status": "CLOSED",
+                "validation_errors": [],
+                "recorded_at": "2026-08-30T01:00:02+00:00",
+            }), encoding="utf-8")
+
+            receipt = rule_handshake_module.accept_live_e2e(
+                repo,
+                "controller-1",
+                revision,
+                skill_root=target,
+                registry_path=registry,
+                now=datetime(2026, 8, 30, 1, 0, 3, tzinfo=UTC),
+            )
+            self.assertEqual(receipt["status"], "accepted")
+            current = evaluate_rule_handshake(
+                repo, skill_root=target, registry_path=registry
+            )
+            self.assertEqual(current["state"], "current")
+            self.assertFalse(current["blocking"])
+
+            registry_value = json.loads(registry.read_text(encoding="utf-8"))
+            registry_value["__controller_sessions__"]["controller-1"]["desktop_codex"].append("desktop-next")
+            registry_value["__controller_targets__"]["controller-1"]["desktop_codex"] = {
+                "status": "active",
+                "session_id": "desktop-next",
+                "generation": 3,
+            }
+            registry.write_text(json.dumps(registry_value), encoding="utf-8")
+            after_legitimate_target_rotation = evaluate_rule_handshake(
+                repo, skill_root=target, registry_path=registry
+            )
+            self.assertEqual(after_legitimate_target_rotation["state"], "current")
+            self.assertFalse(after_legitimate_target_rotation["blocking"])
+
+    def test_failed_live_e2e_does_not_freeze_invalid_wake_snapshot(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, previous_revision = make_source(base)
+            bridge = source / "scripts" / "web_lifecycle_bridge.py"
+            bridge.write_text("VALUE = 2\n", encoding="utf-8")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "change live continuation")
+            revision = git(source, "rev-parse", "HEAD")
+            target = base / "installed"
+            install_skill(
+                source, target, summary="live continuation", impact="live_assignments",
+                stop_condition="real continuation e2e", previous_revision=previous_revision, now=NOW,
+            )
+            repo = make_project(base)
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-current"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-current",
+                            "generation": 2,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+            acknowledge_rule_revision(
+                repo, "controller-1", revision, skill_root=target, registry_path=registry, now=NOW
+            )
+            ledger = repo / "TASK_LEDGER.md"
+            ledger.write_text(ledger.read_text(encoding="utf-8").replace(
+                "adaptive-delivery@old", f"adaptive-delivery@{revision}"
+            ), encoding="utf-8")
+            state_dir = rule_state_path(repo).parent
+            (state_dir / "controller-wake-receipt.json").write_text(json.dumps({
+                "controller_id": "controller-1",
+                "selected_host": "desktop_codex",
+                "result": "DEFERRED",
+                "execution_target_session_id": "desktop-current",
+                "target_generation": 2,
+                "completed_at_unix_ms": int(NOW.timestamp() * 1000) + 1000,
+            }), encoding="utf-8")
+            cycle_dir = state_dir / "controller-cycle-evidence"
+            cycle_dir.mkdir(parents=True, exist_ok=True)
+            (cycle_dir / "closed.json").write_text(json.dumps({
+                "record_kind": "controller_cycle_evidence",
+                "controller_id": "controller-1",
+                "terminal_status": "CLOSED",
+                "validation_errors": [],
+                "recorded_at": "2026-08-30T01:00:02+00:00",
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "wake evidence is not confirmed"):
+                rule_handshake_module.accept_live_e2e(
+                    repo, "controller-1", revision, skill_root=target, registry_path=registry, now=NOW
+                )
+
+            frozen = state_dir / "runtime-live-e2e-evidence" / f"{revision}.wake.json"
+            self.assertFalse(frozen.exists())
+
+    def test_live_e2e_debt_survives_later_nonimpacting_install_until_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, revision1 = make_source(base)
+            target = base / "installed"
+            repo = make_project(base, revision_text=revision1)
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            install_skill(source, target, summary="baseline", impact="none", stop_condition="none", now=NOW)
+            acknowledge_rule_revision(repo, "controller-1", revision1, skill_root=target, registry_path=registry, now=NOW)
+
+            critical = source / "scripts" / "web_lifecycle_bridge.py"
+            critical.write_text("VALUE = 2\n", encoding="utf-8")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "critical continuation change")
+            revision2 = git(source, "rev-parse", "HEAD")
+            install_skill(
+                source, target, summary="critical", impact="live_assignments",
+                stop_condition="real e2e", previous_revision=revision1, now=NOW,
+            )
+            acknowledge_rule_revision(repo, "controller-1", revision2, skill_root=target, registry_path=registry, now=NOW)
+            ledger = repo / "TASK_LEDGER.md"
+            ledger.write_text(ledger.read_text(encoding="utf-8").replace(
+                f"adaptive-delivery@{revision1}", f"adaptive-delivery@{revision2}"
+            ), encoding="utf-8")
+            self.assertEqual(
+                evaluate_rule_handshake(repo, skill_root=target, registry_path=registry)["state"],
+                "pending_live_e2e",
+            )
+
+            (source / "README.md").write_text("docs only\n", encoding="utf-8")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "docs only")
+            revision3 = git(source, "rev-parse", "HEAD")
+            install_skill(
+                source, target, summary="docs", impact="none", stop_condition="next turn",
+                previous_revision=revision2, now=NOW,
+            )
+            acknowledge_rule_revision(repo, "controller-1", revision3, skill_root=target, registry_path=registry, now=NOW)
+            ledger.write_text(ledger.read_text(encoding="utf-8").replace(
+                f"adaptive-delivery@{revision2}", f"adaptive-delivery@{revision3}"
+            ), encoding="utf-8")
+
+            status = evaluate_rule_handshake(repo, skill_root=target, registry_path=registry)
+            self.assertEqual(status["state"], "pending_live_e2e")
+            self.assertTrue(status["blocking"])
+            self.assertEqual(status["live_e2e_required_since_revision"], revision2)
+
+    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, previous_revision = make_source(base)
+            (source / "scripts" / "web_lifecycle_bridge.py").write_text("VALUE = 2\n", encoding="utf-8")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "critical continuation change")
+            revision = git(source, "rev-parse", "HEAD")
+            target = base / "installed"
+            install_skill(
+                source, target, summary="critical", impact="live_assignments",
+                stop_condition="real e2e", previous_revision=previous_revision, now=NOW,
+            )
+            repo = make_project(base)
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-current"]}},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 2
+                }}},
+            }), encoding="utf-8")
+            acknowledge_rule_revision(repo, "controller-1", revision, skill_root=target, registry_path=registry, now=NOW)
+            ledger = repo / "TASK_LEDGER.md"
+            ledger.write_text(ledger.read_text(encoding="utf-8").replace(
+                "adaptive-delivery@old", f"adaptive-delivery@{revision}"
+            ), encoding="utf-8")
+            state_dir = rule_state_path(repo).parent
+            (state_dir / "controller-wake-receipt.json").write_text(json.dumps({
+                "controller_id": "controller-1",
+                "selected_host": "desktop_codex",
+                "result": "CONFIRMED",
+                "execution_target_session_id": "desktop-current",
+                "target_generation": 2,
+                "completed_at_unix_ms": int(NOW.timestamp() * 1000) - 1000,
+            }), encoding="utf-8")
+            cycle_dir = state_dir / "controller-cycle-evidence"
+            cycle_dir.mkdir(parents=True, exist_ok=True)
+            (cycle_dir / "closed.json").write_text(json.dumps({
+                "record_kind": "controller_cycle_evidence",
+                "controller_id": "controller-1",
+                "terminal_status": "CLOSED",
+                "validation_errors": [],
+                "recorded_at": "2026-08-30T01:00:02+00:00",
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "wake.*rule ACK"):
+                rule_handshake_module.accept_live_e2e(
+                    repo, "controller-1", revision, skill_root=target, registry_path=registry, now=NOW
+                )
 
     def test_later_nonimpacting_install_cannot_clear_unacked_live_impact_debt(self):
         with tempfile.TemporaryDirectory() as d:

@@ -2451,16 +2451,60 @@ def resolve_controller_host(
     registry_data: dict[str, Any],
     session_id: str,
 ) -> str:
-    for value in (lifecycle_state.get("controller_host"), host_facts.get("controller_host")):
-        host = str(value or "").strip()
-        if host in {"web", "desktop_codex"}:
-            return host
     sessions = registry_data.get("__controller_sessions__", {}) if isinstance(registry_data, dict) else {}
     controller_sessions = sessions.get(session_id, {}) if isinstance(sessions, dict) else {}
     if not isinstance(controller_sessions, dict):
         controller_sessions = {}
+
+    targets = registry_data.get("__controller_targets__", {}) if isinstance(registry_data, dict) else {}
+    controller_targets = targets.get(session_id, {}) if isinstance(targets, dict) else {}
+    if not isinstance(controller_targets, dict):
+        controller_targets = {}
+
+    explicit_active_hosts: set[str] = set()
+    for host in ("web", "desktop_codex"):
+        record = controller_targets.get(host)
+        if not isinstance(record, dict):
+            continue
+        try:
+            status, target_session, _generation = target_guard.validate_target_record(record, host=host)
+        except (TypeError, ValueError):
+            continue
+        if status == "active" and target_session:
+            explicit_active_hosts.add(host)
+
+    preferred_host = None
+    for value in (lifecycle_state.get("controller_host"), host_facts.get("controller_host")):
+        host = str(value or "").strip()
+        if host in {"web", "desktop_codex"}:
+            preferred_host = host
+            break
+
+    if preferred_host is not None:
+        if preferred_host in explicit_active_hosts:
+            return preferred_host
+        aliases = controller_sessions.get(preferred_host)
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        bound_aliases = [
+            str(value).strip() for value in aliases or []
+            if isinstance(value, str) and str(value).strip()
+        ]
+        legacy_preferred_is_routable = (
+            preferred_host == "web" and len(bound_aliases) <= 1
+        ) or (
+            preferred_host == "desktop_codex" and not bound_aliases
+        )
+        if legacy_preferred_is_routable:
+            return preferred_host
+        if len(explicit_active_hosts) == 1:
+            return next(iter(explicit_active_hosts))
+        return preferred_host
+
     web_bound = isinstance(controller_sessions.get("web"), list) and any(str(x).strip() for x in controller_sessions.get("web", []))
     desktop_bound = isinstance(controller_sessions.get("desktop_codex"), list) and any(str(x).strip() for x in controller_sessions.get("desktop_codex", []))
+    if len(explicit_active_hosts) == 1:
+        return next(iter(explicit_active_hosts))
     if desktop_bound and not web_bound:
         return "desktop_codex"
     return "web"

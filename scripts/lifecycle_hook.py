@@ -769,6 +769,8 @@ def lifecycle_triggers(
             triggers.append(f"rule_update_pending:{revision}")
         elif rule_state == "ledger_stale":
             triggers.append(f"rule_ledger_stale:{revision}")
+        elif rule_state == "pending_live_e2e":
+            triggers.append(f"rule_live_e2e_pending:{revision}")
         elif rule_state == "integrity_error":
             triggers.append(f"rule_install_integrity_error:{revision}")
 
@@ -852,6 +854,15 @@ def continuation_reason(
         )
     elif state == "ledger_stale":
         rule_text = f" 已有 LOADED ACK {revision}，但台账规则版本仍旧；先把现有规则版本行同步到精确 revision {revision}。"
+    elif state == "pending_live_e2e":
+        repo_arg = f" --repo {root}" if root else " --repo <repo>"
+        session_arg = f" --controller-session {session_id}" if session_id else " --controller-session <controller-session>"
+        handshake_script = Path(__file__).resolve().parent / "rule_handshake.py"
+        rule_text = (
+            f" Runtime {revision} 已 ACK 且台账已同步，但真实续接 E2E 尚未闭合。"
+            "当前同一 Controller 只允许安全控制回合，不得启动新的 Assignment；完成真实 confirmed wake 后的 CLOSED control cycle，再执行 "
+            f'python3 "{handshake_script}" accept-live-e2e{repo_arg}{session_arg} --revision {revision}。'
+        )
     elif state == "integrity_error":
         errors = "; ".join(str(item) for item in handshake.get("errors", []))
         rule_text = f" Adaptive Agent Runtime 安装完整性失败：{errors}；禁止 ACK 或启动受影响 Assignment。"

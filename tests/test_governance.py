@@ -889,6 +889,30 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             [],
         )
 
+    def test_pending_live_e2e_allows_safe_control_cycle_but_no_new_assignment(self) -> None:
+        status = {
+            "state": "pending_live_e2e", "blocking": True, "impact": "live_assignments",
+            "installed_revision": "rev-new", "changed_files": ["scripts/web_lifecycle_bridge.py"],
+        }
+        self.assertEqual(
+            lifecycle_hook.derive_rule_wake_policy(status, assignment_liveness={}),
+            "after_event",
+        )
+        self.assertEqual(
+            control_event_guard.canonical_rule_handshake_errors(
+                Path("."), Path("TASK_LEDGER.md"),
+                snapshot={"assignment_liveness": {}, "new_assignments": []},
+                handshake_evaluator=lambda *_args, **_kwargs: status,
+            ),
+            [],
+        )
+        errors = control_event_guard.canonical_rule_handshake_errors(
+            Path("."), Path("TASK_LEDGER.md"),
+            snapshot={"assignment_liveness": {}, "new_assignments": [{"task_id": "T2"}]},
+            handshake_evaluator=lambda *_args, **_kwargs: status,
+        )
+        self.assertIn("rule handshake pending_live_e2e for installed revision rev-new", errors)
+
     def test_immediate_rule_update_still_blocks_current_control_receipt(self) -> None:
         status = {
             "state": "pending_ack", "blocking": True, "impact": "live_assignments",

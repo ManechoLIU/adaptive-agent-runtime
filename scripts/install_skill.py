@@ -61,6 +61,20 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_stale_supervisor_cannot_native_wake_after_supersession",
     "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
     "test_execute_native_resume_stale_supervisor_token_blocks_process_launch",
+    "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
+    "test_stale_web_host_with_only_desktop_current_target_resumes_same_controller_desktop",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_critical_live_runtime_update_requires_real_e2e_after_ack_and_ledger_sync",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_forged_live_e2e_acceptance_without_machine_evidence_stays_blocking",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_real_confirmed_wake_followed_by_closed_cycle_can_finalize_live_e2e",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_failed_live_e2e_does_not_freeze_invalid_wake_snapshot",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_live_e2e_debt_survives_later_nonimpacting_install_until_accepted",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_dead_or_untracked_active_supervisor_requires_bootstrap",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
@@ -85,6 +99,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_local_hard_defer_still_fills_other_nonconflicting_capacity",
     "tests.test_governance.GovernanceTests."
     "test_identity_degraded_cannot_authorize_stop_while_project_runnable_exists",
+    "tests.test_governance.GovernanceTests."
+    "test_pending_live_e2e_allows_safe_control_cycle_but_no_new_assignment",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_canonical_runnable_reopens_continuation_without_user_message",
     "tests.test_governance.GovernanceTests."
@@ -282,6 +298,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_scoring_guard.py",
     "scripts/controller_scoring_hook.py",
     "scripts/project_context_guard.py",
+    "scripts/rule_handshake.py",
     "scripts/evaluation_transaction.py",
     "scripts/route_contract.py",
     "scripts/reviewer_supervisor.py",
@@ -295,6 +312,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_desktop_lifecycle_adapter.py",
     "tests/test_controller_scoring_hook.py",
     "tests/test_project_context_guard.py",
+    "tests/test_rule_handshake.py",
     "tests/test_controller_target_guard.py",
     "tests/test_web_lifecycle_bridge.py",
     "tests/test_web_agent_events.py",

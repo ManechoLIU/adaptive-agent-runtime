@@ -18,7 +18,7 @@ Skill 选择证据层级，不替项目重造测试框架、CI/CD 或发布平�
 验证证据必须绑定到候选内容，而不是绑定到“刚刚运行过”的印象。每份可复用收据至少包含：检查 ID、候选内容快照、命令摘要、结果、依赖的环境输入和失效条件。
 
 1. 修改期间运行能推动当前修复的定向检查，并按需要及时暴露回归；完成前审查实际 diff 并解决已知问题。
-2. Runtime 正式升级不得从与当前安装 revision 分叉的 Git 历史直接安装；安装器必须验证 installed revision 是 candidate 的祖先。完整 Web Runtime 还要对 exact candidate revision 执行固定的 same-controller continuation 回归门，缺文件或失败都阻断发布。
+2. Runtime 正式升级不得从与当前安装 revision 分叉的 Git 历史直接安装；安装器必须验证 installed revision 是 candidate 的祖先。完整 Web Runtime 还要对 exact candidate revision 执行固定的 same-controller continuation 回归门，缺文件或失败都阻断发布。若 `impact=live_assignments` 且变更触及 lifecycle / target / wake / continuation / identity 等关键控制链，安装落盘、静态回归、Controller ACK 和台账同步都只能到达 `pending_live_e2e`：必须在真实项目中取得指向 canonical current target 的 `CONFIRMED` wake，并由同一 Controller 在其后产生无 validation error 的 `CLOSED controller_cycle_evidence`，再由 `rule_handshake.py accept-live-e2e` 冻结证据并转为 `current`。`pending_live_e2e` 期间只允许 `new_assignments=[]` 的安全控制回合用于完成验收，新的 Assignment launch 继续 fail closed；不得把“已安装”描述成“已上线验收”。
 3. 完成宣称前冻结候选快照，取得一组与风险相称、对当前候选有效的验证证据。
 4. 同一候选快照、环境输入、检查 ID 和命令已有通过收据时可以复用；项目验收策略或问题调查要求新证据时重跑并记录原因。提交元数据变化本身不使内容收据失效。
 5. 内容变化只使依赖该变化的收据失效。纯文档变化不自动使代码测试失效；共享契约、测试配置或无法确定影响范围的变化才扩大复验。

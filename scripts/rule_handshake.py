@@ -33,13 +33,24 @@ CRITICAL_WAKE_FILES = {
     "references/agent-model-routing.md",
 }
 
+LIVE_E2E_CRITICAL_FILES = CRITICAL_WAKE_FILES | {
+    "scripts/controller_health.py",
+    "scripts/terminal_continuation.py",
+    "scripts/web_agent_health_supervisor.py",
+    "scripts/web_reentry_adapter.py",
+}
+LIVE_E2E_ACCEPTANCE_NAME = "runtime-live-e2e-acceptance.json"
+
 
 def derive_rule_wake_policy(
     status: dict[str, Any],
     *,
     assignment_liveness: dict[str, Any] | None = None,
 ) -> str | None:
-    if str(status.get("state", "")) != "pending_ack":
+    state = str(status.get("state", ""))
+    if state == "pending_live_e2e":
+        return "after_event"
+    if state != "pending_ack":
         return None
     if str(status.get("impact", "")) != "live_assignments":
         return "next_turn"
@@ -127,6 +138,144 @@ def load_rule_state(repo: str | Path) -> dict[str, Any]:
     return _read_json(rule_state_path(repo))
 
 
+def live_e2e_acceptance_path(repo: str | Path) -> Path:
+    return adaptive_delivery_state_dir(repo) / LIVE_E2E_ACCEPTANCE_NAME
+
+
+def load_live_e2e_acceptance(repo: str | Path) -> dict[str, Any]:
+    return _read_json(live_e2e_acceptance_path(repo))
+
+
+def _parse_utc_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _path_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _live_e2e_acceptance_errors(
+    repo: str | Path,
+    acceptance: dict[str, Any],
+    *,
+    manifest_path: Path,
+    installed_revision: str,
+    controller_session_id: str,
+    registry_path: str | Path | None,
+    validate_current_target: bool = False,
+) -> list[str]:
+    errors: list[str] = []
+    if acceptance.get("status") != "accepted":
+        errors.append("live E2E acceptance status is not accepted")
+    if str(acceptance.get("installed_revision") or "").strip() != installed_revision:
+        errors.append("live E2E acceptance revision does not match installed revision")
+    if str(acceptance.get("controller_session_id") or "").strip() != controller_session_id:
+        errors.append("live E2E acceptance Controller does not match loaded Controller")
+    if str(acceptance.get("manifest_sha256") or "").strip() != _sha256(manifest_path):
+        errors.append("live E2E acceptance manifest hash does not match installed manifest")
+
+    state_root = adaptive_delivery_state_dir(repo).resolve()
+    wake_path_text = str(acceptance.get("wake_evidence_path") or "").strip()
+    cycle_path_text = str(acceptance.get("cycle_evidence_path") or "").strip()
+    wake_path = Path(wake_path_text).expanduser() if wake_path_text else None
+    cycle_path = Path(cycle_path_text).expanduser() if cycle_path_text else None
+    if wake_path is None or not wake_path.is_file() or not _path_within(wake_path, state_root):
+        errors.append("live E2E wake evidence is missing or outside project runtime state")
+        wake = {}
+    else:
+        wake = _read_json(wake_path)
+        if str(acceptance.get("wake_evidence_sha256") or "").strip() != _sha256(wake_path):
+            errors.append("live E2E wake evidence hash mismatch")
+    if cycle_path is None or not cycle_path.is_file() or not _path_within(cycle_path, state_root):
+        errors.append("live E2E cycle evidence is missing or outside project runtime state")
+        cycle = {}
+    else:
+        cycle = _read_json(cycle_path)
+        if str(acceptance.get("cycle_evidence_sha256") or "").strip() != _sha256(cycle_path):
+            errors.append("live E2E cycle evidence hash mismatch")
+
+    selected_host = str(wake.get("selected_host") or "").strip()
+    wake_target = str(wake.get("execution_target_session_id") or "").strip()
+    wake_generation = wake.get("target_generation")
+    wake_completed_ms = wake.get("completed_at_unix_ms")
+    if wake.get("result") != "CONFIRMED":
+        errors.append("live E2E wake evidence is not confirmed")
+    if str(wake.get("controller_id") or "").strip() != controller_session_id:
+        errors.append("live E2E wake evidence Controller mismatch")
+    if selected_host not in {"web", "desktop_codex"}:
+        errors.append("live E2E wake evidence host is invalid")
+    if not wake_target or not isinstance(wake_generation, int) or isinstance(wake_generation, bool):
+        errors.append("live E2E wake evidence target or generation is missing")
+
+    registry = _read_json(Path(registry_path).expanduser().resolve() if registry_path else DEFAULT_REGISTRY)
+    registered_repo = registry.get(controller_session_id)
+    try:
+        same_repo = isinstance(registered_repo, str) and git_common_dir(registered_repo) == git_common_dir(repo)
+    except (OSError, ValueError):
+        same_repo = False
+    if not same_repo:
+        errors.append("live E2E acceptance Controller is not uniquely registered for this repository")
+    if validate_current_target:
+        targets = registry.get("__controller_targets__")
+        controller_targets = targets.get(controller_session_id) if isinstance(targets, dict) else None
+        target_record = controller_targets.get(selected_host) if isinstance(controller_targets, dict) else None
+        if isinstance(target_record, dict):
+            if target_record.get("status") != "active":
+                errors.append("live E2E current target is not active")
+            if str(target_record.get("session_id") or "").strip() != wake_target:
+                errors.append("live E2E wake target does not match current target")
+            if target_record.get("generation") != wake_generation:
+                errors.append("live E2E wake generation does not match current target generation")
+        elif selected_host:
+            sessions = registry.get("__controller_sessions__")
+            controller_sessions = sessions.get(controller_session_id) if isinstance(sessions, dict) else None
+            aliases = controller_sessions.get(selected_host) if isinstance(controller_sessions, dict) else None
+            aliases = [aliases] if isinstance(aliases, str) else aliases
+            bound = [str(value).strip() for value in aliases or [] if isinstance(value, str) and value.strip()]
+            if bound or wake_target != controller_session_id or wake_generation != 0:
+                errors.append("live E2E wake lacks an explicit current target")
+
+    if cycle.get("record_kind") != "controller_cycle_evidence":
+        errors.append("live E2E cycle evidence record kind is invalid")
+    if str(cycle.get("controller_id") or "").strip() != controller_session_id:
+        errors.append("live E2E cycle evidence Controller mismatch")
+    if cycle.get("terminal_status") != "CLOSED" or cycle.get("validation_errors") != []:
+        errors.append("live E2E cycle evidence is not a clean CLOSED cycle")
+    cycle_time = _parse_utc_timestamp(cycle.get("recorded_at"))
+    wake_time = (
+        datetime.fromtimestamp(wake_completed_ms / 1000, tz=UTC)
+        if isinstance(wake_completed_ms, int) and not isinstance(wake_completed_ms, bool)
+        else None
+    )
+    if cycle_time is None or wake_time is None or cycle_time < wake_time:
+        errors.append("live E2E CLOSED cycle does not occur after confirmed wake")
+    return errors
+
+
+def _live_e2e_changed_files(
+    manifest: dict[str, Any],
+    *,
+    effective_impact: str,
+    changed_files: list[str],
+) -> list[str]:
+    if effective_impact != "live_assignments":
+        return []
+    return sorted(set(changed_files) & LIVE_E2E_CRITICAL_FILES)
+
+
 def _ledger_path(repo: str | Path, ledger: str | Path | None = None) -> Path | None:
     if ledger:
         path = Path(ledger).expanduser().resolve()
@@ -183,7 +332,6 @@ def evaluate_rule_handshake(
     skill_root: str | Path | None = None,
     registry_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    del registry_path  # registry is required for ACK identity, not status evaluation
     manifest_path = install_manifest_path(skill_root)
     manifest = load_install_manifest(skill_root)
     if not manifest:
@@ -207,7 +355,192 @@ def evaluate_rule_handshake(
         return {**result, "state": "pending_ack", "blocking": effective_impact == "live_assignments"}
     if not _ledger_has_revision(_ledger_path(repo, ledger), installed):
         return {**result, "state": "ledger_stale", "blocking": effective_impact == "live_assignments"}
+    derived_live_e2e_changed_files = _live_e2e_changed_files(
+        manifest, effective_impact=effective_impact, changed_files=unacked_changed_files
+    )
+    state_tracks_live_e2e = "live_e2e_required" in state
+    live_e2e_required = (
+        bool(state.get("live_e2e_required"))
+        if state_tracks_live_e2e
+        else bool(derived_live_e2e_changed_files)
+    )
+    state_changed_files = state.get("live_e2e_required_changed_files")
+    live_e2e_changed_files = (
+        sorted({str(item) for item in state_changed_files if str(item).strip()})
+        if live_e2e_required and isinstance(state_changed_files, list)
+        else derived_live_e2e_changed_files
+    )
+    live_e2e_required_since_revision = (
+        str(state.get("live_e2e_required_since_revision") or "").strip() or installed
+        if live_e2e_required
+        else None
+    )
+    if live_e2e_required:
+        acceptance = load_live_e2e_acceptance(repo)
+        acceptance_errors = _live_e2e_acceptance_errors(
+            repo,
+            acceptance,
+            manifest_path=manifest_path,
+            installed_revision=installed,
+            controller_session_id=str(state.get("controller_session_id") or "").strip(),
+            registry_path=registry_path,
+        )
+        if acceptance_errors:
+            return {
+                **result,
+                "state": "pending_live_e2e",
+                "blocking": True,
+                "live_e2e_changed_files": live_e2e_changed_files,
+                "live_e2e_required_since_revision": live_e2e_required_since_revision,
+                "live_e2e_errors": acceptance_errors,
+            }
     return {**result, "state": "current", "blocking": False, "manifest_sha256": _sha256(manifest_path)}
+
+
+def accept_live_e2e(
+    repo: str | Path,
+    controller_session_id: str,
+    revision: str,
+    *,
+    skill_root: str | Path | None = None,
+    registry_path: str | Path | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    manifest_path = install_manifest_path(skill_root)
+    manifest = load_install_manifest(skill_root)
+    if not manifest:
+        raise ValueError("installed Adaptive Agent Runtime manifest is missing")
+    installed = str(manifest.get("revision") or "").strip()
+    if revision != installed:
+        raise ValueError("live E2E revision does not match installed revision")
+    errors = installation_integrity_errors(skill_root, manifest)
+    if errors:
+        raise ValueError("installation integrity failed: " + "; ".join(errors))
+
+    state = load_rule_state(repo)
+    if str(state.get("loaded_revision") or "").strip() != installed:
+        raise ValueError("live E2E requires exact installed revision to be ACKed first")
+    if str(state.get("controller_session_id") or "").strip() != controller_session_id:
+        raise ValueError("live E2E Controller does not match the ACKed Controller")
+    if not _ledger_has_revision(_ledger_path(repo), installed):
+        raise ValueError("live E2E requires the project ledger to load the exact installed revision")
+
+    registry_file = Path(registry_path).expanduser().resolve() if registry_path else DEFAULT_REGISTRY
+    registry = _read_json(registry_file)
+    registered = registry.get(controller_session_id)
+    try:
+        same_repo = isinstance(registered, str) and git_common_dir(registered) == git_common_dir(repo)
+    except (OSError, ValueError):
+        same_repo = False
+    if not same_repo:
+        raise ValueError("live E2E requires the unique registered Controller for this repository")
+
+    state_root = adaptive_delivery_state_dir(repo)
+    wake_source = state_root / "controller-wake-receipt.json"
+    wake = _read_json(wake_source)
+    if not wake:
+        raise ValueError("live E2E requires a confirmed Controller wake receipt")
+    wake_ms = wake.get("completed_at_unix_ms")
+    if not isinstance(wake_ms, int) or isinstance(wake_ms, bool):
+        raise ValueError("live E2E wake receipt has no machine completion time")
+    acknowledged_at = _parse_utc_timestamp(state.get("acknowledged_at"))
+    if acknowledged_at is None:
+        raise ValueError("live E2E requires a machine timestamp for the exact rule ACK")
+    wake_time = datetime.fromtimestamp(wake_ms / 1000, tz=UTC)
+    if wake_time < acknowledged_at:
+        raise ValueError("live E2E confirmed wake predates the exact rule ACK")
+
+    cycle_dir = state_root / "controller-cycle-evidence"
+    candidates: list[tuple[datetime, Path]] = []
+    if cycle_dir.is_dir():
+        for path in cycle_dir.glob("*.json"):
+            cycle = _read_json(path)
+            recorded = _parse_utc_timestamp(cycle.get("recorded_at"))
+            if (
+                cycle.get("record_kind") == "controller_cycle_evidence"
+                and str(cycle.get("controller_id") or "").strip() == controller_session_id
+                and cycle.get("terminal_status") == "CLOSED"
+                and cycle.get("validation_errors") == []
+                and recorded is not None
+                and recorded >= datetime.fromtimestamp(wake_ms / 1000, tz=UTC)
+            ):
+                candidates.append((recorded, path))
+    if not candidates:
+        raise ValueError("live E2E requires a clean CLOSED Controller cycle after confirmed wake")
+    _recorded, cycle_path = max(candidates, key=lambda item: item[0])
+
+    evidence_dir = state_root / "runtime-live-e2e-evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    wake_snapshot = evidence_dir / f"{installed}.wake.json"
+    encoded_wake = json.dumps(wake, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    fd, temporary = tempfile.mkstemp(
+        prefix=f"{installed}.wake.", suffix=".tmp", dir=evidence_dir
+    )
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(encoded_wake)
+            handle.flush()
+            os.fsync(handle.fileno())
+        provisional = {
+            "schema_version": 1,
+            "status": "accepted",
+            "installed_revision": installed,
+            "controller_session_id": controller_session_id,
+            "accepted_at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
+            "manifest_sha256": _sha256(manifest_path),
+            "wake_evidence_path": str(temporary_path.resolve()),
+            "wake_evidence_sha256": _sha256(temporary_path),
+            "cycle_evidence_path": str(cycle_path.resolve()),
+            "cycle_evidence_sha256": _sha256(cycle_path),
+        }
+        acceptance_errors = _live_e2e_acceptance_errors(
+            repo,
+            provisional,
+            manifest_path=manifest_path,
+            installed_revision=installed,
+            controller_session_id=controller_session_id,
+            registry_path=registry_file,
+            validate_current_target=True,
+        )
+        if acceptance_errors:
+            raise ValueError("live E2E acceptance failed: " + "; ".join(acceptance_errors))
+        if wake_snapshot.exists():
+            if wake_snapshot.read_text(encoding="utf-8") != encoded_wake:
+                raise ValueError("immutable live E2E wake snapshot already exists with different content")
+            temporary_path.unlink()
+        else:
+            os.replace(temporary_path, wake_snapshot)
+        receipt = {
+            **provisional,
+            "wake_evidence_path": str(wake_snapshot.resolve()),
+            "wake_evidence_sha256": _sha256(wake_snapshot),
+        }
+        final_errors = _live_e2e_acceptance_errors(
+            repo,
+            receipt,
+            manifest_path=manifest_path,
+            installed_revision=installed,
+            controller_session_id=controller_session_id,
+            registry_path=registry_file,
+            validate_current_target=True,
+        )
+        if final_errors:
+            raise ValueError("live E2E acceptance failed: " + "; ".join(final_errors))
+        _write_json_atomic(live_e2e_acceptance_path(repo), receipt)
+        updated_state = {
+            **state,
+            "live_e2e_required": False,
+            "live_e2e_required_since_revision": None,
+            "live_e2e_required_changed_files": [],
+            "live_e2e_accepted_revision": installed,
+            "live_e2e_accepted_at": receipt["accepted_at"],
+        }
+        _write_json_atomic(rule_state_path(repo), updated_state)
+        return receipt
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 
 def acknowledge_rule_revision(
@@ -240,6 +573,38 @@ def acknowledge_rule_revision(
     except (OSError, ValueError):
         raise ValueError("loaded ACK controller is not registered for this repository") from None
 
+    prior_state = load_rule_state(repo)
+    prior_loaded = str(prior_state.get("loaded_revision") or "").strip() or None
+    prior_required = bool(prior_state.get("live_e2e_required"))
+    prior_acceptance = load_live_e2e_acceptance(repo)
+    if (
+        prior_required
+        and prior_loaded
+        and prior_acceptance.get("status") == "accepted"
+        and str(prior_acceptance.get("installed_revision") or "").strip() == prior_loaded
+        and str(prior_acceptance.get("controller_session_id") or "").strip() == controller_session_id
+    ):
+        prior_required = False
+    ack_effective_impact, ack_changed_files = _unacked_change_impact(manifest, prior_loaded)
+    new_live_e2e_files = _live_e2e_changed_files(
+        manifest, effective_impact=ack_effective_impact, changed_files=ack_changed_files
+    )
+    live_e2e_required = prior_required or bool(new_live_e2e_files)
+    prior_required_files = prior_state.get("live_e2e_required_changed_files")
+    inherited_files = (
+        {str(item) for item in prior_required_files if str(item).strip()}
+        if prior_required and isinstance(prior_required_files, list)
+        else set()
+    )
+    required_files = sorted(inherited_files | set(new_live_e2e_files))
+    required_since = (
+        str(prior_state.get("live_e2e_required_since_revision") or "").strip()
+        if prior_required
+        else ""
+    )
+    if live_e2e_required and not required_since:
+        required_since = installed
+
     receipt = {
         "schema_version": 1,
         "installed_revision": installed,
@@ -247,6 +612,11 @@ def acknowledge_rule_revision(
         "controller_session_id": controller_session_id,
         "acknowledged_at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
         "manifest_sha256": _sha256(manifest_path),
+        "live_e2e_required": live_e2e_required,
+        "live_e2e_required_since_revision": required_since or None,
+        "live_e2e_required_changed_files": required_files,
+        "live_e2e_accepted_revision": prior_state.get("live_e2e_accepted_revision"),
+        "live_e2e_accepted_at": prior_state.get("live_e2e_accepted_at"),
     }
     _write_json_atomic(rule_state_path(repo), receipt)
     return receipt
@@ -273,6 +643,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     ack.add_argument("--revision", required=True)
     ack.add_argument("--skill-root")
     ack.add_argument("--registry")
+    live_e2e = sub.add_parser("accept-live-e2e")
+    live_e2e.add_argument("--repo", required=True)
+    live_e2e.add_argument("--controller-session", required=True)
+    live_e2e.add_argument("--revision", required=True)
+    live_e2e.add_argument("--skill-root")
+    live_e2e.add_argument("--registry")
     guard = sub.add_parser("launch-guard")
     guard.add_argument("--repo", required=True)
     guard.add_argument("--ledger")
@@ -285,6 +661,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "ack":
             result = acknowledge_rule_revision(
+                args.repo,
+                args.controller_session,
+                args.revision,
+                skill_root=args.skill_root,
+                registry_path=args.registry,
+            )
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.command == "accept-live-e2e":
+            result = accept_live_e2e(
                 args.repo,
                 args.controller_session,
                 args.revision,

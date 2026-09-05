@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 
 
 _TEST_LIFECYCLE_STATE = tempfile.TemporaryDirectory(prefix="adaptive-runtime-lifecycle-test-")
+atexit.register(_TEST_LIFECYCLE_STATE.cleanup)
 os.environ["AD_LIFECYCLE_STATE_DIR"] = _TEST_LIFECYCLE_STATE.name
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -4240,7 +4242,9 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                     web_bridge, "dispatch_pending_lifecycle_wake", return_value={
                         "result": result, "decision": "DEFER", "pending_control_event": True
                     }
-                ), patch.object(web_bridge, "dispatch_event", return_value=0):
+                ), patch.object(web_bridge, "dispatch_event", return_value=0), patch.object(
+                    web_bridge, "schedule_auto_native_stop", return_value=True
+                ):
                     post = web_bridge.main([
                         "post-shell", "--cwd", str(repo), "--command", "true",
                         "--exit-code", "0", "--registry", str(registry), "--web-session-id", "web-session-1",
@@ -5180,6 +5184,70 @@ class WebHostNativeWakeIsolationTests(unittest.TestCase):
             self.assertEqual(saved["state"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
             self.assertEqual(saved["error_code"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
 
+    def test_stale_web_host_with_only_desktop_current_target_resumes_same_controller_desktop(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {
+                        "web": ["web-old", "web-older"],
+                        "desktop_codex": ["desktop-current"],
+                    }
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-current",
+                            "generation": 2,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+            state_path = root / "auto.json"
+            state_path.write_text(json.dumps({
+                "receipt_id": "r1",
+                "session_id": "controller-1",
+                "repo": str(repo.resolve()),
+                "state": "RESUME_PENDING",
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True,
+                "controller_host": "web",
+                "requires_user": False,
+                "wake_generation": 9,
+            }
+            confirmed = {
+                "operation": "native_resume",
+                "result": "CONFIRMED",
+                "state": "RESUME_CONFIRMED",
+                "returncode": 0,
+                "pending_control_event": True,
+                "execution_target_session_id": "desktop-current",
+                "target_generation": 2,
+                "target_mode": "explicit_current",
+            }
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+                web_bridge, "execute_native_resume", return_value=confirmed
+            ) as native_resume, patch.object(
+                web_bridge, "execute_web_reentry", side_effect=AssertionError("stale Web host must not bypass canonical desktop current target")
+            ), patch.object(web_bridge, "_rearm_auto_native_stop") as rearm:
+                rc = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state_path,
+                )
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(rc, 0)
+            self.assertTrue(native_resume.called)
+            self.assertTrue(rearm.called)
+            self.assertEqual(saved["state"], "RESUME_REARMED")
+            self.assertEqual(saved["execution_target_session_id"], "desktop-current")
+            self.assertEqual(saved["target_generation"], 2)
+
 class ControllerHostResolutionIsolationTests(unittest.TestCase):
     def test_missing_lifecycle_host_resolves_unique_desktop_binding(self) -> None:
         registry = {
@@ -5192,6 +5260,63 @@ class ControllerHostResolutionIsolationTests(unittest.TestCase):
             "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-1"], "web": ["web-1"]}}
         }
         self.assertEqual(web_bridge.resolve_controller_host({}, {}, registry, "controller-1"), "web")
+
+    def test_stale_web_lifecycle_host_yields_to_the_only_explicit_current_target(self) -> None:
+        registry = {
+            "__controller_sessions__": {
+                "controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                    "web": ["web-old", "web-older"],
+                }
+            },
+            "__controller_targets__": {
+                "controller-1": {
+                    "desktop_codex": {
+                        "status": "active",
+                        "session_id": "desktop-current",
+                        "generation": 2,
+                    }
+                }
+            },
+        }
+
+        self.assertEqual(
+            web_bridge.resolve_controller_host(
+                {"controller_host": "web"}, {}, registry, "controller-1"
+            ),
+            "desktop_codex",
+        )
+
+    def test_explicit_current_web_target_preserves_web_lifecycle_host(self) -> None:
+        registry = {
+            "__controller_sessions__": {
+                "controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                    "web": ["web-current", "web-old"],
+                }
+            },
+            "__controller_targets__": {
+                "controller-1": {
+                    "desktop_codex": {
+                        "status": "active",
+                        "session_id": "desktop-current",
+                        "generation": 2,
+                    },
+                    "web": {
+                        "status": "active",
+                        "session_id": "web-current",
+                        "generation": 4,
+                    },
+                }
+            },
+        }
+
+        self.assertEqual(
+            web_bridge.resolve_controller_host(
+                {"controller_host": "web"}, {}, registry, "controller-1"
+            ),
+            "web",
+        )
 
 
 class WebLocalReentryIntegrationTests(unittest.TestCase):
