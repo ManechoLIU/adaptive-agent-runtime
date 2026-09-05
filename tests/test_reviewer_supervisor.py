@@ -511,6 +511,86 @@ class ReviewerSupervisorProcessGroupCleanupTests(unittest.TestCase):
         self.assertIn("SIGKILL", result.diagnostic)
 
 
+class ReviewerSupervisorRoutingTests(unittest.TestCase):
+    def test_web_controller_review_does_not_launch_codex_directly(self):
+        calls = []
+
+        def factory(argv, **kwargs):
+            calls.append(argv)
+            return _FakeProcess([json.dumps({"type": "thread.started", "thread_id": "thread-1"}) + "\n"], returncode=1)
+
+        contract = ReviewContract(
+            repo=Path.cwd(), base="main", head="a" * 40, instructions="review exact head",
+            event_path=Path(tempfile.mkdtemp()) / "events.jsonl",
+            final_path=Path(tempfile.mkdtemp()) / "final.json",
+        )
+        run_attempt(
+            contract, 0, popen_factory=factory, codex_executable="/usr/bin/codex",
+            controller_host="web",
+        )
+        self.assertFalse(calls, "web Controller formal review must not directly launch codex exec")
+
+
+class ReviewerSupervisorWebHandoffTests(unittest.TestCase):
+    def test_web_review_emits_canonical_dispatch_request_without_codex(self):
+        repo = Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "x.txt").write_text("x\n")
+        subprocess.run(["git", "add", "x.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+        result = run_review(repo, head, "review", controller_host="web")
+        self.assertEqual(result.state, "REVIEW_DISPATCH_REQUIRED")
+        state = json.loads(result.state_path.read_text())
+        request = state["review_request"]
+        self.assertEqual(request["candidate_revision"], head)
+        self.assertEqual(request["role"], "reviewer")
+        self.assertEqual(request["agent_type"], "reviewer")
+        self.assertEqual(request["assignment_id"], f"review:{result.run_id}")
+        self.assertNotIn("provider", request)
+        self.assertNotIn("model", request)
+
+
+    def test_web_review_finalizes_only_from_canonical_runtime_reviewer_lease(self):
+        from scripts.assignment_runtime import save_runtime_state
+        from scripts.reviewer_supervisor import finalize_web_review
+
+        repo = Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "x.txt").write_text("x\n")
+        subprocess.run(["git", "add", "x.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        pending = run_review(repo, head, "review", controller_host="web")
+        state = json.loads(pending.state_path.read_text())
+        assignment_id = state["review_request"]["assignment_id"]
+        verdict = {"reviewed_head": head, "verdict": "PASS", "critical": [], "important": [], "minor": []}
+        save_runtime_state(repo, {
+            "schema_version": 2,
+            "lineages": {},
+            "leases": {assignment_id: {
+                "assignment_id": assignment_id,
+                "task_id": assignment_id,
+                "execution_transport": "web",
+                "execution_role": "reviewer",
+                "candidate_revision": head,
+                "terminal_state": "completed",
+                "delivery_outcome": "pass",
+                "review_verdict": verdict,
+            }},
+        })
+        result = finalize_web_review(repo, pending.run_id)
+        self.assertEqual(result.state, "PASS")
+        self.assertEqual(result.verdict, verdict)
+        persisted = json.loads(result.state_path.read_text())
+        self.assertEqual(persisted["state"], "PASS")
+        self.assertEqual(persisted["verdict"], verdict)
+
 class ReviewerSupervisorRunTests(unittest.TestCase):
     def setUp(self):
         self._repo_tmp = tempfile.TemporaryDirectory()

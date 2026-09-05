@@ -224,12 +224,24 @@ def run_attempt(
     *,
     popen_factory: Callable = subprocess.Popen,
     codex_executable: str = "codex",
+    controller_host: str = "desktop_codex",
     timeout_seconds: float = 600.0,
     process_group_killer: Callable[[int, int], None] = _signal_process_group,
     process_group_getter: Callable[[int], int] = _capture_process_group,
     process_group_exists: Callable[[int], bool] = _process_group_exists,
     termination_grace_seconds: float = 5.0,
 ) -> AttemptResult:
+    if controller_host not in {"desktop_codex", "web"}:
+        raise ValueError(f"unsupported controller_host: {controller_host}")
+    if controller_host == "web":
+        return AttemptResult(
+            state="REVIEW_INFRA_FAILED",
+            pid=-1,
+            exit_code=78,
+            running_observed=False,
+            diagnostic="web Controller review requires canonical Host reviewer dispatch; direct codex exec is forbidden",
+            retry_safe=False,
+        )
     contract.event_path.parent.mkdir(parents=True, exist_ok=True)
     contract.final_path.parent.mkdir(parents=True, exist_ok=True)
     schema_path = contract.final_path.with_name(contract.final_path.name + ".schema.json")
@@ -468,6 +480,7 @@ def _run_review_locked(
     max_infra_retries: int = 1,
     attempt_runner=None,
     codex_executable: Optional[str] = None,
+    controller_host: str = "desktop_codex",
     timeout_seconds: float = 600.0,
 ) -> ReviewRunResult:
     repo = Path(repo).resolve()
@@ -504,6 +517,25 @@ def _run_review_locked(
         return ReviewRunResult(run_id, "REVIEW_INFRA_FAILED", head, None, 0, state_path)
 
     atomic_write_json(state_path, base_state)
+    if controller_host == "web":
+        request = {
+            "assignment_id": f"review:{run_id}",
+            "task_id": f"review:{run_id}",
+            "role": "reviewer",
+            "agent_type": "reviewer",
+            "candidate_revision": head,
+            "base_revision": base_revision,
+            "instructions": review_instructions,
+            "instructions_sha256": instruction_hash,
+            "worktree": str(repo),
+        }
+        pending = dict(base_state)
+        pending.update({
+            "state": "REVIEW_DISPATCH_REQUIRED",
+            "review_request": request,
+        })
+        atomic_write_json(state_path, pending)
+        return ReviewRunResult(run_id, "REVIEW_DISPATCH_REQUIRED", head, None, 0, state_path)
     last_diag = ""
     for attempt in range(max_infra_retries + 1):
         event_path = root / f"{run_id}.attempt-{attempt}.events.jsonl"
@@ -512,7 +544,7 @@ def _run_review_locked(
         try:
             if runner is None:
                 result = run_attempt(
-                    contract, attempt, codex_executable=codex, timeout_seconds=timeout_seconds
+                    contract, attempt, codex_executable=codex, controller_host=controller_host, timeout_seconds=timeout_seconds
                 )
             else:
                 result = runner(contract, attempt)
@@ -580,6 +612,54 @@ def _run_review_locked(
 
 
 
+def finalize_web_review(repo: Path, run_id: str) -> ReviewRunResult:
+    repo = Path(repo).resolve()
+    state_path = git_common_state_root(repo) / f"{run_id}.json"
+    if not state_path.exists():
+        raise FileNotFoundError(f"review run not found: {run_id}")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("state") != "REVIEW_DISPATCH_REQUIRED":
+        raise ValueError("web review is not awaiting canonical reviewer completion")
+    request = state.get("review_request")
+    if not isinstance(request, dict):
+        raise ValueError("web review request missing")
+    assignment_id = str(request.get("assignment_id") or "").strip()
+    expected_head = str(state.get("candidate_head") or "").strip()
+    if not assignment_id or not expected_head:
+        raise ValueError("web review request identity missing")
+    try:
+        from scripts.assignment_runtime import load_runtime_state
+    except ModuleNotFoundError:
+        from assignment_runtime import load_runtime_state
+    lease = load_runtime_state(repo).get("leases", {}).get(assignment_id)
+    if not isinstance(lease, dict):
+        raise ValueError("canonical Web reviewer lease not found")
+    if lease.get("execution_transport") != "web" or lease.get("execution_role") != "reviewer":
+        raise ValueError("canonical Assignment is not a Web reviewer lease")
+    if str(lease.get("candidate_revision") or "") != expected_head:
+        raise ValueError("canonical Web reviewer candidate revision mismatch")
+    if str(lease.get("terminal_state") or "") != "completed":
+        raise ValueError("canonical Web reviewer has not completed")
+    verdict_payload = lease.get("review_verdict")
+    verdict = validate_verdict(verdict_payload, expected_head)
+    expected_outcome = "pass" if verdict["verdict"] == "PASS" else "fail"
+    if str(lease.get("delivery_outcome") or "") != expected_outcome:
+        raise ValueError("canonical Web reviewer delivery outcome conflicts with verdict")
+    if _git_head(repo) != expected_head:
+        raise ValueError("HEAD changed after Web review request")
+    if _git_status(repo):
+        raise ValueError("worktree became dirty during Web review")
+    terminal = dict(state)
+    terminal.update({
+        "state": verdict["verdict"],
+        "verdict": verdict,
+        "completed_at": time.time(),
+        "review_assignment_id": assignment_id,
+    })
+    atomic_write_json(state_path, terminal)
+    return ReviewRunResult(run_id, verdict["verdict"], expected_head, verdict, 1, state_path)
+
+
 def run_review(
     repo: Path,
     base: str,
@@ -588,6 +668,7 @@ def run_review(
     max_infra_retries: int = 1,
     attempt_runner=None,
     codex_executable: Optional[str] = None,
+    controller_host: str = "desktop_codex",
     timeout_seconds: float = 600.0,
 ) -> ReviewRunResult:
     repo = Path(repo).resolve()
@@ -622,6 +703,7 @@ def run_review(
             max_infra_retries=max_infra_retries,
             attempt_runner=attempt_runner,
             codex_executable=codex_executable,
+            controller_host=controller_host,
             timeout_seconds=timeout_seconds,
         )
     finally:
@@ -632,17 +714,26 @@ def run_review(
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Supervise a revision-bound Codex code review")
+    parser = argparse.ArgumentParser(description="Supervise a revision-bound machine code review")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run")
     run.add_argument("--repo", required=True)
     run.add_argument("--base", default="main")
     run.add_argument("--instructions", default="Review correctness, migration safety, runtime safety, and test coverage.")
     run.add_argument("--timeout-seconds", type=float, default=600.0)
+    run.add_argument("--controller-host", choices=("web", "desktop_codex"), default="desktop_codex")
+    finalize = sub.add_parser("finalize-web")
+    finalize.add_argument("--repo", required=True)
+    finalize.add_argument("--run-id", required=True)
     args = parser.parse_args(argv)
-    result = run_review(Path(args.repo), args.base, args.instructions, timeout_seconds=args.timeout_seconds)
+    if args.command == "finalize-web":
+        result = finalize_web_review(Path(args.repo), args.run_id)
+    else:
+        result = run_review(Path(args.repo), args.base, args.instructions, controller_host=args.controller_host, timeout_seconds=args.timeout_seconds)
     print(json.dumps({"run_id": result.run_id, "state": result.state, "reviewed_head": result.reviewed_head, "state_path": str(result.state_path)}, ensure_ascii=False))
-    return 0 if result.state == "PASS" else 10 if result.state == "FINDINGS" else 20
+    if result.state in {"PASS", "REVIEW_DISPATCH_REQUIRED"}:
+        return 0
+    return 10 if result.state == "FINDINGS" else 20
 
 
 if __name__ == "__main__":

@@ -43,6 +43,12 @@ WEB_BLOCK_END = "# <<< adaptive-delivery web lifecycle bridge <<<"
 MANIFEST_NAME = ".adaptive-delivery-install.json"
 IMPACTS = {"none", "live_assignments"}
 RUNTIME_RELEASE_REGRESSION_TESTS = (
+    "tests.test_reviewer_supervisor.ReviewerSupervisorRoutingTests."
+    "test_web_controller_review_does_not_launch_codex_directly",
+    "tests.test_reviewer_supervisor.ReviewerSupervisorWebHandoffTests."
+    "test_web_review_emits_canonical_dispatch_request_without_codex",
+    "tests.test_reviewer_supervisor.ReviewerSupervisorWebHandoffTests."
+    "test_web_review_finalizes_only_from_canonical_runtime_reviewer_lease",
     "tests.test_web_reentry_adapter.WebReentryContinuationRegressionTests."
     "test_transient_web_reentry_failure_rearms_existing_continuation_supervisor",
     "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
@@ -278,9 +284,11 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/project_context_guard.py",
     "scripts/evaluation_transaction.py",
     "scripts/route_contract.py",
+    "scripts/reviewer_supervisor.py",
     "scripts/assignment_lease_guard.py",
     "scripts/run_external_agent.mjs",
     "tests/test_web_agent_execution.py",
+    "tests/test_reviewer_supervisor.py",
     "tests/test_web_reentry_adapter.py",
     "tests/test_web_collaboration_continuation.py",
     "tests/test_governance.py",

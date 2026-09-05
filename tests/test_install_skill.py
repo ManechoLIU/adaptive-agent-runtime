@@ -388,7 +388,7 @@ class InstallMigrationContractTests(unittest.TestCase):
         (source / "scripts").mkdir()
         for name in (
             "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
-            "web_agent_health_supervisor.py", "web_agent_events.py", "route_contract.py",
+            "web_agent_health_supervisor.py", "web_agent_events.py", "route_contract.py", "reviewer_supervisor.py",
             "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "assignment_lease_guard.py",
             "controller_scoring_guard.py", "project_context_guard.py", "evaluation_transaction.py",
         ):
@@ -667,6 +667,15 @@ class InstallMigrationContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+            (tests_dir / "test_reviewer_supervisor.py").write_text(
+                "import unittest\n"
+                "class ReviewerSupervisorRoutingTests(unittest.TestCase):\n"
+                "    def test_web_controller_review_does_not_launch_codex_directly(self): self.assertTrue(True)\n"
+                "class ReviewerSupervisorWebHandoffTests(unittest.TestCase):\n"
+                "    def test_web_review_emits_canonical_dispatch_request_without_codex(self): self.assertTrue(True)\n"
+                "    def test_web_review_finalizes_only_from_canonical_runtime_reviewer_lease(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_web_reentry_adapter.py").write_text(
                 "import unittest\n"
                 "class WebReentryContinuationRegressionTests(unittest.TestCase):\n"
@@ -875,6 +884,15 @@ class InstallMigrationContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+            (tests_dir / "test_reviewer_supervisor.py").write_text(
+                "import unittest\n"
+                "class ReviewerSupervisorRoutingTests(unittest.TestCase):\n"
+                "    def test_web_controller_review_does_not_launch_codex_directly(self): self.assertTrue(True)\n"
+                "class ReviewerSupervisorWebHandoffTests(unittest.TestCase):\n"
+                "    def test_web_review_emits_canonical_dispatch_request_without_codex(self): self.assertTrue(True)\n"
+                "    def test_web_review_finalizes_only_from_canonical_runtime_reviewer_lease(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_web_reentry_adapter.py").write_text(
                 "import unittest\n"
                 "class WebReentryContinuationRegressionTests(unittest.TestCase):\n"
