@@ -1007,8 +1007,14 @@ def reconcile_managed_web_assignments(
     dispatch_state = _load_dispatch_state(repo)
     pending_dispatches = [
         record for record in dispatch_state.get("dispatches", {}).values()
-        if isinstance(record, dict) and record.get("state") == "pending"
-        and record.get("controller_id") == controller_id
+        if isinstance(record, dict)
+        and record.get("state") == "pending"
+        and (
+            (record.get("delegation_owner_kind", "controller") == "controller"
+             and record.get("delegation_owner_id", record.get("controller_id")) == controller_id)
+            or (record.get("delegation_owner_kind") == "session"
+                and bool(str(record.get("delegation_owner_id") or "").strip()))
+        )
     ]
     runtime = load_runtime_state(repo)
     web_leases = {
@@ -1054,10 +1060,13 @@ def reconcile_managed_web_assignments(
         ):
             continue
         try:
+            owner_kind = str(ticket.get("delegation_owner_kind") or "controller")
+            owner_id = str(ticket.get("delegation_owner_id") or ticket.get("controller_id") or "").strip()
             bound_dispatches.append(bind_web_assignment_dispatch(
                 repo=repo,
                 registry_path=registry,
-                controller_id=controller_id,
+                controller_id=controller_id if owner_kind == "controller" else None,
+                delegator_session_id=owner_id if owner_kind == "session" else None,
                 dispatch_id=dispatch_id,
                 event_paths=paths,
                 now=now,
@@ -1121,6 +1130,21 @@ def reconcile_managed_web_assignments(
                     terminal_receipt = Path(str(record["terminal_receipt"]))
 
                 if lease.get("terminal_state") and terminal_receipt is not None:
+                    if lease.get("delegation_owner_kind") == "session":
+                        if record.get("terminal_wake_state") == "session_parent":
+                            continue
+                        parent_session_id = str(lease.get("delegation_owner_id") or "").strip()
+                        record["terminal_wake_state"] = "session_parent"
+                        record["terminal_wake_error"] = None
+                        terminal_continuations.append({
+                            "assignment_id": assignment_id,
+                            "controller_id": None,
+                            "wake_state": "session_parent",
+                            "delegation_parent_session_id": parent_session_id,
+                            "terminal_receipt": str(terminal_receipt),
+                            "error": None,
+                        })
+                        continue
                     if record.get("terminal_wake_state") in {"confirmed", "delegated"}:
                         continue
                     consumer = terminal_consumer or terminal_continuation.consume_terminal_receipt

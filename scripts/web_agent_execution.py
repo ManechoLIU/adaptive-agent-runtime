@@ -1014,11 +1014,14 @@ def watch_web_assignment_once(
         "recovery_reason": recovery["reason"],
     }
     if health["state"] in {"unhealthy", "budget_exhausted"}:
-        result.update(_runtime_continuation_result(
-            repo=repo_path, registry_path=registry,
-            event_source=f"web_assignment_{health['state']}:{assignment_id}:attempt:{expected_attempt}",
-            consumer=runtime_change_consumer,
-        ))
+        if lease.get("delegation_owner_kind") == "session":
+            result["delegation_parent_session_id"] = str(lease.get("delegation_owner_id") or "")
+        else:
+            result.update(_runtime_continuation_result(
+                repo=repo_path, registry_path=registry,
+                event_source=f"web_assignment_{health['state']}:{assignment_id}:attempt:{expected_attempt}",
+                consumer=runtime_change_consumer,
+            ))
     return result
 
 
@@ -1525,6 +1528,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = prepare_web_assignment_dispatch(
                     repo=args.repo, registry_path=args.registry,
                     controller_id=str(event.get("controller_id") or ""),
+                    delegator_session_id=str(event.get("delegator_session_id") or "") or None,
                     task_name=str(event.get("task_name") or ""),
                     assignment=event.get("assignment") if isinstance(event.get("assignment"), dict) else {},
                 )
@@ -1532,6 +1536,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = recover_web_assignment(
                     repo=args.repo, registry_path=args.registry,
                     controller_id=str(event.get("controller_id") or ""),
+                    delegator_session_id=str(event.get("delegator_session_id") or "") or None,
                     assignment_id=str(event.get("assignment_id") or ""),
                     conversation_id=str(event.get("conversation_id") or ""),
                 )
@@ -1542,6 +1547,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = bind_web_assignment_dispatch(
                     repo=args.repo, registry_path=args.registry,
                     controller_id=str(event.get("controller_id") or ""),
+                    delegator_session_id=str(event.get("delegator_session_id") or "") or None,
                     dispatch_id=str(event.get("dispatch_id") or ""),
                     event_paths=paths,
                 )

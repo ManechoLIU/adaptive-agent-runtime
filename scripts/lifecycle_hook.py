@@ -1830,7 +1830,37 @@ def run_hook() -> int:
     controller_id = registered_controller_id(source_session_id)
     expected_root = registered_root(source_session_id)
     if controller_id is None or expected_root is None:
-        return 0
+        if event.get("hook_event_name") != "PreToolUse":
+            return 0
+        try:
+            spawn_contract = target_guard.collaboration_spawn_contract(
+                tool_name=event.get("tool_name"),
+                tool_input=event.get("tool_input"),
+            )
+            if spawn_contract is None:
+                return 0
+            snapshot = project_snapshot(cwd)
+            if snapshot is None:
+                return 0
+            session_repo = Path(str(snapshot["root"])).expanduser().resolve()
+            try:
+                from scripts.web_agent_execution import require_prepared_web_dispatch
+            except ModuleNotFoundError:
+                from web_agent_execution import require_prepared_web_dispatch
+            require_prepared_web_dispatch(
+                repo=session_repo,
+                controller_id=None,
+                delegator_session_id=source_session_id,
+                task_name=spawn_contract["task_name"],
+                expected_model=spawn_contract["model"],
+                expected_agent_type=spawn_contract["agent_type"],
+            )
+            return 0
+        except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
+            print(json.dumps(_pre_tool_denial(
+                f"Web Agent dispatch gate rejected collaboration.spawn_agent: {exc}"
+            ), ensure_ascii=False))
+            return 0
     snapshot = project_snapshot(cwd)
     if snapshot is None or not controller_event_is_managed(event, cwd, expected_root):
         return 0

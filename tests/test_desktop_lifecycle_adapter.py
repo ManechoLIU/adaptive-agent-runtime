@@ -631,6 +631,62 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             code = lifecycle_hook.run_hook()
         return code, output.getvalue()
 
+    def test_non_controller_session_spawn_still_runs_runtime_dispatch_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            event = {
+                "hook_event_name": "PreToolUse",
+                "session_id": "ordinary-web-session-1",
+                "turn_id": "turn-1",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": "ordinary-session-child",
+                    "model": "gpt-5.6-sol",
+                    "agent_type": "default",
+                },
+                "cwd": str(repo),
+            }
+            with patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)):
+                code, output = self.invoke_hook(event)
+
+        self.assertEqual(code, 0)
+        denial = json.loads(output)
+        self.assertEqual(denial["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("Web Agent dispatch gate rejected collaboration.spawn_agent", denial["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_non_controller_session_spawn_binds_dispatch_gate_to_source_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            event = {
+                "hook_event_name": "PreToolUse",
+                "session_id": "ordinary-web-session-1",
+                "turn_id": "turn-1",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": "ordinary-session-child",
+                    "model": "gpt-5.6-sol",
+                    "agent_type": "default",
+                },
+                "cwd": str(repo),
+            }
+            with patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch(
+                "scripts.web_agent_execution.require_prepared_web_dispatch", return_value={}
+            ) as gate:
+                code, output = self.invoke_hook(event)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+        gate.assert_called_once_with(
+            repo=repo.resolve(),
+            controller_id=None,
+            delegator_session_id="ordinary-web-session-1",
+            task_name="ordinary-session-child",
+            expected_model="gpt-5.6-sol",
+            expected_agent_type="default",
+        )
+
     def test_managed_outbound_pre_tool_holds_lease_until_matching_post_tool_use(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

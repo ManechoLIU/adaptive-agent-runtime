@@ -70,6 +70,12 @@ class WebCollaborationContinuationRegressionTests(unittest.TestCase):
         )
         self._machine_source_patcher.start()
         self.addCleanup(self._machine_source_patcher.stop)
+        self._continuation_supervisor_patcher = patch(
+            "scripts.web_lifecycle_bridge.ensure_continuation_supervisor",
+            return_value=False,
+        )
+        self._continuation_supervisor_patcher.start()
+        self.addCleanup(self._continuation_supervisor_patcher.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -164,6 +170,162 @@ class WebCollaborationContinuationRegressionTests(unittest.TestCase):
             health_probe=lambda: True,
             watchdog_launcher=lambda **_: {"launched": False},
         )
+
+    def test_reconcile_binds_pending_session_owned_dispatch_without_controller_impersonation(self):
+        assignment = self.assignment()
+        prepared = prepare_web_assignment_dispatch(
+            repo=self.repo,
+            registry_path=self.registry,
+            controller_id=None,
+            delegator_session_id="ordinary-web-session-1",
+            task_name="session-owned-start",
+            assignment=assignment,
+            now=T0,
+            health_probe=lambda: True,
+        )
+        self.events.write_text(
+            chr(10).join([
+                json.dumps({
+                    "timestamp": T0.isoformat(),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "namespace": "collaboration",
+                        "name": "spawn_agent",
+                        "call_id": "spawn-session-owned",
+                        "arguments": json.dumps({
+                            "task_name": "session-owned-start",
+                            "agent_type": assignment["agent_type"],
+                            "model": assignment["model"],
+                        }),
+                    },
+                }),
+                json.dumps({
+                    "timestamp": (T0 + timedelta(seconds=1)).isoformat(),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "item": {
+                            "type": "SubAgentActivity",
+                            "kind": "started",
+                            "id": "spawn-session-owned",
+                            "agent_thread_id": "session-owned-child",
+                            "agent_path": "/root/session-owned-child",
+                        },
+                    },
+                }),
+            ]) + chr(10),
+            encoding="utf-8",
+        )
+
+        result = web_bridge.reconcile_managed_web_assignments(
+            repo=self.repo,
+            controller_id="controller-1",
+            registry=self.registry,
+            event_paths=[self.events],
+            now=T0 + timedelta(seconds=2),
+            event_source_probe=lambda: True,
+        )
+
+        self.assertEqual(result["binding_errors"], [])
+        self.assertEqual(len(result["bound_dispatches"]), 1)
+        bound = result["bound_dispatches"][0]
+        self.assertEqual(bound["dispatch_id"], prepared["dispatch_id"])
+        self.assertEqual(bound["delegation_owner_kind"], "session")
+        self.assertEqual(bound["delegation_owner_id"], "ordinary-web-session-1")
+        self.assertIsNone(bound["controller_id"])
+        lease = load_runtime_state(self.repo)["leases"]["A-WEB"]
+        self.assertEqual(lease["delegation_owner_kind"], "session")
+        self.assertEqual(lease["delegation_owner_id"], "ordinary-web-session-1")
+
+    def test_reconcile_session_owned_terminal_does_not_wake_logical_controller(self):
+        assignment = self.assignment()
+        prepare_web_assignment_dispatch(
+            repo=self.repo,
+            registry_path=self.registry,
+            controller_id=None,
+            delegator_session_id="ordinary-web-session-1",
+            task_name="session-owned-terminal",
+            assignment=assignment,
+            now=T0,
+            health_probe=lambda: True,
+        )
+        self.events.write_text(
+            chr(10).join([
+                json.dumps({
+                    "timestamp": T0.isoformat(),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "namespace": "collaboration",
+                        "name": "spawn_agent",
+                        "call_id": "spawn-session-terminal",
+                        "arguments": json.dumps({
+                            "task_name": "session-owned-terminal",
+                            "agent_type": assignment["agent_type"],
+                            "model": assignment["model"],
+                        }),
+                    },
+                }),
+                json.dumps({
+                    "timestamp": (T0 + timedelta(seconds=1)).isoformat(),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "item": {
+                            "type": "SubAgentActivity",
+                            "kind": "started",
+                            "id": "spawn-session-terminal",
+                            "agent_thread_id": "session-owned-terminal-child",
+                            "agent_path": "/root/session-owned-terminal-child",
+                        },
+                    },
+                }),
+            ]) + chr(10),
+            encoding="utf-8",
+        )
+        web_bridge.reconcile_managed_web_assignments(
+            repo=self.repo, controller_id="controller-1", registry=self.registry,
+            event_paths=[self.events], now=T0 + timedelta(seconds=2), event_source_probe=lambda: True,
+        )
+        self.events.write_text(json.dumps({
+            "timestamp": (T0 + timedelta(minutes=2)).isoformat(),
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "SubAgentActivity",
+                    "kind": "completed",
+                    "id": "terminal-session-owned",
+                    "agent_thread_id": "session-owned-terminal-child",
+                    "agent_path": "/root/session-owned-terminal-child",
+                },
+            },
+        }) + "\n", encoding="utf-8")
+        controller_wakes = []
+        result = web_bridge.reconcile_managed_web_assignments(
+            repo=self.repo, controller_id="controller-1", registry=self.registry,
+            event_paths=[self.events], now=T0 + timedelta(minutes=3),
+            terminal_consumer=lambda **kwargs: controller_wakes.append(kwargs) or {"pending_control_event": False},
+            event_source_probe=lambda: True,
+        )
+
+        self.assertEqual(controller_wakes, [])
+        self.assertEqual(result["terminal_continuations"][0]["wake_state"], "session_parent")
+        self.assertEqual(
+            result["terminal_continuations"][0]["delegation_parent_session_id"],
+            "ordinary-web-session-1",
+        )
+        self.assertIsNone(result["terminal_continuations"][0]["controller_id"])
+
+        duplicate = web_bridge.reconcile_managed_web_assignments(
+            repo=self.repo, controller_id="controller-1", registry=self.registry,
+            event_paths=[self.events], now=T0 + timedelta(minutes=4),
+            terminal_consumer=lambda **kwargs: controller_wakes.append(kwargs) or {"pending_control_event": False},
+            event_source_probe=lambda: True,
+        )
+        self.assertEqual(controller_wakes, [])
+        self.assertEqual(duplicate["terminal_continuations"], [])
 
     def terminal_event(self, kind="completed", observation_id="terminal-1"):
         self.events.write_text(
