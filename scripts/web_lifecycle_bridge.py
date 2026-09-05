@@ -1479,6 +1479,9 @@ def execute_native_resume(
     runtime_path: str | None = None,
     terminal_receipts: Sequence[str] | None = None,
     next_action: str | None = None,
+    supervisor_state_path: Path | None = None,
+    supervisor_receipt_id: str | None = None,
+    supervisor_token: str | None = None,
 ) -> dict[str, Any]:
     """Run one bounded, preflighted same-thread native resume attempt."""
     try:
@@ -1542,13 +1545,45 @@ def execute_native_resume(
                 terminal_receipts=terminal_receipts,
                 next_action=next_action,
             )
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-            )
+            if (
+                supervisor_state_path is not None
+                and supervisor_receipt_id is not None
+                and supervisor_token is not None
+            ):
+                with _owned_supervisor_state(
+                    supervisor_state_path,
+                    receipt_id=supervisor_receipt_id,
+                    supervisor_token=supervisor_token,
+                ) as owner:
+                    if owner is None:
+                        return {
+                            "operation": "native_resume",
+                            "controller_id": session_id,
+                            "execution_target_session_id": execution_target,
+                            "target_generation": target_receipt.get("generation"),
+                            "target_mode": target_receipt.get("target_mode"),
+                            "command": command,
+                            "result": "DEFERRED",
+                            "state": "RESUME_SUPERSEDED",
+                            "pending_control_event": True,
+                            "returncode": 0,
+                            "failure_class": "supervisor_superseded",
+                        }
+                    process = subprocess.Popen(
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=env,
+                    )
+            else:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                )
     except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
         target_rejected = target_receipt is None
         return {
@@ -1763,6 +1798,9 @@ def recover_incompatible_native_target(
         session_id=session_id, repo=repo, registry=registry, codex=codex,
         runtime_path=runtime_path, terminal_receipts=terminal_receipts,
         next_action=next_action,
+        supervisor_state_path=supervisor_state_path,
+        supervisor_receipt_id=supervisor_receipt_id,
+        supervisor_token=supervisor_token,
     )
     resumed = dict(resumed)
     resumed["operation"] = "native_target_recovery"
@@ -3015,6 +3053,9 @@ def _run_auto_native_stop_impl(
         runtime_path=runtime_path,
         terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
         next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
+        supervisor_state_path=state_path,
+        supervisor_receipt_id=receipt_id,
+        supervisor_token=supervisor_token,
     )
     if (
         attempt.get("state") == "RESUME_TARGET_INCOMPATIBLE"

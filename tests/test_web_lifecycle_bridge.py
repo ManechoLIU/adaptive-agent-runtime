@@ -2443,6 +2443,57 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
             self.assertEqual(final["supervisor_token"], new_token)
             self.assertEqual(final["supervisor_pid"], 2222)
 
+    def test_superseded_supervisor_cannot_launch_recovery_resume_after_target_replacement(self) -> None:
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp)); old_token = "old-token"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-bad"]}},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-bad", "generation": 1,
+                }}},
+            }), encoding="utf-8")
+            state.write_text(json.dumps({
+                "receipt_id": "r1", "supervisor_receipt_id": "r1",
+                "supervisor_token": old_token, "supervisor_pid": 1111,
+                "pending_control_event": True,
+            }), encoding="utf-8")
+
+            bootstrap = Mock(return_value=Mock(
+                returncode=0, stdout='{"type":"thread.started","thread_id":"desktop-new"}\n', stderr=""
+            ))
+
+            def replace_then_supersede(**_kwargs):
+                superseded = json.loads(state.read_text())
+                superseded["supervisor_token"] = "new-token"
+                superseded["supervisor_pid"] = 2222
+                state.write_text(json.dumps(superseded), encoding="utf-8")
+                return {
+                    "controller_id": "controller-1",
+                    "execution_target_session_id": "desktop-new",
+                    "status": "active",
+                    "generation": 2,
+                }
+
+            popen = Mock(side_effect=AssertionError("superseded recovery must not launch stale native resume"))
+            with patch.object(web_bridge, "preflight_native_resume", return_value=(True, "", {})), patch.object(
+                web_bridge.subprocess, "run", bootstrap
+            ), patch.object(
+                web_bridge, "replace_desktop_execution_target", side_effect=replace_then_supersede
+            ), patch.object(web_bridge.subprocess, "Popen", popen):
+                result = web_bridge.recover_incompatible_native_target(
+                    session_id="controller-1", repo=repo, registry=registry, codex="codex",
+                    failed_target_session_id="desktop-bad", expected_generation=1,
+                    runtime_path="/usr/bin:/bin", terminal_receipts=["terminal.json"],
+                    next_action="continue", supervisor_state_path=state,
+                    supervisor_receipt_id="r1", supervisor_token=old_token,
+                )
+
+            self.assertEqual(result["state"], "RESUME_SUPERSEDED")
+            self.assertEqual(result["failure_class"], "supervisor_superseded")
+            popen.assert_not_called()
+
     def test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume(self) -> None:
         import threading
         from unittest.mock import Mock, patch
