@@ -244,6 +244,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
     "test_superseded_supervisor_cannot_start_native_recovery_bootstrap_after_resume",
     "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
+    "test_superseded_supervisor_cannot_start_recovery_bootstrap_between_ownership_check_and_launch",
+    "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
     "test_superseded_supervisor_cannot_replace_native_target_after_recovery_bootstrap",
     "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
     "test_superseded_supervisor_cannot_launch_recovery_resume_after_target_replacement",

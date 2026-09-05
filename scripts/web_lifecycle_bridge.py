@@ -1743,9 +1743,34 @@ def recover_incompatible_native_target(
     )
     bootstrap_command = [codex, "exec", "--json", "-C", str(repo.resolve()), bootstrap_prompt]
     try:
-        completed = subprocess.run(
-            bootstrap_command, check=False, capture_output=True, text=True, env=env, timeout=120
-        )
+        if (
+            supervisor_token is not None
+            and supervisor_state_path is not None
+            and supervisor_receipt_id is not None
+        ):
+            with _owned_supervisor_state(
+                supervisor_state_path,
+                receipt_id=supervisor_receipt_id,
+                supervisor_token=supervisor_token,
+            ) as owner:
+                if owner is None:
+                    return {
+                        "operation": "native_target_recovery",
+                        "controller_id": session_id,
+                        "result": "DEFERRED",
+                        "state": "RESUME_SUPERSEDED",
+                        "pending_control_event": True,
+                        "returncode": 0,
+                        "failure_class": "supervisor_superseded",
+                        "recovered_from_execution_target_session_id": failed_target_session_id,
+                    }
+                completed = subprocess.run(
+                    bootstrap_command, check=False, capture_output=True, text=True, env=env, timeout=120
+                )
+        else:
+            completed = subprocess.run(
+                bootstrap_command, check=False, capture_output=True, text=True, env=env, timeout=120
+            )
     except (OSError, subprocess.SubprocessError) as exc:
         return {
             "operation": "native_target_recovery", "controller_id": session_id,
