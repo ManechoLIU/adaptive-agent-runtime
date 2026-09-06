@@ -5395,6 +5395,64 @@ class ControllerHostResolutionIsolationTests(unittest.TestCase):
             "desktop_codex",
         )
 
+    def test_canonical_web_ownership_overrides_stale_desktop_lifecycle_hint(self) -> None:
+        registry = {
+            "__controller_sessions__": {
+                "controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                    "web": ["web-current"],
+                }
+            },
+            "__controller_targets__": {
+                "controller-1": {
+                    "desktop_codex": {"status": "active", "session_id": "desktop-current", "generation": 2},
+                    "web": {"status": "active", "session_id": "web-current", "generation": 4},
+                }
+            },
+            "__controller_execution_ownership__": {
+                "controller-1": {
+                    "active_host": "web",
+                    "execution_target_session_id": "web-current",
+                    "generation": 8,
+                }
+            },
+        }
+        self.assertEqual(
+            web_bridge.resolve_controller_host(
+                {"controller_host": "desktop_codex"}, {}, registry, "controller-1"
+            ),
+            "web",
+        )
+
+    def test_canonical_desktop_ownership_overrides_stale_web_lifecycle_hint(self) -> None:
+        registry = {
+            "__controller_sessions__": {
+                "controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                    "web": ["web-current"],
+                }
+            },
+            "__controller_targets__": {
+                "controller-1": {
+                    "desktop_codex": {"status": "active", "session_id": "desktop-current", "generation": 2},
+                    "web": {"status": "active", "session_id": "web-current", "generation": 4},
+                }
+            },
+            "__controller_execution_ownership__": {
+                "controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 9,
+                }
+            },
+        }
+        self.assertEqual(
+            web_bridge.resolve_controller_host(
+                {"controller_host": "web"}, {}, registry, "controller-1"
+            ),
+            "desktop_codex",
+        )
+
     def test_explicit_current_web_target_preserves_web_lifecycle_host(self) -> None:
         registry = {
             "__controller_sessions__": {

@@ -2552,6 +2552,34 @@ def resolve_controller_host(
     registry_data: dict[str, Any],
     session_id: str,
 ) -> str:
+    ownership = target_guard.execution_ownership_record(
+        registry_data if isinstance(registry_data, dict) else {},
+        controller_id=session_id,
+    )
+    if ownership is not None:
+        active_host, ownership_target, _ownership_generation = (
+            target_guard.validate_execution_ownership_record(ownership)
+        )
+        host_target = target_guard.target_record(
+            registry_data, controller_id=session_id, host=active_host
+        )
+        if host_target is None:
+            aliases = target_guard.host_sessions(
+                registry_data, controller_id=session_id, host=active_host
+            )
+            if aliases or ownership_target != session_id:
+                raise PermissionError(
+                    "canonical Controller ownership target is not current for its host"
+                )
+        else:
+            status, current_target, _host_generation = (
+                target_guard.validate_target_record(host_target, host=active_host)
+            )
+            if status != "active" or current_target != ownership_target:
+                raise PermissionError(
+                    "canonical Controller ownership target is not current for its host"
+                )
+        return active_host
     sessions = registry_data.get("__controller_sessions__", {}) if isinstance(registry_data, dict) else {}
     controller_sessions = sessions.get(session_id, {}) if isinstance(sessions, dict) else {}
     if not isinstance(controller_sessions, dict):
