@@ -2961,6 +2961,16 @@ class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
             self.assertEqual(saved["state"], "RESUME_CONFIRMED")
             self.assertTrue(saved["pending_control_event"])
             self.assertIn("resume controller-1", marker.read_text())
+            wake = json.loads(
+                (repo / ".git" / "adaptive-delivery" / "controller-wake-receipt.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(wake["result"], "CONFIRMED")
+            self.assertEqual(wake["selected_host"], "desktop_codex")
+            self.assertEqual(wake["controller_id"], "controller-1")
+            self.assertEqual(wake["execution_target_session_id"], "controller-1")
+            self.assertEqual(wake["target_generation"], 1)
+            self.assertTrue(wake["pending_control_event"])
 
     def test_auto_native_stop_rearms_after_confirmed_resume_while_lifecycle_remains_pending(self) -> None:
         from unittest.mock import patch

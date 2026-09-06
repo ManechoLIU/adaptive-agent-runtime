@@ -2317,6 +2317,72 @@ def default_wake_receipt_path(repo: Path) -> Path:
     return _git_common_dir(repo) / "adaptive-delivery" / "controller-wake-receipt.json"
 
 
+def persist_confirmed_auto_native_wake(
+    *,
+    lifecycle_state: dict[str, Any],
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    attempt: dict[str, Any],
+    state_path: Path,
+    receipt_id: str,
+    supervisor_token: str | None,
+) -> bool:
+    """Persist a target-fenced canonical receipt for a successful delayed native wake."""
+    if attempt.get("result") != "CONFIRMED":
+        return False
+    execution_target = str(attempt.get("execution_target_session_id") or "").strip()
+    generation = attempt.get("target_generation")
+    if not execution_target or not isinstance(generation, int) or isinstance(generation, bool):
+        return False
+
+    common_dir = _git_common_dir(repo)
+    wake_path = default_wake_receipt_path(repo)
+    lock_path = common_dir / "adaptive-delivery" / "controller-wake.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            with target_guard.locked_execution_target(
+                repo=repo,
+                host=target_guard.DESKTOP_SESSION_HOST,
+                registry_path=registry,
+            ) as current_target:
+                if (
+                    current_target.get("controller_id") != session_id
+                    or current_target.get("execution_target_session_id") != execution_target
+                    or current_target.get("generation") != generation
+                ):
+                    return False
+                with _owned_supervisor_state(
+                    state_path,
+                    receipt_id=receipt_id,
+                    supervisor_token=supervisor_token,
+                ) as owner:
+                    if owner is None:
+                        return False
+                    receipt = _wake_receipt(
+                        common_dir=common_dir,
+                        session_id=session_id,
+                        event_fingerprint=_wake_event_fingerprint(lifecycle_state),
+                        health={"state": "ACTIVE", "controller_host": "desktop_codex"},
+                        decision="WAKE_EXISTING",
+                        selected_host="desktop_codex",
+                        reason="auto_native_stop_confirmed",
+                        operation=attempt.get("operation"),
+                        result="CONFIRMED",
+                        command=attempt.get("command"),
+                        diagnostics=attempt.get("stderr_tail"),
+                        execution_target_session_id=execution_target,
+                        target_generation=generation,
+                        target_mode=attempt.get("target_mode"),
+                    )
+                    _write_json_atomic_file(wake_path, receipt)
+                    return True
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def _lifecycle_module() -> Any:
     try:
         import lifecycle_hook as lifecycle
@@ -3236,6 +3302,18 @@ def _run_auto_native_stop_impl(
                 supervisor_lock_held=supervisor_token is not None,
             )
             return 0
+
+    if attempt.get("result") == "CONFIRMED":
+        persist_confirmed_auto_native_wake(
+            lifecycle_state=lifecycle_state,
+            session_id=session_id,
+            repo=repo,
+            registry=registry,
+            attempt=attempt,
+            state_path=state_path,
+            receipt_id=receipt_id,
+            supervisor_token=supervisor_token,
+        )
 
     stderr_tail = str(attempt.get("stderr_tail", ""))
     if stderr_tail:
