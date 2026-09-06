@@ -962,6 +962,9 @@ def controller_continuation_projection(
         *(f"runnable:{task_id}" for task_id in sorted(runnable_ids)),
         *(f"controller_action:{action_id}" for action_id in sorted(action_ids)),
     }
+    pending_next_action = str(lifecycle_state.get("next_action") or "").strip()
+    if pending_next_action and not requires_user:
+        debt_ids.add("known_next_action")
     if lifecycle_state.get("pending_control_event") is True:
         debt_ids.add("pending_control_event")
 
@@ -979,6 +982,18 @@ def controller_continuation_projection(
                     current["controller_host"] = host
                     current["wake_generation"] = int(current.get("wake_generation", 0) or 0) + 1
                     current["runtime_continuation_debt_ids"] = sorted(debt_ids)
+                    triggers = {
+                        str(item) for item in current.get("triggers", []) if str(item).strip()
+                    }
+                    triggers.add("RUNTIME_CONTINUATION_DEBT")
+                    if str(current.get("next_action") or "").strip():
+                        triggers.add("KNOWN_NEXT_ACTION_NOT_EXECUTED")
+                    current["triggers"] = sorted(triggers)
+                    current["yield_rejected"] = True
+                    current["yield_rejected_reason"] = (
+                        "canonical continuation debt remained after the prior host turn ended"
+                    )
+                    current["yield_recovery_source"] = "canonical_continuation_projection"
                     lifecycle.write_json(state_file, current)
                     lifecycle_state = current
             finally:

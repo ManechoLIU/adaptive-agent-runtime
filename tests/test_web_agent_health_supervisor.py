@@ -262,6 +262,50 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
                 self.assertFalse(result["controller_continuation"]["should_continue"])
                 self.assertFalse(result["controller_continuation"]["supervisor_armed"])
 
+    def test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback(self):
+        from scripts import control_event_guard, lifecycle_hook, web_lifecycle_bridge
+        from scripts.web_agent_health_supervisor import reconcile_web_agent_health_once
+
+        state_file = Path(self.tmp.name) / "controller-next-action-end-turn.json"
+        state_file.write_text(json.dumps({
+            "pending_control_event": False,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 21,
+            "triggers": [],
+            "next_action": "consume reviewer verdict and integrate candidate",
+        }), encoding="utf-8")
+        (self.repo / "TASK_LEDGER.md").write_text("# ledger\n", encoding="utf-8")
+
+        with (
+            patch.object(lifecycle_hook, "state_path", return_value=state_file),
+            patch.object(
+                control_event_guard, "project_wide_dispatch_projection",
+                return_value={"derived_runnable_ids": set(), "work_in_flight": {}, "task_states": {}},
+            ),
+            patch.object(control_event_guard, "unmerged_worktree_candidates", return_value={}),
+            patch.object(control_event_guard, "open_controller_corrections", return_value=[]),
+            patch.object(control_event_guard, "canonical_controller_action_projection", return_value={}),
+            patch.object(web_lifecycle_bridge, "ensure_continuation_supervisor", return_value=True) as ensure,
+        ):
+            result = reconcile_web_agent_health_once(
+                repo=self.repo, registry_path=self.registry, controller_id="controller-1",
+                event_paths=[], now=T0 + timedelta(minutes=3), event_source_probe=lambda: True,
+            )
+
+        persisted = json.loads(state_file.read_text(encoding="utf-8"))
+        projection = result["controller_continuation"]
+        self.assertTrue(projection["should_continue"])
+        self.assertIn("known_next_action", projection["debt_ids"])
+        self.assertTrue(persisted["pending_control_event"])
+        self.assertEqual(persisted["wake_generation"], 22)
+        self.assertIn("KNOWN_NEXT_ACTION_NOT_EXECUTED", persisted["triggers"])
+        self.assertIn("RUNTIME_CONTINUATION_DEBT", persisted["triggers"])
+        self.assertTrue(persisted["yield_rejected"])
+        self.assertEqual(persisted["yield_recovery_source"], "canonical_continuation_projection")
+        ensure.assert_called_once()
+        self.assertEqual(ensure.call_args.kwargs["session_id"], "controller-1")
+
     def test_canonical_runnable_reopens_continuation_without_user_message(self):
         from scripts import control_event_guard, lifecycle_hook, web_lifecycle_bridge
 
