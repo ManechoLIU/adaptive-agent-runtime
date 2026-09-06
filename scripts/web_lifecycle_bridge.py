@@ -2392,6 +2392,23 @@ def persist_confirmed_auto_native_wake(
                     or current_target.get("generation") != generation
                 ):
                     return False
+                expected_ownership_generation = attempt.get("ownership_generation")
+                if expected_ownership_generation is not None:
+                    registry_data = target_guard.load_json(registry)
+                    ownership_record = target_guard.execution_ownership_record(
+                        registry_data, controller_id=session_id
+                    )
+                    if ownership_record is None:
+                        return False
+                    ownership_host, ownership_target, ownership_generation = (
+                        target_guard.validate_execution_ownership_record(ownership_record)
+                    )
+                    if (
+                        ownership_host != target_guard.DESKTOP_SESSION_HOST
+                        or ownership_target != execution_target
+                        or ownership_generation != expected_ownership_generation
+                    ):
+                        return False
                 with _owned_supervisor_state(
                     state_path,
                     receipt_id=receipt_id,
@@ -3097,6 +3114,61 @@ def _rearm_auto_native_stop(
     return schedule_auto_native_stop(**kwargs)
 
 
+def _canonical_ownership_fence(
+    *, repo: Path, registry: Path, session_id: str
+) -> dict[str, Any] | None:
+    del repo  # Hot-path fence is registry-only; never launch Git/subprocess work here.
+    registry_data = load_json(registry)
+    ownership = target_guard.execution_ownership_record(
+        registry_data, controller_id=session_id
+    )
+    if ownership is None:
+        return None
+    active_host, ownership_target, generation = (
+        target_guard.validate_execution_ownership_record(ownership)
+    )
+    host_target = target_guard.target_record(
+        registry_data, controller_id=session_id, host=active_host
+    )
+    if host_target is None:
+        aliases = target_guard.host_sessions(
+            registry_data, controller_id=session_id, host=active_host
+        )
+        if aliases or ownership_target != session_id:
+            raise PermissionError(
+                "canonical Controller ownership target is not current for its host"
+            )
+    else:
+        status, current_target, _host_generation = target_guard.validate_target_record(
+            host_target, host=active_host
+        )
+        if status != "active" or current_target != ownership_target:
+            raise PermissionError(
+                "canonical Controller ownership target is not current for its host"
+            )
+    return {
+        "controller_id": session_id,
+        "active_host": active_host,
+        "execution_target_session_id": ownership_target,
+        "generation": generation,
+    }
+
+
+def _canonical_ownership_fence_matches(
+    expected: dict[str, Any] | None,
+    *, repo: Path, registry: Path, session_id: str,
+) -> bool:
+    if expected is None:
+        return True
+    try:
+        current = _canonical_ownership_fence(
+            repo=repo, registry=registry, session_id=session_id
+        )
+    except (OSError, ValueError, PermissionError, subprocess.SubprocessError):
+        return False
+    return current == expected
+
+
 def _run_auto_native_stop_impl(
     *,
     session_id: str,
@@ -3138,6 +3210,11 @@ def _run_auto_native_stop_impl(
     controller_host = resolve_controller_host(
         lifecycle_state, {}, load_json(registry), session_id
     )
+    ownership_fence = _canonical_ownership_fence(
+        repo=repo, registry=registry, session_id=session_id
+    )
+    if ownership_fence is not None and ownership_fence.get("active_host") != controller_host:
+        raise PermissionError("resolved Controller host disagrees with canonical ownership")
     if controller_host == "web":
         # Read the current supervisor-owned inputs under lock, but never hold the
         # lock while Host/Web re-entry performs external work. Superseding a
@@ -3178,6 +3255,17 @@ def _run_auto_native_stop_impl(
             if current is None:
                 return 0
             owned_lock_held = supervisor_token is not None
+            if not _canonical_ownership_fence_matches(
+                ownership_fence, repo=repo, registry=registry, session_id=session_id
+            ):
+                current.update({
+                    "state": "WEB_REENTRY_SUPERSEDED_HOST_HANDOFF",
+                    "pending_control_event": True,
+                    "failure_class": "host_ownership_superseded",
+                    "completed_at_unix_ms": int(time.time() * 1000),
+                })
+                write_auto_stop_state(state_path, current)
+                return 0
             for evidence_key in (
                 "execution_target_session_id", "target_generation", "target_mode",
             ):
@@ -3319,11 +3407,30 @@ def _run_auto_native_stop_impl(
                 supervisor_token=supervisor_token,
             )
 
-    # Revalidate the token before committing any external result or rearming.
+    if ownership_fence is not None:
+        attempt["ownership_host"] = ownership_fence.get("active_host")
+        attempt["ownership_execution_target_session_id"] = ownership_fence.get(
+            "execution_target_session_id"
+        )
+        attempt["ownership_generation"] = ownership_fence.get("generation")
+
+    # Revalidate both supervisor token and canonical host ownership before
+    # committing any external result or rearming.
     with _owned_supervisor_state(
         state_path, receipt_id=receipt_id, supervisor_token=supervisor_token
     ) as latest:
         if latest is None:
+            return 0
+        if not _canonical_ownership_fence_matches(
+            ownership_fence, repo=repo, registry=registry, session_id=session_id
+        ):
+            latest.update({
+                "state": "RESUME_SUPERSEDED_HOST_HANDOFF",
+                "pending_control_event": True,
+                "failure_class": "host_ownership_superseded",
+                "completed_at_unix_ms": int(time.time() * 1000),
+            })
+            write_auto_stop_state(state_path, latest)
             return 0
         for evidence_key in (
             "command",
