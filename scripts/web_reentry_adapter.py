@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import subprocess
 import time
 import urllib.request
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Callable
 
@@ -82,15 +84,36 @@ def resolve_reentry_session(
     return session_id
 
 
-def discover_ai_bridge_mcp_url(*, ps_text: str | None = None) -> str:
+def _loopback_mcp_endpoint_live(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
+            return False
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=0.35):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def discover_ai_bridge_mcp_url(
+    *,
+    ps_text: str | None = None,
+    endpoint_probe: Callable[[str], bool] | None = None,
+) -> str:
+    live_process_scan = ps_text is None
     if ps_text is None:
         ps_text = subprocess.check_output(["/bin/ps", "aux"], text=True)
     matches = re.findall(
-        r"--mcp\.server-url\s+(http://127\.0\.0\.1:\d+/mcp/[^\s]+)",
+        r"--mcp\.server-url\s+(?:url=)?(http://127\.0\.0\.1:\d+/mcp/[^\s]+)",
         str(ps_text),
     )
     unique = list(dict.fromkeys(matches))
-    if len(unique) != 1:
+    probe = endpoint_probe or (_loopback_mcp_endpoint_live if live_process_scan else None)
+    if probe is not None:
+        unique = [url for url in unique if probe(url)]
+        if len(unique) != 1:
+            raise RuntimeError("exactly one live local AI-Bridge MCP endpoint is required")
+    elif len(unique) != 1:
         raise RuntimeError("exactly one local AI-Bridge MCP endpoint is required")
     return unique[0]
 

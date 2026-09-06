@@ -648,6 +648,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests.test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_production_bridge_registers_trusted_web_attestation_verifier",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab",
+            "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests.test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix",
         }
         self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
         self.assertIn("tests/test_web_agent_health_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
@@ -698,7 +699,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_transient_web_reentry_failure_rearms_existing_continuation_supervisor(self):\n"
                 "        self.assertTrue(True)\n"
                 "class WebReentryAdapterTests(unittest.TestCase):\n"
-                "    def test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab(self): self.assertTrue(True)\n",
+                "    def test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab(self): self.assertTrue(True)\n"
+                "class AiBridgeMcpDiscoveryTests(unittest.TestCase):\n"
+                "    def test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_web_collaboration_continuation.py").write_text(

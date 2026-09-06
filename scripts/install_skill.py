@@ -75,6 +75,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_production_bridge_registers_trusted_web_attestation_verifier",
     "tests.test_web_reentry_adapter.WebReentryAdapterTests."
     "test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab",
+    "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests."
+    "test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix",
     "tests.test_rule_handshake.RuleHandshakeTests."
     "test_critical_live_runtime_update_requires_real_e2e_after_ack_and_ledger_sync",
     "tests.test_rule_handshake.RuleHandshakeTests."

@@ -317,6 +317,38 @@ class WebReentryAdapterTests(unittest.TestCase):
 
 
 class AiBridgeMcpDiscoveryTests(unittest.TestCase):
+    def test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix(self) -> None:
+        ps = (
+            "user 1 tunnel-client run --mcp.server-url url=http://127.0.0.1:52377/mcp/live-id\n"
+            "user 2 tunnel-client run --mcp.server-url http://127.0.0.1:61518/mcp/stale-id\n"
+        )
+        probed: list[str] = []
+        def probe(url: str) -> bool:
+            probed.append(url)
+            return ":52377/" in url
+        self.assertEqual(
+            web_reentry_adapter.discover_ai_bridge_mcp_url(ps_text=ps, endpoint_probe=probe),
+            "http://127.0.0.1:52377/mcp/live-id",
+        )
+        self.assertEqual(set(probed), {
+            "http://127.0.0.1:52377/mcp/live-id",
+            "http://127.0.0.1:61518/mcp/stale-id",
+        })
+
+    def test_discovery_fails_closed_when_zero_or_multiple_live_endpoints_exist(self) -> None:
+        ps = (
+            "user 1 tunnel-client run --mcp.server-url http://127.0.0.1:52377/mcp/a\n"
+            "user 2 tunnel-client run --mcp.server-url http://127.0.0.1:52378/mcp/b\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "exactly one live"):
+            web_reentry_adapter.discover_ai_bridge_mcp_url(
+                ps_text=ps, endpoint_probe=lambda _url: False
+            )
+        with self.assertRaisesRegex(RuntimeError, "exactly one live"):
+            web_reentry_adapter.discover_ai_bridge_mcp_url(
+                ps_text=ps, endpoint_probe=lambda _url: True
+            )
+
     def test_discovers_loopback_mcp_url_without_exposing_non_loopback_endpoint(self) -> None:
         ps = (
             "user 1 ... tunnel-client run --mcp.server-url "
