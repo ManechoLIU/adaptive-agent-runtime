@@ -348,6 +348,12 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             if lease.get(field) != value:
                 changed_fields.append(field)
                 lease[field] = value
+        candidate_revision = str(receipt.get("candidate_revision") or "").strip()
+        if candidate_revision:
+            observed_head = str(receipt.get("last_observed_head") or "").strip()
+            if candidate_revision != observed_head:
+                raise ValueError("candidate_revision must match last_observed_head in the same progress receipt")
+            lease["candidate_revision"] = candidate_revision
         if changed_fields:
             deadline_minutes = int(lease.get("progress_deadline_minutes") or policy.progress_deadline_minutes)
             lease["last_progress_at"] = _iso(issued)

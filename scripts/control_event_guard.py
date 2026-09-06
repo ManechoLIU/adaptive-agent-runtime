@@ -2200,6 +2200,46 @@ def canonical_controller_action_projection(
         from assignment_runtime import evaluate_lease, load_runtime_state
     runtime = load_runtime_state(repo)
     leases = runtime.get("leases", {}) if isinstance(runtime, dict) else {}
+
+    candidate_by_worktree = {
+        str(Path(path).expanduser().resolve()): str(revision).strip()
+        for path, revision in (candidates or {}).items()
+        if str(path).strip() and str(revision).strip()
+    }
+    active_by_worktree: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(leases, dict):
+        for lease in leases.values():
+            if not isinstance(lease, dict) or lease.get("terminal_state"):
+                continue
+            worktree = str(lease.get("worktree", "")).strip()
+            if not worktree:
+                continue
+            active_by_worktree.setdefault(
+                str(Path(worktree).expanduser().resolve()), []
+            ).append(lease)
+    for worktree, revision in sorted(candidate_by_worktree.items()):
+        matching = active_by_worktree.get(worktree, [])
+        if not matching:
+            continue
+        lease = max(matching, key=lambda item: int(item.get("attempt", 0) or 0))
+        observed_head = str(lease.get("last_observed_head") or "").strip()
+        recorded_candidate = str(lease.get("candidate_revision") or "").strip()
+        if observed_head == revision and recorded_candidate == revision:
+            continue
+        assignment_id = str(lease.get("assignment_id") or "").strip()
+        if not assignment_id:
+            continue
+        actions[f"control_plane_reconcile:{assignment_id}"] = {
+            "type": "control_plane_reconcile",
+            "assignment_id": assignment_id,
+            "task_id": str(lease.get("task_id") or "").strip(),
+            "worktree": worktree,
+            "expected_candidate_revision": revision,
+            "observed_runtime_head": observed_head,
+            "recorded_candidate_revision": recorded_candidate or None,
+            "reason": "FACT_PROJECTION_DRIFT",
+        }
+
     for task_id in sorted(work_in_flight):
         matching = [
             lease for lease in leases.values()

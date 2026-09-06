@@ -99,6 +99,27 @@ class RuntimeTests(unittest.TestCase):
         t=T0+timedelta(minutes=10); state=apply_receipt(state,receipt("assignment_progress",t,last_observed_head="abc",event_seq=2),now=t)
         lease=state["leases"]["a1"]
         self.assertEqual(lease["lease_expires_at"],(t+timedelta(minutes=20)).isoformat()); self.assertEqual(lease["progress_deadline_at"],(t+timedelta(minutes=30)).isoformat())
+    def test_progress_can_promote_observed_head_to_candidate_revision(self):
+        state=apply_receipt({},receipt("assignment_started", baseline_head="base"),now=T0)
+        t=T0+timedelta(minutes=10)
+        state=apply_receipt(
+            state,
+            receipt("assignment_progress",t,last_observed_head="cand",candidate_revision="cand",event_seq=2),
+            now=t,
+        )
+        lease=state["leases"]["a1"]
+        self.assertEqual(lease["last_observed_head"],"cand")
+        self.assertEqual(lease["candidate_revision"],"cand")
+
+    def test_progress_rejects_candidate_revision_not_bound_to_observed_head(self):
+        state=apply_receipt({},receipt("assignment_started", baseline_head="base"),now=T0)
+        t=T0+timedelta(minutes=10)
+        with self.assertRaisesRegex(ValueError, "candidate_revision must match last_observed_head"):
+            apply_receipt(
+                state,
+                receipt("assignment_progress",t,last_observed_head="cand",candidate_revision="other",event_seq=2),
+                now=t,
+            )
     def test_progress_stale_then_unhealthy_after_grace_while_heartbeats_continue(self):
         state=apply_receipt({},receipt("assignment_started"),now=T0)
         for seq, minute in enumerate((15, 30), start=2):

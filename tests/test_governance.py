@@ -4176,6 +4176,64 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertTrue(any("control_loop_receipt" in error for error in errors), errors)
         self.assertTrue(any("controller action" in error for error in errors), errors)
 
+    def test_live_candidate_with_stale_matching_lease_requires_control_plane_reconcile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            common = Path(subprocess.run(
+                ["git", "rev-parse", "--git-common-dir"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip())
+            if not common.is_absolute():
+                common = (root / common).resolve()
+            state_dir = common / "adaptive-delivery"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            runtime = {
+                "schema_version": 2,
+                "lineages": {},
+                "leases": {
+                    "assignment-1": {
+                        "assignment_id": "assignment-1",
+                        "task_id": "TASK-1",
+                        "worktree": "/tmp/candidate",
+                        "attempt": 1,
+                        "terminal_state": None,
+                        "baseline_head": "base",
+                        "last_observed_head": "base",
+                        "candidate_revision": None,
+                        "last_heartbeat_at": "2099-01-01T00:00:00+00:00",
+                        "lease_expires_at": "2099-01-01T01:00:00+00:00",
+                        "last_progress_at": "2099-01-01T00:00:00+00:00",
+                        "progress_deadline_at": "2099-01-01T01:00:00+00:00",
+                    }
+                },
+            }
+            (state_dir / "runtime-assignments.json").write_text(json.dumps(runtime), encoding="utf-8")
+            actions = control_event_guard.canonical_controller_action_projection(
+                root,
+                controller_id="controller-1",
+                candidates={"/tmp/candidate": "candidate-abc"},
+                required_review_ids=set(),
+                work_in_flight={"TASK-1": "ACTIVE"},
+                corrections=[],
+            )
+            action_id = "control_plane_reconcile:assignment-1"
+            self.assertIn(action_id, actions)
+            self.assertEqual(actions[action_id]["expected_candidate_revision"], "candidate-abc")
+            self.assertEqual(actions[action_id]["observed_runtime_head"], "base")
+
+            runtime["leases"]["assignment-1"]["last_observed_head"] = "candidate-abc"
+            runtime["leases"]["assignment-1"]["candidate_revision"] = "candidate-abc"
+            (state_dir / "runtime-assignments.json").write_text(json.dumps(runtime), encoding="utf-8")
+            actions = control_event_guard.canonical_controller_action_projection(
+                root,
+                controller_id="controller-1",
+                candidates={"/tmp/candidate": "candidate-abc"},
+                required_review_ids=set(),
+                work_in_flight={"TASK-1": "ACTIVE"},
+                corrections=[],
+            )
+            self.assertNotIn(action_id, actions)
+
     def test_active_writer_does_not_hide_immediate_controller_actions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
