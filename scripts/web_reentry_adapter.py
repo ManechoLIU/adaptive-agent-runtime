@@ -218,6 +218,72 @@ def _composer_node(nodes: list[Any]) -> str | None:
     return None
 
 
+def verify_ai_bridge_web_session_attestation(
+    *,
+    controller_id: str,
+    host: str,
+    expected_target_session_id: str,
+    expected_target_generation: int,
+    expected_target_mode: str | None,
+    host_execution_receipt: Any,
+    adapter_attempt: Any,
+    browser_call: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> bool:
+    """Verify a Web Controller session against a live AI-Bridge browser tab.
+
+    Caller-provided receipt fields are never sufficient by themselves: the
+    verifier independently re-reads the trusted browser boundary and requires
+    the exact ChatGPT conversation/tab to still exist.
+    """
+    del controller_id, expected_target_generation, adapter_attempt
+    if host != "web":
+        return False
+    session_id = str(expected_target_session_id or "").strip()
+    if not session_id:
+        return False
+    if str(expected_target_mode or "").strip() not in {
+        "same_controller_session_recovery",
+        "web_lease",
+        "explicit_current",
+        "canonical_host_ownership",
+    }:
+        return False
+    if not isinstance(host_execution_receipt, dict):
+        return False
+    if str(host_execution_receipt.get("host") or "").strip() != "web":
+        return False
+    receipt_session = str(
+        host_execution_receipt.get("web_session_id")
+        or host_execution_receipt.get("session_id")
+        or ""
+    ).strip()
+    if receipt_session != session_id:
+        return False
+    if str(host_execution_receipt.get("source") or "").strip() != "ai_bridge_browser":
+        return False
+    receipt_tab_id = str(host_execution_receipt.get("tab_id") or "").strip()
+    if not receipt_tab_id:
+        return False
+    receipt_url = str(host_execution_receipt.get("url") or "").strip()
+
+    call = browser_call or _default_browser_call
+    try:
+        listed = call({"action": "list_tabs"})
+    except Exception:
+        return False
+    tabs = listed.get("tabs") if isinstance(listed, dict) else None
+    tabs = tabs if isinstance(tabs, list) else []
+    tab = _tab_for_session(tabs, session_id)
+    if tab is None:
+        return False
+    if str(tab.get("tab_id") or "").strip() != receipt_tab_id:
+        return False
+    live_url = str(tab.get("url") or "").strip()
+    if receipt_url and live_url != receipt_url:
+        return False
+    return True
+
+
 def build_reentry_prompt(
     *, controller_id: str, lifecycle_state: dict[str, Any], terminal_receipts: list[Any] | None = None,
 ) -> str:
@@ -337,12 +403,22 @@ def execute_web_reentry(
         })
         if isinstance(submitted, dict) and submitted.get("ok") is False:
             raise RuntimeError("AI-Bridge browser did not confirm Web re-entry submission")
+        host_receipt: dict[str, Any] = {
+            "host": "web",
+            "web_session_id": web_session_id,
+            "tab_id": tab_id,
+            "source": "ai_bridge_browser",
+            "submitted": True,
+        }
+        observed_url = str((tab or {}).get("url") or "").strip() if tab is not None else ""
+        if observed_url:
+            host_receipt["url"] = observed_url
         return {
             "operation": "web_reentry", "result": "CONFIRMED", "state": "WEB_REENTRY_SUBMITTED",
             "returncode": 0, "controller_id": controller_id,
             "execution_target_session_id": web_session_id, "target_generation": 0,
             "target_mode": "web_lease", "pending_control_event": True,
-            "host_execution_receipt": {"host": "web", "web_session_id": web_session_id, "submitted": True},
+            "host_execution_receipt": host_receipt,
         }
     except Exception as exc:
         return {
