@@ -5521,6 +5521,51 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
             self.assertEqual(receipt["execution_target_session_id"], "web-current")
             reentry.assert_called_once()
 
+    def test_direct_wake_rejects_confirmed_web_result_after_desktop_handoff(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry, _state_path = self.make_repo(root)
+            payload = json.loads(registry.read_text())
+            payload["__controller_sessions__"]["controller-1"]["desktop_codex"] = ["desktop-current"]
+            payload["__controller_targets__"] = {"controller-1": {
+                "web": {"status":"active","session_id":"web-current","generation":4},
+                "desktop_codex": {"status":"active","session_id":"desktop-current","generation":2},
+            }}
+            payload["__controller_execution_ownership__"] = {"controller-1": {
+                "active_host":"web","execution_target_session_id":"web-current","generation":8,
+            }}
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            receipt_path = root / "wake.json"
+
+            def web_then_handoff(**_kwargs):
+                changed = json.loads(registry.read_text())
+                changed["__controller_execution_ownership__"]["controller-1"] = {
+                    "active_host":"desktop_codex",
+                    "execution_target_session_id":"desktop-current",
+                    "generation":9,
+                }
+                registry.write_text(json.dumps(changed), encoding="utf-8")
+                return {
+                    "operation":"web_reentry","result":"CONFIRMED","state":"WEB_REENTRY_SUBMITTED",
+                    "returncode":0,"execution_target_session_id":"web-current",
+                    "target_generation":4,"target_mode":"explicit_current",
+                }
+
+            with patch.object(web_bridge, "execute_web_reentry", side_effect=web_then_handoff), patch.object(
+                web_bridge, "execute_native_resume",
+                side_effect=AssertionError("Web-owned direct wake must not invoke desktop Codex")
+            ):
+                receipt = web_bridge.wake_existing_controller(
+                    lifecycle_state={"pending_control_event":True,"controller_host":"web","wake_generation":8},
+                    session_id="controller-1", repo=repo, registry=registry, codex="codex",
+                    receipt_path=receipt_path,
+                    host_facts={"controller_host":"web","resume_actionable":True},
+                )
+
+            self.assertEqual(receipt["result"], "DEFERRED")
+            self.assertEqual(receipt["error_code"], "CONTROLLER_HOST_OWNERSHIP_SUPERSEDED")
+            self.assertEqual(receipt["selected_host"], "web")
+
     def test_detached_supervisor_submits_web_reentry_then_rearms_observer(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
