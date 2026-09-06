@@ -71,6 +71,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_desktop_result_cannot_persist_or_rearm_after_web_handoff",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_production_bridge_registers_trusted_web_attestation_verifier",
+    "tests.test_web_reentry_adapter.WebReentryAdapterTests."
+    "test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab",
     "tests.test_rule_handshake.RuleHandshakeTests."
     "test_critical_live_runtime_update_requires_real_e2e_after_ack_and_ledger_sync",
     "tests.test_rule_handshake.RuleHandshakeTests."

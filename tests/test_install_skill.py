@@ -646,6 +646,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_governance.GovernanceTests.test_control_loop_stop_rejection_reopens_pending_event_even_if_prior_state_was_closed",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection",
             "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests.test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_production_bridge_registers_trusted_web_attestation_verifier",
+            "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab",
         }
         self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
         self.assertIn("tests/test_web_agent_health_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
@@ -694,7 +696,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "import unittest\n"
                 "class WebReentryContinuationRegressionTests(unittest.TestCase):\n"
                 "    def test_transient_web_reentry_failure_rearms_existing_continuation_supervisor(self):\n"
-                "        self.assertTrue(True)\n",
+                "        self.assertTrue(True)\n"
+                "class WebReentryAdapterTests(unittest.TestCase):\n"
+                "    def test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_web_collaboration_continuation.py").write_text(
@@ -763,6 +767,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership(self): self.assertTrue(True)\n"
                 "    def test_web_recovery_preserves_desktop_target_and_only_advances_web_generation(self): self.assertTrue(True)\n"
                 "    def test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection(self): self.assertTrue(True)\n"
+                "    def test_production_bridge_registers_trusted_web_attestation_verifier(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_web_reentry(self): self.assertTrue(True)\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume(self): self.assertTrue(True)\n"
