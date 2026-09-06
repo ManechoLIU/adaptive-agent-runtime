@@ -5557,6 +5557,115 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
             self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
             self.assertEqual(saved["continuation_count"], 1)
 
+    def test_web_result_cannot_commit_or_rearm_after_desktop_handoff(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry, state_path = self.make_repo(root)
+            payload = json.loads(registry.read_text())
+            payload["__controller_sessions__"]["controller-1"]["desktop_codex"] = ["desktop-current"]
+            payload["__controller_targets__"] = {"controller-1": {
+                "web": {"status":"active","session_id":"web-current","generation":4},
+                "desktop_codex": {"status":"active","session_id":"desktop-current","generation":2},
+            }}
+            payload["__controller_execution_ownership__"] = {"controller-1": {
+                "active_host":"web","execution_target_session_id":"web-current","generation":8,
+            }}
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            state_path.write_text(json.dumps({
+                "receipt_id":"web-handoff","session_id":"controller-1","repo":str(repo.resolve()),
+                "state":"RESUME_PENDING","pending_control_event":True,
+            }), encoding="utf-8")
+            lifecycle = {"pending_control_event":True,"requires_user":False,"controller_host":"web","wake_generation":8}
+
+            def web_then_handoff(**_kwargs):
+                changed = json.loads(registry.read_text())
+                changed["__controller_execution_ownership__"]["controller-1"] = {
+                    "active_host":"desktop_codex",
+                    "execution_target_session_id":"desktop-current",
+                    "generation":9,
+                }
+                registry.write_text(json.dumps(changed), encoding="utf-8")
+                return {
+                    "operation":"web_reentry","result":"CONFIRMED","state":"WEB_REENTRY_SUBMITTED",
+                    "returncode":0,"execution_target_session_id":"web-current",
+                    "target_generation":4,"target_mode":"explicit_current",
+                }
+
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+                web_bridge, "execute_web_reentry", side_effect=web_then_handoff
+            ), patch.object(
+                web_bridge, "_rearm_auto_native_stop",
+                side_effect=AssertionError("stale Web ownership must not rearm")
+            ), patch.object(
+                web_bridge, "execute_native_resume",
+                side_effect=AssertionError("original Web attempt must not call desktop")
+            ):
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="web-handoff", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state_path,
+                )
+
+            self.assertEqual(code, 0)
+            saved = json.loads(state_path.read_text())
+            self.assertEqual(saved["state"], "WEB_REENTRY_SUPERSEDED_HOST_HANDOFF")
+            self.assertEqual(saved["failure_class"], "host_ownership_superseded")
+            self.assertTrue(saved["pending_control_event"])
+
+    def test_desktop_result_cannot_persist_or_rearm_after_web_handoff(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry, state_path = self.make_repo(root)
+            payload = json.loads(registry.read_text())
+            payload["__controller_sessions__"]["controller-1"]["desktop_codex"] = ["desktop-current"]
+            payload["__controller_targets__"] = {"controller-1": {
+                "web": {"status":"active","session_id":"web-current","generation":4},
+                "desktop_codex": {"status":"active","session_id":"desktop-current","generation":2},
+            }}
+            payload["__controller_execution_ownership__"] = {"controller-1": {
+                "active_host":"desktop_codex","execution_target_session_id":"desktop-current","generation":8,
+            }}
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            state_path.write_text(json.dumps({
+                "receipt_id":"desktop-handoff","session_id":"controller-1","repo":str(repo.resolve()),
+                "state":"RESUME_PENDING","pending_control_event":True,
+            }), encoding="utf-8")
+            lifecycle = {"pending_control_event":True,"requires_user":False,"controller_host":"desktop_codex","wake_generation":8}
+
+            def native_then_handoff(**_kwargs):
+                changed = json.loads(registry.read_text())
+                changed["__controller_execution_ownership__"]["controller-1"] = {
+                    "active_host":"web",
+                    "execution_target_session_id":"web-current",
+                    "generation":9,
+                }
+                registry.write_text(json.dumps(changed), encoding="utf-8")
+                return {
+                    "operation":"native_resume","result":"CONFIRMED","state":"RESUME_SUCCEEDED",
+                    "pending_control_event":True,"returncode":0,"stdout_tail":"done","stderr_tail":"",
+                    "controller_id":"controller-1","execution_target_session_id":"desktop-current",
+                    "target_generation":2,"target_mode":"explicit_current",
+                }
+
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+                web_bridge, "execute_native_resume", side_effect=native_then_handoff
+            ), patch.object(
+                web_bridge, "persist_confirmed_auto_native_wake",
+                side_effect=AssertionError("stale desktop ownership must not persist confirmed wake")
+            ), patch.object(
+                web_bridge, "_rearm_auto_native_stop",
+                side_effect=AssertionError("stale desktop ownership must not rearm")
+            ):
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="desktop-handoff", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state_path,
+                )
+
+            self.assertEqual(code, 0)
+            saved = json.loads(state_path.read_text())
+            self.assertEqual(saved["state"], "RESUME_SUPERSEDED_HOST_HANDOFF")
+            self.assertEqual(saved["failure_class"], "host_ownership_superseded")
+            self.assertTrue(saved["pending_control_event"])
+
     def test_detached_supervisor_defers_while_web_response_is_active_and_retries_without_counting_progress(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
