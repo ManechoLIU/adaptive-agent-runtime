@@ -245,6 +245,13 @@ class RuleHandshakeTests(unittest.TestCase):
                         }
                     }
                 },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "desktop_codex",
+                        "execution_target_session_id": "desktop-current",
+                        "generation": 7,
+                    }
+                },
             }), encoding="utf-8")
             acknowledge_rule_revision(
                 repo, "controller-1", revision, skill_root=target, registry_path=registry, now=NOW
@@ -263,6 +270,7 @@ class RuleHandshakeTests(unittest.TestCase):
                 "result": "CONFIRMED",
                 "execution_target_session_id": "desktop-current",
                 "target_generation": 2,
+                "ownership_generation": 7,
                 "completed_at_unix_ms": int(NOW.timestamp() * 1000) + 1000,
             }), encoding="utf-8")
             cycle_dir = state_dir / "controller-cycle-evidence"
@@ -304,6 +312,89 @@ class RuleHandshakeTests(unittest.TestCase):
             )
             self.assertEqual(after_legitimate_target_rotation["state"], "current")
             self.assertFalse(after_legitimate_target_rotation["blocking"])
+
+    def test_live_e2e_rejects_stale_ownership_generation_before_acceptance(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, previous_revision = make_source(base)
+            (source / "scripts" / "web_lifecycle_bridge.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            git(source, "add", ".")
+            git(source, "commit", "-m", "change live continuation")
+            revision = git(source, "rev-parse", "HEAD")
+            target = base / "installed"
+            install_skill(
+                source,
+                target,
+                summary="live continuation",
+                impact="live_assignments",
+                stop_condition="real continuation e2e",
+                previous_revision=previous_revision,
+                now=NOW,
+            )
+            repo = make_project(base)
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-current"]}
+                },
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active",
+                    "session_id": "desktop-current",
+                    "generation": 2,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 9,
+                }},
+            }), encoding="utf-8")
+            acknowledge_rule_revision(
+                repo,
+                "controller-1",
+                revision,
+                skill_root=target,
+                registry_path=registry,
+                now=NOW,
+            )
+            ledger = repo / "TASK_LEDGER.md"
+            ledger.write_text(ledger.read_text(encoding="utf-8").replace(
+                "adaptive-delivery@old", f"adaptive-delivery@{revision}"
+            ), encoding="utf-8")
+            state_dir = rule_state_path(repo).parent
+            (state_dir / "controller-wake-receipt.json").write_text(json.dumps({
+                "controller_id": "controller-1",
+                "selected_host": "desktop_codex",
+                "result": "CONFIRMED",
+                "execution_target_session_id": "desktop-current",
+                "target_generation": 2,
+                "ownership_generation": 8,
+                "completed_at_unix_ms": int(NOW.timestamp() * 1000) + 1000,
+            }), encoding="utf-8")
+            cycle_dir = state_dir / "controller-cycle-evidence"
+            cycle_dir.mkdir(parents=True, exist_ok=True)
+            (cycle_dir / "closed.json").write_text(json.dumps({
+                "record_kind": "controller_cycle_evidence",
+                "controller_id": "controller-1",
+                "terminal_status": "CLOSED",
+                "validation_errors": [],
+                "recorded_at": "2026-08-30T01:00:02+00:00",
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "ownership generation"):
+                rule_handshake_module.accept_live_e2e(
+                    repo,
+                    "controller-1",
+                    revision,
+                    skill_root=target,
+                    registry_path=registry,
+                    now=datetime(2026, 8, 30, 1, 0, 3, tzinfo=UTC),
+                )
+
+            frozen = state_dir / "runtime-live-e2e-evidence" / f"{revision}.wake.json"
+            self.assertFalse(frozen.exists())
 
     def test_failed_live_e2e_does_not_freeze_invalid_wake_snapshot(self):
         with tempfile.TemporaryDirectory() as d:

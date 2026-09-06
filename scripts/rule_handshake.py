@@ -210,6 +210,7 @@ def _live_e2e_acceptance_errors(
     selected_host = str(wake.get("selected_host") or "").strip()
     wake_target = str(wake.get("execution_target_session_id") or "").strip()
     wake_generation = wake.get("target_generation")
+    wake_ownership_generation = wake.get("ownership_generation")
     wake_completed_ms = wake.get("completed_at_unix_ms")
     if wake.get("result") != "CONFIRMED":
         errors.append("live E2E wake evidence is not confirmed")
@@ -219,6 +220,12 @@ def _live_e2e_acceptance_errors(
         errors.append("live E2E wake evidence host is invalid")
     if not wake_target or not isinstance(wake_generation, int) or isinstance(wake_generation, bool):
         errors.append("live E2E wake evidence target or generation is missing")
+    if (
+        not isinstance(wake_ownership_generation, int)
+        or isinstance(wake_ownership_generation, bool)
+        or wake_ownership_generation <= 0
+    ):
+        errors.append("live E2E wake evidence ownership generation is missing")
 
     registry = _read_json(Path(registry_path).expanduser().resolve() if registry_path else DEFAULT_REGISTRY)
     registered_repo = registry.get(controller_session_id)
@@ -247,6 +254,24 @@ def _live_e2e_acceptance_errors(
             bound = [str(value).strip() for value in aliases or [] if isinstance(value, str) and value.strip()]
             if bound or wake_target != controller_session_id or wake_generation != 0:
                 errors.append("live E2E wake lacks an explicit current target")
+        ownerships = registry.get("__controller_execution_ownership__")
+        ownership = (
+            ownerships.get(controller_session_id)
+            if isinstance(ownerships, dict)
+            else None
+        )
+        if not isinstance(ownership, dict):
+            errors.append("live E2E current execution ownership is missing")
+        else:
+            if str(ownership.get("active_host") or "").strip() != selected_host:
+                errors.append("live E2E wake host does not match current execution ownership")
+            if (
+                str(ownership.get("execution_target_session_id") or "").strip()
+                != wake_target
+            ):
+                errors.append("live E2E wake target does not match current execution ownership")
+            if ownership.get("generation") != wake_ownership_generation:
+                errors.append("live E2E wake ownership generation does not match current ownership generation")
 
     if cycle.get("record_kind") != "controller_cycle_evidence":
         errors.append("live E2E cycle evidence record kind is invalid")

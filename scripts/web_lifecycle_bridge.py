@@ -37,7 +37,7 @@ except ModuleNotFoundError:
 
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 DEFAULT_MANUAL_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
-_PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., bool]] = {}
+_PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., Any]] = {}
 DEFAULT_MANUAL_WEB_LEASE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_AUDIT_LOG = (
     Path.home()
@@ -2111,9 +2111,35 @@ def _bounded_adapter_diagnostics(value: Any) -> str | None:
     return bounded_tail(value)
 
 
-def _registered_peer_attestation_verifier(host: str) -> Callable[..., bool] | None:
+def _registered_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
     """Return only a verifier registered by this bridge's trusted host boundary."""
     return _PEER_HOST_ATTESTATION_VERIFIERS.get(host)
+
+
+def _validated_web_origin_attestation(
+    value: Any, *, expected_target_session_id: str
+) -> dict[str, Any]:
+    """Accept only a structured Host-origin proof before any Web delivery call."""
+    if not isinstance(value, dict):
+        raise PermissionError("Web Host origin attestation is not an object")
+    call_receipt = value.get("call_receipt")
+    if (
+        value.get("origin_host") != "chatgpt_web"
+        or value.get("origin_conversation_id") != expected_target_session_id
+        or value.get("origin_attested") is not True
+        or not isinstance(call_receipt, str)
+        or not call_receipt.strip()
+        or len(call_receipt.encode("utf-8")) > 512
+    ):
+        raise PermissionError(
+            "Web Host origin attestation does not match the exact execution target"
+        )
+    return {
+        "origin_host": "chatgpt_web",
+        "origin_conversation_id": expected_target_session_id,
+        "origin_attested": True,
+        "call_receipt": call_receipt.strip(),
+    }
 
 
 def _wake_receipt(
@@ -2132,6 +2158,7 @@ def _wake_receipt(
     error_code: Any = None,
     execution_target_session_id: str | None = None,
     target_generation: int | None = None,
+    ownership_generation: int | None = None,
     target_mode: str | None = None,
 ) -> dict[str, Any]:
     now = int(time.time() * 1000)
@@ -2157,6 +2184,12 @@ def _wake_receipt(
         receipt["execution_target_session_id"] = execution_target_session_id.strip()
     if isinstance(target_generation, int) and target_generation >= 0:
         receipt["target_generation"] = target_generation
+    if (
+        isinstance(ownership_generation, int)
+        and not isinstance(ownership_generation, bool)
+        and ownership_generation > 0
+    ):
+        receipt["ownership_generation"] = ownership_generation
     if isinstance(target_mode, str) and target_mode.strip():
         receipt["target_mode"] = target_mode.strip()
     normalized_command = _bounded_adapter_command(command)
@@ -2343,6 +2376,18 @@ def wake_existing_controller(
                                         raise PermissionError(
                                             "canonical Web execution ownership is missing or mismatched"
                                         )
+                                    origin_attestation = _validated_web_origin_attestation(
+                                        verifier(
+                                            phase="pre_delivery",
+                                            controller_id=session_id,
+                                            host="web",
+                                            expected_target_session_id=expected_target,
+                                            expected_target_generation=expected_generation,
+                                            expected_target_mode=expected_mode,
+                                            expected_ownership_generation=expected_ownership_generation,
+                                        ),
+                                        expected_target_session_id=expected_target,
+                                    )
                                     attempt = adapter(
                                         controller_id=session_id,
                                         session_id=expected_target,
@@ -2354,6 +2399,7 @@ def wake_existing_controller(
                                         registry=registry,
                                         lifecycle_state=lifecycle_state,
                                         runtime_path=runtime_path,
+                                        host_origin_attestation=origin_attestation,
                                     )
                                     if not isinstance(attempt, dict):
                                         raise PermissionError(
@@ -2367,25 +2413,16 @@ def wake_existing_controller(
                                         or attempt.get("ownership_generation")
                                         != expected_ownership_generation
                                         or attempt.get("target_mode") != expected_mode
+                                        or not isinstance(
+                                            attempt.get("host_execution_receipt"), dict
+                                        )
+                                        or attempt["host_execution_receipt"].get(
+                                            "call_receipt"
+                                        )
+                                        != origin_attestation["call_receipt"]
                                     ):
                                         raise PermissionError(
-                                            "Web host adapter receipt does not match canonical target and ownership generations"
-                                        )
-                                    attested = verifier(
-                                        controller_id=session_id,
-                                        host="web",
-                                        expected_target_session_id=expected_target,
-                                        expected_target_generation=expected_generation,
-                                        expected_target_mode=expected_mode,
-                                        expected_ownership_generation=expected_ownership_generation,
-                                        host_execution_receipt=attempt.get(
-                                            "host_execution_receipt"
-                                        ),
-                                        adapter_attempt=attempt,
-                                    )
-                                    if attested is not True:
-                                        raise PermissionError(
-                                            "Web Host origin attestation rejected"
+                                            "Web host adapter receipt does not match canonical target, ownership, and Host call receipt"
                                         )
                         except Exception as exc:
                             if adapter is None:
@@ -2596,6 +2633,11 @@ def wake_existing_controller(
                 error_code=attempt.get("error_code"),
                 execution_target_session_id=attempt.get("execution_target_session_id"),
                 target_generation=attempt.get("target_generation"),
+                ownership_generation=(
+                    ownership_fence.get("generation")
+                    if isinstance(ownership_fence, dict)
+                    else attempt.get("ownership_generation")
+                ),
                 target_mode=attempt.get("target_mode"),
             )
         _write_json_atomic_file(receipt_path, receipt)
@@ -2627,7 +2669,14 @@ def persist_confirmed_auto_native_wake(
         return False
     execution_target = str(attempt.get("execution_target_session_id") or "").strip()
     generation = attempt.get("target_generation")
+    ownership_generation = attempt.get("ownership_generation")
     if not execution_target or not isinstance(generation, int) or isinstance(generation, bool):
+        return False
+    if ownership_generation is not None and (
+        not isinstance(ownership_generation, int)
+        or isinstance(ownership_generation, bool)
+        or ownership_generation <= 0
+    ):
         return False
 
     common_dir = _git_common_dir(repo)
@@ -2648,21 +2697,20 @@ def persist_confirmed_auto_native_wake(
                     or current_target.get("generation") != generation
                 ):
                     return False
-                expected_ownership_generation = attempt.get("ownership_generation")
-                if expected_ownership_generation is not None:
+                if ownership_generation is not None:
                     registry_data = target_guard.load_json(registry)
                     ownership_record = target_guard.execution_ownership_record(
                         registry_data, controller_id=session_id
                     )
                     if ownership_record is None:
                         return False
-                    ownership_host, ownership_target, ownership_generation = (
+                    ownership_host, ownership_target, current_ownership_generation = (
                         target_guard.validate_execution_ownership_record(ownership_record)
                     )
                     if (
                         ownership_host != target_guard.DESKTOP_SESSION_HOST
                         or ownership_target != execution_target
-                        or ownership_generation != expected_ownership_generation
+                        or current_ownership_generation != ownership_generation
                     ):
                         return False
                 with _owned_supervisor_state(
@@ -2686,6 +2734,7 @@ def persist_confirmed_auto_native_wake(
                         diagnostics=attempt.get("stderr_tail"),
                         execution_target_session_id=execution_target,
                         target_generation=generation,
+                        ownership_generation=ownership_generation,
                         target_mode=attempt.get("target_mode"),
                     )
                     _write_json_atomic_file(wake_path, receipt)
@@ -2788,10 +2837,34 @@ def dispatch_pending_lifecycle_wake(
             prior_target_id = session_id
         if prior_generation is None and current_target.get("target_mode") == "legacy_canonical":
             prior_generation = 0
+        current_ownership_generation = None
+        current_ownership_host = None
+        current_ownership_target = None
+        try:
+            current_ownership = _canonical_ownership_fence(
+                repo=repo, registry=registry, session_id=session_id
+            )
+        except (OSError, ValueError, PermissionError, subprocess.SubprocessError):
+            current_ownership = None
+        if isinstance(current_ownership, dict):
+            current_ownership_generation = current_ownership.get("generation")
+            current_ownership_host = current_ownership.get("active_host")
+            current_ownership_target = current_ownership.get(
+                "execution_target_session_id"
+            )
+        ownership_matches_prior = (
+            current_ownership is None
+            or (
+                prior.get("ownership_generation") == current_ownership_generation
+                and current_ownership_host == controller_host
+                and current_ownership_target == current_target_id
+            )
+        )
         target_matches_prior = (
             prior_target_id == current_target_id
             and prior_generation == current_generation
             and prior.get("target_mode", current_target.get("target_mode")) == current_target.get("target_mode")
+            and ownership_matches_prior
         )
     if (
         prior.get("event_fingerprint") == fingerprint

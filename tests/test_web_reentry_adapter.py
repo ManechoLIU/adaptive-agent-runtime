@@ -167,7 +167,7 @@ class WebReentryAdapterTests(unittest.TestCase):
             self.assertEqual(result["state"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
             self.assertEqual(calls, [])
 
-    def test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab(self) -> None:
+    def test_ai_bridge_destination_consistency_requires_matching_live_chatgpt_tab(self) -> None:
         calls: list[dict] = []
 
         def browser_call(arguments: dict) -> dict:
@@ -186,7 +186,7 @@ class WebReentryAdapterTests(unittest.TestCase):
             "url": "https://chatgpt.com/c/web-current",
             "source": "ai_bridge_browser",
         }
-        self.assertTrue(web_reentry_adapter.verify_ai_bridge_web_session_attestation(
+        self.assertTrue(web_reentry_adapter.verify_ai_bridge_web_destination_tab_consistency(
             controller_id="controller-1", host="web",
             expected_target_session_id="web-current", expected_target_generation=3,
             expected_target_mode="same_controller_session_recovery",
@@ -194,7 +194,7 @@ class WebReentryAdapterTests(unittest.TestCase):
             adapter_attempt={"repo": "/tmp/repo"}, browser_call=browser_call,
         ))
         forged = dict(receipt); forged["tab_id"] = "forged-tab"
-        self.assertFalse(web_reentry_adapter.verify_ai_bridge_web_session_attestation(
+        self.assertFalse(web_reentry_adapter.verify_ai_bridge_web_destination_tab_consistency(
             controller_id="controller-1", host="web",
             expected_target_session_id="web-current", expected_target_generation=3,
             expected_target_mode="same_controller_session_recovery",
@@ -203,13 +203,13 @@ class WebReentryAdapterTests(unittest.TestCase):
         ))
         self.assertEqual(len(calls), 2)
 
-    def test_ai_bridge_web_attestation_rejects_caller_only_claim_without_live_tab(self) -> None:
+    def test_ai_bridge_destination_consistency_rejects_caller_only_claim_without_live_tab(self) -> None:
         receipt = {
             "host": "web", "web_session_id": "web-current",
             "tab_id": "tab-controller", "url": "https://chatgpt.com/c/web-current",
             "source": "ai_bridge_browser",
         }
-        self.assertFalse(web_reentry_adapter.verify_ai_bridge_web_session_attestation(
+        self.assertFalse(web_reentry_adapter.verify_ai_bridge_web_destination_tab_consistency(
             controller_id="controller-1", host="web",
             expected_target_session_id="web-current", expected_target_generation=0,
             expected_target_mode="same_controller_session_recovery",

@@ -87,12 +87,22 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_legacy_browser_attested_target_is_quarantined_before_browser_use",
     "tests.test_web_reentry_adapter.WebReentryAdapterTests."
     "test_submit_holds_registry_fence_against_target_rotation",
+    "tests.test_web_reentry_adapter.WebReentryAdapterTests."
+    "test_target_generation_change_before_submit_never_types",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_web_supervisor_rejects_confirmed_receipt_for_noncanonical_target",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_identity_blocked_event_retries_after_registry_changes",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
     "test_registered_current_web_adapter_is_fenced_and_host_attested",
+    "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
+    "test_current_web_adapter_is_not_called_when_pre_delivery_attestation_rejects",
+    "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
+    "test_current_web_adapter_receipt_must_correlate_origin_call_receipt",
+    "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
+    "test_current_web_adapter_is_not_called_for_malformed_origin_attestation",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
     "test_registered_current_web_adapter_without_ownership_is_never_called",
     "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests."
@@ -109,6 +119,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_live_e2e_debt_survives_later_nonimpacting_install_until_accepted",
     "tests.test_rule_handshake.RuleHandshakeTests."
     "test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_live_e2e_rejects_stale_ownership_generation_before_acceptance",
+    "tests.test_web_lifecycle_bridge.WebReentryDebounceTests."
+    "test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_dead_or_untracked_active_supervisor_requires_bootstrap",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."

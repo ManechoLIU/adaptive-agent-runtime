@@ -654,10 +654,17 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_reentry_without_explicit_canonical_web_target_never_calls_browser",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_legacy_browser_attested_target_is_quarantined_before_browser_use",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_submit_holds_registry_fence_against_target_rotation",
+            "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_target_generation_change_before_submit_never_types",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_web_supervisor_rejects_confirmed_receipt_for_noncanonical_target",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again",
+            "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_identity_blocked_event_retries_after_registry_changes",
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_registered_current_web_adapter_is_fenced_and_host_attested",
+            "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_current_web_adapter_is_not_called_when_pre_delivery_attestation_rejects",
+            "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_current_web_adapter_receipt_must_correlate_origin_call_receipt",
+            "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_current_web_adapter_is_not_called_for_malformed_origin_attestation",
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_registered_current_web_adapter_without_ownership_is_never_called",
+            "tests.test_web_lifecycle_bridge.WebReentryDebounceTests.test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_live_e2e_rejects_stale_ownership_generation_before_acceptance",
             "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests.test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix",
         }
         self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
@@ -713,6 +720,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_reentry_without_explicit_canonical_web_target_never_calls_browser(self): self.assertTrue(True)\n"
                 "    def test_legacy_browser_attested_target_is_quarantined_before_browser_use(self): self.assertTrue(True)\n"
                 "    def test_submit_holds_registry_fence_against_target_rotation(self): self.assertTrue(True)\n"
+                "    def test_target_generation_change_before_submit_never_types(self): self.assertTrue(True)\n"
                 "class AiBridgeMcpDiscoveryTests(unittest.TestCase):\n"
                 "    def test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix(self): self.assertTrue(True)\n",
                 encoding="utf-8",
@@ -758,7 +766,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_real_confirmed_wake_followed_by_closed_cycle_can_finalize_live_e2e(self): self.assertTrue(True)\n"
                 "    def test_failed_live_e2e_does_not_freeze_invalid_wake_snapshot(self): self.assertTrue(True)\n"
                 "    def test_live_e2e_debt_survives_later_nonimpacting_install_until_accepted(self): self.assertTrue(True)\n"
-                "    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self): self.assertTrue(True)\n",
+                "    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_rejects_stale_ownership_generation_before_acceptance(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_controller_target_guard.py").write_text(
@@ -802,15 +811,21 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class WebHostNativeWakeIsolationTests(unittest.TestCase):\n"
                 "    def test_stale_web_host_with_only_desktop_current_target_resumes_same_controller_desktop(self): self.assertTrue(True)\n"
                 "    def test_registered_current_web_adapter_is_fenced_and_host_attested(self): self.assertTrue(True)\n"
+                "    def test_current_web_adapter_is_not_called_when_pre_delivery_attestation_rejects(self): self.assertTrue(True)\n"
+                "    def test_current_web_adapter_receipt_must_correlate_origin_call_receipt(self): self.assertTrue(True)\n"
+                "    def test_current_web_adapter_is_not_called_for_malformed_origin_attestation(self): self.assertTrue(True)\n"
                 "    def test_registered_current_web_adapter_without_ownership_is_never_called(self): self.assertTrue(True)\n"
                 "class WebContinuationSupervisorBootstrapTests(unittest.TestCase):\n"
                 "    def test_dead_or_untracked_active_supervisor_requires_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again(self): self.assertTrue(True)\n"
+                "    def test_identity_blocked_event_retries_after_registry_changes(self): self.assertTrue(True)\n"
                 "class WebLocalReentryIntegrationTests(unittest.TestCase):\n"
                 "    def test_direct_wake_rejects_confirmed_web_result_after_desktop_handoff(self): self.assertTrue(True)\n"
                 "    def test_desktop_result_cannot_persist_or_rearm_after_web_handoff(self): self.assertTrue(True)\n"
-                "    def test_web_supervisor_rejects_confirmed_receipt_for_noncanonical_target(self): self.assertTrue(True)\n",
+                "    def test_web_supervisor_rejects_confirmed_receipt_for_noncanonical_target(self): self.assertTrue(True)\n"
+                "class WebReentryDebounceTests(unittest.TestCase):\n"
+                "    def test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(

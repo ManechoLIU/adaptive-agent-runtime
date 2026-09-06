@@ -261,7 +261,7 @@ def _composer_node(nodes: list[Any]) -> str | None:
     return None
 
 
-def verify_ai_bridge_web_session_attestation(
+def verify_ai_bridge_web_destination_tab_consistency(
     *,
     controller_id: str,
     host: str,
@@ -272,11 +272,11 @@ def verify_ai_bridge_web_session_attestation(
     adapter_attempt: Any,
     browser_call: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> bool:
-    """Verify a Web Controller session against a live AI-Bridge browser tab.
+    """Check only that a destination tab still matches caller-observed browser data.
 
-    Caller-provided receipt fields are never sufficient by themselves: the
-    verifier independently re-reads the trusted browser boundary and requires
-    the exact ChatGPT conversation/tab to still exist.
+    This is not Host identity attestation and cannot satisfy the pre-delivery
+    origin verifier contract. Browser tab, URL, and DOM state are mutable
+    destination consistency evidence only.
     """
     del controller_id, expected_target_generation, adapter_attempt
     if host != "web":

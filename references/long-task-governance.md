@@ -135,6 +135,8 @@ Project-context / SessionStart receipt 必须同时输出 project_controller_sta
 
 native wake 在启动进程前自动经过 `scripts/controller_target_guard.py`，并以 registry 共享读锁把最终 target resolution 与进程启动绑定；wake receipt 同时记录逻辑 `controller_id`、`execution_target_session_id` 与 target generation，换代后旧 debounce 收据失效。Hook 只把三类 Controller 定向动作作为受保护出站：发送消息、导航，以及显式线程目标的打开任务；其他 App / MCP 工具不在此覆盖宣称内。它们在 `PreToolUse` 校验目标并以完整 Hook payload 的 `tool_use_id` 持久创建 target-bound lease，lease 覆盖实际 tool use，且只在匹配的 `PostToolUse` 后释放。active lease 存在时 replace / unbind 必须被阻止；缺少完整 Hook payload、`tool_use_id` 或匹配 PostToolUse 一律 fail closed，不能以模型日志或自报收据补齐，lease 也不会自动过期。仅在可信宿主已核实 terminal / interrupted 后，管理员才可执行 `controller_target_guard.py reconcile --repo <repo> --host <host> --controller-id <controller-id> --tool-use-id <tool-use-id> --action <action> --target-session-id <id> --generation <n> --host-receipt-reference <reference> --reason <reason>`：它只释放精确匹配的 lease / target / generation，保留最近 64 条审计；审计引用只定位已核实事实，不能成为宿主证明。不经过该 Hook 的这三类调用必须先运行 `controller_target_guard.py check --repo <repo> --host <desktop-host> --action message|navigate --target-session-id <id>` 并只使用 `ALLOWED` 收据中的精确目标。独立 check 与 App 执行之间不具备宿主原子性；宿主未暴露 Hook 或原子 capability 时适配器必须标为 degraded，Skill 文本不能冒充 App 已执行或机器已强制该 Guard。
 
+存在 canonical ownership 的 wake receipt 必须同时记录 ownership generation。Debounce 与 Live-E2E acceptance 必须同时匹配 active host、精确 execution target、target generation 和 ownership generation；ownership 重新 claim 或跨 Host 切换后，即使 target ID 与 target generation 恰好相同，旧 receipt 也不得复用或作为验收证据。
+
 | 误判理由 | 机器结论 |
 | --- | --- |
 | “canonical 一直是 execution thread” | canonical 只证明逻辑归属；存在显式 current target 时向 canonical 出站必须拒绝。 |

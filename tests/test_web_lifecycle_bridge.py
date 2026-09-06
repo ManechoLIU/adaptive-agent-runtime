@@ -5677,6 +5677,7 @@ class WebHostNativeWakeIsolationTests(unittest.TestCase):
 
             def web_resume(**kwargs: object) -> dict:
                 adapter_calls.append(dict(kwargs))
+                attestation = kwargs["host_origin_attestation"]
                 return {
                     "operation": "web_resume",
                     "result": "CONFIRMED",
@@ -5686,12 +5687,20 @@ class WebHostNativeWakeIsolationTests(unittest.TestCase):
                     "target_generation": kwargs["target_generation"],
                     "ownership_generation": 8,
                     "target_mode": "explicit_current",
-                    "host_execution_receipt": {"origin_attested": True},
+                    "host_execution_receipt": {
+                        "call_receipt": attestation["call_receipt"],
+                        "submitted": True,
+                    },
                 }
 
-            def verify_web_attestation(**kwargs: object) -> bool:
+            def verify_web_attestation(**kwargs: object) -> dict:
                 verifier_calls.append(dict(kwargs))
-                return kwargs["host_execution_receipt"] == {"origin_attested": True}
+                return {
+                    "origin_host": "chatgpt_web",
+                    "origin_conversation_id": kwargs["expected_target_session_id"],
+                    "origin_attested": True,
+                    "call_receipt": "host-call-1",
+                }
 
             with patch.object(
                 web_bridge,
@@ -5714,12 +5723,180 @@ class WebHostNativeWakeIsolationTests(unittest.TestCase):
                 )
 
             self.assertEqual(receipt["result"], "CONFIRMED")
+            self.assertEqual(receipt["ownership_generation"], 8)
             self.assertEqual(len(adapter_calls), 1)
             self.assertEqual(adapter_calls[0]["execution_target_session_id"], "web-current")
             self.assertEqual(adapter_calls[0]["target_generation"], 4)
             self.assertEqual(len(verifier_calls), 1)
+            self.assertEqual(verifier_calls[0]["phase"], "pre_delivery")
             self.assertEqual(verifier_calls[0]["expected_target_session_id"], "web-current")
             self.assertEqual(verifier_calls[0]["expected_target_generation"], 4)
+            self.assertEqual(
+                adapter_calls[0]["host_origin_attestation"]["call_receipt"],
+                "host-call-1",
+            )
+
+    def test_current_web_adapter_is_not_called_when_pre_delivery_attestation_rejects(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active",
+                    "session_id": "web-current",
+                    "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web",
+                    "execution_target_session_id": "web-current",
+                    "generation": 8,
+                }},
+            }), encoding="utf-8")
+            adapter_calls: list[dict] = []
+
+            with patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=lambda **_kwargs: False,
+            ):
+                receipt = web_bridge.wake_existing_controller(
+                    lifecycle_state={
+                        "pending_control_event": True,
+                        "controller_host": "web",
+                        "wake_generation": 1,
+                    },
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex="codex",
+                    receipt_path=root / "wake.json",
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                    resume_adapters={
+                        "web": lambda **kwargs: adapter_calls.append(dict(kwargs))
+                        or {"result": "CONFIRMED"}
+                    },
+                )
+
+            self.assertEqual(receipt["result"], "FAILED")
+            self.assertEqual(receipt["error_code"], "WEB_HOST_ATTESTATION_INVALID")
+            self.assertEqual(adapter_calls, [])
+
+    def test_current_web_adapter_receipt_must_correlate_origin_call_receipt(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web",
+                    "execution_target_session_id": "web-current",
+                    "generation": 8,
+                }},
+            }), encoding="utf-8")
+
+            def adapter(**kwargs: object) -> dict:
+                return {
+                    "operation": "web_resume",
+                    "result": "CONFIRMED",
+                    "state": "RESUME_CONFIRMED",
+                    "returncode": 0,
+                    "execution_target_session_id": kwargs["execution_target_session_id"],
+                    "target_generation": kwargs["target_generation"],
+                    "ownership_generation": kwargs["ownership_generation"],
+                    "target_mode": kwargs["target_mode"],
+                    "host_execution_receipt": {
+                        "call_receipt": "different-host-call",
+                        "submitted": True,
+                    },
+                }
+
+            verifier = lambda **_kwargs: {
+                "origin_host": "chatgpt_web",
+                "origin_conversation_id": "web-current",
+                "origin_attested": True,
+                "call_receipt": "host-call-1",
+            }
+            with patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+            ):
+                receipt = web_bridge.wake_existing_controller(
+                    lifecycle_state={
+                        "pending_control_event": True,
+                        "controller_host": "web",
+                        "wake_generation": 1,
+                    },
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex="codex",
+                    receipt_path=root / "wake.json",
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                    resume_adapters={"web": adapter},
+                )
+
+            self.assertEqual(receipt["result"], "FAILED")
+            self.assertEqual(receipt["error_code"], "WEB_HOST_ATTESTATION_INVALID")
+            self.assertTrue(receipt["pending_control_event"])
+
+    def test_current_web_adapter_is_not_called_for_malformed_origin_attestation(self) -> None:
+        from unittest.mock import patch
+
+        malformed = (
+            None,
+            {},
+            {"origin_host": "chatgpt_web", "origin_conversation_id": "web-current", "origin_attested": False, "call_receipt": "r1"},
+            {"origin_host": "chatgpt_web", "origin_conversation_id": "web-other", "origin_attested": True, "call_receipt": "r1"},
+            {"origin_host": "browser_tab", "origin_conversation_id": "web-current", "origin_attested": True, "call_receipt": "r1"},
+            {"origin_host": "chatgpt_web", "origin_conversation_id": "web-current", "origin_attested": True, "call_receipt": ""},
+        )
+        for attestation in malformed:
+            with self.subTest(attestation=attestation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                repo = root / "repo"
+                repo.mkdir()
+                subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+                registry = root / "controllers.json"
+                registry.write_text(json.dumps({
+                    "controller-1": str(repo.resolve()),
+                    "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+                    "__controller_targets__": {"controller-1": {"web": {
+                        "status": "active", "session_id": "web-current", "generation": 4,
+                    }}},
+                    "__controller_execution_ownership__": {"controller-1": {
+                        "active_host": "web", "execution_target_session_id": "web-current", "generation": 8,
+                    }},
+                }), encoding="utf-8")
+                adapter_calls: list[dict] = []
+                with patch.object(
+                    web_bridge,
+                    "_registered_peer_attestation_verifier",
+                    return_value=lambda **_kwargs: attestation,
+                ):
+                    receipt = web_bridge.wake_existing_controller(
+                        lifecycle_state={"pending_control_event": True, "controller_host": "web", "wake_generation": 1},
+                        session_id="controller-1", repo=repo, registry=registry, codex="codex",
+                        receipt_path=root / "wake.json",
+                        host_facts={"controller_host": "web", "resume_actionable": True},
+                        resume_adapters={"web": lambda **kwargs: adapter_calls.append(dict(kwargs)) or {"result": "CONFIRMED"}},
+                    )
+                self.assertEqual(receipt["result"], "FAILED")
+                self.assertEqual(adapter_calls, [])
 
     def test_registered_current_web_adapter_without_ownership_is_never_called(self) -> None:
         from unittest.mock import patch
@@ -6476,7 +6653,8 @@ class WebReentryDebounceTests(WebLocalReentryIntegrationTests):
                 "controller_id":"controller-1",
                 "event_fingerprint":web_bridge._wake_event_fingerprint(lifecycle),
                 "result":"CONFIRMED","selected_host":"web",
-                "execution_target_session_id":"web-current","target_generation":4,"target_mode":"explicit_current",
+                "execution_target_session_id":"web-current","target_generation":4,"ownership_generation":8,
+                "target_mode":"explicit_current",
                 "pending_control_event":True,
             }), encoding="utf-8")
             with patch.object(web_bridge, "DEFAULT_MANUAL_WEB_LEASES", lease), patch.object(
@@ -6489,6 +6667,76 @@ class WebReentryDebounceTests(WebLocalReentryIntegrationTests):
                 )
             self.assertTrue(result.get("debounced"))
             self.assertEqual(result["execution_target_session_id"], "web-current")
+
+    def test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, _ = self.make_repo(root)
+            registry_payload = json.loads(registry.read_text(encoding="utf-8"))
+            registry_payload["__controller_targets__"] = {"controller-1": {"web": {
+                "status": "active",
+                "session_id": "web-current",
+                "generation": 4,
+            }}}
+            registry_payload["__controller_execution_ownership__"] = {"controller-1": {
+                "active_host": "web",
+                "execution_target_session_id": "web-current",
+                "generation": 9,
+            }}
+            registry.write_text(json.dumps(registry_payload), encoding="utf-8")
+            lease = root / "leases.json"
+            lease.write_text(json.dumps({"schema_version": 1, "leases": {"controller-1": {
+                "repo": str(repo.resolve()),
+                "controller_id": "controller-1",
+                "web_session_id": "web-current",
+                "authorized_at_unix": 1,
+                "expires_at_unix": 4102444800,
+                "provenance": "manual_user_authorized",
+                "mode": "resume_only",
+            }}}), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True,
+                "controller_host": "web",
+                "wake_generation": 4,
+                "triggers": ["READY:F1"],
+            }
+            receipt_path = root / "wake.json"
+            receipt_path.write_text(json.dumps({
+                "schema_version": 1,
+                "canonical_common_dir": str(web_bridge._git_common_dir(repo)),
+                "controller_id": "controller-1",
+                "event_fingerprint": web_bridge._wake_event_fingerprint(lifecycle),
+                "result": "CONFIRMED",
+                "selected_host": "web",
+                "execution_target_session_id": "web-current",
+                "target_generation": 4,
+                "ownership_generation": 8,
+                "target_mode": "explicit_current",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            fresh = {
+                "result": "DEFERRED",
+                "error_code": "FRESH_WAKE_REQUIRED",
+                "ownership_generation": 9,
+            }
+            with patch.object(web_bridge, "DEFAULT_MANUAL_WEB_LEASES", lease), patch.object(
+                web_bridge, "wake_existing_controller", return_value=fresh
+            ) as wake:
+                result = web_bridge.dispatch_pending_lifecycle_wake(
+                    lifecycle_state=lifecycle,
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex="codex",
+                    receipt_path=receipt_path,
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                )
+
+            wake.assert_called_once()
+            self.assertFalse(result.get("debounced", False))
+            self.assertEqual(result["ownership_generation"], 9)
 
 
 class WebReentryApprovalSupervisorTests(WebLocalReentryIntegrationTests):
