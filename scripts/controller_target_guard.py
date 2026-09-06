@@ -16,6 +16,7 @@ from typing import Any, Sequence
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 CONTROLLER_SESSIONS_KEY = "__controller_sessions__"
 CONTROLLER_TARGETS_KEY = "__controller_targets__"
+CONTROLLER_EXECUTION_OWNERSHIP_KEY = "__controller_execution_ownership__"
 CONTROLLER_OUTBOUND_LEASES_KEY = "__controller_outbound_leases__"
 CONTROLLER_OUTBOUND_LEASE_RECONCILIATIONS_KEY = "__controller_outbound_lease_reconciliations__"
 MAX_OUTBOUND_LEASE_RECONCILIATIONS = 64
@@ -530,6 +531,186 @@ def target_record(
     if not isinstance(record, dict):
         raise ValueError("Controller target record is invalid")
     return dict(record)
+
+
+def execution_ownership_record(
+    registry: dict[str, Any], *, controller_id: str
+) -> dict[str, Any] | None:
+    ownership = registry.get(CONTROLLER_EXECUTION_OWNERSHIP_KEY)
+    if ownership is None:
+        return None
+    if not isinstance(ownership, dict):
+        raise ValueError("controller execution ownership registry is invalid")
+    record = ownership.get(controller_id)
+    if record is None:
+        return None
+    if not isinstance(record, dict):
+        raise ValueError("Controller execution ownership record is invalid")
+    return dict(record)
+
+
+def validate_execution_ownership_record(
+    record: dict[str, Any]
+) -> tuple[str, str, int]:
+    active_host = str(record.get("active_host") or "").strip()
+    if active_host not in SUPPORTED_HOSTS:
+        raise PermissionError("Controller execution ownership active_host is invalid")
+    target = _bounded_string(
+        record.get("execution_target_session_id"),
+        label="Controller execution ownership target session_id",
+        maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH,
+    )
+    generation = record.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise PermissionError("Controller execution ownership generation is invalid")
+    return active_host, target, generation
+
+
+def resolve_execution_ownership(
+    *, repo: Path, registry_path: Path = DEFAULT_REGISTRY
+) -> dict[str, Any]:
+    repo = repo.expanduser().resolve()
+    registry_path = registry_path.expanduser()
+    controller_id, registry = registered_controller_for_repo(repo, registry_path)
+    record = execution_ownership_record(registry, controller_id=controller_id)
+    if record is None:
+        raise PermissionError("Controller execution ownership is not established")
+    active_host, target, generation = validate_execution_ownership_record(record)
+    host_target = target_record(registry, controller_id=controller_id, host=active_host)
+    if host_target is None:
+        aliases = host_sessions(registry, controller_id=controller_id, host=active_host)
+        if aliases or target != controller_id:
+            raise PermissionError("Controller execution ownership target is not current for its host")
+    else:
+        status, current_target, _host_generation = validate_target_record(
+            host_target, host=active_host
+        )
+        if status != "active" or current_target != target:
+            raise PermissionError("Controller execution ownership target is not current for its host")
+    return {
+        "result": "RESOLVED",
+        "controller_id": controller_id,
+        "controller_session_id": controller_id,
+        "active_host": active_host,
+        "host": active_host,
+        "execution_target_session_id": target,
+        "generation": generation,
+        "target_mode": "canonical_host_ownership",
+        "repo": str(repo),
+        "registry": str(registry_path.resolve()),
+        "registry_sha256": _registry_sha256(registry_path),
+        **({"provenance": record.get("provenance")} if record.get("provenance") else {}),
+    }
+
+
+def claim_controller_host(
+    *,
+    repo: Path,
+    controller_id: str,
+    requested_host: str,
+    requested_target_session_id: str,
+    expected_generation: int,
+    registry_path: Path = DEFAULT_REGISTRY,
+    provenance: str | None = None,
+) -> dict[str, Any]:
+    repo = repo.expanduser().resolve()
+    registry_path = registry_path.expanduser()
+    controller_id = _bounded_string(
+        controller_id, label="controller id", maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH
+    )
+    requested_host = str(requested_host or "").strip()
+    if requested_host not in SUPPORTED_HOSTS:
+        raise ValueError(f"unsupported controller host: {requested_host}")
+    requested_target_session_id = _bounded_string(
+        requested_target_session_id,
+        label="requested target session id",
+        maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH,
+    )
+    if isinstance(expected_generation, bool) or not isinstance(expected_generation, int) or expected_generation < 0:
+        raise ValueError("expected ownership generation must be a non-negative integer")
+    provenance_value = str(provenance or "").strip() or None
+
+    lock_path = registry_lock_path(registry_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            registry = load_json(registry_path)
+            matches = _matching_controller_ids_for_repo(repo, registry)
+            if matches != [controller_id]:
+                raise PermissionError(
+                    "Controller host claim requires the existing unique project Controller"
+                )
+
+            aliases = host_sessions(
+                registry, controller_id=controller_id, host=requested_host
+            )
+            current_target_record = target_record(
+                registry, controller_id=controller_id, host=requested_host
+            )
+            if current_target_record is None:
+                if aliases:
+                    raise PermissionError(
+                        f"{requested_host} aliases exist without an explicit current target"
+                    )
+                current_target = controller_id
+            else:
+                status, current_target, _host_generation = validate_target_record(
+                    current_target_record, host=requested_host
+                )
+                if status != "active" or current_target is None:
+                    raise PermissionError(f"{requested_host} execution target is not active")
+                if current_target != controller_id and current_target not in aliases:
+                    raise PermissionError(
+                        f"{requested_host} execution target is not a bound Controller entry"
+                    )
+            if current_target != requested_target_session_id:
+                raise PermissionError(
+                    f"requested target {requested_target_session_id} is not the current "
+                    f"{requested_host} target {current_target}"
+                )
+
+            prior = execution_ownership_record(registry, controller_id=controller_id)
+            if prior is None:
+                current_generation = 0
+            else:
+                _prior_host, _prior_target, current_generation = (
+                    validate_execution_ownership_record(prior)
+                )
+            if current_generation != expected_generation:
+                raise PermissionError(
+                    "Controller execution ownership generation changed; stale host claim refused"
+                )
+
+            ownership = registry.get(CONTROLLER_EXECUTION_OWNERSHIP_KEY)
+            if ownership is None:
+                ownership = {}
+            if not isinstance(ownership, dict):
+                raise ValueError("controller execution ownership registry is invalid")
+            next_record: dict[str, Any] = {
+                "active_host": requested_host,
+                "execution_target_session_id": requested_target_session_id,
+                "generation": current_generation + 1,
+            }
+            if provenance_value is not None:
+                next_record["provenance"] = provenance_value
+            ownership[controller_id] = next_record
+            registry[CONTROLLER_EXECUTION_OWNERSHIP_KEY] = ownership
+            _write_registry(registry_path, registry)
+            return {
+                "result": "CLAIMED",
+                "controller_id": controller_id,
+                "controller_session_id": controller_id,
+                "active_host": requested_host,
+                "host": requested_host,
+                "execution_target_session_id": requested_target_session_id,
+                "generation": current_generation + 1,
+                "target_mode": "canonical_host_ownership",
+                "repo": str(repo),
+                **({"provenance": provenance_value} if provenance_value else {}),
+            }
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def validate_target_record(

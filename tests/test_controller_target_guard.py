@@ -33,6 +33,132 @@ class ControllerTargetGuardTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
         return repo
 
+    def test_claim_controller_host_web_initializes_cross_host_ownership(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-current"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "web": {
+                            "status": "active",
+                            "session_id": "web-current",
+                            "generation": 4,
+                        }
+                    }
+                },
+            }), encoding="utf-8")
+
+            receipt = guard.claim_controller_host(
+                repo=repo,
+                controller_id="controller-1",
+                requested_host="web",
+                requested_target_session_id="web-current",
+                expected_generation=0,
+                registry_path=registry,
+                provenance="test_web_entry",
+            )
+
+            self.assertEqual(receipt["controller_id"], "controller-1")
+            self.assertEqual(receipt["active_host"], "web")
+            self.assertEqual(receipt["execution_target_session_id"], "web-current")
+            self.assertEqual(receipt["generation"], 1)
+            resolved = guard.resolve_execution_ownership(repo=repo, registry_path=registry)
+            self.assertEqual(resolved["controller_id"], "controller-1")
+            self.assertEqual(resolved["active_host"], "web")
+            self.assertEqual(resolved["execution_target_session_id"], "web-current")
+            self.assertEqual(resolved["generation"], 1)
+            saved = guard.load_json(registry)
+            self.assertEqual(saved["controller-1"], str(repo.resolve()))
+
+    def test_claim_controller_host_desktop_after_web_increments_one_cross_host_generation(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {
+                        "web": ["web-current"],
+                        "desktop_codex": ["desktop-current"],
+                    }
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "web": {"status": "active", "session_id": "web-current", "generation": 4},
+                        "desktop_codex": {"status": "active", "session_id": "desktop-current", "generation": 7},
+                    }
+                },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "web",
+                        "execution_target_session_id": "web-current",
+                        "generation": 1,
+                    }
+                },
+            }), encoding="utf-8")
+
+            receipt = guard.claim_controller_host(
+                repo=repo, controller_id="controller-1", requested_host="desktop_codex",
+                requested_target_session_id="desktop-current", expected_generation=1,
+                registry_path=registry, provenance="test_desktop_entry",
+            )
+
+            self.assertEqual(receipt["controller_id"], "controller-1")
+            self.assertEqual(receipt["active_host"], "desktop_codex")
+            self.assertEqual(receipt["execution_target_session_id"], "desktop-current")
+            self.assertEqual(receipt["generation"], 2)
+            saved = guard.load_json(registry)
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["session_id"], "web-current")
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["desktop_codex"]["session_id"], "desktop-current")
+
+    def test_claim_controller_host_rejects_stale_cross_host_generation_without_mutation(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            payload = {
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {
+                        "web": ["web-current"],
+                        "desktop_codex": ["desktop-current"],
+                    }
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "web": {"status": "active", "session_id": "web-current", "generation": 4},
+                        "desktop_codex": {"status": "active", "session_id": "desktop-current", "generation": 7},
+                    }
+                },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "desktop_codex",
+                        "execution_target_session_id": "desktop-current",
+                        "generation": 2,
+                    }
+                },
+            }
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(PermissionError, "generation"):
+                guard.claim_controller_host(
+                    repo=repo, controller_id="controller-1", requested_host="web",
+                    requested_target_session_id="web-current", expected_generation=1,
+                    registry_path=registry,
+                )
+
+            self.assertEqual(guard.load_json(registry), payload)
+
     def test_collaboration_spawn_contract_captures_task_model_and_agent_type(self) -> None:
         guard = load_guard()
         contract = guard.collaboration_spawn_contract(
