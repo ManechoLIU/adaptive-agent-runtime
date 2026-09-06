@@ -2585,13 +2585,23 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                     web_bridge, "_pid_is_alive", return_value=True
                 ):
                     old_thread.start(); self.assertTrue(bootstrap_entered.wait(1))
-                    self.assertTrue(web_bridge.schedule_auto_native_stop(
-                        session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
-                        codex="codex", delay_seconds=1, state_path=state, force_rearm=True,
-                        replace_supervisor_token=old_token,
-                    ))
+                    schedule_done = threading.Event(); schedule_result: list[bool] = []
+                    def supersede() -> None:
+                        schedule_result.append(web_bridge.schedule_auto_native_stop(
+                            session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
+                            codex="codex", delay_seconds=1, state_path=state, force_rearm=True,
+                            replace_supervisor_token=old_token,
+                        ))
+                        schedule_done.set()
+                    supersede_thread = threading.Thread(target=supersede)
+                    supersede_thread.start()
+                    self.assertTrue(
+                        schedule_done.wait(0.5),
+                        "replacement supervisor must be able to supersede while recovery bootstrap is still blocked",
+                    )
+                    self.assertEqual(schedule_result, [True])
                     new_token = json.loads(state.read_text())["supervisor_token"]
-                    release_bootstrap.set(); self.assertTrue(old_done.wait(2))
+                    release_bootstrap.set(); self.assertTrue(old_done.wait(2)); supersede_thread.join(2)
             finally:
                 release_bootstrap.set(); old_thread.join(2)
             replace_target.assert_not_called()

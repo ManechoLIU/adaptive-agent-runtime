@@ -1772,6 +1772,10 @@ def recover_incompatible_native_target(
             and supervisor_state_path is not None
             and supervisor_receipt_id is not None
         ):
+            # Fence ownership immediately before launching the bootstrap, but never hold
+            # the supervisor lock across external work. A newer generation must be able
+            # to supersede this worker while Codex bootstraps; the post-bootstrap fence
+            # below prevents the stale generation from replacing the canonical target.
             with _owned_supervisor_state(
                 supervisor_state_path,
                 receipt_id=supervisor_receipt_id,
@@ -1788,13 +1792,9 @@ def recover_incompatible_native_target(
                         "failure_class": "supervisor_superseded",
                         "recovered_from_execution_target_session_id": failed_target_session_id,
                     }
-                completed = subprocess.run(
-                    bootstrap_command, check=False, capture_output=True, text=True, env=env, timeout=120
-                )
-        else:
-            completed = subprocess.run(
-                bootstrap_command, check=False, capture_output=True, text=True, env=env, timeout=120
-            )
+        completed = subprocess.run(
+            bootstrap_command, check=False, capture_output=True, text=True, env=env, timeout=120
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return {
             "operation": "native_target_recovery", "controller_id": session_id,
