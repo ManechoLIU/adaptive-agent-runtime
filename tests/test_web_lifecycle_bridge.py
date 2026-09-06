@@ -3012,6 +3012,55 @@ class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
             self.assertTrue(saved["pending_control_event"])
             self.assertEqual(saved["continuation_count"], 1)
 
+    def test_auto_native_stop_backs_off_provider_usage_limit_without_health_loop_spin(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo, registry = self.make_repo_registry(root)
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "r-limit", "session_id": "controller-1",
+                "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True, "requires_user": False,
+                "controller_host": "desktop_codex", "wake_generation": 9,
+            }
+            limited = {
+                "operation": "native_resume", "result": "FAILED", "state": "RESUME_FAILED",
+                "pending_control_event": True, "returncode": 1,
+                "stdout_tail": "", "stderr_tail": "You've hit your usage limit. Try again later.",
+                "controller_id": "controller-1", "failure_class": "usage_limit_exceeded",
+                "error_code": "WEB_LIFECYCLE_RESUME_FAILED",
+            }
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+                web_bridge, "execute_native_resume", return_value=limited
+            ), patch.object(web_bridge, "_rearm_auto_native_stop", return_value=True) as rearm:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo, receipt_id="r-limit",
+                    registry=registry, codex="/opt/homebrew/bin/codex", delay_seconds=0,
+                    state_path=state, runtime_path="/usr/bin:/bin",
+                )
+            self.assertEqual(code, 0)
+            rearm.assert_called_once()
+            self.assertGreaterEqual(rearm.call_args.kwargs["delay_seconds"], 300.0)
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["state"], "RESUME_RETRY_BACKOFF")
+            self.assertEqual(saved["failure_class"], "usage_limit_exceeded")
+            self.assertTrue(saved["pending_control_event"])
+
+    def test_provider_limit_backoff_counts_as_live_supervisor_state(self) -> None:
+        from unittest.mock import patch
+        with patch.object(web_bridge, "_pid_is_alive", return_value=True):
+            self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+                {"pending_control_event": True, "requires_user": False},
+                {
+                    "state": "RESUME_RETRY_BACKOFF", "receipt_id": "r-limit",
+                    "supervisor_receipt_id": "r-limit", "supervisor_token": "token",
+                    "supervisor_pid": 42,
+                },
+            ))
+
     def test_auto_native_stop_does_not_rearm_after_confirmed_resume_when_lifecycle_closes(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:

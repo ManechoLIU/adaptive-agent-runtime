@@ -2798,6 +2798,7 @@ def continuation_supervisor_needs_bootstrap(
         "RESUME_PENDING",
         "RESUME_REARMED",
         "RESUME_DEFERRED_ACTIVE_WRITER",
+        "RESUME_RETRY_BACKOFF",
         "WEB_REENTRY_SUBMITTED",
         "WEB_REENTRY_DEFERRED_ACTIVE",
     }
@@ -3298,6 +3299,20 @@ def _run_auto_native_stop_impl(
             _rearm_auto_native_stop(
                 session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
                 codex=codex, delay_seconds=retry_delay, state_path=state_path, runtime_path=runtime_path,
+                supervisor_token=supervisor_token,
+                supervisor_lock_held=supervisor_token is not None,
+            )
+            return 0
+        if str(attempt.get("failure_class") or "") in {"usage_limit_exceeded", "quota_exhausted"}:
+            latest.update({
+                "state": "RESUME_RETRY_BACKOFF",
+                "pending_control_event": True,
+                "retry_count": int(latest.get("retry_count", 0) or 0) + 1,
+            })
+            write_auto_stop_state(state_path, latest)
+            _rearm_auto_native_stop(
+                session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
+                codex=codex, delay_seconds=300.0, state_path=state_path, runtime_path=runtime_path,
                 supervisor_token=supervisor_token,
                 supervisor_lock_held=supervisor_token is not None,
             )
