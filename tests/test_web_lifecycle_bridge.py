@@ -28,6 +28,51 @@ _SPEC.loader.exec_module(web_bridge)
 
 
 class WebLifecycleBridgeTests(unittest.TestCase):
+    def test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection(self) -> None:
+        from unittest.mock import patch
+        completed = subprocess.CompletedProcess(
+            args=["lifecycle_hook.py"], returncode=0,
+            stdout=json.dumps({"decision": "block", "reason": "Yield Gate rejected"}) + "\n",
+            stderr="",
+        )
+        with patch.object(web_bridge.subprocess, "run", return_value=completed):
+            result = web_bridge.dispatch_event_result({"hook_event_name": "Stop"})
+        self.assertEqual(result["transport_returncode"], 0)
+        self.assertTrue(result["yield_blocked"])
+        self.assertEqual(result["lifecycle_output"]["decision"], "block")
+        self.assertIn("Yield Gate", result["reason"])
+
+    def test_blocked_web_lifecycle_dispatch_arms_continuation_before_returning_blocked(self) -> None:
+        from unittest.mock import patch
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False,
+            "controller_host": "web", "wake_generation": 9,
+            "triggers": ["YIELD_GATE_REJECTED"],
+        }
+        outcome = {
+            "transport_returncode": 0, "yield_blocked": True,
+            "lifecycle_output": {"decision": "block", "reason": "Yield Gate rejected"},
+            "reason": "Yield Gate rejected",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"; repo.mkdir()
+            registry = Path(tmp) / "controllers.json"; registry.write_text("{}", encoding="utf-8")
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+                web_bridge, "dispatch_pending_lifecycle_wake",
+                return_value={"result": "CONFIRMED", "pending_control_event": True},
+            ) as wake, patch.object(
+                web_bridge, "ensure_continuation_supervisor", return_value=True
+            ) as ensure:
+                code = web_bridge.complete_web_lifecycle_dispatch(
+                    dispatch_outcome=outcome, session_id="controller-1", repo=repo, registry=registry,
+                    codex="codex", receipt_prefix="yield-test",
+                )
+        self.assertEqual(code, 78)
+        wake.assert_called_once()
+        ensure.assert_called_once()
+        self.assertEqual(ensure.call_args.kwargs["session_id"], "controller-1")
+        self.assertTrue(ensure.call_args.kwargs["lifecycle_state"]["pending_control_event"])
+
     def run_bridge(self, *args: str, stdin: str = "") -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["/usr/bin/python3", str(BRIDGE), *args],

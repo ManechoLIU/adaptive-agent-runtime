@@ -2703,7 +2703,8 @@ def append_captured_event(path: Path, event: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
-def dispatch_event(event: dict[str, Any]) -> int:
+def dispatch_event_result(event: dict[str, Any]) -> dict[str, Any]:
+    """Run the lifecycle hook and keep logical gate outcome separate from transport success."""
     hook = Path(__file__).resolve().with_name("lifecycle_hook.py")
     completed = subprocess.run(
         [sys.executable, str(hook)],
@@ -2716,7 +2717,67 @@ def dispatch_event(event: dict[str, Any]) -> int:
         print(completed.stdout, end="")
     if completed.stderr:
         print(completed.stderr, file=sys.stderr, end="")
-    return completed.returncode
+    lifecycle_output: dict[str, Any] = {}
+    for line in reversed(completed.stdout.splitlines()):
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            lifecycle_output = parsed
+            break
+    yield_blocked = lifecycle_output.get("decision") == "block"
+    return {
+        "transport_returncode": int(completed.returncode),
+        "yield_blocked": yield_blocked,
+        "lifecycle_output": lifecycle_output,
+        "reason": str(lifecycle_output.get("reason") or ""),
+    }
+
+
+def dispatch_event(event: dict[str, Any]) -> int:
+    """Compatibility wrapper for callers that only care whether hook transport executed."""
+    return int(dispatch_event_result(event)["transport_returncode"])
+
+
+def complete_web_lifecycle_dispatch(
+    *, dispatch_outcome: dict[str, Any], session_id: str, repo: Path, registry: Path,
+    codex: str, receipt_prefix: str, runtime_path: str | None = None,
+) -> int:
+    """Finish a Web lifecycle transaction without losing a rejected logical Yield."""
+    transport_returncode = int(dispatch_outcome.get("transport_returncode", 78) or 0)
+    if transport_returncode != 0:
+        return transport_returncode
+    lifecycle_state = _load_lifecycle_state(session_id)
+    wake_receipt = dispatch_pending_lifecycle_wake(
+        lifecycle_state=lifecycle_state,
+        session_id=session_id,
+        repo=repo,
+        registry=registry,
+        codex=codex,
+        runtime_path=runtime_path,
+    )
+    if lifecycle_state.get("pending_control_event") is True and not wake_receipt_confirmed(wake_receipt):
+        if wake_receipt_needs_auto_native_stop(wake_receipt):
+            schedule_auto_native_stop(
+                session_id=session_id, repo=repo,
+                receipt_id=f"{receipt_prefix}:{lifecycle_state.get('wake_generation', 0)}",
+                registry=registry, codex=codex,
+                delay_seconds=1.0, state_path=default_auto_stop_state_path(session_id),
+                runtime_path=runtime_path,
+            )
+        return 78
+    ensure_continuation_supervisor(
+        lifecycle_state=lifecycle_state,
+        session_id=session_id,
+        repo=repo,
+        registry=registry,
+        codex=codex,
+        runtime_path=runtime_path,
+    )
+    if dispatch_outcome.get("yield_blocked") is True:
+        return 78
+    return 0
 
 
 def rule_wake_schedule_decision(lifecycle_state: dict[str, Any]) -> str:
@@ -3978,34 +4039,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 encoding="utf-8",
             )
             return 0
-        dispatch_code = dispatch_event(event)
-        if dispatch_code != 0:
-            return dispatch_code
-        lifecycle_state = _load_lifecycle_state(session_id)
-        wake_receipt = dispatch_pending_lifecycle_wake(
-            lifecycle_state=lifecycle_state,
-            session_id=session_id,
-            repo=repo,
-            registry=Path(args.registry).expanduser(),
-            codex="/opt/homebrew/bin/codex",
-        )
-        if lifecycle_state.get("pending_control_event") is True and not wake_receipt_confirmed(wake_receipt):
-            if wake_receipt_needs_auto_native_stop(wake_receipt):
-                schedule_auto_native_stop(
-                    session_id=session_id, repo=repo,
-                    receipt_id=f"post-shell:{lifecycle_state.get('wake_generation', 0)}",
-                    registry=registry_path, codex="/opt/homebrew/bin/codex",
-                    delay_seconds=1.0, state_path=default_auto_stop_state_path(session_id),
-                )
-            return 78
-        ensure_continuation_supervisor(
-            lifecycle_state=lifecycle_state,
+        dispatch_outcome = dispatch_event_result(event)
+        return complete_web_lifecycle_dispatch(
+            dispatch_outcome=dispatch_outcome,
             session_id=session_id,
             repo=repo,
             registry=registry_path,
             codex="/opt/homebrew/bin/codex",
+            receipt_prefix="post-shell",
         )
-        return 0
 
     if args.command_name == "audit-once":
         repo = Path(args.repo).expanduser().resolve()
