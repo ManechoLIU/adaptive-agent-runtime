@@ -26,14 +26,22 @@ except ModuleNotFoundError:
     from scripts import controller_target_guard as target_guard
 
 try:
-    from web_reentry_adapter import execute_web_reentry, resolve_reentry_session
+    from web_reentry_adapter import (
+        execute_web_reentry, resolve_reentry_session,
+        verify_ai_bridge_web_session_attestation,
+    )
 except ModuleNotFoundError:
-    from scripts.web_reentry_adapter import execute_web_reentry, resolve_reentry_session
+    from scripts.web_reentry_adapter import (
+        execute_web_reentry, resolve_reentry_session,
+        verify_ai_bridge_web_session_attestation,
+    )
 
 
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 DEFAULT_MANUAL_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
-_PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., bool]] = {}
+_PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., bool]] = {
+    "web": verify_ai_bridge_web_session_attestation,
+}
 DEFAULT_MANUAL_WEB_LEASE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_AUDIT_LOG = (
     Path.home()

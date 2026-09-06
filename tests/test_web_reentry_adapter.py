@@ -72,6 +72,56 @@ class WebReentryAdapterTests(unittest.TestCase):
                     controller_id="controller-1", repo=repo, registry_path=registry, lease_path=lease
                 )
 
+    def test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab(self) -> None:
+        calls: list[dict] = []
+
+        def browser_call(arguments: dict) -> dict:
+            calls.append(dict(arguments))
+            self.assertEqual(arguments, {"action": "list_tabs"})
+            return {"tabs": [{
+                "tab_id": "tab-controller",
+                "url": "https://chatgpt.com/c/web-current",
+                "title": "SelfAlone Controller",
+            }]}
+
+        receipt = {
+            "host": "web",
+            "web_session_id": "web-current",
+            "tab_id": "tab-controller",
+            "url": "https://chatgpt.com/c/web-current",
+            "source": "ai_bridge_browser",
+        }
+        self.assertTrue(web_reentry_adapter.verify_ai_bridge_web_session_attestation(
+            controller_id="controller-1", host="web",
+            expected_target_session_id="web-current", expected_target_generation=3,
+            expected_target_mode="same_controller_session_recovery",
+            host_execution_receipt=receipt,
+            adapter_attempt={"repo": "/tmp/repo"}, browser_call=browser_call,
+        ))
+        forged = dict(receipt); forged["tab_id"] = "forged-tab"
+        self.assertFalse(web_reentry_adapter.verify_ai_bridge_web_session_attestation(
+            controller_id="controller-1", host="web",
+            expected_target_session_id="web-current", expected_target_generation=3,
+            expected_target_mode="same_controller_session_recovery",
+            host_execution_receipt=forged,
+            adapter_attempt={"repo": "/tmp/repo"}, browser_call=browser_call,
+        ))
+        self.assertEqual(len(calls), 2)
+
+    def test_ai_bridge_web_attestation_rejects_caller_only_claim_without_live_tab(self) -> None:
+        receipt = {
+            "host": "web", "web_session_id": "web-current",
+            "tab_id": "tab-controller", "url": "https://chatgpt.com/c/web-current",
+            "source": "ai_bridge_browser",
+        }
+        self.assertFalse(web_reentry_adapter.verify_ai_bridge_web_session_attestation(
+            controller_id="controller-1", host="web",
+            expected_target_session_id="web-current", expected_target_generation=0,
+            expected_target_mode="same_controller_session_recovery",
+            host_execution_receipt=receipt, adapter_attempt={},
+            browser_call=lambda _args: {"tabs": []},
+        ))
+
     def test_reentry_checkpoint_recomputes_dag_and_route_before_any_new_dispatch(self) -> None:
         prompt = web_reentry_adapter.build_reentry_prompt(
             controller_id="controller-1",
@@ -122,6 +172,12 @@ class WebReentryAdapterTests(unittest.TestCase):
             self.assertEqual(result["state"], "WEB_REENTRY_SUBMITTED")
             self.assertEqual(result["execution_target_session_id"], "web-current")
             self.assertEqual(result["target_mode"], "web_lease")
+            host_receipt = result["host_execution_receipt"]
+            self.assertEqual(host_receipt["host"], "web")
+            self.assertEqual(host_receipt["web_session_id"], "web-current")
+            self.assertEqual(host_receipt["tab_id"], "tab-1")
+            self.assertEqual(host_receipt["source"], "ai_bridge_browser")
+            self.assertEqual(host_receipt["url"], "https://chatgpt.com/g/g-p-proj/c/web-current")
             self.assertEqual([c["action"] for c in calls], ["list_tabs", "focus_tab", "snapshot", "type"])
             self.assertEqual(calls[-1]["node_id"], "composer")
             self.assertTrue(calls[-1]["submit"])

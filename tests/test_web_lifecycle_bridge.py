@@ -370,6 +370,11 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "controller-1",
             )
 
+    def test_production_bridge_registers_trusted_web_attestation_verifier(self) -> None:
+        verifier = web_bridge._registered_peer_attestation_verifier("web")
+        self.assertTrue(callable(verifier))
+        self.assertIsNone(web_bridge._registered_peer_attestation_verifier("desktop_codex"))
+
     def test_same_controller_web_recovery_rebinds_trusted_new_session_without_new_controller(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
