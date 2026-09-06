@@ -305,6 +305,17 @@ def resolve_manual_web_session(
     return session_id
 
 
+def _controller_ownership_generation(registry_path: Path, controller_id: str) -> int:
+    registry = load_json(registry_path)
+    record = target_guard.execution_ownership_record(
+        registry, controller_id=controller_id
+    )
+    if record is None:
+        return 0
+    _host, _target, generation = target_guard.validate_execution_ownership_record(record)
+    return generation
+
+
 def recover_same_controller_web_session(
     *,
     repo: Path,
@@ -350,12 +361,29 @@ def recover_same_controller_web_session(
             "verified Web Controller Session identity required; "
             "same-controller recovery refuses conflicting session ownership"
         )
+    ownership_generation = _controller_ownership_generation(
+        registry_path, controller_id
+    )
     if binding.get("verification") == "VERIFIED":
+        ownership = target_guard.claim_controller_host(
+            repo=repo,
+            controller_id=controller_id,
+            requested_host="web",
+            requested_target_session_id=web_session_id,
+            expected_generation=ownership_generation,
+            registry_path=registry_path,
+            provenance="web_entry",
+        )
         return {
             "result": "ALREADY_VERIFIED",
             "state": "VERIFIED",
             "controller_id": controller_id,
-            "identity": identity,
+            "active_host": ownership["active_host"],
+            "ownership_generation": ownership["generation"],
+            "identity": target_guard.controller_identity_projection(
+                repo=repo, host="web", source_session_id=web_session_id,
+                registry_path=registry_path,
+            ),
         }
 
     verifier = _registered_peer_attestation_verifier("web")
@@ -501,6 +529,14 @@ def recover_same_controller_web_session(
             }
             targets[controller_id] = controller_targets
             registry["__controller_targets__"] = targets
+            ownership_claim = target_guard._claim_controller_host_in_registry(
+                registry,
+                controller_id=controller_id,
+                requested_host="web",
+                requested_target_session_id=web_session_id,
+                expected_generation=ownership_generation,
+                provenance="web_entry",
+            )
             _write_json_atomic_file(registry_path, registry)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -518,6 +554,8 @@ def recover_same_controller_web_session(
         "state": "VERIFIED",
         "controller_id": controller_id,
         "execution_target_session_id": web_session_id,
+        "active_host": ownership_claim["active_host"],
+        "ownership_generation": ownership_claim["generation"],
         "target_generation": recovered["session_binding_state"].get(
             "target_generation"
         ),

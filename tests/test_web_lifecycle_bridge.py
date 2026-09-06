@@ -423,6 +423,8 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(recovered["identity"]["identity_state"], "VERIFIED")
             self.assertEqual(recovered["controller_id"], "controller-1")
             self.assertEqual(recovered["target_generation"], 4)
+            self.assertEqual(recovered["active_host"], "web")
+            self.assertEqual(recovered["ownership_generation"], 1)
             self.assertEqual(
                 recovered["identity"]["session_binding_state"]["provenance"],
                 "host_attested_same_controller_recovery",
@@ -449,6 +451,12 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
                 "web-new",
             )
+            self.assertEqual(saved["__controller_execution_ownership__"]["controller-1"], {
+                "active_host": "web",
+                "execution_target_session_id": "web-new",
+                "generation": 1,
+                "provenance": "web_entry",
+            })
             old_identity = web_bridge.target_guard.controller_identity_projection(
                 repo=repo,
                 host="web",

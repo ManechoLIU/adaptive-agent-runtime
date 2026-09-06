@@ -383,6 +383,45 @@ class GovernanceTests(unittest.TestCase):
             },
         )
 
+    def test_explicit_desktop_entry_claims_cross_host_ownership_without_changing_controller(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+            lifecycle_hook.bind_desktop_session(
+                controller_id="controller-1", desktop_session_id="desktop-entry-2", repo=main
+            )
+            payload = lifecycle_hook.load_json(registry)
+            payload["__controller_execution_ownership__"] = {
+                "controller-1": {
+                    "active_host": "web",
+                    "execution_target_session_id": "controller-1",
+                    "generation": 5,
+                }
+            }
+            lifecycle_hook.write_json(registry, payload)
+
+            receipt = lifecycle_hook.replace_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-2",
+                repo=main,
+                expected_generation=0,
+                expected_ownership_generation=5,
+            )
+
+        self.assertEqual(receipt["controller_id"], "controller-1")
+        self.assertEqual(receipt["host"], "desktop_codex")
+        self.assertEqual(receipt["ownership_generation"], 6)
+        saved = lifecycle_hook.load_json(registry)
+        self.assertEqual(saved["controller-1"], str(main.resolve()))
+        self.assertEqual(saved["__controller_execution_ownership__"]["controller-1"], {
+            "active_host": "desktop_codex",
+            "execution_target_session_id": "desktop-entry-2",
+            "generation": 6,
+            "provenance": "desktop_entry",
+        })
+
     def test_replacing_desktop_target_deactivates_old_alias_and_advances_generation(self) -> None:
         from unittest.mock import patch
 

@@ -1585,7 +1585,8 @@ def _reject_cross_controller_desktop_owner(
 
 
 def replace_desktop_session(
-    *, controller_id: str, desktop_session_id: str, repo: Path, expected_generation: int
+    *, controller_id: str, desktop_session_id: str, repo: Path, expected_generation: int,
+    expected_ownership_generation: int | None = None,
 ) -> dict[str, Any]:
     controller_id = controller_id.strip()
     desktop_session_id = desktop_session_id.strip()
@@ -1661,6 +1662,16 @@ def replace_desktop_session(
             controller_targets[DESKTOP_SESSION_HOST] = target
             targets[controller_id] = controller_targets
             registry[CONTROLLER_TARGETS_KEY] = targets
+            ownership_claim = None
+            if expected_ownership_generation is not None:
+                ownership_claim = target_guard._claim_controller_host_in_registry(
+                    registry,
+                    controller_id=controller_id,
+                    requested_host=DESKTOP_SESSION_HOST,
+                    requested_target_session_id=desktop_session_id,
+                    expected_generation=expected_ownership_generation,
+                    provenance="desktop_entry",
+                )
             write_json(REGISTRY_PATH, registry)
             return {
                 "controller_id": controller_id,
@@ -1669,6 +1680,7 @@ def replace_desktop_session(
                 "host": DESKTOP_SESSION_HOST,
                 "repo": str(canonical_root.resolve()),
                 **target,
+                **({"ownership_generation": ownership_claim["generation"]} if ownership_claim else {}),
             }
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

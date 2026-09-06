@@ -603,18 +603,15 @@ def resolve_execution_ownership(
     }
 
 
-def claim_controller_host(
+def _claim_controller_host_in_registry(
+    registry: dict[str, Any],
     *,
-    repo: Path,
     controller_id: str,
     requested_host: str,
     requested_target_session_id: str,
     expected_generation: int,
-    registry_path: Path = DEFAULT_REGISTRY,
     provenance: str | None = None,
 ) -> dict[str, Any]:
-    repo = repo.expanduser().resolve()
-    registry_path = registry_path.expanduser()
     controller_id = _bounded_string(
         controller_id, label="controller id", maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH
     )
@@ -630,6 +627,84 @@ def claim_controller_host(
         raise ValueError("expected ownership generation must be a non-negative integer")
     provenance_value = str(provenance or "").strip() or None
 
+    aliases = host_sessions(registry, controller_id=controller_id, host=requested_host)
+    current_target_record = target_record(
+        registry, controller_id=controller_id, host=requested_host
+    )
+    if current_target_record is None:
+        if aliases:
+            raise PermissionError(
+                f"{requested_host} aliases exist without an explicit current target"
+            )
+        current_target = controller_id
+    else:
+        status, current_target, _host_generation = validate_target_record(
+            current_target_record, host=requested_host
+        )
+        if status != "active" or current_target is None:
+            raise PermissionError(f"{requested_host} execution target is not active")
+        if current_target != controller_id and current_target not in aliases:
+            raise PermissionError(
+                f"{requested_host} execution target is not a bound Controller entry"
+            )
+    if current_target != requested_target_session_id:
+        raise PermissionError(
+            f"requested target {requested_target_session_id} is not the current "
+            f"{requested_host} target {current_target}"
+        )
+
+    prior = execution_ownership_record(registry, controller_id=controller_id)
+    if prior is None:
+        current_generation = 0
+    else:
+        _prior_host, _prior_target, current_generation = validate_execution_ownership_record(prior)
+    if current_generation != expected_generation:
+        raise PermissionError(
+            "Controller execution ownership generation changed; stale host claim refused"
+        )
+
+    ownership = registry.get(CONTROLLER_EXECUTION_OWNERSHIP_KEY)
+    if ownership is None:
+        ownership = {}
+    if not isinstance(ownership, dict):
+        raise ValueError("controller execution ownership registry is invalid")
+    next_record: dict[str, Any] = {
+        "active_host": requested_host,
+        "execution_target_session_id": requested_target_session_id,
+        "generation": current_generation + 1,
+    }
+    if provenance_value is not None:
+        next_record["provenance"] = provenance_value
+    ownership[controller_id] = next_record
+    registry[CONTROLLER_EXECUTION_OWNERSHIP_KEY] = ownership
+    return {
+        "result": "CLAIMED",
+        "controller_id": controller_id,
+        "controller_session_id": controller_id,
+        "active_host": requested_host,
+        "host": requested_host,
+        "execution_target_session_id": requested_target_session_id,
+        "generation": current_generation + 1,
+        "target_mode": "canonical_host_ownership",
+        **({"provenance": provenance_value} if provenance_value else {}),
+    }
+
+
+def claim_controller_host(
+    *,
+    repo: Path,
+    controller_id: str,
+    requested_host: str,
+    requested_target_session_id: str,
+    expected_generation: int,
+    registry_path: Path = DEFAULT_REGISTRY,
+    provenance: str | None = None,
+) -> dict[str, Any]:
+    repo = repo.expanduser().resolve()
+    registry_path = registry_path.expanduser()
+    controller_id = _bounded_string(
+        controller_id, label="controller id", maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH
+    )
     lock_path = registry_lock_path(registry_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as lock:
@@ -641,74 +716,16 @@ def claim_controller_host(
                 raise PermissionError(
                     "Controller host claim requires the existing unique project Controller"
                 )
-
-            aliases = host_sessions(
-                registry, controller_id=controller_id, host=requested_host
+            receipt = _claim_controller_host_in_registry(
+                registry,
+                controller_id=controller_id,
+                requested_host=requested_host,
+                requested_target_session_id=requested_target_session_id,
+                expected_generation=expected_generation,
+                provenance=provenance,
             )
-            current_target_record = target_record(
-                registry, controller_id=controller_id, host=requested_host
-            )
-            if current_target_record is None:
-                if aliases:
-                    raise PermissionError(
-                        f"{requested_host} aliases exist without an explicit current target"
-                    )
-                current_target = controller_id
-            else:
-                status, current_target, _host_generation = validate_target_record(
-                    current_target_record, host=requested_host
-                )
-                if status != "active" or current_target is None:
-                    raise PermissionError(f"{requested_host} execution target is not active")
-                if current_target != controller_id and current_target not in aliases:
-                    raise PermissionError(
-                        f"{requested_host} execution target is not a bound Controller entry"
-                    )
-            if current_target != requested_target_session_id:
-                raise PermissionError(
-                    f"requested target {requested_target_session_id} is not the current "
-                    f"{requested_host} target {current_target}"
-                )
-
-            prior = execution_ownership_record(registry, controller_id=controller_id)
-            if prior is None:
-                current_generation = 0
-            else:
-                _prior_host, _prior_target, current_generation = (
-                    validate_execution_ownership_record(prior)
-                )
-            if current_generation != expected_generation:
-                raise PermissionError(
-                    "Controller execution ownership generation changed; stale host claim refused"
-                )
-
-            ownership = registry.get(CONTROLLER_EXECUTION_OWNERSHIP_KEY)
-            if ownership is None:
-                ownership = {}
-            if not isinstance(ownership, dict):
-                raise ValueError("controller execution ownership registry is invalid")
-            next_record: dict[str, Any] = {
-                "active_host": requested_host,
-                "execution_target_session_id": requested_target_session_id,
-                "generation": current_generation + 1,
-            }
-            if provenance_value is not None:
-                next_record["provenance"] = provenance_value
-            ownership[controller_id] = next_record
-            registry[CONTROLLER_EXECUTION_OWNERSHIP_KEY] = ownership
             _write_registry(registry_path, registry)
-            return {
-                "result": "CLAIMED",
-                "controller_id": controller_id,
-                "controller_session_id": controller_id,
-                "active_host": requested_host,
-                "host": requested_host,
-                "execution_target_session_id": requested_target_session_id,
-                "generation": current_generation + 1,
-                "target_mode": "canonical_host_ownership",
-                "repo": str(repo),
-                **({"provenance": provenance_value} if provenance_value else {}),
-            }
+            return {**receipt, "repo": str(repo)}
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
