@@ -78,15 +78,17 @@ delivery. Registering a live browser-tab lookup as the trusted host verifier is
 forbidden; tab lookup may confirm the destination transport, but cannot attest
 the conversation that originated the control call.
 
-For any supplied Web delivery adapter, Host origin verification is a
-pre-delivery gate, never post-delivery validation. The registered Host verifier
-must first return a structured `chatgpt_web` attestation for the exact canonical
-conversation and a non-empty Host-issued `call_receipt`. Only then may Runtime
-invoke the adapter, passing that attestation into the call. The adapter's
-execution receipt must repeat the same `call_receipt` together with the exact
-target generation and ownership generation. A rejected, unavailable, malformed,
-wrong-target, or uncorrelated attestation causes zero adapter calls and preserves
-the pending event.
+For every Web delivery path, including the built-in AI-Bridge browser adapter
+and any supplied Host adapter, Host origin verification is a pre-delivery gate,
+never post-delivery validation. The verifier is registered only by the trusted
+Host integration; public callers cannot inject it. It must first return a
+structured `chatgpt_web` attestation for the exact canonical conversation and a
+non-empty Host-issued `call_receipt`. Only then may Runtime invoke or enter a
+delivery adapter. The adapter's execution receipt must repeat the same
+`call_receipt` together with the exact target generation and ownership
+generation. A missing, rejected, unavailable, malformed, wrong-target, or
+uncorrelated attestation causes zero browser/type or supplied-adapter delivery
+calls and preserves the pending event.
 
 If any identity or uniqueness check fails, the adapter returns a blocking result and does not mutate the binding registry.
 

@@ -5,11 +5,28 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import web_reentry_adapter
 
 
 class WebReentryAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.origin_verifier_patcher = patch.object(
+            web_reentry_adapter,
+            "_registered_web_origin_attestation_verifier",
+            return_value=lambda **kwargs: {
+                "origin_host": "chatgpt_web",
+                "origin_conversation_id": kwargs["expected_target_session_id"],
+                "origin_attested": True,
+                "call_receipt": "test-host-call-receipt",
+            },
+        )
+        self.origin_verifier_patcher.start()
+
+    def tearDown(self) -> None:
+        self.origin_verifier_patcher.stop()
+
     def make_identity(
         self,
         root: Path,
@@ -109,6 +126,37 @@ class WebReentryAdapterTests(unittest.TestCase):
 
             self.assertEqual(result["result"], "DEFERRED")
             self.assertEqual(result["state"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
+            self.assertEqual(calls, [])
+
+    def test_reentry_without_registered_host_origin_verifier_never_calls_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, lease = self.make_identity(Path(tmp))
+            calls: list[dict] = []
+
+            with patch.object(
+                web_reentry_adapter,
+                "_registered_web_origin_attestation_verifier",
+                return_value=None,
+            ):
+                result = web_reentry_adapter.execute_web_reentry(
+                    controller_id="controller-1",
+                    repo=repo,
+                    registry_path=registry,
+                    lease_path=lease,
+                    lifecycle_state={
+                        "pending_control_event": True,
+                        "requires_user": False,
+                        "wake_generation": 9,
+                    },
+                    browser_call=lambda arguments: calls.append(dict(arguments)) or {},
+                )
+
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(result["state"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
+            self.assertEqual(
+                result["error_code"],
+                "WEB_HOST_ATTESTATION_VERIFIER_UNAVAILABLE",
+            )
             self.assertEqual(calls, [])
 
     def test_reentry_without_explicit_canonical_web_target_never_calls_browser(self) -> None:
@@ -274,6 +322,7 @@ class WebReentryAdapterTests(unittest.TestCase):
             self.assertEqual(host_receipt["web_session_id"], "web-current")
             self.assertEqual(host_receipt["tab_id"], "tab-1")
             self.assertEqual(host_receipt["source"], "ai_bridge_browser")
+            self.assertEqual(host_receipt["call_receipt"], "test-host-call-receipt")
             self.assertEqual(host_receipt["url"], "https://chatgpt.com/g/g-p-proj/c/web-current")
             self.assertEqual([c["action"] for c in calls], ["list_tabs", "focus_tab", "snapshot", "type"])
             self.assertEqual(calls[-1]["node_id"], "composer")

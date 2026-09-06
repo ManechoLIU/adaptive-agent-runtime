@@ -84,6 +84,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_reentry_adapter.WebReentryAdapterTests."
     "test_reentry_without_explicit_canonical_web_target_never_calls_browser",
     "tests.test_web_reentry_adapter.WebReentryAdapterTests."
+    "test_reentry_without_registered_host_origin_verifier_never_calls_browser",
+    "tests.test_web_reentry_adapter.WebReentryAdapterTests."
     "test_legacy_browser_attested_target_is_quarantined_before_browser_use",
     "tests.test_web_reentry_adapter.WebReentryAdapterTests."
     "test_submit_holds_registry_fence_against_target_rotation",
@@ -91,6 +93,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_target_generation_change_before_submit_never_types",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_web_supervisor_rejects_confirmed_receipt_for_noncanonical_target",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_builtin_web_reentry_without_registered_origin_verifier_never_calls_browser_adapter",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."

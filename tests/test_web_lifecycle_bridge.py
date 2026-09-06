@@ -5622,7 +5622,10 @@ class WebHostNativeWakeIsolationTests(unittest.TestCase):
                 )
             self.assertEqual(receipt["selected_host"], "web")
             self.assertEqual(receipt["result"], "DEFERRED")
-            self.assertEqual(receipt["error_code"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
+            self.assertEqual(
+                receipt["error_code"],
+                "WEB_HOST_ATTESTATION_VERIFIER_UNAVAILABLE",
+            )
 
     def test_web_current_host_wake_refuses_unregistered_supplied_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6236,7 +6239,7 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
         state_path = root / "auto.json"
         return repo, registry, state_path
 
-    def test_builtin_web_reentry_is_used_for_current_web_host_without_desktop_resume(self) -> None:
+    def test_builtin_web_reentry_without_registered_origin_verifier_never_calls_browser_adapter(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             repo, registry, _ = self.make_repo(Path(tmp))
@@ -6251,13 +6254,11 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
             }}
             registry.write_text(json.dumps(payload), encoding="utf-8")
             receipt_path = Path(tmp) / "wake.json"
-            confirmed = {
-                "operation": "web_reentry", "result": "CONFIRMED", "state": "WEB_REENTRY_SUBMITTED",
-                "returncode": 0, "execution_target_session_id": "web-current",
-                "target_generation": 4, "ownership_generation": 8,
-                "target_mode": "explicit_current",
-            }
-            with patch.object(web_bridge, "execute_web_reentry", return_value=confirmed) as reentry, patch.object(
+            with patch.object(
+                web_bridge,
+                "execute_web_reentry",
+                side_effect=AssertionError("unattested built-in Web adapter must not run"),
+            ) as reentry, patch.object(
                 web_bridge, "execute_native_resume", side_effect=AssertionError("web wake must not invoke desktop Codex")
             ):
                 receipt = web_bridge.wake_existing_controller(
@@ -6266,10 +6267,14 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
                     receipt_path=receipt_path,
                     host_facts={"controller_host": "web", "resume_actionable": True},
                 )
-            self.assertEqual(receipt["result"], "CONFIRMED")
+            self.assertEqual(receipt["result"], "DEFERRED")
             self.assertEqual(receipt["selected_host"], "web")
-            self.assertEqual(receipt["execution_target_session_id"], "web-current")
-            reentry.assert_called_once()
+            self.assertEqual(
+                receipt["error_code"],
+                "WEB_HOST_ATTESTATION_VERIFIER_UNAVAILABLE",
+            )
+            self.assertTrue(receipt["pending_control_event"])
+            reentry.assert_not_called()
 
     def test_local_web_wake_rejects_receipt_for_noncanonical_target(self) -> None:
         from unittest.mock import patch
@@ -6307,8 +6312,9 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
             }
 
             with patch.object(
-                web_bridge, "execute_web_reentry", return_value=wrong
-            ):
+                web_bridge, "_registered_peer_attestation_verifier",
+                return_value=lambda **_kwargs: True,
+            ), patch.object(web_bridge, "execute_web_reentry", return_value=wrong):
                 receipt = web_bridge.wake_existing_controller(
                     lifecycle_state={
                         "pending_control_event": True,
@@ -6419,7 +6425,10 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
                     "target_generation":4,"target_mode":"explicit_current",
                 }
 
-            with patch.object(web_bridge, "execute_web_reentry", side_effect=web_then_handoff), patch.object(
+            with patch.object(
+                web_bridge, "_registered_peer_attestation_verifier",
+                return_value=lambda **_kwargs: True,
+            ), patch.object(web_bridge, "execute_web_reentry", side_effect=web_then_handoff), patch.object(
                 web_bridge, "execute_native_resume",
                 side_effect=AssertionError("Web-owned direct wake must not invoke desktop Codex")
             ):

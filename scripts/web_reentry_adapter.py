@@ -21,6 +21,7 @@ DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 DEFAULT_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
 MCP_PROTOCOL_VERSION = "2025-03-26"
 MCP_TIMEOUT_SECONDS = 8
+_WEB_ORIGIN_ATTESTATION_VERIFIER: Callable[..., Any] | None = None
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -29,6 +30,36 @@ def _load_json(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _registered_web_origin_attestation_verifier() -> Callable[..., Any] | None:
+    """Return only the verifier installed by the trusted Host integration."""
+    return _WEB_ORIGIN_ATTESTATION_VERIFIER
+
+
+def _validated_web_origin_attestation(
+    value: Any, *, expected_target_session_id: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise PermissionError("Web Host origin attestation is not an object")
+    call_receipt = value.get("call_receipt")
+    if (
+        value.get("origin_host") != "chatgpt_web"
+        or value.get("origin_conversation_id") != expected_target_session_id
+        or value.get("origin_attested") is not True
+        or not isinstance(call_receipt, str)
+        or not call_receipt.strip()
+        or len(call_receipt.encode("utf-8")) > 512
+    ):
+        raise PermissionError(
+            "Web Host origin attestation does not match the exact execution target"
+        )
+    return {
+        "origin_host": "chatgpt_web",
+        "origin_conversation_id": expected_target_session_id,
+        "origin_attested": True,
+        "call_receipt": call_receipt.strip(),
+    }
 
 
 def resolve_reentry_session(
@@ -409,6 +440,49 @@ def _execute_web_reentry_under_registry_fence(
             "error_code": "WEB_REENTRY_IDENTITY_UNAVAILABLE", "stderr_tail": str(exc)[:1024],
         }
 
+    verifier = _registered_web_origin_attestation_verifier()
+    if not callable(verifier):
+        return {
+            "operation": "web_reentry",
+            "result": "DEFERRED",
+            "state": "WEB_REENTRY_IDENTITY_UNAVAILABLE",
+            "returncode": 78,
+            "failure_class": "web_reentry_identity_unavailable",
+            "error_code": "WEB_HOST_ATTESTATION_VERIFIER_UNAVAILABLE",
+            "stderr_tail": "trusted Web Host origin attestation verifier is unavailable",
+            "execution_target_session_id": web_session_id,
+            "target_generation": target_generation,
+            "ownership_generation": ownership_generation,
+            "target_mode": target_mode,
+        }
+    try:
+        origin_attestation = _validated_web_origin_attestation(
+            verifier(
+                phase="pre_delivery",
+                controller_id=controller_id,
+                host="web",
+                expected_target_session_id=web_session_id,
+                expected_target_generation=target_generation,
+                expected_target_mode=target_mode,
+                expected_ownership_generation=ownership_generation,
+            ),
+            expected_target_session_id=web_session_id,
+        )
+    except Exception as exc:
+        return {
+            "operation": "web_reentry",
+            "result": "DEFERRED",
+            "state": "WEB_REENTRY_IDENTITY_UNAVAILABLE",
+            "returncode": 78,
+            "failure_class": "web_reentry_identity_unavailable",
+            "error_code": "WEB_HOST_ATTESTATION_INVALID",
+            "stderr_tail": str(exc)[:1024],
+            "execution_target_session_id": web_session_id,
+            "target_generation": target_generation,
+            "ownership_generation": ownership_generation,
+            "target_mode": target_mode,
+        }
+
     if browser_call is None:
         client = _McpSession(discover_ai_bridge_mcp_url())
         call = client.browser
@@ -514,6 +588,7 @@ def _execute_web_reentry_under_registry_fence(
             "tab_id": tab_id,
             "source": "ai_bridge_browser",
             "submitted": True,
+            "call_receipt": origin_attestation["call_receipt"],
         }
         observed_url = str((tab or {}).get("url") or "").strip() if tab is not None else ""
         if observed_url:

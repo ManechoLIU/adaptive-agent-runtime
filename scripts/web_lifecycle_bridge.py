@@ -2305,7 +2305,7 @@ def wake_existing_controller(
                 elif selected_host == "web":
                     adapter = (resume_adapters or {}).get("web")
                     verifier = _registered_peer_attestation_verifier("web")
-                    if adapter is not None and not callable(verifier):
+                    if not callable(verifier):
                         attempt = {
                             "operation": None,
                             "result": "DEFERRED",
