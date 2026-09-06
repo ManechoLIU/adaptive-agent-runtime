@@ -4050,6 +4050,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 recovery = {
                     "result": "ALREADY_VERIFIED",
                     "controller_id": controller_id,
+                    "resume_lease_rotated": rotate_existing_manual_web_resume_lease(
+                        repo=repo,
+                        controller_id=controller_id,
+                        web_session_id=web_session_id,
+                    ),
                 }
             except PermissionError:
                 recovery = recover_same_controller_web_session(

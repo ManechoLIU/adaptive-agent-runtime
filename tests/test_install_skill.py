@@ -648,6 +648,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests.test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_production_bridge_registers_trusted_web_attestation_verifier",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab",
             "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests.test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix",
         }
@@ -773,6 +774,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection(self): self.assertTrue(True)\n"
                 "    def test_production_bridge_registers_trusted_web_attestation_verifier(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target(self): self.assertTrue(True)\n"
+                "    def test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_web_reentry(self): self.assertTrue(True)\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume(self): self.assertTrue(True)\n"

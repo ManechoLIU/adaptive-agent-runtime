@@ -288,6 +288,71 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 78)
             self.assertIn("verified Web Controller Session identity", result.stderr)
 
+    def test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim(self) -> None:
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+                "__controller_targets__": {
+                    "controller-1": {
+                        "web": {"status": "active", "session_id": "web-current", "generation": 4}
+                    }
+                },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "web",
+                        "execution_target_session_id": "web-current",
+                        "generation": 7,
+                    }
+                },
+            }), encoding="utf-8")
+            lease = root / "manual-web-leases.json"
+            lease.write_text(json.dumps({
+                "schema_version": 1,
+                "leases": {
+                    "controller-1": {
+                        "repo": str(repo.resolve()),
+                        "controller_id": "controller-1",
+                        "web_session_id": "web-old",
+                        "authorized_at_unix": 100,
+                        "expires_at_unix": 4102444800,
+                        "provenance": "manual_user_authorized",
+                        "mode": "resume_only",
+                    }
+                },
+            }), encoding="utf-8")
+            output = StringIO()
+            with patch.object(web_bridge, "DEFAULT_MANUAL_WEB_LEASES", lease), patch.object(
+                web_bridge, "web_session_restore_payload", return_value={
+                    "session_binding_state": {"verification": "VERIFIED"},
+                    "controller_actions_allowed": True,
+                }
+            ), redirect_stdout(output):
+                rc = web_bridge.main([
+                    "session-start",
+                    "--repo", str(repo),
+                    "--registry", str(registry),
+                    "--web-session-id", "web-current",
+                ])
+
+            self.assertEqual(rc, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["session_recovery_result"]["result"], "ALREADY_VERIFIED")
+            self.assertTrue(payload["session_recovery_result"]["resume_lease_rotated"])
+            record = json.loads(lease.read_text(encoding="utf-8"))["leases"]["controller-1"]
+            self.assertEqual(record["web_session_id"], "web-current")
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(saved["__controller_execution_ownership__"]["controller-1"]["generation"], 7)
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["generation"], 4)
+
     def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
