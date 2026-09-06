@@ -228,6 +228,44 @@ class ControllerTargetGuardTests(unittest.TestCase):
             self.assertTrue(identity["same_controller_recovery_allowed"])
             self.assertFalse(identity["create_new_controller_allowed"])
 
+    def test_identity_projection_degrades_legacy_browser_attested_web_target(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-current"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {"web": {
+                        "status": "active",
+                        "session_id": "web-current",
+                        "generation": 2,
+                        "provenance": "host_attested_same_controller_recovery",
+                        "binding_mode": "resume_only",
+                        "host_identity_receipt_sha256": "a" * 64,
+                    }}
+                },
+            }), encoding="utf-8")
+
+            identity = guard.controller_identity_projection(
+                repo=repo,
+                host="web",
+                source_session_id="web-current",
+                registry_path=registry,
+            )
+
+            self.assertEqual(identity["identity_state"], "DEGRADED")
+            self.assertEqual(
+                identity["session_binding_state"]["reason"],
+                "HOST_IDENTITY_UNAVAILABLE",
+            )
+            self.assertFalse(identity["controller_actions_allowed"])
+            self.assertTrue(identity["same_controller_recovery_allowed"])
+
     def test_identity_projection_marks_real_controller_conflict_as_conflicted(self) -> None:
         guard = load_guard()
         with tempfile.TemporaryDirectory() as tmp:

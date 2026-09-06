@@ -10,11 +10,17 @@ from scripts import web_reentry_adapter
 
 
 class WebReentryAdapterTests(unittest.TestCase):
-    def make_identity(self, root: Path, *, web_session_id: str = "web-current") -> tuple[Path, Path, Path]:
+    def make_identity(
+        self,
+        root: Path,
+        *,
+        web_session_id: str = "web-current",
+        include_ownership: bool = True,
+    ) -> tuple[Path, Path, Path]:
         repo = root / "repo"
         repo.mkdir()
         registry = root / "controllers.json"
-        registry.write_text(json.dumps({
+        registry_payload = {
             "controller-1": str(repo.resolve()),
             "__controller_sessions__": {"controller-1": {"web": [web_session_id, "web-old"]}},
             "__controller_targets__": {
@@ -26,7 +32,16 @@ class WebReentryAdapterTests(unittest.TestCase):
                     }
                 }
             },
-        }), encoding="utf-8")
+        }
+        if include_ownership:
+            registry_payload["__controller_execution_ownership__"] = {
+                "controller-1": {
+                    "active_host": "web",
+                    "execution_target_session_id": web_session_id,
+                    "generation": 7,
+                }
+            }
+        registry.write_text(json.dumps(registry_payload), encoding="utf-8")
         lease = root / "web-leases.json"
         lease.write_text(json.dumps({
             "schema_version": 1,
@@ -71,6 +86,86 @@ class WebReentryAdapterTests(unittest.TestCase):
                 web_reentry_adapter.resolve_reentry_session(
                     controller_id="controller-1", repo=repo, registry_path=registry, lease_path=lease
                 )
+
+    def test_reentry_without_canonical_web_ownership_never_calls_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, lease = self.make_identity(
+                Path(tmp), include_ownership=False
+            )
+            calls: list[dict] = []
+
+            result = web_reentry_adapter.execute_web_reentry(
+                controller_id="controller-1",
+                repo=repo,
+                registry_path=registry,
+                lease_path=lease,
+                lifecycle_state={
+                    "pending_control_event": True,
+                    "requires_user": False,
+                    "wake_generation": 9,
+                },
+                browser_call=lambda arguments: calls.append(dict(arguments)) or {},
+            )
+
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(result["state"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
+            self.assertEqual(calls, [])
+
+    def test_reentry_without_explicit_canonical_web_target_never_calls_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, lease = self.make_identity(Path(tmp))
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            del payload["__controller_targets__"]["controller-1"]["web"]
+            payload["__controller_sessions__"]["controller-1"]["web"] = [
+                "web-current"
+            ]
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            calls: list[dict] = []
+
+            result = web_reentry_adapter.execute_web_reentry(
+                controller_id="controller-1",
+                repo=repo,
+                registry_path=registry,
+                lease_path=lease,
+                lifecycle_state={
+                    "pending_control_event": True,
+                    "requires_user": False,
+                    "wake_generation": 9,
+                },
+                browser_call=lambda arguments: calls.append(dict(arguments)) or {},
+            )
+
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(result["state"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
+            self.assertEqual(calls, [])
+
+    def test_legacy_browser_attested_target_is_quarantined_before_browser_use(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, lease = self.make_identity(Path(tmp))
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            payload["__controller_targets__"]["controller-1"]["web"].update({
+                "provenance": "host_attested_same_controller_recovery",
+                "binding_mode": "resume_only",
+                "host_identity_receipt_sha256": "a" * 64,
+            })
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            calls: list[dict] = []
+
+            result = web_reentry_adapter.execute_web_reentry(
+                controller_id="controller-1",
+                repo=repo,
+                registry_path=registry,
+                lease_path=lease,
+                lifecycle_state={
+                    "pending_control_event": True,
+                    "requires_user": False,
+                },
+                browser_call=lambda arguments: calls.append(dict(arguments)) or {},
+            )
+
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(result["state"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
+            self.assertEqual(calls, [])
 
     def test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab(self) -> None:
         calls: list[dict] = []
@@ -171,7 +266,9 @@ class WebReentryAdapterTests(unittest.TestCase):
             self.assertEqual(result["result"], "CONFIRMED")
             self.assertEqual(result["state"], "WEB_REENTRY_SUBMITTED")
             self.assertEqual(result["execution_target_session_id"], "web-current")
-            self.assertEqual(result["target_mode"], "web_lease")
+            self.assertEqual(result["target_generation"], 3)
+            self.assertEqual(result["ownership_generation"], 7)
+            self.assertEqual(result["target_mode"], "explicit_current")
             host_receipt = result["host_execution_receipt"]
             self.assertEqual(host_receipt["host"], "web")
             self.assertEqual(host_receipt["web_session_id"], "web-current")
@@ -182,6 +279,111 @@ class WebReentryAdapterTests(unittest.TestCase):
             self.assertEqual(calls[-1]["node_id"], "composer")
             self.assertTrue(calls[-1]["submit"])
             self.assertIn("Continue this existing registered Web Controller", calls[-1]["text"])
+
+    def test_target_generation_change_before_submit_never_types(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, lease = self.make_identity(Path(tmp))
+            calls: list[dict] = []
+
+            def browser_call(arguments: dict) -> dict:
+                calls.append(dict(arguments))
+                if arguments["action"] == "list_tabs":
+                    return {
+                        "tabs": [{
+                            "tab_id": "tab-1",
+                            "url": "https://chatgpt.com/c/web-current",
+                        }]
+                    }
+                if arguments["action"] == "snapshot":
+                    changed = json.loads(registry.read_text(encoding="utf-8"))
+                    changed["__controller_targets__"]["controller-1"]["web"] = {
+                        "status": "active",
+                        "session_id": "web-other",
+                        "generation": 4,
+                    }
+                    changed["__controller_sessions__"]["controller-1"]["web"].append(
+                        "web-other"
+                    )
+                    changed["__controller_execution_ownership__"]["controller-1"] = {
+                        "active_host": "web",
+                        "execution_target_session_id": "web-other",
+                        "generation": 8,
+                    }
+                    registry.write_text(json.dumps(changed), encoding="utf-8")
+                    return {
+                        "nodes": [{
+                            "node_id": "composer",
+                            "role": "textbox",
+                            "name": "Chat with ChatGPT",
+                        }]
+                    }
+                return {"ok": True}
+
+            result = web_reentry_adapter.execute_web_reentry(
+                controller_id="controller-1",
+                repo=repo,
+                registry_path=registry,
+                lease_path=lease,
+                lifecycle_state={
+                    "pending_control_event": True,
+                    "requires_user": False,
+                },
+                browser_call=browser_call,
+            )
+
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(result["state"], "WEB_REENTRY_SUPERSEDED_TARGET")
+            self.assertFalse(any(call["action"] == "type" for call in calls))
+
+    def test_submit_holds_registry_fence_against_target_rotation(self) -> None:
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, lease = self.make_identity(Path(tmp))
+            fence_observed: list[bool] = []
+
+            def browser_call(arguments: dict) -> dict:
+                if arguments["action"] == "list_tabs":
+                    return {"tabs": [{
+                        "tab_id": "tab-1",
+                        "url": "https://chatgpt.com/c/web-current",
+                    }]}
+                if arguments["action"] == "snapshot":
+                    return {"nodes": [{
+                        "node_id": "composer",
+                        "role": "textbox",
+                        "name": "Chat with ChatGPT",
+                    }]}
+                if arguments["action"] == "type":
+                    lock_path = web_reentry_adapter.target_guard.registry_lock_path(
+                        registry
+                    )
+                    with lock_path.open("a+") as contender:
+                        try:
+                            fcntl.flock(
+                                contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                            )
+                        except BlockingIOError:
+                            fence_observed.append(True)
+                        else:
+                            fence_observed.append(False)
+                            fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
+                return {"ok": True}
+
+            result = web_reentry_adapter.execute_web_reentry(
+                controller_id="controller-1",
+                repo=repo,
+                registry_path=registry,
+                lease_path=lease,
+                lifecycle_state={
+                    "pending_control_event": True,
+                    "requires_user": False,
+                },
+                browser_call=browser_call,
+            )
+
+            self.assertEqual(result["result"], "CONFIRMED")
+            self.assertEqual(fence_observed, [True])
 
     def test_missing_target_tab_opens_exact_leased_conversation_before_submit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

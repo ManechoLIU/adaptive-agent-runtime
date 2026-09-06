@@ -69,6 +69,15 @@ For `chatgpt_web`:
 5. Reuse the existing `require_web_controller_session(...)` and lifecycle identity checks afterward.
 6. Resume the existing Controller; never create a second logical Controller as a side effect of Web binding.
 
+The Runtime stores `identity_proof=host_attested_origin` only after the trusted
+host verifier accepts the call-correlated origin receipt. A historical target
+whose provenance claims `host_attested_same_controller_recovery` but lacks that
+marker is treated as legacy browser-tab evidence: identity projects as degraded,
+session start is rejected, and Web continuation remains pending without browser
+delivery. Registering a live browser-tab lookup as the trusted host verifier is
+forbidden; tab lookup may confirm the destination transport, but cannot attest
+the conversation that originated the control call.
+
 If any identity or uniqueness check fails, the adapter returns a blocking result and does not mutate the binding registry.
 
 ## Resume versus Replace
@@ -104,6 +113,7 @@ The downgrade has strict limits:
 - Resolution is scoped to the registered repository / Git common-dir and existing Controller. It never creates or replaces a Controller.
 - An explicit host-provided `ADAPTIVE_DELIVERY_WEB_SESSION_ID` takes precedence over the manual lease.
 - Missing, expired, repo-mismatched, Controller-mismatched, or no-longer-bound leases resolve to no identity and preserve fail-closed lifecycle behavior.
+- A manual lease cannot repair or override a target quarantined for missing trusted host-origin proof. Registry ownership, target generation, lease identity, and the exact browser conversation must all agree before delivery.
 - This mode does **not** attest which ChatGPT conversation originated an AI-Bridge call. While the lease is active, a different Web conversation that can invoke AI-Bridge shell work inside the same registered repository cannot be distinguished locally and may be attributed to the leased Web session. This limitation must be surfaced as a downgrade, not described as verified host identity.
 - Once host-attested origin identity is available, production Controller operation should migrate to that path and stop relying on the manual lease.
 

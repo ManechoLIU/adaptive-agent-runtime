@@ -28,20 +28,16 @@ except ModuleNotFoundError:
 try:
     from web_reentry_adapter import (
         execute_web_reentry, resolve_reentry_session,
-        verify_ai_bridge_web_session_attestation,
     )
 except ModuleNotFoundError:
     from scripts.web_reentry_adapter import (
         execute_web_reentry, resolve_reentry_session,
-        verify_ai_bridge_web_session_attestation,
     )
 
 
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 DEFAULT_MANUAL_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
-_PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., bool]] = {
-    "web": verify_ai_bridge_web_session_attestation,
-}
+_PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., bool]] = {}
 DEFAULT_MANUAL_WEB_LEASE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_AUDIT_LOG = (
     Path.home()
@@ -198,7 +194,10 @@ def require_web_controller_session(
             )
         )
     else:
-        verified = (
+        verified = not (
+            record.get("provenance") == "host_attested_same_controller_recovery"
+            and record.get("identity_proof") != "host_attested_origin"
+        ) and (
             target_guard.active_source_controller_id(
                 registry, source_session_id=value, host="web"
             )
@@ -603,6 +602,7 @@ def recover_same_controller_web_session(
                 "generation": generation,
                 "provenance": "host_attested_same_controller_recovery",
                 "binding_mode": "resume_only",
+                "identity_proof": "host_attested_origin",
                 "host_identity_receipt_sha256": receipt_fingerprint,
             }
             targets[controller_id] = controller_targets
@@ -2072,6 +2072,13 @@ def _wake_event_fingerprint(lifecycle_state: dict[str, Any]) -> str:
     return __import__("hashlib").sha256(encoded).hexdigest()
 
 
+def _file_sha256(path: Path) -> str:
+    try:
+        return __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
 def _bounded_adapter_operation(value: Any) -> str | None:
     if value is None:
         return None
@@ -2264,34 +2271,143 @@ def wake_existing_controller(
                     )
                 elif selected_host == "web":
                     adapter = (resume_adapters or {}).get("web")
-                    try:
-                        if adapter is None:
-                            attempt = execute_web_reentry(
-                                controller_id=session_id,
-                                repo=repo,
-                                registry_path=registry,
-                                lease_path=DEFAULT_MANUAL_WEB_LEASES,
-                                lifecycle_state=lifecycle_state,
-                            )
-                        else:
-                            attempt = adapter(
-                                controller_id=session_id,
-                                session_id=session_id,
-                                repo=repo,
-                                registry=registry,
-                                lifecycle_state=lifecycle_state,
-                                runtime_path=runtime_path,
-                            )
-                    except Exception as exc:
+                    verifier = _registered_peer_attestation_verifier("web")
+                    if adapter is not None and not callable(verifier):
                         attempt = {
-                            "operation": "web_reentry",
+                            "operation": None,
                             "result": "DEFERRED",
-                            "state": "WEB_REENTRY_PENDING",
+                            "state": "RESUME_DEFERRED",
                             "returncode": 78,
-                            "stderr_tail": f"web host adapter failed: {exc}",
-                            "error_code": "WEB_HOST_REENTRY_ADAPTER_FAILED",
-                            "failure_class": "web_reentry_unavailable",
+                            "stderr_tail": (
+                                "no registered host-attested verifier for supplied Web host adapter"
+                            ),
+                            "error_code": "WEB_HOST_ATTESTATION_VERIFIER_UNAVAILABLE",
+                            "failure_class": "web_reentry_identity_unavailable",
                         }
+                    else:
+                        try:
+                            if adapter is None:
+                                attempt = execute_web_reentry(
+                                    controller_id=session_id,
+                                    repo=repo,
+                                    registry_path=registry,
+                                    lease_path=DEFAULT_MANUAL_WEB_LEASES,
+                                    lifecycle_state=lifecycle_state,
+                                )
+                            else:
+                                with target_guard.locked_execution_target(
+                                    repo=repo,
+                                    host="web",
+                                    registry_path=registry,
+                                ) as current_target:
+                                    current_registry = load_json(registry)
+                                    current_web_record = target_guard.target_record(
+                                        current_registry,
+                                        controller_id=session_id,
+                                        host="web",
+                                    )
+                                    if (
+                                        isinstance(current_web_record, dict)
+                                        and current_web_record.get("provenance")
+                                        == "host_attested_same_controller_recovery"
+                                        and current_web_record.get("identity_proof")
+                                        != "host_attested_origin"
+                                    ):
+                                        raise PermissionError(
+                                            "legacy browser-tab Web identity record is not a trusted Host origin attestation"
+                                        )
+                                    expected_target = str(
+                                        current_target["execution_target_session_id"]
+                                    )
+                                    expected_generation = current_target.get("generation")
+                                    expected_mode = current_target.get("target_mode")
+                                    expected_ownership_generation = (
+                                        ownership_fence.get("generation")
+                                        if isinstance(ownership_fence, dict)
+                                        else None
+                                    )
+                                    if (
+                                        not isinstance(ownership_fence, dict)
+                                        or ownership_fence.get("active_host") != "web"
+                                        or ownership_fence.get(
+                                            "execution_target_session_id"
+                                        )
+                                        != expected_target
+                                        or not isinstance(
+                                            expected_ownership_generation, int
+                                        )
+                                        or isinstance(
+                                            expected_ownership_generation, bool
+                                        )
+                                    ):
+                                        raise PermissionError(
+                                            "canonical Web execution ownership is missing or mismatched"
+                                        )
+                                    attempt = adapter(
+                                        controller_id=session_id,
+                                        session_id=expected_target,
+                                        execution_target_session_id=expected_target,
+                                        target_generation=expected_generation,
+                                        target_mode=expected_mode,
+                                        ownership_generation=expected_ownership_generation,
+                                        repo=repo,
+                                        registry=registry,
+                                        lifecycle_state=lifecycle_state,
+                                        runtime_path=runtime_path,
+                                    )
+                                    if not isinstance(attempt, dict):
+                                        raise PermissionError(
+                                            "Web host adapter returned a non-object execution receipt"
+                                        )
+                                    if (
+                                        attempt.get("execution_target_session_id")
+                                        != expected_target
+                                        or attempt.get("target_generation")
+                                        != expected_generation
+                                        or attempt.get("ownership_generation")
+                                        != expected_ownership_generation
+                                        or attempt.get("target_mode") != expected_mode
+                                    ):
+                                        raise PermissionError(
+                                            "Web host adapter receipt does not match canonical target and ownership generations"
+                                        )
+                                    attested = verifier(
+                                        controller_id=session_id,
+                                        host="web",
+                                        expected_target_session_id=expected_target,
+                                        expected_target_generation=expected_generation,
+                                        expected_target_mode=expected_mode,
+                                        expected_ownership_generation=expected_ownership_generation,
+                                        host_execution_receipt=attempt.get(
+                                            "host_execution_receipt"
+                                        ),
+                                        adapter_attempt=attempt,
+                                    )
+                                    if attested is not True:
+                                        raise PermissionError(
+                                            "Web Host origin attestation rejected"
+                                        )
+                        except Exception as exc:
+                            if adapter is None:
+                                attempt = {
+                                    "operation": "web_reentry",
+                                    "result": "DEFERRED",
+                                    "state": "WEB_REENTRY_PENDING",
+                                    "returncode": 78,
+                                    "stderr_tail": f"web host adapter failed: {exc}",
+                                    "error_code": "WEB_HOST_REENTRY_ADAPTER_FAILED",
+                                    "failure_class": "web_reentry_unavailable",
+                                }
+                            else:
+                                attempt = {
+                                    "operation": "web_reentry",
+                                    "result": "FAILED",
+                                    "state": "WEB_REENTRY_IDENTITY_UNAVAILABLE",
+                                    "returncode": 78,
+                                    "stderr_tail": f"web host adapter failed: {exc}",
+                                    "error_code": "WEB_HOST_ATTESTATION_INVALID",
+                                    "failure_class": "web_reentry_identity_unavailable",
+                                }
                     if not isinstance(attempt, dict):
                         attempt = {
                             "operation": "web_reentry",
@@ -2435,6 +2551,28 @@ def wake_existing_controller(
                             "stderr_tail": f"host adapter target guard error: {exc}",
                             "error_code": "CONTROLLER_TARGET_REJECTED",
                         }
+            if selected_host == "web" and attempt.get("result") == "CONFIRMED":
+                try:
+                    receipt = _validate_confirmed_web_reentry_receipt(
+                        attempt=attempt,
+                        session_id=session_id,
+                        registry=registry,
+                        ownership_fence=ownership_fence,
+                    )
+                except (OSError, ValueError, PermissionError) as exc:
+                    attempt = {
+                        "operation": "web_reentry",
+                        "result": "FAILED",
+                        "state": "RESUME_FAILED",
+                        "returncode": 78,
+                        "stderr_tail": str(exc),
+                        "error_code": "CONTROLLER_TARGET_RECEIPT_MISMATCH",
+                        "execution_target_session_id": None,
+                        "target_generation": None,
+                        "ownership_generation": None,
+                    }
+                else:
+                    attempt.update(receipt)
             if not _canonical_ownership_fence_matches(
                 ownership_fence, repo=repo, registry=registry, session_id=session_id
             ):
@@ -2618,11 +2756,19 @@ def dispatch_pending_lifecycle_wake(
         except (OSError, ValueError, PermissionError):
             current_web_session = None
         if current_web_session:
-            current_target = {
-                "execution_target_session_id": current_web_session,
-                "generation": 0,
-                "target_mode": "web_lease",
-            }
+            try:
+                resolved_web_target = target_guard.resolve_execution_target(
+                    repo=repo, host="web", registry_path=registry
+                )
+            except (OSError, ValueError, PermissionError):
+                resolved_web_target = None
+            if (
+                isinstance(resolved_web_target, dict)
+                and resolved_web_target.get("controller_id") == session_id
+                and resolved_web_target.get("execution_target_session_id")
+                == current_web_session
+            ):
+                current_target = resolved_web_target
     else:
         try:
             current_target = resolve_native_resume_target(
@@ -3050,11 +3196,33 @@ def _release_supervisor_token(
 
 
 def continuation_supervisor_needs_bootstrap(
-    lifecycle_state: dict[str, Any], supervisor_state: dict[str, Any]
+    lifecycle_state: dict[str, Any],
+    supervisor_state: dict[str, Any],
+    *,
+    current_registry_sha256: str | None = None,
 ) -> bool:
     if lifecycle_state.get("pending_control_event") is not True:
         return False
     if lifecycle_state.get("requires_user") is True:
+        return False
+    if (
+        str(supervisor_state.get("state") or "") == "RESUME_STALLED_NO_PROGRESS"
+        and str(supervisor_state.get("last_lifecycle_fingerprint") or "")
+        == _wake_event_fingerprint(lifecycle_state)
+    ):
+        return False
+    if (
+        str(supervisor_state.get("state") or "")
+        in {
+            "WEB_REENTRY_IDENTITY_UNAVAILABLE",
+            "WEB_REENTRY_TARGET_RECEIPT_MISMATCH",
+        }
+        and str(supervisor_state.get("last_lifecycle_fingerprint") or "")
+        == _wake_event_fingerprint(lifecycle_state)
+        and current_registry_sha256 is not None
+        and str(supervisor_state.get("blocked_registry_sha256") or "")
+        == current_registry_sha256
+    ):
         return False
     active_states = {
         "RESUME_PENDING",
@@ -3091,7 +3259,11 @@ def ensure_continuation_supervisor(
 ) -> bool:
     state_path = default_auto_stop_state_path(session_id)
     supervisor_state = load_json(state_path)
-    if not continuation_supervisor_needs_bootstrap(lifecycle_state, supervisor_state):
+    if not continuation_supervisor_needs_bootstrap(
+        lifecycle_state,
+        supervisor_state,
+        current_registry_sha256=_file_sha256(registry),
+    ):
         return False
     generation = int(lifecycle_state.get("wake_generation", 0) or 0)
     schedule_auto_native_stop(
@@ -3348,6 +3520,60 @@ def _canonical_ownership_fence_matches(
     return current == expected
 
 
+def _validate_confirmed_web_reentry_receipt(
+    *,
+    attempt: dict[str, Any],
+    session_id: str,
+    registry: Path,
+    ownership_fence: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(ownership_fence, dict):
+        raise PermissionError("canonical Controller execution ownership is missing")
+    registry_data = load_json(registry)
+    target = target_guard.target_record(
+        registry_data, controller_id=session_id, host="web"
+    )
+    ownership = target_guard.execution_ownership_record(
+        registry_data, controller_id=session_id
+    )
+    if target is None or ownership is None:
+        raise PermissionError("canonical Web target or execution ownership is missing")
+    if (
+        target.get("provenance") == "host_attested_same_controller_recovery"
+        and target.get("identity_proof") != "host_attested_origin"
+    ):
+        raise PermissionError(
+            "legacy browser-tab Web identity record is not a trusted Host origin attestation"
+        )
+    status, expected_target, target_generation = target_guard.validate_target_record(
+        target, host="web"
+    )
+    ownership_host, ownership_target, ownership_generation = (
+        target_guard.validate_execution_ownership_record(ownership)
+    )
+    if (
+        status != "active"
+        or ownership_host != "web"
+        or ownership_target != expected_target
+        or ownership_fence.get("active_host") != "web"
+        or ownership_fence.get("execution_target_session_id") != expected_target
+        or ownership_fence.get("generation") != ownership_generation
+        or attempt.get("execution_target_session_id") != expected_target
+        or attempt.get("target_generation") != target_generation
+        or attempt.get("ownership_generation") != ownership_generation
+        or attempt.get("target_mode") != "explicit_current"
+    ):
+        raise PermissionError(
+            "Web host target receipt does not match canonical target and ownership generations"
+        )
+    return {
+        "execution_target_session_id": expected_target,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+        "target_mode": "explicit_current",
+    }
+
+
 def _run_auto_native_stop_impl(
     *,
     session_id: str,
@@ -3407,6 +3633,7 @@ def _run_auto_native_stop_impl(
                 current.update({"state": "CONTINUATION_CLOSED", "pending_control_event": False})
                 current.pop("failure_class", None)
                 current.pop("error_code", None)
+                current.pop("blocked_registry_sha256", None)
                 write_auto_stop_state(state_path, current)
                 return 0
             if lifecycle_state.get("requires_user") is True:
@@ -3425,6 +3652,29 @@ def _run_auto_native_stop_impl(
             lease_path=DEFAULT_MANUAL_WEB_LEASES, lifecycle_state=lifecycle_state,
             approval_id=approval_id,
         )
+        if attempt.get("result") == "CONFIRMED":
+            try:
+                receipt = _validate_confirmed_web_reentry_receipt(
+                    attempt=attempt,
+                    session_id=session_id,
+                    registry=registry,
+                    ownership_fence=ownership_fence,
+                )
+            except (OSError, ValueError, PermissionError) as exc:
+                attempt = {
+                    "operation": "web_reentry",
+                    "result": "DEFERRED",
+                    "state": "WEB_REENTRY_TARGET_RECEIPT_MISMATCH",
+                    "returncode": 78,
+                    "failure_class": "web_reentry_identity_unavailable",
+                    "error_code": "CONTROLLER_TARGET_RECEIPT_MISMATCH",
+                    "stderr_tail": str(exc),
+                    "execution_target_session_id": None,
+                    "target_generation": None,
+                    "ownership_generation": None,
+                }
+            else:
+                attempt.update(receipt)
 
         # External work completed; only the still-current generation may commit
         # its result or schedule its successor.
@@ -3508,6 +3758,7 @@ def _run_auto_native_stop_impl(
                 })
                 current.pop("failure_class", None)
                 current.pop("error_code", None)
+                current.pop("blocked_registry_sha256", None)
                 if unchanged >= AUTO_CONTINUATION_STALL_LIMIT:
                     current.update({
                         "state": "RESUME_STALLED_NO_PROGRESS",
@@ -3538,6 +3789,11 @@ def _run_auto_native_stop_impl(
                 "stderr_tail": bounded_tail(str(attempt.get("stderr_tail", ""))),
                 "retry_count": retry_count,
             })
+            if failure_class == "web_reentry_identity_unavailable":
+                current.update({
+                    "last_lifecycle_fingerprint": fingerprint,
+                    "blocked_registry_sha256": _file_sha256(registry),
+                })
             write_auto_stop_state(state_path, current)
             if failure_class == "web_reentry_unavailable":
                 retry_delay = min(60.0, float(2 ** min(max(retry_count - 1, 0), 5)))

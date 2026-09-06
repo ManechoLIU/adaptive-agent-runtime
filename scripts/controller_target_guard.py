@@ -392,9 +392,22 @@ def controller_identity_projection(
                         record, host=host
                     )
                     if status == "active" and target == supplied_session:
-                        verification = "VERIFIED"
-                        reason = "CURRENT_EXECUTION_TARGET"
-                        mode = str(record.get("binding_mode") or "explicit_current")
+                        if (
+                            host == "web"
+                            and record.get("provenance")
+                            == "host_attested_same_controller_recovery"
+                            and record.get("identity_proof")
+                            != "host_attested_origin"
+                        ):
+                            verification = "UNVERIFIED"
+                            reason = "HOST_IDENTITY_UNAVAILABLE"
+                            mode = str(
+                                record.get("binding_mode") or "explicit_current"
+                            )
+                        else:
+                            verification = "VERIFIED"
+                            reason = "CURRENT_EXECUTION_TARGET"
+                            mode = str(record.get("binding_mode") or "explicit_current")
                     elif supplied_session in aliases or supplied_session == project_controller:
                         verification = "STALE"
                         reason = (

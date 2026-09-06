@@ -72,13 +72,29 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
-    "test_production_bridge_registers_trusted_web_attestation_verifier",
+    "test_production_bridge_has_no_trusted_web_attestation_verifier",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_browser_tab_receipt_cannot_recover_an_unverified_web_session",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim",
     "tests.test_web_reentry_adapter.WebReentryAdapterTests."
-    "test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab",
+    "test_reentry_without_canonical_web_ownership_never_calls_browser",
+    "tests.test_web_reentry_adapter.WebReentryAdapterTests."
+    "test_reentry_without_explicit_canonical_web_target_never_calls_browser",
+    "tests.test_web_reentry_adapter.WebReentryAdapterTests."
+    "test_legacy_browser_attested_target_is_quarantined_before_browser_use",
+    "tests.test_web_reentry_adapter.WebReentryAdapterTests."
+    "test_submit_holds_registry_fence_against_target_rotation",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_web_supervisor_rejects_confirmed_receipt_for_noncanonical_target",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again",
+    "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
+    "test_registered_current_web_adapter_is_fenced_and_host_attested",
+    "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
+    "test_registered_current_web_adapter_without_ownership_is_never_called",
     "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests."
     "test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix",
     "tests.test_rule_handshake.RuleHandshakeTests."

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import re
 import socket
 import subprocess
@@ -67,11 +68,18 @@ def resolve_reentry_session(
     target = target_guard.target_record(
         registry, controller_id=controller_id, host="web"
     )
+    if (
+        isinstance(target, dict)
+        and target.get("provenance") == "host_attested_same_controller_recovery"
+        and target.get("identity_proof") != "host_attested_origin"
+    ):
+        raise PermissionError(
+            "legacy browser-tab Web identity record is not a trusted Host origin attestation"
+        )
     if target is None:
-        if bound != {session_id}:
-            raise PermissionError(
-                "Web re-entry requires one legacy binding or an explicit current Web target"
-            )
+        raise PermissionError(
+            "Web re-entry requires an explicit canonical current Web target"
+        )
     elif (
         target_guard.active_source_controller_id(
             registry, source_session_id=session_id, host="web"
@@ -80,6 +88,18 @@ def resolve_reentry_session(
     ):
         raise PermissionError(
             "Web re-entry lease session is not the current verified Controller entry"
+        )
+    ownership = target_guard.execution_ownership_record(
+        registry, controller_id=controller_id
+    )
+    if ownership is None:
+        raise PermissionError("canonical Controller execution ownership is missing")
+    active_host, ownership_target, _ownership_generation = (
+        target_guard.validate_execution_ownership_record(ownership)
+    )
+    if active_host != "web" or ownership_target != session_id:
+        raise PermissionError(
+            "Web re-entry lease does not match canonical Controller execution ownership"
         )
     return session_id
 
@@ -341,7 +361,7 @@ def build_reentry_prompt(
     return prompt[:7800]
 
 
-def execute_web_reentry(
+def _execute_web_reentry_under_registry_fence(
     *,
     controller_id: str,
     repo: Path,
@@ -361,6 +381,26 @@ def execute_web_reentry(
     try:
         web_session_id = resolve_reentry_session(
             controller_id=controller_id, repo=Path(repo), registry_path=Path(registry_path), lease_path=Path(lease_path)
+        )
+        registry = _load_json(Path(registry_path).expanduser())
+        target = target_guard.target_record(
+            registry, controller_id=controller_id, host="web"
+        )
+        if target is None:
+            target_generation = 0
+            target_mode = "legacy_canonical"
+        else:
+            _status, _target_session, target_generation = (
+                target_guard.validate_target_record(target, host="web")
+            )
+            target_mode = "explicit_current"
+        ownership = target_guard.execution_ownership_record(
+            registry, controller_id=controller_id
+        )
+        if ownership is None:
+            raise PermissionError("canonical Controller execution ownership is missing")
+        _ownership_host, _ownership_target, ownership_generation = (
+            target_guard.validate_execution_ownership_record(ownership)
         )
     except (OSError, ValueError, PermissionError) as exc:
         return {
@@ -393,8 +433,10 @@ def execute_web_reentry(
                     "failure_class": "local_approval_required",
                     "approval_id": waiting_id if isinstance(waiting_id, str) else None,
                     "approval_expires_at_unix": expires_at if isinstance(expires_at, int) else None,
-                    "execution_target_session_id": web_session_id, "target_generation": 0,
-                    "target_mode": "web_lease",
+                    "execution_target_session_id": web_session_id,
+                    "target_generation": target_generation,
+                    "ownership_generation": ownership_generation,
+                    "target_mode": target_mode,
                 }
             tab_id = str(opened.get("tab_id") or "").strip() if isinstance(opened, dict) else ""
             if not tab_id:
@@ -411,7 +453,10 @@ def execute_web_reentry(
             return {
                 "operation": "web_reentry", "result": "DEFERRED", "state": "WEB_REENTRY_DEFERRED_ACTIVE",
                 "returncode": 0, "failure_class": "web_host_active",
-                "execution_target_session_id": web_session_id, "target_mode": "web_lease",
+                "execution_target_session_id": web_session_id,
+                "target_generation": target_generation,
+                "ownership_generation": ownership_generation,
+                "target_mode": target_mode,
             }
         composer = _composer_node(nodes)
         if not composer:
@@ -421,6 +466,43 @@ def execute_web_reentry(
             lifecycle_state=lifecycle_state,
             terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []),
         )
+        current_registry = _load_json(Path(registry_path).expanduser())
+        current_target = target_guard.target_record(
+            current_registry, controller_id=controller_id, host="web"
+        )
+        current_ownership = target_guard.execution_ownership_record(
+            current_registry, controller_id=controller_id
+        )
+        if current_target is None or current_ownership is None:
+            raise PermissionError(
+                "canonical Web target or execution ownership disappeared before submit"
+            )
+        current_status, current_session, current_generation = (
+            target_guard.validate_target_record(current_target, host="web")
+        )
+        current_host, current_ownership_target, current_ownership_generation = (
+            target_guard.validate_execution_ownership_record(current_ownership)
+        )
+        if (
+            current_status != "active"
+            or current_session != web_session_id
+            or current_generation != target_generation
+            or current_host != "web"
+            or current_ownership_target != web_session_id
+            or current_ownership_generation != ownership_generation
+        ):
+            return {
+                "operation": "web_reentry",
+                "result": "DEFERRED",
+                "state": "WEB_REENTRY_SUPERSEDED_TARGET",
+                "returncode": 0,
+                "failure_class": "controller_target_superseded",
+                "error_code": "CONTROLLER_TARGET_SUPERSEDED",
+                "execution_target_session_id": web_session_id,
+                "target_generation": target_generation,
+                "ownership_generation": ownership_generation,
+                "target_mode": target_mode,
+            }
         submitted = call({
             "action": "type", "tab_id": tab_id, "node_id": composer, "text": prompt, "submit": True,
         })
@@ -439,8 +521,10 @@ def execute_web_reentry(
         return {
             "operation": "web_reentry", "result": "CONFIRMED", "state": "WEB_REENTRY_SUBMITTED",
             "returncode": 0, "controller_id": controller_id,
-            "execution_target_session_id": web_session_id, "target_generation": 0,
-            "target_mode": "web_lease", "pending_control_event": True,
+            "execution_target_session_id": web_session_id,
+            "target_generation": target_generation,
+            "ownership_generation": ownership_generation,
+            "target_mode": target_mode, "pending_control_event": True,
             "host_execution_receipt": host_receipt,
         }
     except Exception as exc:
@@ -448,5 +532,37 @@ def execute_web_reentry(
             "operation": "web_reentry", "result": "DEFERRED", "state": "WEB_REENTRY_PENDING",
             "returncode": 78, "failure_class": "web_reentry_unavailable",
             "error_code": "WEB_REENTRY_UNAVAILABLE", "stderr_tail": str(exc)[:1024],
-            "execution_target_session_id": web_session_id, "target_generation": 0, "target_mode": "web_lease",
+            "execution_target_session_id": web_session_id,
+            "target_generation": target_generation,
+            "ownership_generation": ownership_generation,
+            "target_mode": target_mode,
         }
+
+
+def execute_web_reentry(
+    *,
+    controller_id: str,
+    repo: Path,
+    lifecycle_state: dict[str, Any],
+    registry_path: Path = DEFAULT_REGISTRY,
+    lease_path: Path = DEFAULT_WEB_LEASES,
+    browser_call: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    approval_id: str | None = None,
+) -> dict[str, Any]:
+    registry_path = Path(registry_path).expanduser()
+    lock_path = target_guard.registry_lock_path(registry_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+        try:
+            return _execute_web_reentry_under_registry_fence(
+                controller_id=controller_id,
+                repo=repo,
+                lifecycle_state=lifecycle_state,
+                registry_path=registry_path,
+                lease_path=lease_path,
+                browser_call=browser_call,
+                approval_id=approval_id,
+            )
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
