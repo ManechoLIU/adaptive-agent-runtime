@@ -636,6 +636,20 @@ class InstallMigrationContractTests(unittest.TestCase):
             RUNTIME_RELEASE_REGRESSION_TESTS,
         )
 
+    def test_runtime_release_gate_includes_host_ownership_and_yield_enforcement_regressions(self):
+        from scripts.install_skill import RUNTIME_RELEASE_REGRESSION_TESTS, RUNTIME_RELEASE_REQUIRED_FILES
+
+        required_tests = {
+            "tests.test_controller_target_guard.ControllerTargetGuardTests.test_claim_controller_host_desktop_after_web_increments_one_cross_host_generation",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_direct_wake_rejects_confirmed_web_result_after_desktop_handoff",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_desktop_result_cannot_persist_or_rearm_after_web_handoff",
+            "tests.test_governance.GovernanceTests.test_control_loop_stop_rejection_reopens_pending_event_even_if_prior_state_was_closed",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection",
+            "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests.test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback",
+        }
+        self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
+        self.assertIn("tests/test_web_agent_health_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
+
     def test_runtime_release_regression_gate_runs_required_tests_from_immutable_revision(self):
         import subprocess
         from scripts.install_skill import (
@@ -697,7 +711,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class WebAgentHealthSupervisorTests(unittest.TestCase):\n"
                 "    def test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message(self): self.assertTrue(True)\n"
                 "    def test_canonical_runnable_reopens_continuation_without_user_message(self): self.assertTrue(True)\n"
-                "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n",
+                "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n"
+                "    def test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_project_context_guard.py").write_text(
@@ -734,7 +749,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_identity_projection_keeps_unique_project_controller_when_session_id_unavailable(self): self.assertTrue(True)\n"
                 "    def test_identity_projection_verifies_current_desktop_target_without_changing_controller_id(self): self.assertTrue(True)\n"
                 "    def test_identity_projection_marks_old_target_stale_but_keeps_project_ownership(self): self.assertTrue(True)\n"
-                "    def test_identity_projection_reports_project_controller_conflict_without_silent_selection(self): self.assertTrue(True)\n",
+                "    def test_identity_projection_reports_project_controller_conflict_without_silent_selection(self): self.assertTrue(True)\n"
+                "    def test_claim_controller_host_desktop_after_web_increments_one_cross_host_generation(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_web_lifecycle_bridge.py").write_text(
@@ -746,6 +762,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_same_controller_web_recovery_rejects_attestation_if_target_generation_changes_before_lock(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership(self): self.assertTrue(True)\n"
                 "    def test_web_recovery_preserves_desktop_target_and_only_advances_web_generation(self): self.assertTrue(True)\n"
+                "    def test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_web_reentry(self): self.assertTrue(True)\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume(self): self.assertTrue(True)\n"
@@ -762,7 +779,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_stale_web_host_with_only_desktop_current_target_resumes_same_controller_desktop(self): self.assertTrue(True)\n"
                 "class WebContinuationSupervisorBootstrapTests(unittest.TestCase):\n"
                 "    def test_dead_or_untracked_active_supervisor_requires_bootstrap(self): self.assertTrue(True)\n"
-                "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n",
+                "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n"
+                "class WebLocalReentryIntegrationTests(unittest.TestCase):\n"
+                "    def test_direct_wake_rejects_confirmed_web_result_after_desktop_handoff(self): self.assertTrue(True)\n"
+                "    def test_desktop_result_cannot_persist_or_rearm_after_web_handoff(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(
@@ -805,6 +825,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_pending_parent_partial_dependency_creates_dynamic_runnable_slice(self): self.assertTrue(True)\n"
                 "    def test_reviewer_terminal_recomputes_unrelated_project_runnable(self): self.assertTrue(True)\n"
                 "    def test_stop_without_current_turn_control_loop_receipt_fails_closed_even_when_idle(self): self.assertTrue(True)\n"
+                "    def test_control_loop_stop_rejection_reopens_pending_event_even_if_prior_state_was_closed(self): self.assertTrue(True)\n"
                 "    def test_active_writer_does_not_hide_immediate_controller_actions(self): self.assertTrue(True)\n"
                 "    def test_control_loop_receipt_rejects_missing_or_reordered_control_steps(self): self.assertTrue(True)\n"
                 "    def test_failed_control_cycle_generates_executable_controller_correction(self): self.assertTrue(True)\n"

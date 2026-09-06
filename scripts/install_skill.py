@@ -63,6 +63,14 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_execute_native_resume_stale_supervisor_token_blocks_process_launch",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
     "test_stale_web_host_with_only_desktop_current_target_resumes_same_controller_desktop",
+    "tests.test_controller_target_guard.ControllerTargetGuardTests."
+    "test_claim_controller_host_desktop_after_web_increments_one_cross_host_generation",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_direct_wake_rejects_confirmed_web_result_after_desktop_handoff",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_desktop_result_cannot_persist_or_rearm_after_web_handoff",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection",
     "tests.test_rule_handshake.RuleHandshakeTests."
     "test_critical_live_runtime_update_requires_real_e2e_after_ack_and_ledger_sync",
     "tests.test_rule_handshake.RuleHandshakeTests."
@@ -83,6 +91,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_no_canonical_work_does_not_reopen_after_observation_only_turn",
+    "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
+    "test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
     "test_regression_parent_already_yielded_then_writer_completed_wakes_same_controller_with_next_runnable",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
@@ -119,6 +129,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_reviewer_terminal_recomputes_unrelated_project_runnable",
     "tests.test_governance.GovernanceTests."
     "test_stop_without_current_turn_control_loop_receipt_fails_closed_even_when_idle",
+    "tests.test_governance.GovernanceTests."
+    "test_control_loop_stop_rejection_reopens_pending_event_even_if_prior_state_was_closed",
     "tests.test_governance.GovernanceTests."
     "test_active_writer_does_not_hide_immediate_controller_actions",
     "tests.test_governance.GovernanceTests."
@@ -315,6 +327,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_rule_handshake.py",
     "tests/test_controller_target_guard.py",
     "tests/test_web_lifecycle_bridge.py",
+    "tests/test_web_agent_health_supervisor.py",
     "tests/test_web_agent_events.py",
     "tests/test_evaluation_transaction.py",
     "tests/external-agent-routing.test.mjs",
