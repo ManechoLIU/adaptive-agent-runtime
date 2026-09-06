@@ -609,27 +609,28 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
 
     candidates = unmerged_worktree_candidates(root)
     try:
-        from assignment_runtime import evaluate_lease, load_runtime_state
+        from assignment_runtime import evaluate_lease, load_runtime_state, select_current_lease
     except ModuleNotFoundError:
-        from scripts.assignment_runtime import evaluate_lease, load_runtime_state
+        from scripts.assignment_runtime import evaluate_lease, load_runtime_state, select_current_lease
 
     runtime_state = load_runtime_state(root)
     leases = runtime_state.get("leases", {}) if isinstance(runtime_state, dict) else {}
     ledger_states = {identifier: status for identifier, status in task_rows(text)}
     assignment_liveness: dict[str, dict[str, Any]] = {}
-    if isinstance(leases, dict):
-        for lease in leases.values():
-            if not isinstance(lease, dict):
-                continue
-            task_id = str(lease.get("task_id", "")).strip()
-            ledger_state = ledger_states.get(task_id, "")
-            if not task_id or ledger_state not in {"ACTIVE", "RECOVERING"}:
-                continue
-            decision = evaluate_lease(lease)
-            assignment_liveness[task_id] = {"ledger_state": ledger_state, **decision}
     for task_id, ledger_state in ledger_states.items():
-        if ledger_state in {"ACTIVE", "RECOVERING"} and task_id not in assignment_liveness:
+        if ledger_state not in {"ACTIVE", "RECOVERING"}:
+            continue
+        matching = [
+            lease for lease in leases.values()
+            if isinstance(lease, dict)
+            and str(lease.get("task_id", "")).strip() == task_id
+        ] if isinstance(leases, dict) else []
+        lease = select_current_lease(matching)
+        if lease is None:
             assignment_liveness[task_id] = {"ledger_state": ledger_state, "state": "unknown", "reason": "missing_runtime_lease"}
+            continue
+        decision = evaluate_lease(lease)
+        assignment_liveness[task_id] = {"ledger_state": ledger_state, **decision}
     task_projection = {
         task_id: project_task_state(
             ledger_state,

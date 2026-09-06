@@ -2195,9 +2195,9 @@ def canonical_controller_action_projection(
         actions[f"review:{review_id}"] = {"type": "review", "review_id": review_id}
 
     try:
-        from scripts.assignment_runtime import evaluate_lease, load_runtime_state
+        from scripts.assignment_runtime import evaluate_lease, load_runtime_state, select_current_lease
     except ModuleNotFoundError:
-        from assignment_runtime import evaluate_lease, load_runtime_state
+        from assignment_runtime import evaluate_lease, load_runtime_state, select_current_lease
     runtime = load_runtime_state(repo)
     leases = runtime.get("leases", {}) if isinstance(runtime, dict) else {}
 
@@ -2221,7 +2221,9 @@ def canonical_controller_action_projection(
         matching = active_by_worktree.get(worktree, [])
         if not matching:
             continue
-        lease = max(matching, key=lambda item: int(item.get("attempt", 0) or 0))
+        lease = select_current_lease(matching)
+        if lease is None:
+            continue
         observed_head = str(lease.get("last_observed_head") or "").strip()
         recorded_candidate = str(lease.get("candidate_revision") or "").strip()
         if observed_head == revision and recorded_candidate == revision:
@@ -2252,7 +2254,14 @@ def canonical_controller_action_projection(
                 "reason": "missing_runtime_lease",
             }
             continue
-        lease = max(matching, key=lambda item: int(item.get("attempt", 0) or 0))
+        lease = select_current_lease(matching)
+        if lease is None:
+            actions[f"recovery:{task_id}"] = {
+                "type": "recovery",
+                "task_id": task_id,
+                "reason": "missing_runtime_lease",
+            }
+            continue
         health = evaluate_lease(lease)
         if str(health.get("state", "")) in {"unhealthy", "budget_exhausted", "terminal"}:
             actions[f"recovery:{task_id}"] = {

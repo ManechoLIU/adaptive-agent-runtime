@@ -64,6 +64,20 @@ def _iso(value: datetime) -> str:
 def runtime_state_path(repo: str | Path) -> Path:
     return adaptive_delivery_state_dir(repo) / "runtime-assignments.json"
 
+def select_current_lease(leases: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Select the newest canonical Assignment fact independent of JSON insertion order."""
+    candidates = [lease for lease in leases if isinstance(lease, dict)]
+    if not candidates:
+        return None
+    def order_key(lease: dict[str, Any]) -> tuple[str, int, int, str]:
+        return (
+            str(lease.get("started_at") or ""),
+            int(lease.get("attempt", 0) or 0),
+            int(lease.get("last_event_seq", 0) or 0),
+            str(lease.get("assignment_id") or ""),
+        )
+    return max(candidates, key=order_key)
+
 def _normalized_contract_text(value: str) -> str:
     return LINEAGE_WHITESPACE_RE.sub(" ", str(value)).strip(" ")
 

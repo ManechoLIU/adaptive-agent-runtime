@@ -154,6 +154,53 @@ class GovernanceTests(unittest.TestCase):
             self.assertEqual(snap["assignment_liveness"]["T1"]["state"],"unhealthy")
             self.assertEqual(snap["assignment_liveness"]["T1"]["reason"],"lease_expired")
 
+    def test_project_snapshot_prefers_newer_assignment_over_older_terminal_for_same_task(self) -> None:
+        import json
+        import subprocess
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            subprocess.run(["git", "-C", str(root), "init", "-b", "main"], check=True, capture_output=True)
+            (root/".git"/"adaptive-delivery").mkdir(parents=True)
+            (root/"TASK_LEDGER.md").write_text("| ID | 状态 | 负责人 | 下一步 |\n|---|---|---|---|\n| `T1` | `ACTIVE` | controller | y |\n",encoding="utf-8")
+            now=datetime.now(timezone.utc)
+            newer={"assignment_id":"new","task_id":"T1","agent_id":"controller","provider":"controller","session_id":"s2","worktree":"/tmp/wt","attempt":1,"started_at":(now-timedelta(minutes=5)).isoformat(),"lease_expires_at":(now+timedelta(minutes=20)).isoformat(),"progress_deadline_at":(now+timedelta(minutes=30)).isoformat(),"terminal_state":None}
+            older={"assignment_id":"old","task_id":"T1","agent_id":"grok","provider":"grok","session_id":"s1","worktree":"/tmp/wt","attempt":1,"started_at":(now-timedelta(minutes=30)).isoformat(),"lease_expires_at":(now-timedelta(minutes=10)).isoformat(),"progress_deadline_at":(now-timedelta(minutes=10)).isoformat(),"terminal_state":"failed","terminal_at":(now-timedelta(minutes=20)).isoformat()}
+            # Deliberately place the newer lease first so the legacy loop overwrites it with old terminal state.
+            (root/".git"/"adaptive-delivery"/"runtime-assignments.json").write_text(json.dumps({"schema_version":2,"leases":{"new":newer,"old":older},"lineages":{}}))
+            def fake_git(_root,*args):
+                if args==("rev-parse","--show-toplevel"): return str(root)
+                if args==("rev-parse","--git-common-dir"): return str(root / ".git")
+                if args==("worktree","list","--porcelain"): return f"worktree {root}\nHEAD abc\nbranch refs/heads/main\n"
+                if args==("branch","--show-current"): return "main"
+                if args==("status","--porcelain=v1","--untracked-files=no"): return ""
+                if args==("rev-parse","HEAD"): return "abc"
+                raise AssertionError(args)
+            with patch.object(lifecycle_hook,"run_git",side_effect=fake_git), patch("control_event_guard.unmerged_worktree_candidates",return_value={}):
+                snap=lifecycle_hook.project_snapshot(root)
+            self.assertEqual(snap["assignment_liveness"]["T1"]["state"],"healthy")
+
+    def test_controller_action_projection_prefers_newer_assignment_over_older_terminal_for_same_task(self) -> None:
+        import json
+        import subprocess
+        from datetime import datetime, timedelta, timezone
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            common=root/".git"/"adaptive-delivery"
+            common.mkdir(parents=True)
+            now=datetime.now(timezone.utc)
+            older={"assignment_id":"old","task_id":"T1","agent_id":"grok","provider":"grok","session_id":"s1","worktree":"/tmp/wt","attempt":1,"started_at":(now-timedelta(minutes=30)).isoformat(),"lease_expires_at":(now-timedelta(minutes=10)).isoformat(),"progress_deadline_at":(now-timedelta(minutes=10)).isoformat(),"terminal_state":"failed","terminal_at":(now-timedelta(minutes=20)).isoformat()}
+            newer={"assignment_id":"new","task_id":"T1","agent_id":"controller","provider":"controller","session_id":"s2","worktree":"/tmp/wt","attempt":1,"started_at":(now-timedelta(minutes=5)).isoformat(),"lease_expires_at":(now+timedelta(minutes=20)).isoformat(),"progress_deadline_at":(now+timedelta(minutes=30)).isoformat(),"terminal_state":None}
+            # Deliberately place the old lease first so max(attempt) chooses the wrong one when attempts tie.
+            (common/"runtime-assignments.json").write_text(json.dumps({"schema_version":2,"leases":{"old":older,"new":newer},"lineages":{}}))
+            actions=control_event_guard.canonical_controller_action_projection(
+                root, controller_id="controller-1", candidates={}, required_review_ids=set(),
+                work_in_flight={"T1":"ACTIVE"}, corrections=[]
+            )
+            self.assertNotIn("recovery:T1", actions)
+
     def lifecycle_worktree_fixture(self) -> tuple[Path, Path, Path, Path]:
         import subprocess
 
