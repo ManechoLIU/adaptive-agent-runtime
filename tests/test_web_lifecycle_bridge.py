@@ -37,6 +37,37 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             check=False,
         )
 
+    def test_periodic_reconcile_arms_existing_supervisor_for_desktop_pending_continuation(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = tmp_path / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo)}) + "\n", encoding="utf-8")
+            continuation = {
+                "should_continue": True,
+                "controller_host": "desktop_codex",
+                "lifecycle_state": {
+                    "pending_control_event": True,
+                    "requires_user": False,
+                    "controller_host": "desktop_codex",
+                    "wake_generation": 7,
+                },
+            }
+            with patch.object(web_bridge, "_registered_controller_for_common_dir", return_value="controller-1"), \
+                 patch("scripts.web_agent_execution._load_dispatch_state", return_value={"dispatches": {}}), \
+                 patch("scripts.assignment_runtime.load_runtime_state", return_value={"leases": {}}), \
+                 patch.object(web_bridge, "controller_continuation_projection", return_value=continuation), \
+                 patch.object(web_bridge, "ensure_continuation_supervisor", return_value=True) as ensure:
+                result = web_bridge.reconcile_managed_web_assignments(
+                    repo=repo, controller_id="controller-1", registry=registry, event_paths=[]
+                )
+
+            self.assertTrue(result["controller_continuation"]["supervisor_armed"])
+            ensure.assert_called_once()
+
     def test_translate_selfalone_shell_receipt_into_post_tool_event(self) -> None:
         receipt = {
             "receiptId": "receipt-1",

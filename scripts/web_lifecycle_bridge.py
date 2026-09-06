@@ -1212,10 +1212,7 @@ def reconcile_managed_web_assignments(
         registry=registry,
     )
     supervisor_armed = False
-    if (
-        controller_continuation.get("should_continue") is True
-        and controller_continuation.get("controller_host") == "web"
-    ):
+    if controller_continuation.get("should_continue") is True:
         supervisor_armed = ensure_continuation_supervisor(
             lifecycle_state=dict(controller_continuation.get("lifecycle_state") or {}),
             session_id=controller_id,
