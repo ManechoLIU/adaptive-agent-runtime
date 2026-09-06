@@ -2104,6 +2104,11 @@ def wake_existing_controller(
     })
     if _registered_controller_for_common_dir(repo, registry) != session_id:
         facts.pop("registered_controller", None)
+    ownership_fence = _canonical_ownership_fence(
+        repo=repo, registry=registry, session_id=session_id
+    )
+    if ownership_fence is not None:
+        facts["controller_host"] = ownership_fence["active_host"]
     health = derive_controller_health(facts)
     wake = decide_controller_wake(health)
     decision = str(wake["decision"])
@@ -2331,6 +2336,20 @@ def wake_existing_controller(
                             "stderr_tail": f"host adapter target guard error: {exc}",
                             "error_code": "CONTROLLER_TARGET_REJECTED",
                         }
+            if not _canonical_ownership_fence_matches(
+                ownership_fence, repo=repo, registry=registry, session_id=session_id
+            ):
+                attempt = {
+                    "operation": attempt.get("operation"),
+                    "result": "DEFERRED",
+                    "state": "RESUME_SUPERSEDED_HOST_HANDOFF",
+                    "returncode": 0,
+                    "stderr_tail": "Controller host ownership changed while wake was in flight",
+                    "error_code": "CONTROLLER_HOST_OWNERSHIP_SUPERSEDED",
+                    "execution_target_session_id": attempt.get("execution_target_session_id"),
+                    "target_generation": attempt.get("target_generation"),
+                    "target_mode": attempt.get("target_mode"),
+                }
             result = str(attempt.get("result", "FAILED"))
             receipt = _wake_receipt(
                 common_dir=common_dir, session_id=session_id, event_fingerprint=fingerprint,
