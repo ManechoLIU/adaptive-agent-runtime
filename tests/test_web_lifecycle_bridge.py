@@ -770,6 +770,87 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "controller-1",
             )
 
+    def test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-old"]}},
+                "__controller_targets__": {
+                    "controller-1": {
+                        "web": {"status": "active", "session_id": "web-old", "generation": 3}
+                    }
+                },
+            }), encoding="utf-8")
+            lease = root / "manual-web-leases.json"
+            lease.write_text(json.dumps({
+                "schema_version": 1,
+                "leases": {
+                    "controller-1": {
+                        "repo": str(repo.resolve()),
+                        "controller_id": "controller-1",
+                        "web_session_id": "web-old",
+                        "authorized_at_unix": 100,
+                        "expires_at_unix": 4102444800,
+                        "provenance": "manual_user_authorized",
+                        "mode": "resume_only",
+                    }
+                },
+            }), encoding="utf-8")
+
+            with patch.object(web_bridge, "DEFAULT_MANUAL_WEB_LEASES", lease), patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=lambda **_kwargs: True,
+            ):
+                recovered = web_bridge.recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id="web-new",
+                    registry_path=registry,
+                    host_identity_receipt={"attested": True},
+                )
+
+            self.assertEqual(recovered["result"], "RECOVERED")
+            self.assertTrue(recovered["resume_lease_rotated"])
+            record = json.loads(lease.read_text(encoding="utf-8"))["leases"]["controller-1"]
+            self.assertEqual(record["web_session_id"], "web-new")
+            self.assertEqual(record["authorized_at_unix"], 100)
+            self.assertEqual(record["expires_at_unix"], 4102444800)
+            self.assertEqual(record["provenance"], "manual_user_authorized")
+            self.assertEqual(record["mode"], "resume_only")
+
+    def test_same_controller_web_recovery_does_not_create_resume_lease_without_prior_authorization(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            lease = root / "manual-web-leases.json"
+
+            with patch.object(web_bridge, "DEFAULT_MANUAL_WEB_LEASES", lease), patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=lambda **_kwargs: True,
+            ):
+                recovered = web_bridge.recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id="web-new",
+                    registry_path=registry,
+                    host_identity_receipt={"attested": True},
+                )
+
+            self.assertEqual(recovered["result"], "RECOVERED")
+            self.assertFalse(recovered["resume_lease_rotated"])
+            self.assertFalse(lease.exists())
+
     def test_bind_web_session_cli_refuses_session_already_bound_to_other_controller(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

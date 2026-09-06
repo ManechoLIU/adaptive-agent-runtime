@@ -73,6 +73,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_production_bridge_registers_trusted_web_attestation_verifier",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target",
     "tests.test_web_reentry_adapter.WebReentryAdapterTests."
     "test_ai_bridge_web_attestation_requires_matching_live_chatgpt_tab",
     "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests."

@@ -265,6 +265,70 @@ def authorize_manual_web_session(
     return record
 
 
+def rotate_existing_manual_web_resume_lease(
+    *,
+    repo: Path,
+    controller_id: str,
+    web_session_id: str,
+    lease_path: Path | None = None,
+    now_unix: int | None = None,
+) -> bool:
+    """Carry an existing user-authorized resume-only lease across verified Web target rotation.
+
+    This never creates authorization. It only retargets an unexpired lease that already
+    belongs to the same logical Controller and repository, preserving its original
+    authorization time and expiry.
+    """
+    repo = canonical_root(repo)
+    lease_path = Path(lease_path or DEFAULT_MANUAL_WEB_LEASES).expanduser()
+    now = int(time.time() if now_unix is None else now_unix)
+    lock_path = lease_path.with_suffix(lease_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            payload = load_json(lease_path)
+            leases = payload.get("leases")
+            if not isinstance(leases, dict):
+                return False
+            record = leases.get(controller_id)
+            if not isinstance(record, dict):
+                return False
+            if record.get("controller_id") not in (None, controller_id):
+                return False
+            if record.get("provenance") != "manual_user_authorized" or record.get("mode") != "resume_only":
+                return False
+            expires_at = record.get("expires_at_unix")
+            if not isinstance(expires_at, int) or isinstance(expires_at, bool) or expires_at <= now:
+                return False
+            lease_repo_value = record.get("repo")
+            if not isinstance(lease_repo_value, str) or not lease_repo_value.strip():
+                return False
+            lease_repo = Path(lease_repo_value).expanduser().resolve()
+            try:
+                same_repo = _git_common_dir(lease_repo) == _git_common_dir(repo)
+            except (OSError, subprocess.SubprocessError):
+                same_repo = lease_repo == repo.resolve()
+            if not same_repo:
+                return False
+            current_session = str(record.get("web_session_id") or "").strip()
+            if current_session == web_session_id:
+                return False
+            leases[controller_id] = {
+                **record,
+                "repo": str(repo.resolve()),
+                "controller_id": controller_id,
+                "web_session_id": web_session_id,
+                "rotated_at_unix": now,
+            }
+            payload["schema_version"] = 1
+            payload["leases"] = leases
+            _write_json_atomic_file(lease_path, payload)
+            return True
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def resolve_manual_web_session(
     *, cwd: Path, registry_path: Path, lease_path: Path, now_unix: int | None = None
 ) -> str | None:
@@ -382,12 +446,18 @@ def recover_same_controller_web_session(
             registry_path=registry_path,
             provenance="web_entry",
         )
+        resume_lease_rotated = rotate_existing_manual_web_resume_lease(
+            repo=repo,
+            controller_id=controller_id,
+            web_session_id=web_session_id,
+        )
         return {
             "result": "ALREADY_VERIFIED",
             "state": "VERIFIED",
             "controller_id": controller_id,
             "active_host": ownership["active_host"],
             "ownership_generation": ownership["generation"],
+            "resume_lease_rotated": resume_lease_rotated,
             "identity": target_guard.controller_identity_projection(
                 repo=repo, host="web", source_session_id=web_session_id,
                 registry_path=registry_path,
@@ -557,11 +627,17 @@ def recover_same_controller_web_session(
     )
     if recovered["session_binding_state"].get("verification") != "VERIFIED":
         raise RuntimeError("same-controller recovery did not produce a verified current session")
+    resume_lease_rotated = rotate_existing_manual_web_resume_lease(
+        repo=repo,
+        controller_id=controller_id,
+        web_session_id=web_session_id,
+    )
     return {
         "result": "RECOVERED",
         "state": "VERIFIED",
         "controller_id": controller_id,
         "execution_target_session_id": web_session_id,
+        "resume_lease_rotated": resume_lease_rotated,
         "active_host": ownership_claim["active_host"],
         "ownership_generation": ownership_claim["generation"],
         "target_generation": recovered["session_binding_state"].get(
