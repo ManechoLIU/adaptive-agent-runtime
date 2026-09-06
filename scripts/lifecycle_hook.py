@@ -943,6 +943,26 @@ def _is_observation_status_query(event: dict[str, Any]) -> bool:
     return bool(OBSERVATION_STATUS_QUERY.search(prompt))
 
 
+def _mark_yield_rejected(
+    state: dict[str, Any], event: dict[str, Any], *, reason: str, trigger: str | None = None
+) -> None:
+    """Persist a rejected logical Yield so detached continuation cannot lose the edge."""
+    state["pending_control_event"] = True
+    if state.get("requires_user") is not True:
+        state["requires_user"] = False
+    triggers = {
+        str(item) for item in state.get("triggers", []) if str(item).strip()
+    }
+    triggers.add("YIELD_GATE_REJECTED")
+    if trigger:
+        triggers.add(trigger)
+    state["triggers"] = sorted(triggers)
+    state["yield_rejected"] = True
+    state["yield_rejected_turn_id"] = _event_turn_id(event)
+    state["yield_rejected_reason"] = reason[:2048]
+    state["yield_rejection_count"] = int(state.get("yield_rejection_count", 0) or 0) + 1
+
+
 def evaluate_event(
     event: dict[str, Any],
     *,
@@ -998,14 +1018,15 @@ def evaluate_event(
         }
         current_triggers.add("KNOWN_NEXT_ACTION_NOT_EXECUTED")
         state["triggers"] = sorted(current_triggers)
-        return {
-            "decision": "block",
-            "reason": (
-                "Hard Yield Gate: Controller 已明确给出当前可执行的下一动作，"
-                "必须先执行、hard BLOCK/DEFER，或完成事实收敛与 project-wide recompute；"
-                "不得一边声明下一步一边 Yield。"
-            ),
-        }, state
+        reason = (
+            "Hard Yield Gate: Controller 已明确给出当前可执行的下一动作，"
+            "必须先执行、hard BLOCK/DEFER，或完成事实收敛与 project-wide recompute；"
+            "不得一边声明下一步一边 Yield。"
+        )
+        _mark_yield_rejected(
+            state, event, reason=reason, trigger="KNOWN_NEXT_ACTION_NOT_EXECUTED"
+        )
+        return {"decision": "block", "reason": reason}, state
 
     if event_name == "Stop" and snapshot.get("control_loop_required") is True:
         active_turn = str(state.get("active_turn_id", "")).strip()
@@ -1021,6 +1042,9 @@ def evaluate_event(
             )
             if pending_triggers:
                 reason += " Pending triggers: " + pending_triggers + "."
+            _mark_yield_rejected(
+                state, event, reason="control-loop gate rejected: " + reason
+            )
             return {"decision": "block", "reason": reason}, state
     if event_name == "PostToolUse" and _event_turn_id(event) and _event_turn_id(event) != str(state.get("active_turn_id", "")):
         # A delayed result cannot unlock a newer turn or contaminate its trace.

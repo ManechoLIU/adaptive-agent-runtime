@@ -4035,6 +4035,56 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         )
         self.assertIn("active dispatch decisions exceed available capacity: 2 > 1", errors)
 
+    def test_known_next_action_stop_rejection_persists_yield_continuation_debt(self) -> None:
+        snapshot = {
+            "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
+            "ready_ids": ["READY-1"], "runnable_ids": ["READY-1"],
+            "candidate_revisions": [], "control_loop_required": True,
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-yield-1",
+                "last_assistant_message": "原因已查明，下一步派发 Reviewer。",
+                "controller_host": "web",
+            },
+            snapshot=snapshot,
+            prior_state={"pending_control_event": False, "requires_user": False, "triggers": []},
+        )
+        self.assertEqual(output.get("decision"), "block")
+        self.assertTrue(state["pending_control_event"])
+        self.assertFalse(state["requires_user"])
+        self.assertTrue(state["yield_rejected"])
+        self.assertEqual(state["yield_rejected_turn_id"], "turn-yield-1")
+        self.assertIn("KNOWN_NEXT_ACTION_NOT_EXECUTED", state["triggers"])
+        self.assertIn("YIELD_GATE_REJECTED", state["triggers"])
+        self.assertIn("下一动作", state["yield_rejected_reason"])
+
+    def test_control_loop_stop_rejection_reopens_pending_event_even_if_prior_state_was_closed(self) -> None:
+        snapshot = {
+            "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
+            "ready_ids": [], "runnable_ids": [], "candidate_revisions": [],
+            "ledger_errors": [], "assignment_liveness": {}, "controller_corrections": [],
+            "control_loop_required": True, "rule_handshake": {"state": "current", "blocking": False},
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop", "session_id": "controller-1", "turn_id": "turn-yield-2",
+                "controller_host": "web",
+            },
+            snapshot=snapshot,
+            prior_state={
+                "active_turn_id": "turn-yield-2", "pending_control_event": False,
+                "requires_user": False, "must_yield": False, "triggers": [], "snapshot": snapshot,
+            },
+        )
+        self.assertEqual(output.get("decision"), "block")
+        self.assertTrue(state["pending_control_event"])
+        self.assertFalse(state["requires_user"])
+        self.assertTrue(state["yield_rejected"])
+        self.assertEqual(state["yield_rejected_turn_id"], "turn-yield-2")
+        self.assertIn("YIELD_GATE_REJECTED", state["triggers"])
+        self.assertIn("control-loop", state["yield_rejected_reason"])
+
     def test_stop_without_current_turn_control_loop_receipt_fails_closed_even_when_idle(self) -> None:
         snapshot = {
             "head": "abc",
