@@ -637,6 +637,24 @@ def finalize_web_review(repo: Path, run_id: str) -> ReviewRunResult:
     transport = str(lease.get("execution_transport") or "").strip()
     if transport not in {"web", "external_process"} or lease.get("execution_role") != "reviewer":
         raise ValueError("canonical Assignment is not a supported reviewer lease")
+    if transport == "external_process":
+        provider = str(lease.get("provider") or "").strip()
+        model = str(lease.get("model") or "").strip()
+        auth_mode = str(lease.get("auth_mode") or "").strip()
+        route = lease.get("route_contract")
+        supported = (
+            (provider == "grok-build" and model == "grok-4.6" and auth_mode in {"oauth", "api"})
+            or (provider == "kimi-code" and auth_mode == "oauth" and model == "kimi-code/k3")
+            or (provider == "kimi-code" and auth_mode == "api" and model == "kimi-k3")
+        )
+        route_matches = (
+            isinstance(route, dict)
+            and str(route.get("provider") or "").strip() == provider
+            and str(route.get("model") or "").strip() == model
+            and str(route.get("auth_mode") or "").strip() == auth_mode
+        )
+        if not supported or not route_matches:
+            raise ValueError("canonical Assignment is not a supported canonical external reviewer route")
     if str(lease.get("candidate_revision") or "") != expected_head:
         raise ValueError("canonical Web reviewer candidate revision mismatch")
     if str(lease.get("terminal_state") or "") != "completed":

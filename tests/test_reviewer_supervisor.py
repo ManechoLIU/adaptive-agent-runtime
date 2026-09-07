@@ -575,6 +575,7 @@ class ReviewerSupervisorWebHandoffTests(unittest.TestCase):
                 "assignment_id": assignment_id, "task_id": assignment_id,
                 "execution_transport": "external_process", "execution_role": "reviewer",
                 "provider": "grok-build", "model": "grok-4.6", "auth_mode": "oauth",
+                "route_contract": {"provider": "grok-build", "model": "grok-4.6", "auth_mode": "oauth"},
                 "candidate_revision": head, "terminal_state": "completed",
                 "delivery_outcome": "pass", "review_verdict": verdict,
             }}
@@ -582,6 +583,42 @@ class ReviewerSupervisorWebHandoffTests(unittest.TestCase):
         result = finalize_web_review(repo, pending.run_id)
         self.assertEqual(result.state, "PASS")
         self.assertEqual(result.verdict, verdict)
+
+    def test_web_review_rejects_external_reviewer_without_supported_canonical_route_identity(self):
+        from scripts.assignment_runtime import save_runtime_state
+        from scripts.reviewer_supervisor import finalize_web_review
+
+        repo = Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "x.txt").write_text("x\n")
+        subprocess.run(["git", "add", "x.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        pending = run_review(repo, head, "review", controller_host="web")
+        state = json.loads(pending.state_path.read_text())
+        assignment_id = state["review_request"]["assignment_id"]
+        verdict = {"reviewed_head": head, "verdict": "PASS", "critical": [], "important": [], "minor": []}
+
+        for provider, model, auth_mode, route in [
+            (None, None, None, None),
+            ("other-provider", "other-model", "oauth", {"provider": "other-provider", "model": "other-model", "auth_mode": "oauth"}),
+            ("grok-build", "grok-4.6", "oauth", None),
+            ("kimi-code", "wrong-model", "api", {"provider": "kimi-code", "model": "wrong-model", "auth_mode": "api"}),
+        ]:
+            lease = {
+                "assignment_id": assignment_id, "task_id": assignment_id,
+                "execution_transport": "external_process", "execution_role": "reviewer",
+                "candidate_revision": head, "terminal_state": "completed",
+                "delivery_outcome": "pass", "review_verdict": verdict,
+                "provider": provider, "model": model, "auth_mode": auth_mode, "route_contract": route,
+            }
+            save_runtime_state(repo, {"schema_version": 2, "lineages": {}, "leases": {assignment_id: lease}})
+            pending.state_path.write_text(json.dumps(state), encoding="utf-8")
+            with self.subTest(provider=provider, model=model, route=route):
+                with self.assertRaisesRegex(ValueError, "supported canonical external reviewer route"):
+                    finalize_web_review(repo, pending.run_id)
 
     def test_web_review_finalizes_only_from_canonical_runtime_reviewer_lease(self):
         from scripts.assignment_runtime import save_runtime_state
