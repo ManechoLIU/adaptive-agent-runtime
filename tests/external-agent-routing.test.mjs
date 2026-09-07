@@ -906,6 +906,36 @@ test("delivery verdict preserves transport failure and explicit evidence-backed 
 
 
 
+test("reviewer delivery receipt persists structured review verdict", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-review-verdict-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const receipts = path.join(bin, "receipts.jsonl");
+  const deliveryPath = path.join(bin, "delivery.json");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const verdict = { reviewed_head: head, verdict: "PASS", critical: [], important: [], minor: [] };
+  await writeFile(deliveryPath, JSON.stringify({
+    delivery_outcome: "pass", summary: "review passed", evidence: [`git:${head}`], artifacts: [`git:${head}`],
+    next_action: "integrate candidate", retry_class: "none", review_verdict: verdict,
+  }));
+  const ack = await assignmentAckFile(bin, { assignment_id: "review-a1", agent_id: "reviewer",
+    primary_goal: "review immutable candidate", task_id: "review-a1", owned_scope: ["TASK_LEDGER.md"], role: "reviewer", candidate_revision: head, reviewer_for_revision: head,
+  }, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "review-a1", "--task-id", "review-a1", "--agent-id", "reviewer", "--session-id", "review-session",
+    "--assignment-ack", ack, "--runtime-receipts", receipts, "--delivery-receipt", deliveryPath,
+  ], { encoding: "utf8", input: "review", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
+  assert.equal(result.status, 0, result.stderr);
+  const events = (await readFile(receipts, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.deepEqual(events.at(-1).review_verdict, verdict);
+});
+
+
 test("long external execution emits automatic heartbeat before terminal", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-heartbeat-"));
   const repo = await makeAssignmentRepo(bin);

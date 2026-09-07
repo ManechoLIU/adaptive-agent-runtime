@@ -554,6 +554,35 @@ class ReviewerSupervisorWebHandoffTests(unittest.TestCase):
         self.assertNotIn("model", request)
 
 
+    def test_web_review_finalizes_from_canonical_external_reviewer_lease(self):
+        from scripts.assignment_runtime import save_runtime_state
+        from scripts.reviewer_supervisor import finalize_web_review
+
+        repo = Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "x.txt").write_text("x\n")
+        subprocess.run(["git", "add", "x.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        pending = run_review(repo, head, "review", controller_host="web")
+        state = json.loads(pending.state_path.read_text())
+        assignment_id = state["review_request"]["assignment_id"]
+        verdict = {"reviewed_head": head, "verdict": "PASS", "critical": [], "important": [], "minor": []}
+        save_runtime_state(repo, {
+            "schema_version": 2, "lineages": {}, "leases": {assignment_id: {
+                "assignment_id": assignment_id, "task_id": assignment_id,
+                "execution_transport": "external_process", "execution_role": "reviewer",
+                "provider": "grok-build", "model": "grok-4.6", "auth_mode": "oauth",
+                "candidate_revision": head, "terminal_state": "completed",
+                "delivery_outcome": "pass", "review_verdict": verdict,
+            }}
+        })
+        result = finalize_web_review(repo, pending.run_id)
+        self.assertEqual(result.state, "PASS")
+        self.assertEqual(result.verdict, verdict)
+
     def test_web_review_finalizes_only_from_canonical_runtime_reviewer_lease(self):
         from scripts.assignment_runtime import save_runtime_state
         from scripts.reviewer_supervisor import finalize_web_review

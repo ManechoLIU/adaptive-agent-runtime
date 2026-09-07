@@ -290,17 +290,37 @@ def replace_web_session(
                 controller_targets["web"] = target
                 targets[controller_id] = controller_targets
                 registry["__controller_targets__"] = targets
-                _write_json_atomic_file(registry_path, registry)
                 idempotent = False
+
+            lease_lock_path = lease_path.with_suffix(lease_path.suffix + ".lock")
+            lease_lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lease_lock_path.open("a+") as lease_lock:
+                fcntl.flock(lease_lock.fileno(), fcntl.LOCK_EX)
+                try:
+                    lease_before = load_json(lease_path)
+                    lease_after, resume_lease_rotated = _rotated_manual_web_resume_lease_payload(
+                        lease_before,
+                        repo=repo,
+                        controller_id=controller_id,
+                        web_session_id=web_session_id,
+                        now_unix=int(time.time()),
+                    )
+                    if resume_lease_rotated:
+                        _write_json_atomic_file(lease_path, lease_after)
+                    if not idempotent:
+                        try:
+                            _write_json_atomic_file(registry_path, registry)
+                        except Exception:
+                            if resume_lease_rotated:
+                                _write_json_atomic_file(lease_path, lease_before)
+                            raise
+                finally:
+                    fcntl.flock(lease_lock.fileno(), fcntl.LOCK_UN)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
-    resume_lease_rotated = rotate_existing_manual_web_resume_lease(
-        repo=repo,
-        controller_id=controller_id,
-        web_session_id=web_session_id,
-        lease_path=lease_path,
-    )
+    binding = str(target.get("binding_mode") or "temporary")
+    host_attested = bool(target.get("host_attested")) if "host_attested" in target else False
     return {
         "controller_id": controller_id,
         "controller_session_id": controller_id,
@@ -308,8 +328,8 @@ def replace_web_session(
         "host": "web",
         "repo": str(repo.resolve()),
         **target,
-        "binding": "temporary",
-        "host_attested": False,
+        "binding": binding,
+        "host_attested": host_attested,
         "resume_lease_rotated": resume_lease_rotated,
         "idempotent": idempotent,
     }
@@ -498,6 +518,54 @@ def authorize_manual_web_session(
     return record
 
 
+
+def _rotated_manual_web_resume_lease_payload(
+    payload: dict[str, Any],
+    *,
+    repo: Path,
+    controller_id: str,
+    web_session_id: str,
+    now_unix: int,
+) -> tuple[dict[str, Any], bool]:
+    leases = payload.get("leases")
+    if not isinstance(leases, dict):
+        return payload, False
+    record = leases.get(controller_id)
+    if not isinstance(record, dict):
+        return payload, False
+    if record.get("controller_id") not in (None, controller_id):
+        return payload, False
+    if record.get("provenance") != "manual_user_authorized" or record.get("mode") != "resume_only":
+        return payload, False
+    expires_at = record.get("expires_at_unix")
+    if not isinstance(expires_at, int) or isinstance(expires_at, bool) or expires_at <= now_unix:
+        return payload, False
+    lease_repo_value = record.get("repo")
+    if not isinstance(lease_repo_value, str) or not lease_repo_value.strip():
+        return payload, False
+    lease_repo = Path(lease_repo_value).expanduser().resolve()
+    try:
+        same_repo = _git_common_dir(lease_repo) == _git_common_dir(repo)
+    except (OSError, subprocess.SubprocessError):
+        same_repo = lease_repo == repo.resolve()
+    if not same_repo:
+        return payload, False
+    current_session = str(record.get("web_session_id") or "").strip()
+    if current_session == web_session_id:
+        return payload, False
+    updated = json.loads(json.dumps(payload))
+    updated_leases = updated.setdefault("leases", {})
+    updated_leases[controller_id] = {
+        **record,
+        "repo": str(repo.resolve()),
+        "controller_id": controller_id,
+        "web_session_id": web_session_id,
+        "rotated_at_unix": now_unix,
+    }
+    updated["schema_version"] = 1
+    return updated, True
+
+
 def rotate_existing_manual_web_resume_lease(
     *,
     repo: Path,
@@ -506,7 +574,7 @@ def rotate_existing_manual_web_resume_lease(
     lease_path: Path | None = None,
     now_unix: int | None = None,
 ) -> bool:
-    """Carry an existing user-authorized resume-only lease across verified Web target rotation.
+    """Carry an existing user-authorized resume-only lease across Web target rotation.
 
     This never creates authorization. It only retargets an unexpired lease that already
     belongs to the same logical Controller and repository, preserving its original
@@ -521,43 +589,16 @@ def rotate_existing_manual_web_resume_lease(
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             payload = load_json(lease_path)
-            leases = payload.get("leases")
-            if not isinstance(leases, dict):
-                return False
-            record = leases.get(controller_id)
-            if not isinstance(record, dict):
-                return False
-            if record.get("controller_id") not in (None, controller_id):
-                return False
-            if record.get("provenance") != "manual_user_authorized" or record.get("mode") != "resume_only":
-                return False
-            expires_at = record.get("expires_at_unix")
-            if not isinstance(expires_at, int) or isinstance(expires_at, bool) or expires_at <= now:
-                return False
-            lease_repo_value = record.get("repo")
-            if not isinstance(lease_repo_value, str) or not lease_repo_value.strip():
-                return False
-            lease_repo = Path(lease_repo_value).expanduser().resolve()
-            try:
-                same_repo = _git_common_dir(lease_repo) == _git_common_dir(repo)
-            except (OSError, subprocess.SubprocessError):
-                same_repo = lease_repo == repo.resolve()
-            if not same_repo:
-                return False
-            current_session = str(record.get("web_session_id") or "").strip()
-            if current_session == web_session_id:
-                return False
-            leases[controller_id] = {
-                **record,
-                "repo": str(repo.resolve()),
-                "controller_id": controller_id,
-                "web_session_id": web_session_id,
-                "rotated_at_unix": now,
-            }
-            payload["schema_version"] = 1
-            payload["leases"] = leases
-            _write_json_atomic_file(lease_path, payload)
-            return True
+            updated, rotated = _rotated_manual_web_resume_lease_payload(
+                payload,
+                repo=repo,
+                controller_id=controller_id,
+                web_session_id=web_session_id,
+                now_unix=now,
+            )
+            if rotated:
+                _write_json_atomic_file(lease_path, updated)
+            return rotated
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 

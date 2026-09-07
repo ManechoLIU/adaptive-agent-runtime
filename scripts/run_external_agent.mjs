@@ -507,10 +507,30 @@ function readDeliveryReceipt(pathname) {
   if (receipt.reconciliation_evidence !== undefined && !Array.isArray(receipt.reconciliation_evidence)) {
     throw new Error("delivery-receipt reconciliation_evidence must be an array when provided");
   }
+  let reviewVerdict;
+  if (receipt.review_verdict !== undefined) {
+    const verdict = receipt.review_verdict;
+    const keys = verdict && typeof verdict === "object" && !Array.isArray(verdict) ? Object.keys(verdict).sort() : [];
+    const expectedKeys = ["critical", "important", "minor", "reviewed_head", "verdict"].sort();
+    if (JSON.stringify(keys) !== JSON.stringify(expectedKeys)
+        || !["PASS", "FINDINGS"].includes(verdict.verdict)
+        || typeof verdict.reviewed_head !== "string" || !verdict.reviewed_head.trim()
+        || !["critical", "important", "minor"].every((key) => Array.isArray(verdict[key]) && verdict[key].every((item) => typeof item === "string" && item.trim()))) {
+      throw new Error("delivery-receipt review_verdict is invalid");
+    }
+    const findings = verdict.critical.length + verdict.important.length + verdict.minor.length;
+    if ((verdict.verdict === "PASS" && findings !== 0) || (verdict.verdict === "FINDINGS" && findings === 0)) {
+      throw new Error("delivery-receipt review_verdict conflicts with findings");
+    }
+    const expectedOutcome = verdict.verdict === "PASS" ? "pass" : "fail";
+    if (deliveryOutcome !== expectedOutcome) throw new Error("delivery-receipt review_verdict conflicts with delivery_outcome");
+    reviewVerdict = verdict;
+  }
   return {
     delivery_outcome: deliveryOutcome, summary, evidence: receipt.evidence, artifacts: receipt.artifacts,
     next_action: receipt.next_action, retry_class: receipt.retry_class,
     reconciliation_evidence: receipt.reconciliation_evidence || [],
+    ...(reviewVerdict ? { review_verdict: reviewVerdict } : {}),
   };
 }
 
@@ -541,6 +561,8 @@ function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
     ...(eventType === "assignment_started" ? {
       ...options.executionLineage,
       execution_transport: "external_process",
+      execution_role: options.assignmentRole || null,
+      candidate_revision: options.candidateRevision || null,
       model: options.model,
       agent_type: options.agentType || `external-${options.engine}`,
       auth_mode: options.authMode,
@@ -886,6 +908,12 @@ async function main() {
       options.agentType = typeof assignment.agent_type === "string" && assignment.agent_type.trim()
         ? assignment.agent_type.trim()
         : `external-${options.engine}`;
+      options.assignmentRole = typeof assignment.role === "string" && assignment.role.trim()
+        ? assignment.role.trim().toLowerCase()
+        : null;
+      options.candidateRevision = typeof assignment.candidate_revision === "string" && assignment.candidate_revision.trim()
+        ? assignment.candidate_revision.trim()
+        : null;
       options.executionLineage = deriveExecutionLineage(options, assignment);
     }
     validateRuleHandshake(options);
@@ -961,6 +989,7 @@ async function main() {
       next_action: delivery?.next_action || (deliveryError ? "repair delivery receipt" : code === 0 ? "inspect delivery" : "inspect external agent output"),
       retry_class: delivery?.retry_class || (deliveryError ? "none" : code === 0 ? "none" : "provider_exit"),
       reconciliation_evidence: delivery?.reconciliation_evidence || [],
+      ...(delivery?.review_verdict ? { review_verdict: delivery.review_verdict } : {}),
       result_unknown: Boolean(options.sideEffect) && (code !== 0 || deliveryError !== null || delivery?.delivery_outcome === "unresolved" || delivery === null),
     });
     persistExternalTerminalReceipt(options, {

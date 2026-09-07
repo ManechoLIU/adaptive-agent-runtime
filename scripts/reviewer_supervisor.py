@@ -634,8 +634,9 @@ def finalize_web_review(repo: Path, run_id: str) -> ReviewRunResult:
     lease = load_runtime_state(repo).get("leases", {}).get(assignment_id)
     if not isinstance(lease, dict):
         raise ValueError("canonical Web reviewer lease not found")
-    if lease.get("execution_transport") != "web" or lease.get("execution_role") != "reviewer":
-        raise ValueError("canonical Assignment is not a Web reviewer lease")
+    transport = str(lease.get("execution_transport") or "").strip()
+    if transport not in {"web", "external_process"} or lease.get("execution_role") != "reviewer":
+        raise ValueError("canonical Assignment is not a supported reviewer lease")
     if str(lease.get("candidate_revision") or "") != expected_head:
         raise ValueError("canonical Web reviewer candidate revision mismatch")
     if str(lease.get("terminal_state") or "") != "completed":
