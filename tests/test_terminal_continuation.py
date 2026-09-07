@@ -429,37 +429,43 @@ def _pending_reconcile_partial_classification_test(self):
 PendingTerminalReconcileTests.test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks = _pending_reconcile_partial_classification_test
 
 def _pending_reconcile_rejects_lifecycle_change_before_publish(self):
+    import fcntl
     module = self._module()
     with tempfile.TemporaryDirectory() as tmp:
         root=Path(tmp); repo=root/'repo'; repo.mkdir(); subprocess.run(['git','init','-q','-b','main',str(repo)],check=True)
         registry=root/'controllers.json'; registry.write_text(json.dumps(_ownership_registry(repo)),encoding='utf-8')
         receipt=root/'terminal.json'; receipt.write_text(json.dumps({'event_type':'external_agent_terminal','repo':str(repo.resolve()),'summary':'done'}),encoding='utf-8')
-        states=[{'pending_terminal_receipts':[str(receipt)]},{'pending_terminal_receipts':[]}]
-        with patch.object(module.lifecycle,'state_path',return_value=root/'controller.json'), patch.object(
-            module.lifecycle,'load_json',side_effect=states
-        ):
-            with self.assertRaisesRegex(PermissionError,'pending terminal receipt set changed'):
-                module.reconcile_pending_terminal_receipts(repo=repo,registry_path=registry)
-        self.assertFalse((repo/'.git/adaptive-delivery/terminal-reconcile.json').exists())
+        state_path=root/'controller.json'; state_path.write_text(json.dumps({'pending_terminal_receipts':[str(receipt)]}),encoding='utf-8')
+        lifecycle_lock=state_path.with_suffix(state_path.suffix+'.lock')
+        observed=[]
+        original_write=module._write_json_atomic
+        def inspect_write(path,value):
+            with lifecycle_lock.open('a+') as handle:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)
+                except BlockingIOError:
+                    observed.append('blocked')
+                else:
+                    observed.append('unexpectedly_unlocked')
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return original_write(path,value)
+        with patch.object(module.lifecycle,'state_path',return_value=state_path), patch.object(module,'_write_json_atomic',side_effect=inspect_write):
+            module.reconcile_pending_terminal_receipts(repo=repo,registry_path=registry)
+        self.assertEqual(observed,['blocked'])
 
 
 def _pending_reconcile_rejects_target_generation_change_before_publish(self):
     module=self._module()
     with tempfile.TemporaryDirectory() as tmp:
         root=Path(tmp); repo=root/'repo'; repo.mkdir(); subprocess.run(['git','init','-q','-b','main',str(repo)],check=True)
-        registry=root/'controllers.json'; registry.write_text(json.dumps(_ownership_registry(repo,generation=1)),encoding='utf-8')
+        registry=root/'controllers.json'
+        value=_ownership_registry(repo,generation=1)
+        value['__controller_targets__']['controller-1']['web']['generation']=2
+        registry.write_text(json.dumps(value),encoding='utf-8')
         receipt=root/'terminal.json'; receipt.write_text(json.dumps({'event_type':'external_agent_terminal','repo':str(repo.resolve()),'summary':'done'}),encoding='utf-8')
-        state={'pending_terminal_receipts':[str(receipt)]}
-        self.assertTrue(hasattr(module, '_terminal_reconcile_execution_fence'), 'reconcile must expose a reusable execution fence helper')
-        original=module._terminal_reconcile_execution_fence
-        calls=[]
-        def fence(*args,**kwargs):
-            value=original(*args,**kwargs); calls.append(value)
-            if len(calls)==2:
-                return {**value,'target_generation':value['target_generation']+1,'ownership_generation':value['ownership_generation']+1}
-            return value
-        with patch.object(module.lifecycle,'state_path',return_value=root/'controller.json'), patch.object(module.lifecycle,'load_json',return_value=state), patch.object(module,'_terminal_reconcile_execution_fence',side_effect=fence):
-            with self.assertRaisesRegex(PermissionError,'execution fence changed'):
+        state_path=root/'controller.json'; state_path.write_text(json.dumps({'pending_terminal_receipts':[str(receipt)]}),encoding='utf-8')
+        with patch.object(module.lifecycle,'state_path',return_value=state_path):
+            with self.assertRaisesRegex(PermissionError,'target generation does not match execution ownership generation'):
                 module.reconcile_pending_terminal_receipts(repo=repo,registry_path=registry)
 
 
@@ -497,3 +503,67 @@ def _pending_reconcile_hashes_same_bytes_it_parses(self):
 PendingTerminalReconcileTests.test_reconcile_pending_rejects_lifecycle_change_before_publish = _pending_reconcile_rejects_lifecycle_change_before_publish
 PendingTerminalReconcileTests.test_reconcile_pending_rejects_target_generation_change_before_publish = _pending_reconcile_rejects_target_generation_change_before_publish
 PendingTerminalReconcileTests.test_reconcile_pending_hashes_same_bytes_it_parses = _pending_reconcile_hashes_same_bytes_it_parses
+
+def _pending_reconcile_holds_fences_through_audit(self):
+    import fcntl
+    module=self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root=Path(tmp); repo=root/'repo'; repo.mkdir(); subprocess.run(['git','init','-q','-b','main',str(repo)],check=True)
+        registry=root/'controllers.json'; registry.write_text(json.dumps(_ownership_registry(repo)),encoding='utf-8')
+        receipt=root/'terminal.json'; receipt.write_text(json.dumps({'event_type':'external_agent_terminal','repo':str(repo.resolve()),'summary':'done'}),encoding='utf-8')
+        state_path=root/'controller.json'; state_path.write_text(json.dumps({'pending_terminal_receipts':[str(receipt)]}),encoding='utf-8')
+        lifecycle_lock=state_path.with_suffix(state_path.suffix+'.lock')
+        registry_lock=module.web_bridge.target_guard.registry_lock_path(registry)
+        observed={}
+        original_write=module._write_json_atomic
+        def inspect_write(path,value):
+            for name,lock_path in [('lifecycle',lifecycle_lock),('registry',registry_lock)]:
+                lock_path.parent.mkdir(parents=True,exist_ok=True)
+                with lock_path.open('a+') as h:
+                    try:
+                        fcntl.flock(h.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        observed[name]=True
+                    else:
+                        observed[name]=False
+                        fcntl.flock(h.fileno(), fcntl.LOCK_UN)
+            return original_write(path,value)
+        with patch.object(module.lifecycle,'state_path',return_value=state_path), patch.object(module,'_write_json_atomic',side_effect=inspect_write):
+            module.reconcile_pending_terminal_receipts(repo=repo,registry_path=registry)
+        self.assertEqual(observed,{'lifecycle':True,'registry':True})
+
+
+def _pending_reconcile_fingerprint_is_order_independent(self):
+    module=self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root=Path(tmp); repo=root/'repo'; repo.mkdir(); subprocess.run(['git','init','-q','-b','main',str(repo)],check=True)
+        registry=root/'controllers.json'; registry.write_text(json.dumps(_ownership_registry(repo)),encoding='utf-8')
+        a=root/'a.json'; b=root/'b.json'
+        for p,name in [(a,'a'),(b,'b')]: p.write_text(json.dumps({'event_type':'external_agent_terminal','repo':str(repo.resolve()),'summary':name}),encoding='utf-8')
+        state_path=root/'controller.json'
+        state_path.write_text(json.dumps({'pending_terminal_receipts':[str(a),str(b)]}),encoding='utf-8')
+        with patch.object(module.lifecycle,'state_path',return_value=state_path):
+            first=module.reconcile_pending_terminal_receipts(repo=repo,registry_path=registry)
+        state_path.write_text(json.dumps({'pending_terminal_receipts':[str(b),str(a)]}),encoding='utf-8')
+        with patch.object(module.lifecycle,'state_path',return_value=state_path):
+            second=module.reconcile_pending_terminal_receipts(repo=repo,registry_path=registry)
+        self.assertEqual(first['reconcile_fingerprint'],second['reconcile_fingerprint'])
+
+
+def _atomic_audit_writer_handles_concurrent_publication(self):
+    import threading
+    module=self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        path=Path(tmp)/'audit.json'; errors=[]
+        def worker(i):
+            try: module._write_json_atomic(path,{'i':i})
+            except Exception as e: errors.append(e)
+        threads=[threading.Thread(target=worker,args=(i,)) for i in range(20)]
+        [t.start() for t in threads]; [t.join() for t in threads]
+        self.assertEqual(errors,[])
+        self.assertIn(json.loads(path.read_text())['i'],range(20))
+        self.assertEqual(list(path.parent.glob(path.name+'.tmp*')),[])
+
+PendingTerminalReconcileTests.test_reconcile_pending_holds_lifecycle_and_registry_fences_through_audit = _pending_reconcile_holds_fences_through_audit
+PendingTerminalReconcileTests.test_reconcile_pending_fingerprint_is_order_independent = _pending_reconcile_fingerprint_is_order_independent
+PendingTerminalReconcileTests.test_atomic_audit_writer_handles_concurrent_publication = _atomic_audit_writer_handles_concurrent_publication

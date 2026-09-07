@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
+import tempfile
 import subprocess
 import sys
 from pathlib import Path
@@ -178,23 +180,32 @@ def consume_terminal_receipt(
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=path.name + ".tmp.", dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _normalized_pending_terminal_paths(state: dict[str, Any]) -> list[str]:
     pending_raw = state.get("pending_terminal_receipts", [])
     if not isinstance(pending_raw, list):
         raise ValueError("pending terminal receipt state is invalid")
-    return list(dict.fromkeys(
+    return sorted({
         str(value).strip()
         for value in pending_raw
         if isinstance(value, str) and str(value).strip()
-    ))
+    })
 
 
-def _terminal_reconcile_execution_fence(
+def _terminal_reconcile_execution_fence_locked(
     *, repo: Path, registry_path: Path, controller_id: str
 ) -> dict[str, Any]:
     registry = web_bridge.load_json(registry_path)
@@ -208,39 +219,26 @@ def _terminal_reconcile_execution_fence(
     )
     if not ownership_host:
         raise PermissionError("canonical execution ownership host is required for terminal reconciliation")
-    with web_bridge.target_guard.locked_execution_target(
+    target_receipt = web_bridge.target_guard.resolve_execution_target(
         repo=repo, host=ownership_host, registry_path=registry_path
-    ) as target_receipt:
-        locked_registry = web_bridge.load_json(registry_path)
-        locked_ownership = web_bridge.target_guard.execution_ownership_record(
-            locked_registry, controller_id=controller_id
+    )
+    if target_receipt.get("controller_id") != controller_id:
+        raise PermissionError("terminal reconciliation target does not belong to the registered Controller")
+    if target_receipt.get("execution_target_session_id") != ownership_target:
+        raise PermissionError("canonical execution ownership does not match terminal reconciliation target")
+    if target_receipt.get("host") != ownership_host:
+        raise PermissionError("canonical execution ownership host does not match terminal reconciliation target")
+    target_generation = int(target_receipt.get("generation", 0) or 0)
+    if target_generation != ownership_generation:
+        raise PermissionError(
+            "canonical target generation does not match execution ownership generation"
         )
-        if locked_ownership is None:
-            raise PermissionError("canonical execution ownership is required for terminal reconciliation")
-        locked_host, locked_target, locked_generation = (
-            web_bridge.target_guard.validate_execution_ownership_record(locked_ownership)
-        )
-        if locked_host != ownership_host or locked_target != ownership_target:
-            raise PermissionError("canonical execution ownership changed during terminal reconciliation")
-        if locked_generation != ownership_generation:
-            raise PermissionError("canonical execution ownership generation changed during terminal reconciliation")
-        if target_receipt.get("controller_id") != controller_id:
-            raise PermissionError("terminal reconciliation target does not belong to the registered Controller")
-        if target_receipt.get("execution_target_session_id") != locked_target:
-            raise PermissionError("canonical execution ownership does not match terminal reconciliation target")
-        if target_receipt.get("host") != locked_host:
-            raise PermissionError("canonical execution ownership host does not match terminal reconciliation target")
-        target_generation = int(target_receipt.get("generation", 0) or 0)
-        if target_generation != locked_generation:
-            raise PermissionError(
-                "canonical target generation does not match execution ownership generation"
-            )
-        return {
-            "execution_host": locked_host,
-            "execution_target_session_id": locked_target,
-            "target_generation": target_generation,
-            "ownership_generation": locked_generation,
-        }
+    return {
+        "execution_host": ownership_host,
+        "execution_target_session_id": ownership_target,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+    }
 
 
 def _terminal_receipt_from_bytes(path: Path, payload: bytes) -> dict[str, Any]:
@@ -271,96 +269,101 @@ def reconcile_pending_terminal_receipts(
     controller_repo = Path(registered_repo).expanduser().resolve()
 
     lifecycle_state_path = lifecycle.state_path(controller_id)
-    initial_state = lifecycle.load_json(lifecycle_state_path)
-    pending_paths = _normalized_pending_terminal_paths(initial_state)
-    initial_fence = _terminal_reconcile_execution_fence(
-        repo=controller_repo, registry_path=registry_path, controller_id=controller_id
-    )
+    lifecycle_lock_path = lifecycle_state_path.with_suffix(lifecycle_state_path.suffix + ".lock")
+    registry_lock_path = web_bridge.target_guard.registry_lock_path(registry_path)
+    lifecycle_lock_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    receipts: list[dict[str, Any]] = []
-    fingerprint_items: list[str] = []
-    for raw_path in pending_paths:
-        receipt_path = Path(raw_path).expanduser().resolve()
-        payload = receipt_path.read_bytes()
-        receipt = _terminal_receipt_from_bytes(receipt_path, payload)
-        receipt_repo = str(receipt.get("repo") or "").strip()
-        if not receipt_repo:
-            raise ValueError("terminal receipt repository identity is required")
+    with lifecycle_lock_path.open("a+") as lifecycle_lock:
+        fcntl.flock(lifecycle_lock.fileno(), fcntl.LOCK_SH)
         try:
-            if web_bridge._git_common_dir(Path(receipt_repo).expanduser().resolve()) != web_bridge._git_common_dir(controller_repo):
-                raise PermissionError("terminal receipt repository does not match continuation repository")
-        except Exception as exc:
-            if isinstance(exc, PermissionError):
-                raise
-            raise ValueError(f"cannot verify terminal receipt repository: {exc}") from exc
-        assignment_id = str(receipt.get("assignment_id") or "").strip()
-        verification_state = "verified_legacy_unbound"
-        verification_error = None
-        action_suggestion = "executed"
-        if assignment_id:
-            try:
-                _verify_assignment_bound_receipt(controller_repo, receipt)
-            except PermissionError as exc:
-                verification_state = "legacy_unverifiable"
-                verification_error = str(exc)
-                action_suggestion = "blocked"
-            else:
-                verification_state = "verified_current"
-        digest = hashlib.sha256(payload).hexdigest()
-        fingerprint_items.append(f"{receipt_path}:{digest}:{verification_state}")
-        receipts.append({
-            "path": str(receipt_path),
-            "sha256": digest,
-            "assignment_id": assignment_id or None,
-            "task_id": str(receipt.get("task_id") or "").strip() or None,
-            "agent_id": str(receipt.get("agent_id") or "").strip() or None,
-            "session_id": str(receipt.get("session_id") or "").strip() or None,
-            "attempt": receipt.get("attempt"),
-            "lease_id": str(receipt.get("lease_id") or "").strip() or None,
-            "delivery_outcome": str(receipt.get("delivery_outcome") or "").strip() or None,
-            "exit_code": receipt.get("exit_code"),
-            "summary": str(receipt.get("summary") or "")[:4000],
-            "result_path": str(receipt.get("result_path") or "").strip() or None,
-            "review_verdict": receipt.get("review_verdict") if isinstance(receipt.get("review_verdict"), dict) else None,
-            "verification_state": verification_state,
-            "verification_error": verification_error,
-            "action_suggestion": action_suggestion,
-        })
+            with registry_lock_path.open("a+") as registry_lock:
+                fcntl.flock(registry_lock.fileno(), fcntl.LOCK_SH)
+                try:
+                    state = lifecycle.load_json(lifecycle_state_path)
+                    pending_paths = _normalized_pending_terminal_paths(state)
+                    fence = _terminal_reconcile_execution_fence_locked(
+                        repo=controller_repo, registry_path=registry_path, controller_id=controller_id
+                    )
 
-    final_state = lifecycle.load_json(lifecycle_state_path)
-    final_pending_paths = _normalized_pending_terminal_paths(final_state)
-    if final_pending_paths != pending_paths:
-        raise PermissionError("pending terminal receipt set changed during reconciliation")
-    final_fence = _terminal_reconcile_execution_fence(
-        repo=controller_repo, registry_path=registry_path, controller_id=controller_id
-    )
-    if final_fence != initial_fence:
-        raise PermissionError("terminal reconciliation execution fence changed before audit publication")
+                    receipts: list[dict[str, Any]] = []
+                    fingerprint_items: list[str] = []
+                    for raw_path in pending_paths:
+                        receipt_path = Path(raw_path).expanduser().resolve()
+                        payload = receipt_path.read_bytes()
+                        receipt = _terminal_receipt_from_bytes(receipt_path, payload)
+                        receipt_repo = str(receipt.get("repo") or "").strip()
+                        if not receipt_repo:
+                            raise ValueError("terminal receipt repository identity is required")
+                        try:
+                            if web_bridge._git_common_dir(Path(receipt_repo).expanduser().resolve()) != web_bridge._git_common_dir(controller_repo):
+                                raise PermissionError("terminal receipt repository does not match continuation repository")
+                        except Exception as exc:
+                            if isinstance(exc, PermissionError):
+                                raise
+                            raise ValueError(f"cannot verify terminal receipt repository: {exc}") from exc
+                        assignment_id = str(receipt.get("assignment_id") or "").strip()
+                        verification_state = "verified_legacy_unbound"
+                        verification_error = None
+                        action_suggestion = "executed"
+                        if assignment_id:
+                            try:
+                                _verify_assignment_bound_receipt(controller_repo, receipt)
+                            except PermissionError as exc:
+                                verification_state = "legacy_unverifiable"
+                                verification_error = str(exc)
+                                action_suggestion = "blocked"
+                            else:
+                                verification_state = "verified_current"
+                        digest = hashlib.sha256(payload).hexdigest()
+                        fingerprint_items.append(f"{receipt_path}:{digest}:{verification_state}")
+                        receipts.append({
+                            "path": str(receipt_path),
+                            "sha256": digest,
+                            "assignment_id": assignment_id or None,
+                            "task_id": str(receipt.get("task_id") or "").strip() or None,
+                            "agent_id": str(receipt.get("agent_id") or "").strip() or None,
+                            "session_id": str(receipt.get("session_id") or "").strip() or None,
+                            "attempt": receipt.get("attempt"),
+                            "lease_id": str(receipt.get("lease_id") or "").strip() or None,
+                            "delivery_outcome": str(receipt.get("delivery_outcome") or "").strip() or None,
+                            "exit_code": receipt.get("exit_code"),
+                            "summary": str(receipt.get("summary") or "")[:4000],
+                            "result_path": str(receipt.get("result_path") or "").strip() or None,
+                            "review_verdict": receipt.get("review_verdict") if isinstance(receipt.get("review_verdict"), dict) else None,
+                            "verification_state": verification_state,
+                            "verification_error": verification_error,
+                            "action_suggestion": action_suggestion,
+                        })
 
-    fingerprint_source = "\n".join([
-        controller_id,
-        initial_fence["execution_host"],
-        initial_fence["execution_target_session_id"],
-        str(initial_fence["target_generation"]),
-        str(initial_fence["ownership_generation"]),
-        *fingerprint_items,
-    ])
-    reconcile_fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
-    result = {
-        "schema_version": 1,
-        "operation": "reconcile_pending_terminal_receipts",
-        "controller_id": controller_id,
-        "repo": str(controller_repo),
-        "pending_count": len(receipts),
-        "receipts": receipts,
-        **initial_fence,
-        "reconcile_fingerprint": reconcile_fingerprint,
-        "clears_lifecycle_debt": False,
-        "close_condition": "successful control-cycle receipt",
-    }
-    audit_path = web_bridge._git_common_dir(controller_repo) / "adaptive-delivery" / "terminal-reconcile.json"
-    _write_json_atomic(audit_path, result)
-    return {**result, "audit_path": str(audit_path)}
+                    fingerprint_source = "\n".join([
+                        controller_id,
+                        fence["execution_host"],
+                        fence["execution_target_session_id"],
+                        str(fence["target_generation"]),
+                        str(fence["ownership_generation"]),
+                        *sorted(fingerprint_items),
+                    ])
+                    reconcile_fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+                    result = {
+                        "schema_version": 1,
+                        "operation": "reconcile_pending_terminal_receipts",
+                        "controller_id": controller_id,
+                        "repo": str(controller_repo),
+                        "pending_count": len(receipts),
+                        "receipts": receipts,
+                        **fence,
+                        "reconcile_fingerprint": reconcile_fingerprint,
+                        "clears_lifecycle_debt": False,
+                        "close_condition": "successful control-cycle receipt",
+                    }
+                    audit_path = web_bridge._git_common_dir(controller_repo) / "adaptive-delivery" / "terminal-reconcile.json"
+                    _write_json_atomic(audit_path, result)
+                    return {**result, "audit_path": str(audit_path)}
+                finally:
+                    fcntl.flock(registry_lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            fcntl.flock(lifecycle_lock.fileno(), fcntl.LOCK_UN)
 
 
 def notify_runtime_change(

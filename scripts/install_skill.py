@@ -171,6 +171,12 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_reconcile_pending_rejects_target_generation_change_before_publish",
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
     "test_reconcile_pending_hashes_same_bytes_it_parses",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_reconcile_pending_holds_lifecycle_and_registry_fences_through_audit",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_reconcile_pending_fingerprint_is_order_independent",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_atomic_audit_writer_handles_concurrent_publication",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
     "test_regression_parent_already_yielded_then_writer_completed_wakes_same_controller_with_next_runnable",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
