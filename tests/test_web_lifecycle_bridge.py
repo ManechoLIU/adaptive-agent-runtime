@@ -1311,6 +1311,34 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertIn("ownership generation", result.stderr)
             self.assertEqual(json.loads(registry.read_text()), original)
 
+    def test_unbind_web_session_rejects_session_outside_controller_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-current", "generation": 4,
+                    "provenance": "manual_user_authorized", "binding_mode": "temporary", "host_attested": False,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-current", "generation": 1,
+                    "provenance": "manual_user_authorized",
+                }},
+            }), encoding="utf-8")
+            result = self.run_bridge(
+                "unbind-web-session", "--repo", str(repo), "--controller-id", "controller-1",
+                "--web-session-id", "web-unknown", "--expected-generation", "4",
+                "--expected-ownership-generation", "1", "--registry", str(registry),
+            )
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("lineage", result.stderr)
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["session_id"], "web-current")
+
     def test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -404,6 +404,19 @@ def unbind_web_session(
             _reject_cross_controller_web_owner(
                 registry=registry, controller_id=controller_id, web_session_id=web_session_id
             )
+            sessions = registry.get("__controller_sessions__")
+            controller_sessions = sessions.get(controller_id) if isinstance(sessions, dict) else None
+            web_sessions = controller_sessions.get("web") if isinstance(controller_sessions, dict) else None
+            if isinstance(web_sessions, str):
+                web_sessions = [web_sessions]
+            aliases = {
+                value.strip() for value in (web_sessions or [])
+                if isinstance(value, str) and value.strip()
+            }
+            if web_session_id not in aliases:
+                raise PermissionError(
+                    "Web session unbind requires the session to belong to this Controller lineage"
+                )
             targets = registry.get("__controller_targets__")
             if targets is None:
                 targets = {}
