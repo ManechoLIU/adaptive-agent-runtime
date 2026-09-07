@@ -174,6 +174,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
     "test_reconcile_pending_holds_lifecycle_and_registry_fences_through_audit",
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_reconcile_pending_holds_runtime_assignment_fence_through_audit",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
     "test_reconcile_pending_fingerprint_is_order_independent",
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
     "test_atomic_audit_writer_handles_concurrent_publication",

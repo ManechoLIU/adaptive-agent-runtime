@@ -766,6 +766,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_reconcile_pending_rejects_target_generation_change_before_publish(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_hashes_same_bytes_it_parses(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_holds_lifecycle_and_registry_fences_through_audit(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_holds_runtime_assignment_fence_through_audit(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_fingerprint_is_order_independent(self): self.assertTrue(True)\n"
                 "    def test_atomic_audit_writer_handles_concurrent_publication(self): self.assertTrue(True)\n",
                 encoding="utf-8",
@@ -1044,6 +1045,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_reconcile_pending_rejects_target_generation_change_before_publish(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_hashes_same_bytes_it_parses(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_holds_lifecycle_and_registry_fences_through_audit(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_holds_runtime_assignment_fence_through_audit(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_fingerprint_is_order_independent(self): self.assertTrue(True)\n"
                 "    def test_atomic_audit_writer_handles_concurrent_publication(self): self.assertTrue(True)\n",
                 encoding="utf-8",

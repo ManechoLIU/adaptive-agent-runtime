@@ -567,3 +567,71 @@ def _atomic_audit_writer_handles_concurrent_publication(self):
 PendingTerminalReconcileTests.test_reconcile_pending_holds_lifecycle_and_registry_fences_through_audit = _pending_reconcile_holds_fences_through_audit
 PendingTerminalReconcileTests.test_reconcile_pending_fingerprint_is_order_independent = _pending_reconcile_fingerprint_is_order_independent
 PendingTerminalReconcileTests.test_atomic_audit_writer_handles_concurrent_publication = _atomic_audit_writer_handles_concurrent_publication
+
+def _pending_reconcile_holds_runtime_assignment_fence_through_audit(self):
+    import fcntl
+    module = self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo = root / 'repo'
+        repo.mkdir()
+        subprocess.run(['git', 'init', '-q', '-b', 'main', str(repo)], check=True)
+        registry = root / 'controllers.json'
+        registry.write_text(json.dumps(_ownership_registry(repo)), encoding='utf-8')
+        receipt = root / 'terminal.json'
+        receipt.write_text(json.dumps({
+            'event_type': 'external_agent_terminal',
+            'repo': str(repo.resolve()),
+            'assignment_id': 'A-1',
+            'task_id': 'T-1',
+            'agent_id': 'agent-1',
+            'session_id': 'session-1',
+            'attempt': 1,
+            'lease_id': 'lease-1',
+            'summary': 'done',
+            'delivery_outcome': 'pass',
+        }), encoding='utf-8')
+        state_dir = repo / '.git' / 'adaptive-delivery'
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / 'runtime-assignments.json').write_text(json.dumps({
+            'schema_version': 2,
+            'leases': {
+                'A-1': {
+                    'assignment_id': 'A-1',
+                    'task_id': 'T-1',
+                    'agent_id': 'agent-1',
+                    'session_id': 'session-1',
+                    'attempt': 1,
+                    'lease_id': 'lease-1',
+                    'terminal_state': 'completed',
+                    'delivery_outcome': 'pass',
+                }
+            },
+            'lineages': {},
+        }), encoding='utf-8')
+        runtime_lock = state_dir / 'runtime-assignments.lock'
+        state_path = root / 'controller.json'
+        state_path.write_text(json.dumps({'pending_terminal_receipts': [str(receipt)]}), encoding='utf-8')
+        observed = []
+        original_write = module._write_json_atomic
+
+        def inspect_write(path, value):
+            runtime_lock.parent.mkdir(parents=True, exist_ok=True)
+            with runtime_lock.open('a+') as handle:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    observed.append('blocked')
+                else:
+                    observed.append('unexpectedly_unlocked')
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return original_write(path, value)
+
+        with patch.object(module.lifecycle, 'state_path', return_value=state_path), patch.object(
+            module, '_write_json_atomic', side_effect=inspect_write
+        ):
+            result = module.reconcile_pending_terminal_receipts(repo=repo, registry_path=registry)
+        self.assertEqual(result['receipts'][0]['verification_state'], 'verified_current')
+        self.assertEqual(observed, ['blocked'])
+
+PendingTerminalReconcileTests.test_reconcile_pending_holds_runtime_assignment_fence_through_audit = _pending_reconcile_holds_runtime_assignment_fence_through_audit
