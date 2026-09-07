@@ -1843,6 +1843,52 @@ class WebLifecycleAuditTests(unittest.TestCase):
             self.assertEqual(schedule.call_args.kwargs["receipt_id"], "pending-click-1")
             self.assertEqual(schedule.call_args.kwargs["session_id"], "controller-1")
 
+    def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-old", "web-current"]}
+                },
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "explicit current execution target"):
+                web_bridge.canonical_rule_wake_target(
+                    lifecycle_state={"controller_host": "desktop_codex"},
+                    session_id="controller-1", repo=repo, registry=registry,
+                )
+
+    def test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-stale"]}},
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-stale", "generation": 2,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only",
+                    "host_identity_receipt_sha256": "deadbeef",
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-stale",
+                    "generation": 2, "provenance": "web_entry",
+                }},
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "trusted Host origin"):
+                web_bridge.canonical_rule_wake_target(
+                    lifecycle_state={"controller_host": "web"},
+                    session_id="controller-1", repo=repo, registry=registry,
+                )
+
     def test_rule_wake_schedule_immediate_is_ready_now(self) -> None:
         decision = web_bridge.rule_wake_schedule_decision({
             "rule_wake_policy": "immediate",

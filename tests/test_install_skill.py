@@ -740,6 +740,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             (tests_dir / "test_web_agent_health_supervisor.py").write_text(
                 "import unittest\n"
                 "class WebAgentHealthSupervisorTests(unittest.TestCase):\n"
+                "    def test_global_health_cycle_refreshes_and_schedules_immediate_rule_update_for_registered_controller(self): self.assertTrue(True)\n"
+                "    def test_global_health_cycle_does_not_schedule_rule_update_without_explicit_current_target(self): self.assertTrue(True)\n"
                 "    def test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message(self): self.assertTrue(True)\n"
                 "    def test_canonical_runnable_reopens_continuation_without_user_message(self): self.assertTrue(True)\n"
                 "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n"
@@ -787,6 +789,9 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
             (tests_dir / "test_web_lifecycle_bridge.py").write_text(
                 "import unittest\n"
+                "class WebLifecycleAuditTests(unittest.TestCase):\n"
+                "    def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self): self.assertTrue(True)\n"
+                "    def test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
@@ -997,6 +1002,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             (tests_dir / "test_web_agent_health_supervisor.py").write_text(
                 "import unittest\n"
                 "class WebAgentHealthSupervisorTests(unittest.TestCase):\n"
+                "    def test_global_health_cycle_refreshes_and_schedules_immediate_rule_update_for_registered_controller(self): self.assertTrue(True)\n"
+                "    def test_global_health_cycle_does_not_schedule_rule_update_without_explicit_current_target(self): self.assertTrue(True)\n"
                 "    def test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message(self): self.assertTrue(True)\n"
                 "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n",
                 encoding="utf-8",
@@ -1036,6 +1043,9 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
             (tests_dir / "test_web_lifecycle_bridge.py").write_text(
                 "import unittest\n"
+                "class WebLifecycleAuditTests(unittest.TestCase):\n"
+                "    def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self): self.assertTrue(True)\n"
+                "    def test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"

@@ -138,6 +138,14 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_live_active_supervisor_does_not_need_duplicate_bootstrap",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
+    "test_global_health_cycle_refreshes_and_schedules_immediate_rule_update_for_registered_controller",
+    "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
+    "test_global_health_cycle_does_not_schedule_rule_update_without_explicit_current_target",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof",
+    "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_no_canonical_work_does_not_reopen_after_observation_only_turn",

@@ -126,6 +126,46 @@ def reconcile_web_agent_health_once(
     }
 
 
+def reconcile_registered_controller_rule_update_once(
+    *, repo: Path, registry: Path, controller_id: str, codex: str = "/opt/homebrew/bin/codex"
+) -> dict[str, Any]:
+    lifecycle_state = web_lifecycle_bridge.refresh_rule_wake_state(
+        session_id=controller_id, repo=repo
+    )
+    decision = web_lifecycle_bridge.rule_wake_schedule_decision(lifecycle_state)
+    if decision != "schedule_now":
+        return {"schedule": decision}
+    try:
+        target = web_lifecycle_bridge.canonical_rule_wake_target(
+            lifecycle_state=lifecycle_state,
+            session_id=controller_id,
+            repo=repo,
+            registry=registry,
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return {"schedule": "blocked", "reason": str(exc)}
+    schedule = web_lifecycle_bridge.maybe_schedule_rule_wake(
+        lifecycle_state=lifecycle_state,
+        session_id=controller_id,
+        repo=repo,
+        registry=registry,
+        codex=codex,
+        delay_seconds=1.0,
+        state_path=web_lifecycle_bridge.default_auto_stop_state_path(controller_id),
+    )
+    return {
+        "schedule": schedule,
+        "host": target.get("host"),
+        "execution_target_session_id": target.get("execution_target_session_id"),
+        "target_generation": target.get("generation"),
+        **(
+            {"ownership_generation": target.get("ownership_generation")}
+            if target.get("ownership_generation") is not None
+            else {}
+        ),
+    }
+
+
 def reconcile_all_web_agent_health_once(
     *,
     registry_path: str | Path = DEFAULT_REGISTRY,
@@ -155,13 +195,17 @@ def reconcile_all_web_agent_health_once(
                 != controller_id
             ):
                 continue
-            results.append(reconcile_web_agent_health_once(
+            health_result = reconcile_web_agent_health_once(
                 repo=repo,
                 registry_path=registry,
                 controller_id=controller_id,
                 event_paths=None if machine_event_source_ready(path=event_source_path, now=now) else [],
                 now=now,
-            ))
+            )
+            rule_wake = reconcile_registered_controller_rule_update_once(
+                repo=repo, registry=registry, controller_id=controller_id
+            )
+            results.append({**health_result, "rule_wake": rule_wake})
         except (OSError, ValueError, PermissionError, RuntimeError):
             # Canonical state remains durable; a later KeepAlive cycle retries.
             continue

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.assignment_runtime import load_runtime_state
+from scripts import web_lifecycle_bridge
 
 UTC = timezone.utc
 T0 = datetime(2026, 9, 4, 2, 0, tzinfo=UTC)
@@ -597,6 +598,56 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
         self.assertEqual(result["health"][0]["runtime_state"], "unhealthy")
         self.assertEqual(result["health"][0]["controller_id"], "controller-1")
         self.assertEqual(len(wakes), 1)
+
+    def test_global_health_cycle_refreshes_and_schedules_immediate_rule_update_for_registered_controller(self):
+        from unittest.mock import patch
+        from scripts.web_agent_health_supervisor import reconcile_all_web_agent_health_once
+
+        self.registry.write_text(json.dumps({"controller-1": str(self.repo)}), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True,
+            "rule_wake_policy": "immediate",
+            "triggers": ["rule_update_pending:rev-new"],
+            "snapshot": {"rule_handshake": {"installed_revision": "rev-new"}},
+        }
+        with patch.object(web_lifecycle_bridge, "refresh_rule_wake_state", return_value=lifecycle) as refresh, patch.object(
+            web_lifecycle_bridge, "maybe_schedule_rule_wake", return_value="scheduled"
+        ) as schedule, patch.object(
+            web_lifecycle_bridge, "canonical_rule_wake_target", return_value={
+                "host": "web", "execution_target_session_id": "web-current", "generation": 4
+            }
+        ) as target, patch(
+            "scripts.web_agent_health_supervisor.machine_event_source_ready", return_value=False
+        ):
+            results = reconcile_all_web_agent_health_once(registry_path=self.registry, now=T0)
+
+        refresh.assert_called_once_with(session_id="controller-1", repo=self.repo.resolve())
+        target.assert_called_once()
+        schedule.assert_called_once()
+        self.assertEqual(results[0]["rule_wake"]["schedule"], "scheduled")
+        self.assertEqual(results[0]["rule_wake"]["execution_target_session_id"], "web-current")
+
+    def test_global_health_cycle_does_not_schedule_rule_update_without_explicit_current_target(self):
+        from unittest.mock import patch
+        from scripts.web_agent_health_supervisor import reconcile_all_web_agent_health_once
+
+        self.registry.write_text(json.dumps({"controller-1": str(self.repo)}), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True,
+            "rule_wake_policy": "immediate",
+            "triggers": ["rule_update_pending:rev-new"],
+            "snapshot": {"rule_handshake": {"installed_revision": "rev-new"}},
+        }
+        with patch.object(web_lifecycle_bridge, "refresh_rule_wake_state", return_value=lifecycle), patch.object(
+            web_lifecycle_bridge, "canonical_rule_wake_target", side_effect=PermissionError("explicit current execution target required")
+        ), patch.object(web_lifecycle_bridge, "maybe_schedule_rule_wake") as schedule, patch(
+            "scripts.web_agent_health_supervisor.machine_event_source_ready", return_value=False
+        ):
+            results = reconcile_all_web_agent_health_once(registry_path=self.registry, now=T0)
+
+        schedule.assert_not_called()
+        self.assertEqual(results[0]["rule_wake"]["schedule"], "blocked")
+        self.assertIn("explicit current execution target", results[0]["rule_wake"]["reason"])
 
     def test_duplicate_terminal_observation_does_not_repeat_continuation_handoff(self):
         from scripts.web_agent_health_supervisor import reconcile_web_agent_health_once

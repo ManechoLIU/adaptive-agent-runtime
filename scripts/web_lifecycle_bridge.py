@@ -3340,6 +3340,51 @@ def resolve_controller_host(
     return "web"
 
 
+def canonical_rule_wake_target(
+    *, lifecycle_state: dict[str, Any], session_id: str, repo: Path, registry: Path
+) -> dict[str, Any]:
+    """Resolve only an explicit canonical current target for autonomous rule-update wake."""
+    registry_data = load_json(registry)
+    host = resolve_controller_host(lifecycle_state, {}, registry_data, session_id)
+    receipt = target_guard.resolve_execution_target(
+        repo=repo.resolve(), host=host, registry_path=registry
+    )
+    if receipt.get("controller_id") != session_id:
+        raise PermissionError("rule wake target does not belong to the registered Controller")
+    if receipt.get("target_mode") != "explicit_current":
+        raise PermissionError(
+            "explicit current execution target required for autonomous rule-update wake"
+        )
+    target = target_guard.target_record(
+        registry_data, controller_id=session_id, host=host
+    )
+    if (
+        host == "web"
+        and isinstance(target, dict)
+        and target.get("provenance") == "host_attested_same_controller_recovery"
+        and target.get("identity_proof") != "host_attested_origin"
+    ):
+        raise PermissionError(
+            "autonomous rule-update wake requires trusted Host origin proof for legacy Web recovery targets"
+        )
+    ownership = target_guard.execution_ownership_record(
+        registry_data, controller_id=session_id
+    )
+    if ownership is not None:
+        ownership_host, ownership_target, ownership_generation = (
+            target_guard.validate_execution_ownership_record(ownership)
+        )
+        if (
+            ownership_host != host
+            or ownership_target != receipt.get("execution_target_session_id")
+        ):
+            raise PermissionError(
+                "canonical execution ownership does not match the rule wake target"
+            )
+        receipt = {**receipt, "ownership_generation": ownership_generation}
+    return receipt
+
+
 def wake_receipt_confirmed(receipt: dict[str, Any] | None) -> bool:
     return isinstance(receipt, dict) and receipt.get("result") == "CONFIRMED"
 
