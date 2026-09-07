@@ -1,4 +1,5 @@
 import json
+import hashlib
 import signal
 import subprocess
 import time
@@ -570,12 +571,19 @@ class ReviewerSupervisorWebHandoffTests(unittest.TestCase):
         state = json.loads(pending.state_path.read_text())
         assignment_id = state["review_request"]["assignment_id"]
         verdict = {"reviewed_head": head, "verdict": "PASS", "critical": [], "important": [], "minor": []}
+        policy = Path(tempfile.mkdtemp()) / "AGENTS.md"
+        policy.write_text("后端默认 provider=grok-build、model=grok-4.6、auth_mode=oauth。\n", encoding="utf-8")
+        route = {
+            "decision": "default", "policy_class": "backend",
+            "provider": "grok-build", "model": "grok-4.6", "auth_mode": "oauth",
+            "policy_source": {"path": str(policy), "sha256": hashlib.sha256(policy.read_bytes()).hexdigest()},
+        }
         save_runtime_state(repo, {
             "schema_version": 2, "lineages": {}, "leases": {assignment_id: {
                 "assignment_id": assignment_id, "task_id": assignment_id,
                 "execution_transport": "external_process", "execution_role": "reviewer",
                 "provider": "grok-build", "model": "grok-4.6", "auth_mode": "oauth",
-                "route_contract": {"provider": "grok-build", "model": "grok-4.6", "auth_mode": "oauth"},
+                "route_contract": route,
                 "candidate_revision": head, "terminal_state": "completed",
                 "delivery_outcome": "pass", "review_verdict": verdict,
             }}
@@ -605,6 +613,7 @@ class ReviewerSupervisorWebHandoffTests(unittest.TestCase):
             (None, None, None, None),
             ("other-provider", "other-model", "oauth", {"provider": "other-provider", "model": "other-model", "auth_mode": "oauth"}),
             ("grok-build", "grok-4.6", "oauth", None),
+            ("grok-build", "grok-4.6", "oauth", {"provider": "grok-build", "model": "grok-4.6", "auth_mode": "oauth"}),
             ("kimi-code", "wrong-model", "api", {"provider": "kimi-code", "model": "wrong-model", "auth_mode": "api"}),
         ]:
             lease = {

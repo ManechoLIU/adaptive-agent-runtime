@@ -653,8 +653,24 @@ def finalize_web_review(repo: Path, run_id: str) -> ReviewRunResult:
             and str(route.get("model") or "").strip() == model
             and str(route.get("auth_mode") or "").strip() == auth_mode
         )
-        if not supported or not route_matches:
-            raise ValueError("canonical Assignment is not a supported canonical external reviewer route")
+        if supported and route_matches:
+            try:
+                from scripts.route_contract import delegated_route_contract_errors
+            except ModuleNotFoundError:
+                from route_contract import delegated_route_contract_errors
+            route_errors = delegated_route_contract_errors(
+                str(lease.get("task_id") or assignment_id),
+                lease.get("owned_scope") or [],
+                route,
+                runtime_repo=repo,
+            )
+        else:
+            route_errors = ["unsupported external reviewer provider/model/auth route"]
+        if route_errors:
+            raise ValueError(
+                "canonical Assignment is not a supported canonical external reviewer route: "
+                + "; ".join(route_errors)
+            )
     if str(lease.get("candidate_revision") or "") != expected_head:
         raise ValueError("canonical Web reviewer candidate revision mismatch")
     if str(lease.get("terminal_state") or "") != "completed":
