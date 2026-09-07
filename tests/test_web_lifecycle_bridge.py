@@ -1030,6 +1030,196 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertFalse(recovered["resume_lease_rotated"])
             self.assertFalse(lease.exists())
 
+    def test_replace_web_session_bootstrap_rotates_target_and_manual_lease_without_host_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "__controller_sessions__": {"controller-1": {"web": ["web-old", "web-new"]}},
+            }), encoding="utf-8")
+            lease = root / "manual-web-leases.json"
+            lease.write_text(json.dumps({
+                "schema_version": 1,
+                "leases": {"controller-1": {
+                    "repo": str(repo.resolve()), "controller_id": "controller-1",
+                    "web_session_id": "web-old", "authorized_at_unix": 10,
+                    "expires_at_unix": 4102444800,
+                    "provenance": "manual_user_authorized", "mode": "resume_only",
+                }},
+            }), encoding="utf-8")
+
+            result = self.run_bridge(
+                "replace-web-session", "--repo", str(repo),
+                "--controller-id", "controller-1", "--web-session-id", "web-new",
+                "--expected-generation", "0", "--registry", str(registry),
+                "--lease-file", str(lease),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            receipt = json.loads(result.stdout)
+            self.assertEqual(receipt["controller_id"], "controller-1")
+            self.assertEqual(receipt["execution_target_session_id"], "web-new")
+            self.assertEqual(receipt["generation"], 1)
+            self.assertEqual(receipt["binding"], "temporary")
+            self.assertFalse(receipt["host_attested"])
+            self.assertTrue(receipt["resume_lease_rotated"])
+            saved = json.loads(registry.read_text())
+            self.assertEqual(saved["__controller_sessions__"]["controller-1"]["web"], ["web-old", "web-new"])
+            target = saved["__controller_targets__"]["controller-1"]["web"]
+            self.assertEqual(target["session_id"], "web-new")
+            self.assertEqual(target["generation"], 1)
+            self.assertEqual(target["provenance"], "manual_user_authorized")
+            self.assertFalse(target["host_attested"])
+            rotated = json.loads(lease.read_text())["leases"]["controller-1"]
+            self.assertEqual(rotated["web_session_id"], "web-new")
+            self.assertEqual(rotated["authorized_at_unix"], 10)
+            self.assertEqual(rotated["expires_at_unix"], 4102444800)
+            self.assertEqual(rotated["provenance"], "manual_user_authorized")
+            self.assertEqual(rotated["mode"], "resume_only")
+            self.assertIn("rotated_at_unix", rotated)
+
+            resolved = web_bridge.target_guard.resolve_execution_target(
+                repo=repo, host="web", registry_path=registry
+            )
+            self.assertEqual(resolved["execution_target_session_id"], "web-new")
+            self.assertEqual(resolved["generation"], 1)
+            with self.assertRaises(PermissionError):
+                web_bridge.target_guard.check_execution_target(
+                    repo=repo, host="web", action="message", target_session_id="web-old",
+                    registry_path=registry,
+                )
+            identity = web_bridge.target_guard.controller_identity_projection(
+                repo=repo, host="web", source_session_id="web-new", registry_path=registry
+            )
+            self.assertEqual(identity["session_binding_state"]["verification"], "UNVERIFIED")
+            self.assertEqual(identity["session_binding_state"]["binding_mode"], "temporary")
+            self.assertEqual(identity["session_binding_state"]["provenance"], "manual_user_authorized")
+            self.assertFalse(identity["session_binding_state"]["host_attested"])
+            self.assertFalse(identity["controller_actions_allowed"])
+            with self.assertRaises(PermissionError):
+                web_bridge.require_web_controller_session(
+                    controller_id="controller-1", web_session_id="web-new", registry_path=registry
+                )
+
+    def test_replace_web_session_rejects_foreign_session_repo_mismatch_and_active_outbound_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir(); other = root / "other"; other.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo), "controller-2": str(other),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-old", "web-new"]},
+                    "controller-2": {"web": ["web-foreign"]},
+                },
+            }), encoding="utf-8")
+            lease = root / "manual.json"
+            foreign = self.run_bridge(
+                "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
+                "--web-session-id", "web-foreign", "--expected-generation", "0",
+                "--registry", str(registry), "--lease-file", str(lease),
+            )
+            self.assertEqual(foreign.returncode, 78)
+            mismatch = self.run_bridge(
+                "replace-web-session", "--repo", str(other), "--controller-id", "controller-1",
+                "--web-session-id", "web-new", "--expected-generation", "0",
+                "--registry", str(registry), "--lease-file", str(lease),
+            )
+            self.assertEqual(mismatch.returncode, 78)
+
+            data = json.loads(registry.read_text())
+            data["__controller_outbound_leases__"] = {
+                "controller-1": {"web": {"tool-1": {
+                    "action": "message", "target_session_id": "web-old", "generation": 0,
+                }}}
+            }
+            registry.write_text(json.dumps(data), encoding="utf-8")
+            blocked = self.run_bridge(
+                "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
+                "--web-session-id", "web-new", "--expected-generation", "0",
+                "--registry", str(registry), "--lease-file", str(lease),
+            )
+            self.assertEqual(blocked.returncode, 78)
+            self.assertIn("outbound", blocked.stderr.lower())
+
+    def test_replace_web_session_rejects_unapproved_session_and_stale_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "__controller_sessions__": {"controller-1": {"web": ["web-old", "web-approved"]}},
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-old", "generation": 3,
+                    "provenance": "manual_user_authorized", "binding_mode": "temporary", "host_attested": False,
+                }}},
+            }), encoding="utf-8")
+            lease = root / "manual.json"
+            unapproved = self.run_bridge(
+                "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
+                "--web-session-id", "web-unapproved", "--expected-generation", "3",
+                "--registry", str(registry), "--lease-file", str(lease),
+            )
+            self.assertEqual(unapproved.returncode, 78)
+            self.assertIn("lineage", unapproved.stderr)
+            stale = self.run_bridge(
+                "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
+                "--web-session-id", "web-approved", "--expected-generation", "2",
+                "--registry", str(registry), "--lease-file", str(lease),
+            )
+            self.assertEqual(stale.returncode, 78)
+            self.assertIn("generation", stale.stderr)
+            current = web_bridge.target_guard.resolve_execution_target(
+                repo=repo, host="web", registry_path=registry
+            )
+            self.assertEqual(current["execution_target_session_id"], "web-old")
+            self.assertEqual(current["generation"], 3)
+
+    def test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "__controller_sessions__": {"controller-1": {"web": ["web-old", "web-current"]}},
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-current", "generation": 4,
+                    "provenance": "manual_user_authorized", "binding_mode": "temporary", "host_attested": False,
+                }}},
+            }), encoding="utf-8")
+            lease = root / "manual.json"
+            same = self.run_bridge(
+                "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
+                "--web-session-id", "web-current", "--expected-generation", "4",
+                "--registry", str(registry), "--lease-file", str(lease),
+            )
+            self.assertEqual(same.returncode, 0, same.stderr)
+            self.assertEqual(json.loads(same.stdout)["generation"], 4)
+
+            unbound = self.run_bridge(
+                "unbind-web-session", "--repo", str(repo), "--controller-id", "controller-1",
+                "--web-session-id", "web-current", "--expected-generation", "4",
+                "--registry", str(registry),
+            )
+            self.assertEqual(unbound.returncode, 0, unbound.stderr)
+            saved = json.loads(registry.read_text())
+            self.assertEqual(saved["__controller_sessions__"]["controller-1"]["web"], ["web-old", "web-current"])
+            target = saved["__controller_targets__"]["controller-1"]["web"]
+            self.assertEqual(target, {"status": "unbound", "session_id": None, "generation": 5,
+                                      "provenance": "manual_user_authorized", "binding_mode": "temporary",
+                                      "host_attested": False})
+            with self.assertRaises(PermissionError):
+                web_bridge.target_guard.resolve_execution_target(repo=repo, host="web", registry_path=registry)
+
     def test_bind_web_session_cli_refuses_session_already_bound_to_other_controller(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

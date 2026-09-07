@@ -394,13 +394,22 @@ def controller_identity_projection(
                     if status == "active" and target == supplied_session:
                         if (
                             host == "web"
-                            and record.get("provenance")
-                            == "host_attested_same_controller_recovery"
-                            and record.get("identity_proof")
-                            != "host_attested_origin"
+                            and (
+                                record.get("host_attested") is False
+                                or (
+                                    record.get("provenance")
+                                    == "host_attested_same_controller_recovery"
+                                    and record.get("identity_proof")
+                                    != "host_attested_origin"
+                                )
+                            )
                         ):
                             verification = "UNVERIFIED"
-                            reason = "HOST_IDENTITY_UNAVAILABLE"
+                            reason = (
+                                "MANUAL_BOOTSTRAP_NOT_HOST_ATTESTED"
+                                if record.get("host_attested") is False
+                                else "HOST_IDENTITY_UNAVAILABLE"
+                            )
                             mode = str(
                                 record.get("binding_mode") or "explicit_current"
                             )
@@ -423,9 +432,14 @@ def controller_identity_projection(
 
                 verified = verification == "VERIFIED"
                 recoverable = verification in {"UNVERIFIED", "STALE"}
+                current_record_for_session = (
+                    isinstance(record, dict)
+                    and str(record.get("status") or "") == "active"
+                    and str(record.get("session_id") or "").strip() == supplied_session
+                )
                 target_provenance = (
                     str(record.get("provenance") or "controller_registry")
-                    if isinstance(record, dict) and verification == "VERIFIED"
+                    if current_record_for_session
                     else "controller_registry"
                 )
                 binding = {
@@ -446,6 +460,8 @@ def controller_identity_projection(
                     ),
                     "same_controller_recovery_allowed": recoverable,
                 }
+                if current_record_for_session and "host_attested" in record:
+                    binding["host_attested"] = bool(record.get("host_attested"))
                 if (
                     isinstance(record, dict)
                     and verification == "VERIFIED"

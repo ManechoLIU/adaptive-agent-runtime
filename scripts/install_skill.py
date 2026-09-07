@@ -76,6 +76,12 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_browser_tab_receipt_cannot_recover_an_unverified_web_session",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_replace_web_session_bootstrap_rotates_target_and_manual_lease_without_host_attestation",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_replace_web_session_rejects_unapproved_session_and_stale_generation",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim",

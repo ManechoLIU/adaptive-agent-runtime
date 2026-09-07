@@ -167,6 +167,239 @@ def bind_web_session_to_controller(
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def _web_target_generation(record: object) -> int:
+    if record is None:
+        return 0
+    if not isinstance(record, dict):
+        raise ValueError("web Controller target record is invalid")
+    try:
+        _status, _session_id, generation = target_guard.validate_target_record(record, host="web")
+    except PermissionError as exc:
+        raise ValueError(str(exc)) from exc
+    return generation
+
+
+def _require_expected_web_generation(record: object, *, expected_generation: int) -> int:
+    if isinstance(expected_generation, bool) or not isinstance(expected_generation, int) or expected_generation < 0:
+        raise ValueError("expected_generation must be a non-negative integer")
+    generation = _web_target_generation(record)
+    if generation != expected_generation:
+        raise PermissionError(
+            f"expected_generation {expected_generation} does not match current generation {generation}"
+        )
+    return generation
+
+
+def _reject_cross_controller_web_owner(
+    *, registry: dict[str, Any], controller_id: str, web_session_id: str
+) -> None:
+    owners = target_guard._session_owners(registry, session_id=web_session_id, host="web")
+    foreign = {owner for owner in owners if owner != controller_id}
+    if foreign:
+        raise PermissionError("Web Controller Session is already bound to another Controller")
+
+
+def replace_web_session(
+    *,
+    repo: Path,
+    controller_id: str,
+    web_session_id: str,
+    expected_generation: int,
+    registry_path: Path,
+    lease_path: Path | None = None,
+) -> dict[str, Any]:
+    repo = canonical_root(repo)
+    controller_id = controller_id.strip()
+    web_session_id = web_session_id.strip()
+    if not controller_id or not web_session_id:
+        raise ValueError("controller-id and web-session-id are required")
+    registry_path = registry_path.expanduser()
+    lease_path = Path(lease_path or DEFAULT_MANUAL_WEB_LEASES).expanduser()
+    lock_path = target_guard.registry_lock_path(registry_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            registered, registry = target_guard.registered_controller_for_repo(repo, registry_path)
+            if registered != controller_id:
+                raise PermissionError(
+                    "Web session replacement requires the existing unique registered Controller for this repository"
+                )
+            target_guard.require_no_active_outbound_lease(
+                registry, controller_id=controller_id, host="web"
+            )
+            _reject_cross_controller_web_owner(
+                registry=registry, controller_id=controller_id, web_session_id=web_session_id
+            )
+            sessions = registry.get("__controller_sessions__")
+            if not isinstance(sessions, dict):
+                sessions = {}
+            controller_sessions = sessions.get(controller_id)
+            if not isinstance(controller_sessions, dict):
+                controller_sessions = {}
+            web_sessions = controller_sessions.get("web")
+            if isinstance(web_sessions, str):
+                web_sessions = [web_sessions]
+            if not isinstance(web_sessions, list):
+                web_sessions = []
+            aliases = list(dict.fromkeys(
+                value.strip() for value in web_sessions if isinstance(value, str) and value.strip()
+            ))
+            if web_session_id not in aliases:
+                raise PermissionError(
+                    "Web session replacement requires the new session to already belong to this Controller lineage"
+                )
+
+            targets = registry.get("__controller_targets__")
+            if targets is None:
+                targets = {}
+            elif not isinstance(targets, dict):
+                raise ValueError("controller target registry is invalid")
+            controller_targets = targets.get(controller_id)
+            if controller_targets is None:
+                controller_targets = {}
+            elif not isinstance(controller_targets, dict):
+                raise ValueError("Controller target map is invalid")
+            prior = controller_targets.get("web")
+            current_generation = _require_expected_web_generation(
+                prior, expected_generation=expected_generation
+            )
+            if isinstance(prior, dict):
+                try:
+                    prior_status, prior_target, _prior_generation = target_guard.validate_target_record(
+                        prior, host="web"
+                    )
+                except PermissionError as exc:
+                    raise ValueError(str(exc)) from exc
+            else:
+                prior_status, prior_target = None, None
+            if prior_status == "active" and prior_target == web_session_id:
+                generation = current_generation
+                target = dict(prior)
+                idempotent = True
+            else:
+                generation = current_generation + 1
+                target = {
+                    "status": "active",
+                    "session_id": web_session_id,
+                    "generation": generation,
+                    "provenance": "manual_user_authorized",
+                    "binding_mode": "temporary",
+                    "host_attested": False,
+                }
+                controller_targets["web"] = target
+                targets[controller_id] = controller_targets
+                registry["__controller_targets__"] = targets
+                _write_json_atomic_file(registry_path, registry)
+                idempotent = False
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    resume_lease_rotated = rotate_existing_manual_web_resume_lease(
+        repo=repo,
+        controller_id=controller_id,
+        web_session_id=web_session_id,
+        lease_path=lease_path,
+    )
+    return {
+        "controller_id": controller_id,
+        "controller_session_id": controller_id,
+        "execution_target_session_id": web_session_id,
+        "host": "web",
+        "repo": str(repo.resolve()),
+        **target,
+        "binding": "temporary",
+        "host_attested": False,
+        "resume_lease_rotated": resume_lease_rotated,
+        "idempotent": idempotent,
+    }
+
+
+def unbind_web_session(
+    *,
+    repo: Path,
+    controller_id: str,
+    web_session_id: str,
+    expected_generation: int,
+    registry_path: Path,
+) -> dict[str, Any]:
+    repo = canonical_root(repo)
+    controller_id = controller_id.strip()
+    web_session_id = web_session_id.strip()
+    if not controller_id or not web_session_id:
+        raise ValueError("controller-id and web-session-id are required")
+    registry_path = registry_path.expanduser()
+    lock_path = target_guard.registry_lock_path(registry_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            registered, registry = target_guard.registered_controller_for_repo(repo, registry_path)
+            if registered != controller_id:
+                raise PermissionError(
+                    "Web session unbind requires the existing unique registered Controller for this repository"
+                )
+            target_guard.require_no_active_outbound_lease(
+                registry, controller_id=controller_id, host="web"
+            )
+            _reject_cross_controller_web_owner(
+                registry=registry, controller_id=controller_id, web_session_id=web_session_id
+            )
+            targets = registry.get("__controller_targets__")
+            if targets is None:
+                targets = {}
+            elif not isinstance(targets, dict):
+                raise ValueError("controller target registry is invalid")
+            controller_targets = targets.get(controller_id)
+            if controller_targets is None:
+                controller_targets = {}
+            elif not isinstance(controller_targets, dict):
+                raise ValueError("Controller target map is invalid")
+            prior = controller_targets.get("web")
+            generation = _require_expected_web_generation(
+                prior, expected_generation=expected_generation
+            )
+            current = None
+            provenance = "manual_user_authorized"
+            binding_mode = "temporary"
+            if isinstance(prior, dict):
+                status, current, _ = target_guard.validate_target_record(prior, host="web")
+                if status != "active":
+                    current = None
+                provenance = str(prior.get("provenance") or provenance)
+                binding_mode = str(prior.get("binding_mode") or binding_mode)
+            if current and current != web_session_id:
+                target = dict(prior)
+                idempotent = True
+            else:
+                target = {
+                    "status": "unbound",
+                    "session_id": None,
+                    "generation": generation + 1,
+                    "provenance": provenance,
+                    "binding_mode": binding_mode,
+                    "host_attested": False,
+                }
+                controller_targets["web"] = target
+                targets[controller_id] = controller_targets
+                registry["__controller_targets__"] = targets
+                _write_json_atomic_file(registry_path, registry)
+                idempotent = False
+            return {
+                "controller_id": controller_id,
+                "controller_session_id": controller_id,
+                "execution_target_session_id": target.get("session_id"),
+                "host": "web",
+                "repo": str(repo.resolve()),
+                **target,
+                "binding": "temporary",
+                "host_attested": False,
+                "idempotent": idempotent,
+            }
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def require_web_controller_session(
     *, controller_id: str, web_session_id: str | None, registry_path: Path
 ) -> str:
@@ -194,14 +427,15 @@ def require_web_controller_session(
             )
         )
     else:
-        verified = not (
-            record.get("provenance") == "host_attested_same_controller_recovery"
-            and record.get("identity_proof") != "host_attested_origin"
-        ) and (
-            target_guard.active_source_controller_id(
-                registry, source_session_id=value, host="web"
+        verified = (
+            record.get("host_attested") is not False
+            and not (
+                record.get("provenance") == "host_attested_same_controller_recovery"
+                and record.get("identity_proof") != "host_attested_origin"
             )
-            == controller_id
+            and target_guard.active_source_controller_id(
+                registry, source_session_id=value, host="web"
+            ) == controller_id
         )
     if not verified:
         raise PermissionError(
@@ -4191,6 +4425,21 @@ def build_parser() -> argparse.ArgumentParser:
     bind_web.add_argument("--web-session-id", required=True)
     bind_web.add_argument("--registry", default=str(DEFAULT_REGISTRY))
 
+    replace_web = subparsers.add_parser("replace-web-session")
+    replace_web.add_argument("--repo", required=True)
+    replace_web.add_argument("--controller-id", required=True)
+    replace_web.add_argument("--web-session-id", required=True)
+    replace_web.add_argument("--expected-generation", type=int, required=True)
+    replace_web.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    replace_web.add_argument("--lease-file", default=str(DEFAULT_MANUAL_WEB_LEASES))
+
+    unbind_web = subparsers.add_parser("unbind-web-session")
+    unbind_web.add_argument("--repo", required=True)
+    unbind_web.add_argument("--controller-id", required=True)
+    unbind_web.add_argument("--web-session-id", required=True)
+    unbind_web.add_argument("--expected-generation", type=int, required=True)
+    unbind_web.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+
     authorize_manual = subparsers.add_parser("authorize-manual-web-session")
     authorize_manual.add_argument("--repo", required=True)
     authorize_manual.add_argument("--controller-id", required=True)
@@ -4316,6 +4565,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             "web_session_id": args.web_session_id,
             "event_source": "web",
         }, ensure_ascii=False))
+        return 0
+
+    if args.command_name == "replace-web-session":
+        repo = canonical_root(args.repo)
+        registry_path = Path(args.registry).expanduser()
+        lease_path = Path(args.lease_file).expanduser()
+        try:
+            receipt = replace_web_session(
+                repo=repo, controller_id=args.controller_id, web_session_id=args.web_session_id,
+                expected_generation=args.expected_generation, registry_path=registry_path,
+                lease_path=lease_path,
+            )
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
+        except (OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.command_name == "unbind-web-session":
+        repo = canonical_root(args.repo)
+        registry_path = Path(args.registry).expanduser()
+        try:
+            receipt = unbind_web_session(
+                repo=repo, controller_id=args.controller_id, web_session_id=args.web_session_id,
+                expected_generation=args.expected_generation, registry_path=registry_path,
+            )
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
+        except (OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
         return 0
 
     if args.command_name == "authorize-manual-web-session":
