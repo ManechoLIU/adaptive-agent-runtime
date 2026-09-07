@@ -671,6 +671,12 @@ class InstallMigrationContractTests(unittest.TestCase):
         }
         self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
         self.assertIn("tests/test_web_agent_health_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("tests/test_terminal_continuation.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("scripts/terminal_continuation.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn(
+            "tests.test_terminal_continuation.PendingTerminalReconcileTests.test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks",
+            RUNTIME_RELEASE_REGRESSION_TESTS,
+        )
 
     def test_runtime_release_regression_gate_runs_required_tests_from_immutable_revision(self):
         import subprocess
@@ -683,7 +689,7 @@ class InstallMigrationContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source = self.make_source(root)
-            for name in ("web_agent_execution.py", "web_reentry_adapter.py"):
+            for name in ("web_agent_execution.py", "web_reentry_adapter.py", "terminal_continuation.py"):
                 (source / "scripts" / name).write_text("# runtime\n", encoding="utf-8")
             (source / "scripts" / "run_external_agent.mjs").write_text(
                 "export const marker = 'external-agent-routing';\n",
@@ -746,6 +752,16 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_canonical_runnable_reopens_continuation_without_user_message(self): self.assertTrue(True)\n"
                 "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n"
                 "    def test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_terminal_continuation.py").write_text(
+                "import unittest\n"
+                "class PendingTerminalReconcileTests(unittest.TestCase):\n"
+                "    def test_reconcile_pending_discovers_canonical_receipts_without_receipt_cli_argument(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_is_idempotent_and_does_not_mutate_lifecycle_or_dispatch_wake(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_fails_closed_when_canonical_ownership_is_missing_or_mismatched(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_cli_has_no_receipt_argument_and_never_self_spawns(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_project_context_guard.py").write_text(
@@ -956,7 +972,7 @@ class InstallMigrationContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source = self.make_source(root)
-            for name in ("web_agent_execution.py", "web_reentry_adapter.py"):
+            for name in ("web_agent_execution.py", "web_reentry_adapter.py", "terminal_continuation.py"):
                 (source / "scripts" / name).write_text("# runtime\n", encoding="utf-8")
             (source / "scripts" / "run_external_agent.mjs").write_text(
                 "export const marker = 'external-agent-routing';\n",
@@ -1008,6 +1024,16 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_global_health_cycle_does_not_schedule_rule_update_without_explicit_current_target(self): self.assertTrue(True)\n"
                 "    def test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message(self): self.assertTrue(True)\n"
                 "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_terminal_continuation.py").write_text(
+                "import unittest\n"
+                "class PendingTerminalReconcileTests(unittest.TestCase):\n"
+                "    def test_reconcile_pending_discovers_canonical_receipts_without_receipt_cli_argument(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_is_idempotent_and_does_not_mutate_lifecycle_or_dispatch_wake(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_fails_closed_when_canonical_ownership_is_missing_or_mismatched(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_cli_has_no_receipt_argument_and_never_self_spawns(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_project_context_guard.py").write_text(

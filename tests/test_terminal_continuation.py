@@ -270,3 +270,160 @@ class AssignmentBoundTerminalReceiptIdentityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PendingTerminalReconcileTests(unittest.TestCase):
+    def _module(self):
+        return TerminalContinuationTests()._load_module("terminal_continuation_pending_reconcile_test")
+
+    def test_reconcile_pending_discovers_canonical_receipts_without_receipt_cli_argument(self) -> None:
+        module = self._module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            receipt = root / "terminal.json"
+            receipt.write_text(json.dumps({
+                "schema_version": 1, "event_type": "external_agent_terminal", "repo": str(repo.resolve()),
+                "agent_id": "reviewer-1", "summary": "done", "delivery_outcome": "pass",
+            }), encoding="utf-8")
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-current", "generation": 3,
+                    "provenance": "manual_user_authorized", "binding_mode": "temporary", "host_attested": False,
+                }}},
+                "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-current", "generation": 3,
+                    "provenance": "manual_user_authorized",
+                }},
+            }), encoding="utf-8")
+            lifecycle_state = {
+                "pending_control_event": True,
+                "pending_terminal_receipts": [str(receipt.resolve())],
+                "controller_host": "web",
+            }
+            with patch.object(module.lifecycle, "load_json", return_value=lifecycle_state), patch.object(
+                module.lifecycle, "state_path", return_value=root / "controller.json"
+            ):
+                result = module.reconcile_pending_terminal_receipts(repo=repo, registry_path=registry)
+            self.assertEqual(result["controller_id"], "controller-1")
+            self.assertEqual(result["pending_count"], 1)
+            self.assertEqual(result["ownership_generation"], 3)
+            self.assertEqual(result["execution_target_session_id"], "web-current")
+            self.assertEqual(result["receipts"][0]["path"], str(receipt.resolve()))
+            self.assertEqual(result["receipts"][0]["agent_id"], "reviewer-1")
+            self.assertTrue(result["receipts"][0]["sha256"])
+
+    def test_reconcile_pending_is_idempotent_and_does_not_mutate_lifecycle_or_dispatch_wake(self) -> None:
+        module = self._module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            receipt = root / "terminal.json"
+            receipt.write_text(json.dumps({
+                "schema_version": 1, "event_type": "external_agent_terminal", "repo": str(repo.resolve()),
+                "agent_id": "agent-1", "summary": "done",
+            }), encoding="utf-8")
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 2
+                }}},
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-current"]}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex", "execution_target_session_id": "desktop-current", "generation": 2,
+                    "provenance": "desktop_entry",
+                }},
+            }), encoding="utf-8")
+            lifecycle_state = {"pending_terminal_receipts": [str(receipt.resolve()), str(receipt.resolve())]}
+            with patch.object(module.lifecycle, "load_json", return_value=lifecycle_state), patch.object(
+                module.lifecycle, "state_path", return_value=root / "controller.json"
+            ), patch.object(module.lifecycle, "persist_event_state") as persist, patch.object(
+                module.web_bridge, "dispatch_pending_lifecycle_wake") as wake:
+                first = module.reconcile_pending_terminal_receipts(repo=repo, registry_path=registry)
+                second = module.reconcile_pending_terminal_receipts(repo=repo, registry_path=registry)
+            self.assertEqual(first["reconcile_fingerprint"], second["reconcile_fingerprint"])
+            self.assertEqual(first["pending_count"], 1)
+            persist.assert_not_called()
+            wake.assert_not_called()
+
+    def test_reconcile_pending_fails_closed_when_canonical_ownership_is_missing_or_mismatched(self) -> None:
+        module = self._module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            receipt = root / "terminal.json"
+            receipt.write_text(json.dumps({"event_type": "external_agent_terminal", "repo": str(repo.resolve())}), encoding="utf-8")
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            with patch.object(module.lifecycle, "load_json", return_value={"pending_terminal_receipts": [str(receipt)]}), patch.object(
+                module.lifecycle, "state_path", return_value=root / "controller.json"
+            ):
+                with self.assertRaisesRegex(PermissionError, "execution ownership"):
+                    module.reconcile_pending_terminal_receipts(repo=repo, registry_path=registry)
+
+    def test_reconcile_pending_cli_has_no_receipt_argument_and_never_self_spawns(self) -> None:
+        module = self._module()
+        with patch.object(module, "reconcile_pending_terminal_receipts", return_value={"pending_count": 0}) as reconcile, patch.object(
+            module.subprocess, "Popen"
+        ) as popen:
+            self.assertEqual(module.main(["reconcile-pending", "--repo", "/tmp/repo"]), 0)
+        reconcile.assert_called_once()
+        popen.assert_not_called()
+
+def _legacy_assignment_fixture(module, root: Path, repo: Path, registry: Path):
+    receipt = root / "legacy-terminal.json"
+    receipt.write_text(json.dumps({
+        "event_type": "external_agent_terminal", "repo": str(repo.resolve()),
+        "assignment_id": "A-legacy", "task_id": "T-legacy", "agent_id": "agent-legacy",
+        "session_id": "session-legacy", "summary": "legacy terminal",
+    }), encoding="utf-8")
+    return receipt
+
+
+def _ownership_registry(repo: Path, host: str = "web", target: str = "web-current", generation: int = 1):
+    return {
+        "controller-1": str(repo.resolve()),
+        "__controller_targets__": {"controller-1": {host: {
+            "status": "active", "session_id": target, "generation": generation,
+            **({"provenance": "manual_user_authorized", "binding_mode": "temporary", "host_attested": False} if host == "web" else {}),
+        }}},
+        "__controller_sessions__": {"controller-1": {host: [target]}},
+        "__controller_execution_ownership__": {"controller-1": {
+            "active_host": host, "execution_target_session_id": target, "generation": generation,
+            "provenance": "test",
+        }},
+    }
+
+
+def _pending_reconcile_partial_classification_test(self):
+    module = self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp); repo = root / "repo"; repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        registry = root / "controllers.json"; registry.write_text(json.dumps(_ownership_registry(repo)), encoding="utf-8")
+        legacy = _legacy_assignment_fixture(module, root, repo, registry)
+        unbound = root / "unbound.json"
+        unbound.write_text(json.dumps({
+            "event_type": "external_agent_terminal", "repo": str(repo.resolve()),
+            "summary": "old external result", "result_path": str(root / "result.txt")
+        }), encoding="utf-8")
+        lifecycle_state = {"pending_terminal_receipts": [str(legacy), str(unbound)]}
+        with patch.object(module.lifecycle, "load_json", return_value=lifecycle_state), patch.object(
+            module.lifecycle, "state_path", return_value=root / "controller.json"
+        ), patch.object(module, "load_runtime_state", return_value={"leases": {"A-legacy": {
+            "assignment_id": "A-legacy", "task_id": "T-legacy", "agent_id": "agent-legacy",
+            "session_id": "session-legacy", "attempt": 1, "lease_id": "lease-1", "terminal_state": "failed"
+        }}}):
+            result = module.reconcile_pending_terminal_receipts(repo=repo, registry_path=registry)
+        self.assertEqual(result["pending_count"], 2)
+        by_path = {item["path"]: item for item in result["receipts"]}
+        self.assertEqual(by_path[str(legacy.resolve())]["verification_state"], "legacy_unverifiable")
+        self.assertEqual(by_path[str(legacy.resolve())]["action_suggestion"], "blocked")
+        self.assertIn("canonical runtime lease identity", by_path[str(legacy.resolve())]["verification_error"])
+        self.assertEqual(by_path[str(unbound.resolve())]["verification_state"], "verified_legacy_unbound")
+        self.assertEqual(by_path[str(unbound.resolve())]["action_suggestion"], "executed")
+
+PendingTerminalReconcileTests.test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks = _pending_reconcile_partial_classification_test

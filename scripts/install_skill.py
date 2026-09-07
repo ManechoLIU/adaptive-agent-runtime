@@ -155,6 +155,16 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_no_canonical_work_does_not_reopen_after_observation_only_turn",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_reconcile_pending_discovers_canonical_receipts_without_receipt_cli_argument",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_reconcile_pending_is_idempotent_and_does_not_mutate_lifecycle_or_dispatch_wake",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_reconcile_pending_fails_closed_when_canonical_ownership_is_missing_or_mismatched",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_reconcile_pending_cli_has_no_receipt_argument_and_never_self_spawns",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
     "test_regression_parent_already_yielded_then_writer_completed_wakes_same_controller_with_next_runnable",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
@@ -378,6 +388,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/reviewer_supervisor.py",
     "scripts/assignment_lease_guard.py",
     "scripts/run_external_agent.mjs",
+    "scripts/terminal_continuation.py",
     "tests/test_web_agent_execution.py",
     "tests/test_reviewer_supervisor.py",
     "tests/test_web_reentry_adapter.py",
@@ -390,6 +401,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_controller_target_guard.py",
     "tests/test_web_lifecycle_bridge.py",
     "tests/test_web_agent_health_supervisor.py",
+    "tests/test_terminal_continuation.py",
     "tests/test_web_agent_events.py",
     "tests/test_evaluation_transaction.py",
     "tests/external-agent-routing.test.mjs",
