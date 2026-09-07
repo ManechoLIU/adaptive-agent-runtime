@@ -635,3 +635,388 @@ def _pending_reconcile_holds_runtime_assignment_fence_through_audit(self):
         self.assertEqual(observed, ['blocked'])
 
 PendingTerminalReconcileTests.test_reconcile_pending_holds_runtime_assignment_fence_through_audit = _pending_reconcile_holds_runtime_assignment_fence_through_audit
+
+class ManualControlCycleReconcileTests(unittest.TestCase):
+    def _module(self):
+        return TerminalContinuationTests()._load_module("terminal_continuation_manual_control_cycle_test")
+
+    def _fixture(self, root: Path):
+        import hashlib, sys
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        (repo / "TASK_LEDGER.md").write_text("# ledger\n", encoding="utf-8")
+        controller_id = "controller-1"
+        target = "web-current"
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps({
+            controller_id: str(repo.resolve()),
+            "__controller_sessions__": {controller_id: {"web": [target]}},
+            "__controller_targets__": {controller_id: {"web": {
+                "status": "active", "session_id": target, "generation": 3,
+                "provenance": "manual_user_authorized", "binding_mode": "temporary",
+                "host_attested": False,
+            }}},
+            "__controller_execution_ownership__": {controller_id: {
+                "active_host": "web", "execution_target_session_id": target,
+                "generation": 3, "provenance": "manual_user_authorized",
+            }},
+        }), encoding="utf-8")
+        lease_file = root / "manual-leases.json"
+        lease_file.write_text(json.dumps({"schema_version": 1, "leases": {controller_id: {
+            "repo": str(repo.resolve()), "controller_id": controller_id,
+            "web_session_id": target, "authorized_at_unix": 100,
+            "expires_at_unix": 10000, "provenance": "manual_user_authorized",
+            "mode": "resume_only",
+        }}}), encoding="utf-8")
+        terminal = root / "terminal.json"
+        terminal.write_text(json.dumps({
+            "event_type": "external_agent_terminal", "repo": str(repo.resolve()),
+            "summary": "done",
+        }), encoding="utf-8")
+        state_path = root / "controller.json"
+        state_path.write_text(json.dumps({
+            "pending_control_event": True,
+            "pending_terminal_receipts": [str(terminal.resolve())],
+            "triggers": ["terminal_receipt_pending"], "wake_generation": 1,
+            "controller_host": "web", "requires_user": False,
+        }), encoding="utf-8")
+        reconcile_path = repo / ".git" / "adaptive-delivery" / "terminal-reconcile.json"
+        reconcile_path.parent.mkdir(parents=True, exist_ok=True)
+        reconcile_path.write_text(json.dumps({
+            "schema_version": 1, "operation": "reconcile_pending_terminal_receipts",
+            "controller_id": controller_id, "repo": str(repo.resolve()),
+            "pending_count": 1,
+            "receipts": [{
+                "path": str(terminal.resolve()),
+                "sha256": hashlib.sha256(terminal.read_bytes()).hexdigest(),
+                "verification_state": "verified_legacy_unbound",
+                "action_suggestion": "executed",
+            }],
+            "execution_host": "web", "execution_target_session_id": target,
+            "target_generation": 3, "ownership_generation": 3,
+            "reconcile_fingerprint": "reconcile-fp", "clears_lifecycle_debt": False,
+            "close_condition": "successful control-cycle receipt",
+        }), encoding="utf-8")
+        action_id = "terminal_receipt:" + hashlib.sha256(str(terminal.resolve()).encode("utf-8")).hexdigest()[:16]
+        control_json = root / "control-cycle.json"
+        evidence = "artifact:" + str(reconcile_path.resolve())
+        cycle_id = "terminal-debt-cycle-1"
+        control_snapshot = {
+            "event_contract": {
+                "event_id": cycle_id, "event_type": "terminal_debt_reconciliation",
+                "primary_task": "T-1", "candidate_revision": "main-1",
+                "terminal_receipt": "terminal debt reconciled",
+            },
+            "ledger_sha256": hashlib.sha256((repo / "TASK_LEDGER.md").read_bytes()).hexdigest(),
+            "capacity_projection": {"evidence": evidence},
+            "controller_actions": [{"id": action_id, "decision": "executed", "evidence": evidence}],
+            "control_loop_receipt": {
+                "controller_action_ids": [action_id],
+                "continuation_debt_ids": [action_id],
+                "open_continuation_debt_ids": [],
+            },
+        }
+        control_json.write_text(json.dumps(control_snapshot), encoding="utf-8")
+        cycle_dir = repo / ".git" / "adaptive-delivery" / "controller-cycle-evidence"
+        cycle_dir.mkdir(parents=True, exist_ok=True)
+        canonical = json.dumps(control_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        cycle_path = cycle_dir / (hashlib.sha256(cycle_id.encode("utf-8")).hexdigest() + ".json")
+        cycle_path.write_text(json.dumps({
+            "schema_version": 1, "record_kind": "controller_cycle_evidence",
+            "evidence_id": cycle_id, "controller_id": controller_id, "cycle_id": cycle_id,
+            "event_type": "terminal_debt_reconciliation", "primary_task": "T-1",
+            "terminal_status": "CLOSED", "evidence_summary": "terminal debt reconciled",
+            "main_revision": "main-1", "ledger_sha256": control_snapshot["ledger_sha256"],
+            "snapshot_sha256": hashlib.sha256(canonical).hexdigest(),
+            "validation_errors": [],
+        }), encoding="utf-8")
+        command = (
+            f"{sys.executable} {ROOT / 'scripts' / 'control_event_guard.py'} {control_json} "
+            f"--ledger {repo / 'TASK_LEDGER.md'} --repo {repo} --controller-session {controller_id}"
+        )
+        audit_log = root / "activity.redacted.jsonl"
+        audit_log.write_text(json.dumps({
+            "receiptId": "receipt-control-1", "childTool": "shell_command", "state": "succeeded",
+            "rootLabel": str(repo.resolve()), "targetLabel": command,
+            "occurredAtUnixMs": 200000,
+            "detail": f"命令：{command} · 工作目录：{repo}\n\n命令输出：\ncontrol-event: allowed; cycle complete",
+        }) + "\n", encoding="utf-8")
+        return repo, registry, lease_file, state_path, reconcile_path, audit_log, control_json
+
+    def test_manual_fenced_control_cycle_reconcile_closes_only_reconciled_terminal_debt_without_verifying_web_identity(self):
+        module = self._module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, lease_file, state_path, _reconcile_path, audit_log, _control_json = self._fixture(root)
+            snapshot = {
+                "root": str(repo.resolve()), "head": None, "ledger_sha256": "x",
+                "worktree_status_sha256": "y", "ready_ids": [], "runnable_ids": [],
+                "candidate_revisions": [], "assignment_liveness": {}, "controller_corrections": [],
+                "control_loop_required": True,
+                "rule_handshake": {"state": "current", "blocking": False},
+            }
+            with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
+                module.lifecycle, "project_snapshot", return_value=snapshot
+):
+                result = module.reconcile_control_cycle_closure(
+                    repo=repo, registry_path=registry, audit_log=audit_log,
+                    manual_lease_path=lease_file, now_unix=500,
+                )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            registry_after = json.loads(registry.read_text(encoding="utf-8"))
+        self.assertEqual(state.get("pending_terminal_receipts"), [])
+        self.assertEqual(result["closed_terminal_receipt_count"], 1)
+        self.assertEqual(result["binding_verification"], "manual_fenced_not_host_attested")
+        self.assertFalse(registry_after["__controller_targets__"]["controller-1"]["web"]["host_attested"])
+
+    def test_manual_fenced_control_cycle_reconcile_requires_unexpired_matching_manual_lease(self):
+        module = self._module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, lease_file, state_path, _reconcile_path, audit_log, _control_json = self._fixture(root)
+            lease_file.write_text(json.dumps({"schema_version": 1, "leases": {}}), encoding="utf-8")
+            with patch.object(module.lifecycle, "state_path", return_value=state_path):
+                with self.assertRaisesRegex(PermissionError, "manual Web resume lease"):
+                    module.reconcile_control_cycle_closure(
+                        repo=repo, registry_path=registry, audit_log=audit_log,
+                        manual_lease_path=lease_file, now_unix=500,
+                    )
+
+    def test_reconcile_control_cycle_cli_accepts_no_receipt_or_web_session_identity_argument(self):
+        module = self._module()
+        parser = module.build_parser()
+        args = parser.parse_args(["reconcile-control-cycle", "--repo", "/tmp/repo"])
+        self.assertEqual(args.command, "reconcile-control-cycle")
+        self.assertFalse(hasattr(args, "receipt"))
+        self.assertFalse(hasattr(args, "web_session_id"))
+        self.assertFalse(hasattr(args, "registry"))
+        self.assertFalse(hasattr(args, "audit_log"))
+        self.assertFalse(hasattr(args, "manual_lease_file"))
+
+def _manual_reconcile_skips_later_unrelated_allowed_receipt(self):
+    module = self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo, registry, lease_file, state_path, reconcile_path, audit_log, _control_json = self._fixture(root)
+        import sys
+        unrelated = root / "unrelated.json"
+        unrelated.write_text(json.dumps({"capacity_projection": {"evidence": "artifact:/tmp/other"}}), encoding="utf-8")
+        command = (
+            f"{sys.executable} {ROOT / 'scripts' / 'control_event_guard.py'} {unrelated} "
+            f"--ledger {repo / 'TASK_LEDGER.md'} --repo {repo} --controller-session controller-1"
+        )
+        with audit_log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "receiptId": "receipt-unrelated-later", "childTool": "shell_command", "state": "succeeded",
+                "rootLabel": str(repo.resolve()), "targetLabel": command, "occurredAtUnixMs": 300000,
+                "detail": f"命令：{command} · 工作目录：{repo}\n\n命令输出：\ncontrol-event: allowed; other cycle",
+            }) + "\n")
+        snapshot = {
+            "root": str(repo.resolve()), "ready_ids": [], "runnable_ids": [], "candidate_revisions": [],
+            "assignment_liveness": {}, "controller_corrections": [], "control_loop_required": True,
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
+            module.lifecycle, "project_snapshot", return_value=snapshot
+):
+            result = module.reconcile_control_cycle_closure(
+                repo=repo, registry_path=registry, audit_log=audit_log,
+                manual_lease_path=lease_file, now_unix=500,
+            )
+        self.assertEqual(result["control_receipt_id"], "receipt-control-1")
+        self.assertEqual(json.loads(state_path.read_text())["pending_terminal_receipts"], [])
+
+
+def _manual_reconcile_requires_target_lineage_membership(self):
+    module = self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo, registry, lease_file, state_path, _reconcile_path, audit_log, _control_json = self._fixture(root)
+        value = json.loads(registry.read_text())
+        value["__controller_sessions__"]["controller-1"]["web"] = ["web-old"]
+        registry.write_text(json.dumps(value), encoding="utf-8")
+        with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
+            module.lifecycle, "project_snapshot", side_effect=AssertionError("lineage must fail before project snapshot")
+        ):
+            with self.assertRaisesRegex(PermissionError, "lineage"):
+                module.reconcile_control_cycle_closure(
+                    repo=repo, registry_path=registry, audit_log=audit_log,
+                    manual_lease_path=lease_file, now_unix=500,
+                )
+
+ManualControlCycleReconcileTests.test_manual_reconcile_skips_later_unrelated_allowed_receipt = _manual_reconcile_skips_later_unrelated_allowed_receipt
+ManualControlCycleReconcileTests.test_manual_reconcile_requires_target_lineage_membership = _manual_reconcile_requires_target_lineage_membership
+
+def _manual_reconcile_rejects_forged_immutable_cycle_evidence(self):
+    module = self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo, registry, lease_file, state_path, _reconcile_path, audit_log, control_json = self._fixture(root)
+        control = json.loads(control_json.read_text())
+        import hashlib
+        cycle_id = control["event_contract"]["event_id"]
+        cycle_path = repo / ".git" / "adaptive-delivery" / "controller-cycle-evidence" / (hashlib.sha256(cycle_id.encode()).hexdigest() + ".json")
+        evidence = json.loads(cycle_path.read_text())
+        evidence["snapshot_sha256"] = "0" * 64
+        cycle_path.write_text(json.dumps(evidence), encoding="utf-8")
+        snapshot = {
+            "root": str(repo.resolve()), "ready_ids": [], "runnable_ids": [], "candidate_revisions": [],
+            "assignment_liveness": {}, "controller_corrections": [], "control_loop_required": True,
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
+            module.lifecycle, "project_snapshot", return_value=snapshot
+        ):
+            with self.assertRaisesRegex(PermissionError, "snapshot_sha256"):
+                module.reconcile_control_cycle_closure(
+                    repo=repo, registry_path=registry, audit_log=audit_log,
+                    manual_lease_path=lease_file, now_unix=500,
+                )
+
+
+def _manual_reconcile_rejects_receipt_from_before_current_target_rotation(self):
+    module = self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo, registry, lease_file, state_path, _reconcile_path, audit_log, _control_json = self._fixture(root)
+        payload = json.loads(lease_file.read_text())
+        payload["leases"]["controller-1"]["rotated_at_unix"] = 250
+        lease_file.write_text(json.dumps(payload), encoding="utf-8")
+        snapshot = {
+            "root": str(repo.resolve()), "ready_ids": [], "runnable_ids": [], "candidate_revisions": [],
+            "assignment_liveness": {}, "controller_corrections": [], "control_loop_required": True,
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
+            module.lifecycle, "project_snapshot", return_value=snapshot
+        ):
+            with self.assertRaisesRegex(PermissionError, "no durable AI-Bridge"):
+                module.reconcile_control_cycle_closure(
+                    repo=repo, registry_path=registry, audit_log=audit_log,
+                    manual_lease_path=lease_file, now_unix=500,
+                )
+
+ManualControlCycleReconcileTests.test_manual_reconcile_rejects_forged_immutable_cycle_evidence = _manual_reconcile_rejects_forged_immutable_cycle_evidence
+ManualControlCycleReconcileTests.test_manual_reconcile_rejects_receipt_from_before_current_target_rotation = _manual_reconcile_rejects_receipt_from_before_current_target_rotation
+
+def _manual_reconcile_is_idempotent_after_durable_lifecycle_closure(self):
+    module = self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo, registry, lease_file, state_path, _reconcile_path, audit_log, _control_json = self._fixture(root)
+        snapshot = {
+            "root": str(repo.resolve()), "ready_ids": [], "runnable_ids": [], "candidate_revisions": [],
+            "assignment_liveness": {}, "controller_corrections": [], "control_loop_required": True,
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
+            module.lifecycle, "project_snapshot", return_value=snapshot
+        ):
+            first = module.reconcile_control_cycle_closure(
+                repo=repo, registry_path=registry, audit_log=audit_log,
+                manual_lease_path=lease_file, now_unix=500,
+            )
+            with patch.object(module, "_latest_allowed_control_receipt", side_effect=AssertionError("idempotent replay must not reconsume audit")):
+                second = module.reconcile_control_cycle_closure(
+                    repo=repo, registry_path=registry, audit_log=audit_log,
+                    manual_lease_path=lease_file, now_unix=501,
+                )
+        self.assertFalse(first.get("idempotent", False))
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(second["control_receipt_id"], first["control_receipt_id"])
+        self.assertEqual(json.loads(state_path.read_text())["pending_terminal_receipts"], [])
+
+ManualControlCycleReconcileTests.test_manual_reconcile_is_idempotent_after_durable_lifecycle_closure = _manual_reconcile_is_idempotent_after_durable_lifecycle_closure
+
+def _manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash(self):
+    module = self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo, registry, lease_file, state_path, _reconcile_path, audit_log, control_json = self._fixture(root)
+        import hashlib
+        control = json.loads(control_json.read_text())
+        cycle_id = control["event_contract"]["event_id"]
+        control["event_contract"]["event_type"] = "generic_control_cycle"
+        control_json.write_text(json.dumps(control), encoding="utf-8")
+        cycle_path = repo / ".git" / "adaptive-delivery" / "controller-cycle-evidence" / (hashlib.sha256(cycle_id.encode()).hexdigest() + ".json")
+        evidence = json.loads(cycle_path.read_text())
+        canonical = json.dumps(control, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        evidence["event_type"] = "generic_control_cycle"
+        evidence["snapshot_sha256"] = hashlib.sha256(canonical).hexdigest()
+        cycle_path.write_text(json.dumps(evidence), encoding="utf-8")
+        snapshot = {
+            "root": str(repo.resolve()), "ready_ids": [], "runnable_ids": [], "candidate_revisions": [],
+            "assignment_liveness": {}, "controller_corrections": [], "control_loop_required": True,
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
+            module.lifecycle, "project_snapshot", return_value=snapshot
+        ):
+            with self.assertRaisesRegex(PermissionError, "terminal_debt_reconciliation"):
+                module.reconcile_control_cycle_closure(
+                    repo=repo, registry_path=registry, audit_log=audit_log,
+                    manual_lease_path=lease_file, now_unix=500,
+                )
+
+ManualControlCycleReconcileTests.test_manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash = _manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash
+
+def _manual_reconcile_closes_only_terminal_debt_and_preserves_current_nonterminal_triggers(self):
+    module = self._module()
+    previous = {
+        "pending_control_event": True,
+        "pending_terminal_receipts": ["/tmp/a.json"],
+        "triggers": [
+            "terminal_receipt_pending",
+            "subagent_stopped:old-agent",
+            "ledger_changed",
+            "READY:READY-1",
+            "rule_update_pending:rev-new",
+            "LEDGER_INVALID:current-ledger-error",
+        ],
+        "wake_generation": 4,
+        "controller_host": "web",
+        "session_id": "controller-1",
+        "active_turn_id": "turn-current",
+        "snapshot": {
+            "head": "old-head", "ledger_sha256": "old-ledger", "worktree_status_sha256": "old-wt",
+            "ready_ids": ["READY-1"], "runnable_ids": ["READY-1"], "candidate_revisions": [],
+        },
+    }
+    snapshot = {
+        "root": "/tmp/repo", "head": "new-head", "ledger_sha256": "new-ledger",
+        "worktree_status_sha256": "new-wt", "ready_ids": ["READY-1"], "runnable_ids": ["READY-1"],
+        "candidate_revisions": [], "ledger_errors": ["current-ledger-error"],
+        "assignment_liveness": {}, "controller_corrections": [], "control_loop_required": True,
+        "rule_handshake": {"state": "pending_ack", "installed_revision": "rev-new", "blocking": True},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "controller.json"
+        state_path.write_text(json.dumps(previous), encoding="utf-8")
+        closure = {
+            "operation": "reconcile_control_cycle_closure", "controller_id": "controller-1",
+            "repo": "/tmp/repo", "closed_terminal_receipt_count": 1,
+            "host_attested": False, "strong_web_identity_established": False,
+        }
+        next_state = module._persist_reconciled_control_event_locked(
+            state_path=state_path,
+            event={
+                "hook_event_name": "PostToolUse", "session_id": "controller-1",
+                "controller_session_id": "controller-1", "controller_host": "web",
+                "cwd": "/tmp/repo", "turn_id": "turn-current",
+                "tool_name": "AI-Bridge.shell_command",
+                "tool_input": {"command": "python3 control_event_guard.py historical.json --ledger TASK_LEDGER.md --controller-session controller-1"},
+                "tool_response": {"exit_code": 0, "output": "control-event: allowed"},
+            },
+            snapshot=snapshot, previous=previous, closure_evidence=closure,
+        )
+    self.assertEqual(next_state["pending_terminal_receipts"], [])
+    self.assertNotIn("terminal_receipt_pending", next_state["triggers"])
+    self.assertFalse(any(item.startswith("subagent_stopped:") for item in next_state["triggers"]))
+    self.assertIn("ledger_changed", next_state["triggers"])
+    self.assertIn("READY:READY-1", next_state["triggers"])
+    self.assertIn("rule_update_pending:rev-new", next_state["triggers"])
+    self.assertIn("LEDGER_INVALID:current-ledger-error", next_state["triggers"])
+    self.assertTrue(next_state["pending_control_event"])
+
+ManualControlCycleReconcileTests.test_manual_reconcile_closes_only_terminal_debt_and_preserves_current_nonterminal_triggers = _manual_reconcile_closes_only_terminal_debt_and_preserves_current_nonterminal_triggers

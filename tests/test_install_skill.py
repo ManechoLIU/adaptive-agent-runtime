@@ -768,7 +768,18 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_reconcile_pending_holds_lifecycle_and_registry_fences_through_audit(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_holds_runtime_assignment_fence_through_audit(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_fingerprint_is_order_independent(self): self.assertTrue(True)\n"
-                "    def test_atomic_audit_writer_handles_concurrent_publication(self): self.assertTrue(True)\n",
+                "    def test_atomic_audit_writer_handles_concurrent_publication(self): self.assertTrue(True)\n"
+                "class ManualControlCycleReconcileTests(unittest.TestCase):\n"
+                "    def test_manual_fenced_control_cycle_reconcile_closes_only_reconciled_terminal_debt_without_verifying_web_identity(self): self.assertTrue(True)\n"
+                "    def test_manual_fenced_control_cycle_reconcile_requires_unexpired_matching_manual_lease(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_requires_target_lineage_membership(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_skips_later_unrelated_allowed_receipt(self): self.assertTrue(True)\n"
+                "    def test_reconcile_control_cycle_cli_accepts_no_receipt_or_web_session_identity_argument(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_forged_immutable_cycle_evidence(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_receipt_from_before_current_target_rotation(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_is_idempotent_after_durable_lifecycle_closure(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_closes_only_terminal_debt_and_preserves_current_nonterminal_triggers(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_project_context_guard.py").write_text(
@@ -1047,7 +1058,18 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_reconcile_pending_holds_lifecycle_and_registry_fences_through_audit(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_holds_runtime_assignment_fence_through_audit(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_fingerprint_is_order_independent(self): self.assertTrue(True)\n"
-                "    def test_atomic_audit_writer_handles_concurrent_publication(self): self.assertTrue(True)\n",
+                "    def test_atomic_audit_writer_handles_concurrent_publication(self): self.assertTrue(True)\n"
+                "class ManualControlCycleReconcileTests(unittest.TestCase):\n"
+                "    def test_manual_fenced_control_cycle_reconcile_closes_only_reconciled_terminal_debt_without_verifying_web_identity(self): self.assertTrue(True)\n"
+                "    def test_manual_fenced_control_cycle_reconcile_requires_unexpired_matching_manual_lease(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_requires_target_lineage_membership(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_skips_later_unrelated_allowed_receipt(self): self.assertTrue(True)\n"
+                "    def test_reconcile_control_cycle_cli_accepts_no_receipt_or_web_session_identity_argument(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_forged_immutable_cycle_evidence(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_receipt_from_before_current_target_rotation(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_is_idempotent_after_durable_lifecycle_closure(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_closes_only_terminal_debt_and_preserves_current_nonterminal_triggers(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_project_context_guard.py").write_text(

@@ -6,9 +6,11 @@ import fcntl
 import hashlib
 import json
 import os
+import shlex
 import tempfile
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -373,6 +375,510 @@ def reconcile_pending_terminal_receipts(
             fcntl.flock(lifecycle_lock.fileno(), fcntl.LOCK_UN)
 
 
+
+def _manual_fenced_web_binding_locked(
+    *,
+    repo: Path,
+    controller_id: str,
+    registry_path: Path,
+    manual_lease_path: Path,
+    now_unix: int,
+) -> dict[str, Any]:
+    registry = web_bridge.load_json(registry_path)
+    target = web_bridge.target_guard.target_record(
+        registry, controller_id=controller_id, host="web"
+    )
+    if not isinstance(target, dict):
+        raise PermissionError("manual control reconciliation requires an explicit current Web target")
+    status, target_session, target_generation = web_bridge.target_guard.validate_target_record(
+        target, host="web"
+    )
+    if status != "active" or not target_session:
+        raise PermissionError("manual control reconciliation requires an active current Web target")
+    if not web_bridge.registered_controller_session(
+        controller_id=controller_id, session_id=target_session, host="web", registry_path=registry_path
+    ):
+        raise PermissionError("current Web target is not a member of the registered Controller lineage")
+    if (
+        target.get("provenance") != "manual_user_authorized"
+        or target.get("binding_mode") != "temporary"
+        or target.get("host_attested") is not False
+    ):
+        raise PermissionError(
+            "manual control reconciliation is limited to manual_user_authorized temporary non-host-attested targets"
+        )
+    ownership = web_bridge.target_guard.execution_ownership_record(
+        registry, controller_id=controller_id
+    )
+    if ownership is None:
+        raise PermissionError("canonical execution ownership is required for manual control reconciliation")
+    ownership_host, ownership_target, ownership_generation = (
+        web_bridge.target_guard.validate_execution_ownership_record(ownership)
+    )
+    if (
+        ownership_host != "web"
+        or ownership_target != target_session
+        or ownership_generation != target_generation
+    ):
+        raise PermissionError(
+            "manual control reconciliation target does not match canonical execution ownership generation"
+        )
+
+    lease_payload = web_bridge.load_json(manual_lease_path)
+    leases = lease_payload.get("leases") if isinstance(lease_payload, dict) else None
+    lease = leases.get(controller_id) if isinstance(leases, dict) else None
+    if not isinstance(lease, dict):
+        raise PermissionError("an unexpired matching manual Web resume lease is required")
+    if (
+        lease.get("provenance") != "manual_user_authorized"
+        or lease.get("mode") != "resume_only"
+        or lease.get("controller_id") not in (None, controller_id)
+        or str(lease.get("web_session_id") or "").strip() != target_session
+    ):
+        raise PermissionError("manual Web resume lease does not match the current Controller target")
+    expires_at = lease.get("expires_at_unix")
+    authorized_at = lease.get("authorized_at_unix")
+    if (
+        not isinstance(expires_at, int)
+        or isinstance(expires_at, bool)
+        or not isinstance(authorized_at, int)
+        or isinstance(authorized_at, bool)
+        or authorized_at <= 0
+        or expires_at <= now_unix
+    ):
+        raise PermissionError("manual Web resume lease is expired or invalid")
+    rotated_at = lease.get("rotated_at_unix")
+    if rotated_at is not None:
+        if (
+            not isinstance(rotated_at, int)
+            or isinstance(rotated_at, bool)
+            or rotated_at <= 0
+            or rotated_at > now_unix
+        ):
+            raise PermissionError("manual Web resume lease rotation timestamp is invalid")
+        lease_effective_at = max(authorized_at, rotated_at)
+    else:
+        lease_effective_at = authorized_at
+    lease_repo_raw = str(lease.get("repo") or "").strip()
+    if not lease_repo_raw:
+        raise PermissionError("manual Web resume lease repository is missing")
+    lease_repo = Path(lease_repo_raw).expanduser().resolve()
+    if web_bridge._git_common_dir(lease_repo) != web_bridge._git_common_dir(repo):
+        raise PermissionError("manual Web resume lease belongs to another repository")
+    return {
+        "execution_host": "web",
+        "execution_target_session_id": target_session,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+        "authorized_at_unix": authorized_at,
+        "lease_effective_at_unix": lease_effective_at,
+        "expires_at_unix": expires_at,
+        "binding_verification": "manual_fenced_not_host_attested",
+    }
+
+
+def _terminal_reconcile_audit_locked(
+    *,
+    repo: Path,
+    controller_id: str,
+    pending_paths: list[str],
+    binding: dict[str, Any],
+) -> tuple[dict[str, Any], Path]:
+    audit_path = web_bridge._git_common_dir(repo) / "adaptive-delivery" / "terminal-reconcile.json"
+    audit = web_bridge.load_json(audit_path)
+    if not audit:
+        raise PermissionError("terminal-reconcile audit is required before control-cycle closure")
+    expected = {
+        "controller_id": controller_id,
+        "repo": str(repo.resolve()),
+        "execution_host": "web",
+        "execution_target_session_id": binding["execution_target_session_id"],
+        "target_generation": binding["target_generation"],
+        "ownership_generation": binding["ownership_generation"],
+        "clears_lifecycle_debt": False,
+        "close_condition": "successful control-cycle receipt",
+    }
+    for field, value in expected.items():
+        if audit.get(field) != value:
+            raise PermissionError(f"terminal-reconcile audit {field} does not match current fenced state")
+    receipts = audit.get("receipts")
+    if not isinstance(receipts, list) or int(audit.get("pending_count", -1)) != len(pending_paths):
+        raise PermissionError("terminal-reconcile audit does not match current pending terminal debt")
+    by_path = {
+        str(item.get("path") or "").strip(): item
+        for item in receipts
+        if isinstance(item, dict) and str(item.get("path") or "").strip()
+    }
+    if set(by_path) != set(pending_paths):
+        raise PermissionError("terminal-reconcile audit receipt set does not match lifecycle pending debt")
+    for raw_path in pending_paths:
+        path = Path(raw_path).expanduser().resolve()
+        item = by_path[raw_path]
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if item.get("sha256") != digest:
+            raise PermissionError("terminal-reconcile audit receipt hash is stale")
+        verification_state = str(item.get("verification_state") or "")
+        action = str(item.get("action_suggestion") or "")
+        if verification_state == "legacy_unverifiable":
+            if action != "blocked":
+                raise PermissionError("legacy_unverifiable terminal receipt must remain blocked")
+        elif verification_state in {"verified_current", "verified_legacy_unbound"}:
+            if action != "executed":
+                raise PermissionError("verified terminal receipt must remain executed in reconciliation")
+        else:
+            raise PermissionError("terminal-reconcile audit contains unsupported verification state")
+    return audit, audit_path
+
+
+def _control_snapshot_path(command: str, *, repo: Path, controller_id: str) -> Path:
+    if not lifecycle._is_control_guard_command(
+        command, controller_session_id=controller_id, cwd=repo
+    ):
+        raise PermissionError("AI-Bridge audit receipt is not a canonical control_event_guard command")
+    tokens = shlex.split(command)
+    if len(tokens) < 3 or tokens[2] == "-" or tokens[2].startswith("-"):
+        raise PermissionError("manual control reconciliation requires a durable control-cycle snapshot file")
+    path = Path(tokens[2]).expanduser()
+    if not path.is_absolute():
+        path = (repo / path).resolve()
+    return path.resolve()
+
+
+def _validate_control_snapshot_reconciles_terminal_debt(
+    *, snapshot_path: Path, reconcile_path: Path, pending_paths: list[str]
+) -> dict[str, Any]:
+    try:
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PermissionError(f"control-cycle snapshot is unavailable: {exc}") from exc
+    if not isinstance(snapshot, dict):
+        raise PermissionError("control-cycle snapshot must be an object")
+    evidence = "artifact:" + str(reconcile_path.resolve())
+    capacity = snapshot.get("capacity_projection")
+    if not isinstance(capacity, dict) or capacity.get("evidence") != evidence:
+        raise PermissionError("control-cycle snapshot is not bound to the current terminal-reconcile audit")
+    expected_action_ids = {
+        "terminal_receipt:" + hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+        for path in pending_paths
+    }
+    loop = snapshot.get("control_loop_receipt")
+    if not isinstance(loop, dict):
+        raise PermissionError("control-cycle snapshot is missing control_loop_receipt")
+    for field in ("controller_action_ids", "continuation_debt_ids"):
+        values = loop.get(field)
+        if not isinstance(values, list) or {str(item) for item in values} != expected_action_ids:
+            raise PermissionError(f"control-cycle snapshot {field} does not match current terminal debt")
+    open_debt = loop.get("open_continuation_debt_ids")
+    if not isinstance(open_debt, list) or open_debt:
+        raise PermissionError("control-cycle snapshot still has open terminal continuation debt")
+    actions = snapshot.get("controller_actions")
+    if not isinstance(actions, list):
+        raise PermissionError("control-cycle snapshot is missing controller_actions")
+    seen: set[str] = set()
+    for action in actions:
+        if not isinstance(action, dict):
+            raise PermissionError("control-cycle snapshot contains malformed controller action")
+        action_id = str(action.get("id") or "").strip()
+        if action_id not in expected_action_ids:
+            raise PermissionError("control-cycle snapshot contains non-terminal controller action")
+        if action_id in seen:
+            raise PermissionError("control-cycle snapshot contains duplicate controller action")
+        seen.add(action_id)
+        if action.get("evidence") != evidence:
+            raise PermissionError("terminal controller action is not bound to terminal-reconcile audit")
+        if str(action.get("decision") or "").strip().lower() not in {"executed", "blocked"}:
+            raise PermissionError("terminal controller action is not fully resolved")
+    if seen != expected_action_ids:
+        raise PermissionError("control-cycle snapshot omitted terminal controller actions")
+    return snapshot
+
+
+def _latest_allowed_control_receipt(
+    *,
+    audit_log: Path,
+    repo: Path,
+    controller_id: str,
+    web_session_id: str,
+    lifecycle_snapshot: dict[str, Any],
+    authorized_at_unix: int,
+    expires_at_unix: int,
+    reconcile_path: Path,
+    pending_paths: list[str],
+) -> tuple[dict[str, Any], dict[str, Any], Path, dict[str, Any]]:
+    if not audit_log.is_file():
+        raise PermissionError("AI-Bridge durable audit log is unavailable")
+    selected: tuple[int, dict[str, Any], dict[str, Any], Path, dict[str, Any]] | None = None
+    with audit_log.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                receipt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(receipt, dict):
+                continue
+            occurred_ms = int(receipt.get("occurredAtUnixMs", 0) or 0)
+            if occurred_ms < authorized_at_unix * 1000 or occurred_ms >= expires_at_unix * 1000:
+                continue
+            event = web_bridge.translate_receipt(
+                receipt, session_id=controller_id, repo=repo, web_session_id=web_session_id
+            )
+            if event is None or not lifecycle.successful_control_receipt(event, lifecycle_snapshot):
+                continue
+            command = web_bridge.extract_command(receipt)
+            try:
+                control_snapshot_path = _control_snapshot_path(
+                    command, repo=repo, controller_id=controller_id
+                )
+                control_snapshot = _validate_control_snapshot_reconciles_terminal_debt(
+                    snapshot_path=control_snapshot_path,
+                    reconcile_path=reconcile_path,
+                    pending_paths=pending_paths,
+                )
+            except PermissionError:
+                continue
+            if selected is None or occurred_ms > selected[0]:
+                selected = (occurred_ms, receipt, event, control_snapshot_path, control_snapshot)
+    if selected is None:
+        raise PermissionError(
+            "no durable AI-Bridge control-event allowed receipt is bound to the current terminal reconciliation"
+        )
+    return selected[1], selected[2], selected[3], selected[4]
+
+
+def _immutable_closed_cycle_evidence(
+    *, repo: Path, controller_id: str, control_snapshot: dict[str, Any]
+) -> tuple[dict[str, Any], Path]:
+    contract = control_snapshot.get("event_contract")
+    if not isinstance(contract, dict):
+        raise PermissionError("control-cycle snapshot is missing event_contract")
+    if str(contract.get("event_type") or "").strip() != "terminal_debt_reconciliation":
+        raise PermissionError(
+            "manual terminal closure requires event_type=terminal_debt_reconciliation"
+        )
+    cycle_id = str(contract.get("event_id") or "").strip()
+    if not cycle_id or len(cycle_id) > 256:
+        raise PermissionError("control-cycle snapshot event_id is missing or invalid")
+    digest = hashlib.sha256(cycle_id.encode("utf-8")).hexdigest()
+    evidence_path = (
+        web_bridge._git_common_dir(repo)
+        / "adaptive-delivery"
+        / "controller-cycle-evidence"
+        / f"{digest}.json"
+    )
+    evidence = web_bridge.load_json(evidence_path)
+    if not evidence:
+        raise PermissionError("immutable CLOSED controller cycle evidence is required")
+    canonical_snapshot = json.dumps(
+        control_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    expected_hash = hashlib.sha256(canonical_snapshot).hexdigest()
+    checks = {
+        "record_kind": "controller_cycle_evidence",
+        "controller_id": controller_id,
+        "cycle_id": cycle_id,
+        "evidence_id": cycle_id,
+        "terminal_status": "CLOSED",
+        "snapshot_sha256": expected_hash,
+        "event_type": str(contract.get("event_type") or "").strip(),
+        "primary_task": str(contract.get("primary_task") or "").strip(),
+    }
+    for field, value in checks.items():
+        if evidence.get(field) != value:
+            raise PermissionError(f"immutable controller cycle evidence {field} does not match the allowed snapshot")
+    validation_errors = evidence.get("validation_errors")
+    if not isinstance(validation_errors, list) or validation_errors:
+        raise PermissionError("immutable controller cycle evidence is not a clean CLOSED result")
+    snapshot_ledger = str(control_snapshot.get("ledger_sha256") or "").strip()
+    if snapshot_ledger and evidence.get("ledger_sha256") != snapshot_ledger:
+        raise PermissionError("immutable controller cycle evidence ledger hash does not match the allowed snapshot")
+    candidate_revision = str(contract.get("candidate_revision") or "").strip()
+    if candidate_revision and evidence.get("main_revision") != candidate_revision:
+        raise PermissionError("immutable controller cycle evidence main revision does not match the allowed snapshot")
+    return evidence, evidence_path
+
+
+def _persist_reconciled_control_event_locked(
+    *,
+    state_path: Path,
+    event: dict[str, Any],
+    snapshot: dict[str, Any],
+    previous: dict[str, Any],
+    closure_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    # A historical allowed control receipt proves only that the reconciled terminal debt
+    # was closed at that earlier control boundary. It must never replay the generic
+    # successful-control branch because doing so would erase facts that appeared later.
+    # Rebuild canonical current triggers from the fresh snapshot, then preserve only
+    # non-terminal lifecycle edges that cannot be reconstructed from snapshot fields.
+    next_state = dict(previous)
+    next_state["snapshot"] = snapshot
+    next_state["pending_terminal_receipts"] = []
+
+    current_triggers = set(lifecycle.lifecycle_triggers(snapshot, None))
+    preserved_edge_triggers = {
+        "main_head_changed",
+        "ledger_changed",
+        "main_worktree_changed",
+        "ready_set_changed",
+        "candidate_queue_changed",
+        "YIELD_GATE_REJECTED",
+        "KNOWN_NEXT_ACTION_NOT_EXECUTED",
+        "post_receipt_action_started",
+        "RUNTIME_CONTINUATION_DEBT",
+    }
+    for raw in previous.get("triggers", []):
+        value = str(raw).strip()
+        if value in preserved_edge_triggers:
+            current_triggers.add(value)
+
+    pending_next_action = str(previous.get("next_action") or "").strip()
+    continuation_pending = bool(pending_next_action) and previous.get("requires_user") is False
+    if continuation_pending:
+        current_triggers.add("next_action_pending")
+
+    next_state["triggers"] = sorted(current_triggers)
+    next_state["pending_control_event"] = bool(
+        current_triggers
+        or continuation_pending
+        or previous.get("requires_user") is True
+    )
+    next_state["manual_control_reconcile"] = dict(closure_evidence)
+    lifecycle.write_json(state_path, next_state)
+    return next_state
+
+
+def reconcile_control_cycle_closure(
+    *,
+    repo: Path,
+    registry_path: Path = web_bridge.DEFAULT_REGISTRY,
+    audit_log: Path = web_bridge.DEFAULT_AUDIT_LOG,
+    manual_lease_path: Path = web_bridge.DEFAULT_MANUAL_WEB_LEASES,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Close already-reconciled terminal debt under a manual fenced Web binding.
+
+    This is intentionally narrower than translate-receipt: it never establishes or
+    upgrades Web identity and accepts no caller-supplied receipt or Web session id.
+    """
+    repo = Path(repo).expanduser().resolve()
+    registry_path = Path(registry_path).expanduser()
+    audit_log = Path(audit_log).expanduser()
+    manual_lease_path = Path(manual_lease_path).expanduser()
+    controller_id = web_bridge._registered_controller_for_common_dir(repo, registry_path)
+    if not controller_id:
+        raise PermissionError("manual control reconciliation requires exactly one registered Controller")
+    state_path = lifecycle.state_path(controller_id)
+    lifecycle_lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    registry_lock_path = web_bridge.target_guard.registry_lock_path(registry_path)
+    runtime_lock_path = runtime_state_path(repo).with_name("runtime-assignments.lock")
+    manual_lock_path = manual_lease_path.with_suffix(manual_lease_path.suffix + ".lock")
+    for path in (lifecycle_lock_path, registry_lock_path, runtime_lock_path, manual_lock_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    now = int(time.time() if now_unix is None else now_unix)
+
+    with lifecycle_lock_path.open("a+") as lifecycle_lock:
+        fcntl.flock(lifecycle_lock.fileno(), fcntl.LOCK_EX)
+        try:
+            with registry_lock_path.open("a+") as registry_lock:
+                fcntl.flock(registry_lock.fileno(), fcntl.LOCK_SH)
+                try:
+                    with runtime_lock_path.open("a+") as runtime_lock:
+                        fcntl.flock(runtime_lock.fileno(), fcntl.LOCK_SH)
+                        try:
+                            with manual_lock_path.open("a+") as manual_lock:
+                                fcntl.flock(manual_lock.fileno(), fcntl.LOCK_SH)
+                                try:
+                                    previous = lifecycle.load_json(state_path)
+                                    pending_paths = _normalized_pending_terminal_paths(previous)
+                                    if not pending_paths:
+                                        prior_closure = previous.get("manual_control_reconcile")
+                                        if (
+                                            isinstance(prior_closure, dict)
+                                            and prior_closure.get("operation") == "reconcile_control_cycle_closure"
+                                            and prior_closure.get("controller_id") == controller_id
+                                            and prior_closure.get("repo") == str(repo)
+                                            and prior_closure.get("host_attested") is False
+                                            and prior_closure.get("strong_web_identity_established") is False
+                                            and int(prior_closure.get("closed_terminal_receipt_count", 0) or 0) > 0
+                                        ):
+                                            return {
+                                                **prior_closure,
+                                                "pending_control_event": bool(previous.get("pending_control_event")),
+                                                "lifecycle_evidence_path": str(state_path),
+                                                "idempotent": True,
+                                            }
+                                        raise PermissionError("no pending terminal debt exists for control-cycle reconciliation")
+                                    binding = _manual_fenced_web_binding_locked(
+                                        repo=repo, controller_id=controller_id,
+                                        registry_path=registry_path,
+                                        manual_lease_path=manual_lease_path, now_unix=now,
+                                    )
+                                    terminal_audit, terminal_audit_path = _terminal_reconcile_audit_locked(
+                                        repo=repo, controller_id=controller_id,
+                                        pending_paths=pending_paths, binding=binding,
+                                    )
+                                    snapshot = lifecycle.project_snapshot(repo)
+                                    if snapshot is None:
+                                        raise RuntimeError("cannot snapshot Controller repository for control reconciliation")
+                                    receipt, event, control_snapshot_path, control_snapshot = _latest_allowed_control_receipt(
+                                        audit_log=audit_log, repo=repo, controller_id=controller_id,
+                                        web_session_id=binding["execution_target_session_id"],
+                                        lifecycle_snapshot=snapshot,
+                                        authorized_at_unix=binding["lease_effective_at_unix"],
+                                        expires_at_unix=binding["expires_at_unix"],
+                                        reconcile_path=terminal_audit_path,
+                                        pending_paths=pending_paths,
+                                    )
+                                    cycle_evidence, cycle_evidence_path = _immutable_closed_cycle_evidence(
+                                        repo=repo, controller_id=controller_id,
+                                        control_snapshot=control_snapshot,
+                                    )
+                                    closure_evidence = {
+                                        "schema_version": 1,
+                                        "operation": "reconcile_control_cycle_closure",
+                                        "controller_id": controller_id,
+                                        "repo": str(repo),
+                                        "control_receipt_id": str(receipt.get("receiptId") or ""),
+                                        "control_snapshot_path": str(control_snapshot_path),
+                                        "controller_cycle_evidence_path": str(cycle_evidence_path),
+                                        "controller_cycle_snapshot_sha256": cycle_evidence.get("snapshot_sha256"),
+                                        "terminal_reconcile_fingerprint": terminal_audit.get("reconcile_fingerprint"),
+                                        "closed_terminal_receipt_count": len(pending_paths),
+                                        **binding,
+                                        "host_attested": False,
+                                        "strong_web_identity_established": False,
+                                        "reconciled_at_unix": now,
+                                    }
+                                    next_state = _persist_reconciled_control_event_locked(
+                                        state_path=state_path, event=event,
+                                        snapshot=snapshot, previous=previous,
+                                        closure_evidence=closure_evidence,
+                                    )
+                                    closure = {
+                                        **closure_evidence,
+                                        "pending_control_event": bool(next_state.get("pending_control_event")),
+                                    }
+                                    closure_path = web_bridge._git_common_dir(repo) / "adaptive-delivery" / "control-reconcile.json"
+                                    try:
+                                        _write_json_atomic(closure_path, closure)
+                                        audit_path_value: str | None = str(closure_path)
+                                    except OSError:
+                                        audit_path_value = None
+                                    return {
+                                        **closure,
+                                        "audit_path": audit_path_value,
+                                        "lifecycle_evidence_path": str(state_path),
+                                        "idempotent": False,
+                                    }
+                                finally:
+                                    fcntl.flock(manual_lock.fileno(), fcntl.LOCK_UN)
+                        finally:
+                            fcntl.flock(runtime_lock.fileno(), fcntl.LOCK_UN)
+                finally:
+                    fcntl.flock(registry_lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            fcntl.flock(lifecycle_lock.fileno(), fcntl.LOCK_UN)
+
 def notify_runtime_change(
     *,
     repo: Path,
@@ -441,11 +947,21 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile = subparsers.add_parser("reconcile-pending")
     reconcile.add_argument("--repo", required=True)
     reconcile.add_argument("--registry", default=str(web_bridge.DEFAULT_REGISTRY))
+    close_cycle = subparsers.add_parser("reconcile-control-cycle")
+    close_cycle.add_argument("--repo", required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "reconcile-control-cycle":
+        try:
+            result = reconcile_control_cycle_closure(repo=Path(args.repo))
+        except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     if args.command == "reconcile-pending":
         try:
             result = reconcile_pending_terminal_receipts(

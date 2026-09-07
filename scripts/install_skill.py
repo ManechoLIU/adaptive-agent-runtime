@@ -179,6 +179,26 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_reconcile_pending_fingerprint_is_order_independent",
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
     "test_atomic_audit_writer_handles_concurrent_publication",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_manual_fenced_control_cycle_reconcile_closes_only_reconciled_terminal_debt_without_verifying_web_identity",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_manual_fenced_control_cycle_reconcile_requires_unexpired_matching_manual_lease",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_manual_reconcile_requires_target_lineage_membership",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_manual_reconcile_skips_later_unrelated_allowed_receipt",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_reconcile_control_cycle_cli_accepts_no_receipt_or_web_session_identity_argument",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_manual_reconcile_rejects_forged_immutable_cycle_evidence",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_manual_reconcile_rejects_receipt_from_before_current_target_rotation",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_manual_reconcile_is_idempotent_after_durable_lifecycle_closure",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_manual_reconcile_closes_only_terminal_debt_and_preserves_current_nonterminal_triggers",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
     "test_regression_parent_already_yielded_then_writer_completed_wakes_same_controller_with_next_runnable",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
