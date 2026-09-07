@@ -723,6 +723,8 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
             "reason": "canonical Controller identity guard is missing",
             "capabilities": [],
             "canonical_identity_cli": "controller_target_guard.py identity",
+            "strong_web_binding_available": False,
+            "host_attestation": "unavailable",
         }
     completed = subprocess.run(
         [sys.executable, str(script), "capabilities"],
@@ -736,6 +738,8 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
             "reason": "canonical Controller identity capability probe failed",
             "capabilities": [],
             "canonical_identity_cli": "controller_target_guard.py identity",
+            "strong_web_binding_available": False,
+            "host_attestation": "unavailable",
         }
     try:
         contract = json.loads(completed.stdout)
@@ -764,6 +768,8 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
         "capabilities": sorted(set(capabilities)),
         "missing_capabilities": missing,
         "canonical_identity_cli": canonical_cli or "controller_target_guard.py identity",
+        "strong_web_binding_available": False,
+        "host_attestation": "unavailable",
     }
 
 

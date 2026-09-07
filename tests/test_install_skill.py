@@ -1163,6 +1163,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             self.assertEqual(identity["canonical_identity_cli"], "controller_target_guard.py identity")
             self.assertIn("controller_identity_projection", identity["capabilities"])
             self.assertIn("same_controller_recovery", identity["capabilities"])
+            self.assertFalse(identity["strong_web_binding_available"])
+            self.assertEqual(identity["host_attestation"], "unavailable")
             web_execution = manifest["capabilities"]["web_agent_execution"]
             self.assertEqual(web_execution["status"], "host_limited")
             self.assertFalse(web_execution["configured"])
