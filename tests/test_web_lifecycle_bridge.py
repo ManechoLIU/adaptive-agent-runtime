@@ -1862,6 +1862,26 @@ class WebLifecycleAuditTests(unittest.TestCase):
                     session_id="controller-1", repo=repo, registry=registry,
                 )
 
+    def test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-current"]}},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 3,
+                }}},
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "execution ownership"):
+                web_bridge.canonical_rule_wake_target(
+                    lifecycle_state={"controller_host": "desktop_codex"},
+                    session_id="controller-1", repo=repo, registry=registry,
+                )
+
     def test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

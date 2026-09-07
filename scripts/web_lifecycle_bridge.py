@@ -3370,18 +3370,21 @@ def canonical_rule_wake_target(
     ownership = target_guard.execution_ownership_record(
         registry_data, controller_id=session_id
     )
-    if ownership is not None:
-        ownership_host, ownership_target, ownership_generation = (
-            target_guard.validate_execution_ownership_record(ownership)
+    if ownership is None:
+        raise PermissionError(
+            "canonical execution ownership is required for autonomous rule-update wake"
         )
-        if (
-            ownership_host != host
-            or ownership_target != receipt.get("execution_target_session_id")
-        ):
-            raise PermissionError(
-                "canonical execution ownership does not match the rule wake target"
-            )
-        receipt = {**receipt, "ownership_generation": ownership_generation}
+    ownership_host, ownership_target, ownership_generation = (
+        target_guard.validate_execution_ownership_record(ownership)
+    )
+    if (
+        ownership_host != host
+        or ownership_target != receipt.get("execution_target_session_id")
+    ):
+        raise PermissionError(
+            "canonical execution ownership does not match the rule wake target"
+        )
+    receipt = {**receipt, "ownership_generation": ownership_generation}
     return receipt
 
 
