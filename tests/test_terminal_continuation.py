@@ -427,3 +427,73 @@ def _pending_reconcile_partial_classification_test(self):
         self.assertEqual(by_path[str(unbound.resolve())]["action_suggestion"], "executed")
 
 PendingTerminalReconcileTests.test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks = _pending_reconcile_partial_classification_test
+
+def _pending_reconcile_rejects_lifecycle_change_before_publish(self):
+    module = self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root=Path(tmp); repo=root/'repo'; repo.mkdir(); subprocess.run(['git','init','-q','-b','main',str(repo)],check=True)
+        registry=root/'controllers.json'; registry.write_text(json.dumps(_ownership_registry(repo)),encoding='utf-8')
+        receipt=root/'terminal.json'; receipt.write_text(json.dumps({'event_type':'external_agent_terminal','repo':str(repo.resolve()),'summary':'done'}),encoding='utf-8')
+        states=[{'pending_terminal_receipts':[str(receipt)]},{'pending_terminal_receipts':[]}]
+        with patch.object(module.lifecycle,'state_path',return_value=root/'controller.json'), patch.object(
+            module.lifecycle,'load_json',side_effect=states
+        ):
+            with self.assertRaisesRegex(PermissionError,'pending terminal receipt set changed'):
+                module.reconcile_pending_terminal_receipts(repo=repo,registry_path=registry)
+        self.assertFalse((repo/'.git/adaptive-delivery/terminal-reconcile.json').exists())
+
+
+def _pending_reconcile_rejects_target_generation_change_before_publish(self):
+    module=self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root=Path(tmp); repo=root/'repo'; repo.mkdir(); subprocess.run(['git','init','-q','-b','main',str(repo)],check=True)
+        registry=root/'controllers.json'; registry.write_text(json.dumps(_ownership_registry(repo,generation=1)),encoding='utf-8')
+        receipt=root/'terminal.json'; receipt.write_text(json.dumps({'event_type':'external_agent_terminal','repo':str(repo.resolve()),'summary':'done'}),encoding='utf-8')
+        state={'pending_terminal_receipts':[str(receipt)]}
+        self.assertTrue(hasattr(module, '_terminal_reconcile_execution_fence'), 'reconcile must expose a reusable execution fence helper')
+        original=module._terminal_reconcile_execution_fence
+        calls=[]
+        def fence(*args,**kwargs):
+            value=original(*args,**kwargs); calls.append(value)
+            if len(calls)==2:
+                return {**value,'target_generation':value['target_generation']+1,'ownership_generation':value['ownership_generation']+1}
+            return value
+        with patch.object(module.lifecycle,'state_path',return_value=root/'controller.json'), patch.object(module.lifecycle,'load_json',return_value=state), patch.object(module,'_terminal_reconcile_execution_fence',side_effect=fence):
+            with self.assertRaisesRegex(PermissionError,'execution fence changed'):
+                module.reconcile_pending_terminal_receipts(repo=repo,registry_path=registry)
+
+
+def _pending_reconcile_hashes_same_bytes_it_parses(self):
+    module=self._module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root=Path(tmp); repo=root/'repo'; repo.mkdir(); subprocess.run(['git','init','-q','-b','main',str(repo)],check=True)
+        registry=root/'controllers.json'; registry.write_text(json.dumps(_ownership_registry(repo)),encoding='utf-8')
+        receipt=root/'terminal.json'
+        payload=json.dumps({'event_type':'external_agent_terminal','repo':str(repo.resolve()),'summary':'stable'}).encode()
+        receipt.write_bytes(payload)
+        state={'pending_terminal_receipts':[str(receipt)]}
+        original_read_bytes=Path.read_bytes
+        original_read_text=Path.read_text
+        reads={'bytes':0,'text':0}
+        def read_bytes(path):
+            if path.resolve()==receipt.resolve():
+                reads['bytes']+=1
+                if reads['bytes']>1:
+                    return json.dumps({'event_type':'external_agent_terminal','repo':str(repo.resolve()),'summary':'replaced'}).encode()
+            return original_read_bytes(path)
+        def read_text(path,*args,**kwargs):
+            if path.resolve()==receipt.resolve():
+                reads['text']+=1
+                raise AssertionError('reconcile must not separately read terminal receipt text')
+            return original_read_text(path,*args,**kwargs)
+        with patch.object(module.lifecycle,'state_path',return_value=root/'controller.json'), patch.object(module.lifecycle,'load_json',return_value=state), patch.object(Path,'read_bytes',read_bytes), patch.object(Path,'read_text',read_text):
+            result=module.reconcile_pending_terminal_receipts(repo=repo,registry_path=registry)
+        self.assertEqual(reads['bytes'],1)
+        self.assertEqual(reads['text'],0)
+        self.assertEqual(result['receipts'][0]['summary'],'stable')
+        import hashlib
+        self.assertEqual(result['receipts'][0]['sha256'],hashlib.sha256(payload).hexdigest())
+
+PendingTerminalReconcileTests.test_reconcile_pending_rejects_lifecycle_change_before_publish = _pending_reconcile_rejects_lifecycle_change_before_publish
+PendingTerminalReconcileTests.test_reconcile_pending_rejects_target_generation_change_before_publish = _pending_reconcile_rejects_target_generation_change_before_publish
+PendingTerminalReconcileTests.test_reconcile_pending_hashes_same_bytes_it_parses = _pending_reconcile_hashes_same_bytes_it_parses

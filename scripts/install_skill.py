@@ -165,6 +165,12 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_reconcile_pending_cli_has_no_receipt_argument_and_never_self_spawns",
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
     "test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_reconcile_pending_rejects_lifecycle_change_before_publish",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_reconcile_pending_rejects_target_generation_change_before_publish",
+    "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+    "test_reconcile_pending_hashes_same_bytes_it_parses",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
     "test_regression_parent_already_yielded_then_writer_completed_wakes_same_controller_with_next_runnable",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."

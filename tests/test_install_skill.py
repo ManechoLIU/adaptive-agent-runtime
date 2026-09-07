@@ -761,7 +761,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_reconcile_pending_is_idempotent_and_does_not_mutate_lifecycle_or_dispatch_wake(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_fails_closed_when_canonical_ownership_is_missing_or_mismatched(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_cli_has_no_receipt_argument_and_never_self_spawns(self): self.assertTrue(True)\n"
-                "    def test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks(self): self.assertTrue(True)\n",
+                "    def test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_rejects_lifecycle_change_before_publish(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_rejects_target_generation_change_before_publish(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_hashes_same_bytes_it_parses(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_project_context_guard.py").write_text(
@@ -1033,7 +1036,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_reconcile_pending_is_idempotent_and_does_not_mutate_lifecycle_or_dispatch_wake(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_fails_closed_when_canonical_ownership_is_missing_or_mismatched(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_cli_has_no_receipt_argument_and_never_self_spawns(self): self.assertTrue(True)\n"
-                "    def test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks(self): self.assertTrue(True)\n",
+                "    def test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_rejects_lifecycle_change_before_publish(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_rejects_target_generation_change_before_publish(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_hashes_same_bytes_it_parses(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_project_context_guard.py").write_text(
