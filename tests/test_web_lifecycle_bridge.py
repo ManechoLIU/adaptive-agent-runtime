@@ -1810,6 +1810,44 @@ class WebLifecycleAuditTests(unittest.TestCase):
         self.assertNotEqual(code2, 0)
         self.assertEqual(second.call_count, 0)
 
+    def test_audit_once_rule_update_uses_guarded_scheduler_and_never_direct_scheduler(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
+            }), encoding="utf-8")
+            audit = root / "audit.jsonl"; cursor = root / "cursor.json"
+            receipt = {
+                "receiptId":"guard-rule-1", "childTool":"shell_command", "state":"succeeded",
+                "rootLabel":str(repo), "targetLabel":GUARD_COMMAND,
+                "detail":f"命令：{GUARD_COMMAND} · 工作目录：{repo}\n\n命令输出：\ncontrol-event: allowed; done\n",
+            }
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True, "rule_wake_policy": "immediate",
+                "triggers": ["rule_update_pending:rev-new"],
+                "snapshot": {"rule_handshake": {"installed_revision": "rev-new"}},
+            }
+            args = ["audit-once", "--session-id", "controller-1", "--repo", str(repo),
+                    "--registry", str(registry), "--web-session-id", "web-session-1",
+                    "--audit-log", str(audit), "--cursor", str(cursor), "--auto-native-stop"]
+            with patch.object(web_bridge, "dispatch_event", return_value=0), patch.object(
+                web_bridge, "_load_lifecycle_state", return_value={}
+            ), patch.object(
+                web_bridge, "refresh_rule_wake_state", return_value=lifecycle
+            ), patch.object(
+                web_bridge, "schedule_auto_native_stop", return_value=True
+            ), patch.object(
+                web_bridge, "schedule_guarded_rule_wake", return_value={"schedule":"blocked","reason":"explicit current execution target required"}
+            ) as guarded, patch.object(web_bridge, "maybe_schedule_rule_wake") as direct:
+                code = web_bridge.main(args)
+        self.assertEqual(code, 0)
+        guarded.assert_called_once()
+        direct.assert_not_called()
+
     def test_auto_native_stop_reschedules_same_controller_after_active_writer_deferral(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:

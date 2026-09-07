@@ -144,6 +144,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_audit_once_rule_update_uses_guarded_scheduler_and_never_direct_scheduler",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof",

@@ -3526,6 +3526,50 @@ def _rule_revision_from_state(lifecycle_state: dict[str, Any]) -> str | None:
     return None
 
 
+def schedule_guarded_rule_wake(
+    *,
+    lifecycle_state: dict[str, Any],
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    codex: str,
+    delay_seconds: float,
+    state_path: Path,
+    capture_path: Path | None = None,
+    runtime_path: str | None = None,
+) -> dict[str, Any]:
+    decision = rule_wake_schedule_decision(lifecycle_state)
+    if decision != "schedule_now":
+        return {"schedule": decision}
+    try:
+        target = canonical_rule_wake_target(
+            lifecycle_state=lifecycle_state,
+            session_id=session_id,
+            repo=repo,
+            registry=registry,
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return {"schedule": "blocked", "reason": str(exc)}
+    schedule = maybe_schedule_rule_wake(
+        lifecycle_state=lifecycle_state,
+        session_id=session_id,
+        repo=repo,
+        registry=registry,
+        codex=codex,
+        delay_seconds=delay_seconds,
+        state_path=state_path,
+        capture_path=capture_path,
+        runtime_path=runtime_path,
+    )
+    return {
+        "schedule": schedule,
+        "host": target.get("host"),
+        "execution_target_session_id": target.get("execution_target_session_id"),
+        "target_generation": target.get("generation"),
+        "ownership_generation": target.get("ownership_generation"),
+    }
+
+
 def maybe_schedule_rule_wake(
     *,
     lifecycle_state: dict[str, Any],
@@ -5116,7 +5160,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if args.auto_stop_state
                     else default_auto_stop_state_path(args.session_id)
                 )
-                maybe_schedule_rule_wake(
+                schedule_guarded_rule_wake(
                     lifecycle_state=lifecycle_state,
                     session_id=args.session_id, repo=repo, registry=Path(args.registry).expanduser(),
                     codex=args.codex, delay_seconds=max(0.0, args.auto_stop_delay_seconds),
