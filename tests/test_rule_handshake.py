@@ -172,6 +172,51 @@ class RuleHandshakeTests(unittest.TestCase):
             self.assertTrue(status["blocking"])
             self.assertIn("scripts/web_lifecycle_bridge.py", status["live_e2e_changed_files"])
 
+    def test_explicit_live_e2e_deferral_is_revision_scoped_and_auditable(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, previous_revision = make_source(base)
+            bridge = source / "scripts" / "web_lifecycle_bridge.py"
+            bridge.write_text("VALUE = 2\n", encoding="utf-8")
+            git(source, "add", ".")
+            git(source, "commit", "-m", "change live continuation")
+            revision = git(source, "rev-parse", "HEAD")
+            target = base / "installed"
+            install_skill(
+                source, target, summary="live continuation", impact="live_assignments",
+                stop_condition="real continuation e2e", previous_revision=previous_revision, now=NOW,
+            )
+            repo = make_project(base)
+            registry = base / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+            acknowledge_rule_revision(
+                repo, "controller-1", revision, skill_root=target, registry_path=registry, now=NOW
+            )
+            ledger = repo / "TASK_LEDGER.md"
+            ledger.write_text(
+                ledger.read_text(encoding="utf-8").replace(
+                    "adaptive-delivery@old", f"adaptive-delivery@{revision}"
+                ), encoding="utf-8"
+            )
+
+            receipt = rule_handshake_module.defer_live_e2e(
+                repo, "controller-1", revision,
+                reason="host attestation unavailable until replacement bridge",
+                skill_root=target, registry_path=registry, now=NOW,
+            )
+            status = evaluate_rule_handshake(
+                repo, skill_root=target, registry_path=registry
+            )
+
+            self.assertEqual(receipt["status"], "deferred")
+            self.assertEqual(receipt["installed_revision"], revision)
+            self.assertEqual(receipt["controller_session_id"], "controller-1")
+            self.assertEqual(status["state"], "current_deferred_live_e2e")
+            self.assertFalse(status["blocking"])
+            self.assertTrue(status["live_e2e_required"])
+            self.assertEqual(status["live_e2e_deferred_revision"], revision)
+            self.assertIn("host attestation unavailable", status["live_e2e_deferred_reason"])
+
     def test_forged_live_e2e_acceptance_without_machine_evidence_stays_blocking(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)

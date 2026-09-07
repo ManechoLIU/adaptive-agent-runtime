@@ -401,6 +401,26 @@ def evaluate_rule_handshake(
         else None
     )
     if live_e2e_required:
+        deferred_revision = str(state.get("live_e2e_deferred_revision") or "").strip()
+        deferred_reason = str(state.get("live_e2e_deferred_reason") or "").strip()
+        deferred_controller = str(state.get("live_e2e_deferred_by_controller") or "").strip()
+        if (
+            deferred_revision == installed
+            and deferred_reason
+            and deferred_controller == str(state.get("controller_session_id") or "").strip()
+        ):
+            return {
+                **result,
+                "state": "current_deferred_live_e2e",
+                "blocking": False,
+                "live_e2e_required": True,
+                "live_e2e_changed_files": live_e2e_changed_files,
+                "live_e2e_required_since_revision": live_e2e_required_since_revision,
+                "live_e2e_deferred_revision": deferred_revision,
+                "live_e2e_deferred_reason": deferred_reason,
+                "live_e2e_deferred_at": state.get("live_e2e_deferred_at"),
+                "manifest_sha256": _sha256(manifest_path),
+            }
         acceptance = load_live_e2e_acceptance(repo)
         acceptance_errors = _live_e2e_acceptance_errors(
             repo,
@@ -568,6 +588,63 @@ def accept_live_e2e(
             temporary_path.unlink()
 
 
+def defer_live_e2e(
+    repo: str | Path,
+    controller_session_id: str,
+    revision: str,
+    *,
+    reason: str,
+    skill_root: str | Path | None = None,
+    registry_path: str | Path | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("live E2E deferral reason is required")
+    manifest = load_install_manifest(skill_root)
+    if not manifest:
+        raise ValueError("installed Adaptive Agent Runtime manifest is missing")
+    installed = str(manifest.get("revision", "")).strip()
+    if revision != installed:
+        raise ValueError("requested revision does not match installed revision")
+    state = load_rule_state(repo)
+    if str(state.get("loaded_revision") or "").strip() != installed:
+        raise ValueError("live E2E deferral requires the installed revision to be loaded first")
+    if not bool(state.get("live_e2e_required")):
+        raise ValueError("live E2E deferral requires pending live E2E debt")
+    if str(state.get("controller_session_id") or "").strip() != controller_session_id:
+        raise ValueError("live E2E deferral requires the loaded Controller")
+
+    registry_file = Path(registry_path).expanduser().resolve() if registry_path else DEFAULT_REGISTRY
+    registry = _read_json(registry_file)
+    registered = registry.get(controller_session_id)
+    if not isinstance(registered, str) or not registered.strip():
+        raise ValueError("live E2E deferral requires a registered controller session")
+    try:
+        if git_common_dir(registered) != git_common_dir(repo):
+            raise ValueError("live E2E deferral Controller is not registered for this repository")
+    except (OSError, ValueError):
+        raise ValueError("live E2E deferral Controller is not registered for this repository") from None
+
+    deferred_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+    updated = {
+        **state,
+        "live_e2e_deferred_revision": installed,
+        "live_e2e_deferred_by_controller": controller_session_id,
+        "live_e2e_deferred_reason": reason,
+        "live_e2e_deferred_at": deferred_at,
+    }
+    _write_json_atomic(rule_state_path(repo), updated)
+    return {
+        "schema_version": 1,
+        "status": "deferred",
+        "installed_revision": installed,
+        "controller_session_id": controller_session_id,
+        "reason": reason,
+        "deferred_at": deferred_at,
+    }
+
+
 def acknowledge_rule_revision(
     repo: str | Path,
     controller_session_id: str,
@@ -674,6 +751,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     live_e2e.add_argument("--revision", required=True)
     live_e2e.add_argument("--skill-root")
     live_e2e.add_argument("--registry")
+    defer_e2e = sub.add_parser("defer-live-e2e")
+    defer_e2e.add_argument("--repo", required=True)
+    defer_e2e.add_argument("--controller-session", required=True)
+    defer_e2e.add_argument("--revision", required=True)
+    defer_e2e.add_argument("--reason", required=True)
+    defer_e2e.add_argument("--skill-root")
+    defer_e2e.add_argument("--registry")
     guard = sub.add_parser("launch-guard")
     guard.add_argument("--repo", required=True)
     guard.add_argument("--ledger")
@@ -699,6 +783,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.repo,
                 args.controller_session,
                 args.revision,
+                skill_root=args.skill_root,
+                registry_path=args.registry,
+            )
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.command == "defer-live-e2e":
+            result = defer_live_e2e(
+                args.repo,
+                args.controller_session,
+                args.revision,
+                reason=args.reason,
                 skill_root=args.skill_root,
                 registry_path=args.registry,
             )
