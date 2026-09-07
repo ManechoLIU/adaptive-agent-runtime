@@ -316,6 +316,7 @@ def replace_web_session(
                 )
             if ownership_host == "web" and ownership_target == web_session_id:
                 next_ownership_generation = ownership_generation
+                ownership_changed = False
             else:
                 ownership_receipt = target_guard._claim_controller_host_in_registry(
                     registry,
@@ -326,6 +327,7 @@ def replace_web_session(
                     provenance="manual_user_authorized",
                 )
                 next_ownership_generation = int(ownership_receipt["generation"])
+                ownership_changed = True
 
             lease_lock_path = lease_path.with_suffix(lease_path.suffix + ".lock")
             lease_lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -342,7 +344,7 @@ def replace_web_session(
                     )
                     if resume_lease_rotated:
                         _write_json_atomic_file(lease_path, lease_after)
-                    if not idempotent:
+                    if not idempotent or ownership_changed:
                         try:
                             _write_json_atomic_file(registry_path, registry)
                         except Exception:

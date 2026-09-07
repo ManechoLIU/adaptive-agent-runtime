@@ -1195,6 +1195,56 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(current["execution_target_session_id"], "web-old")
             self.assertEqual(current["generation"], 3)
 
+    def test_replace_same_web_target_persists_ownership_handoff_from_desktop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-current"], "desktop_codex": ["desktop-current"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {
+                        "web": {
+                            "status": "active", "session_id": "web-current", "generation": 4,
+                            "provenance": "manual_user_authorized", "binding_mode": "temporary",
+                            "host_attested": False,
+                        },
+                        "desktop_codex": {
+                            "status": "active", "session_id": "desktop-current", "generation": 2,
+                        },
+                    }
+                },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "desktop_codex",
+                        "execution_target_session_id": "desktop-current",
+                        "generation": 7,
+                        "provenance": "desktop_entry",
+                    }
+                },
+            }), encoding="utf-8")
+
+            result = self.run_bridge(
+                "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
+                "--web-session-id", "web-current", "--expected-generation", "4",
+                "--expected-ownership-generation", "7", "--registry", str(registry),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            receipt = json.loads(result.stdout)
+            self.assertEqual(receipt["generation"], 4)
+            self.assertEqual(receipt["ownership_generation"], 8)
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            ownership = saved["__controller_execution_ownership__"]["controller-1"]
+            self.assertEqual(ownership["active_host"], "web")
+            self.assertEqual(ownership["execution_target_session_id"], "web-current")
+            self.assertEqual(ownership["generation"], 8)
+            self.assertEqual(ownership["provenance"], "manual_user_authorized")
+
     def test_replace_web_session_rolls_back_manual_lease_when_registry_commit_fails(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
