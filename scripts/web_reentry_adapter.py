@@ -68,7 +68,8 @@ def resolve_reentry_session(
 ) -> str:
     repo = Path(repo).expanduser().resolve()
     registry = _load_json(Path(registry_path).expanduser())
-    if registry.get(controller_id) != str(repo):
+    registered_repo = registry.get(controller_id)
+    if not isinstance(registered_repo, str) or Path(registered_repo).expanduser().resolve() != repo:
         raise PermissionError("registered Controller repository does not match Web re-entry repository")
     sessions = registry.get("__controller_sessions__")
     controller_sessions = sessions.get(controller_id) if isinstance(sessions, dict) else None
@@ -84,7 +85,8 @@ def resolve_reentry_session(
         raise PermissionError("current Web Controller resume lease is missing")
     if record.get("controller_id") not in (None, controller_id):
         raise PermissionError("Web re-entry lease belongs to another Controller")
-    if record.get("repo") != str(repo):
+    lease_repo = record.get("repo")
+    if not isinstance(lease_repo, str) or Path(lease_repo).expanduser().resolve() != repo:
         raise PermissionError("Web re-entry lease repository does not match registered Controller")
     if record.get("provenance") != "manual_user_authorized" or record.get("mode") != "resume_only":
         raise PermissionError("Web re-entry requires a manual resume_only Controller lease")

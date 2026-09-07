@@ -205,6 +205,7 @@ def replace_web_session(
     controller_id: str,
     web_session_id: str,
     expected_generation: int,
+    expected_ownership_generation: int,
     registry_path: Path,
     lease_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -292,6 +293,40 @@ def replace_web_session(
                 registry["__controller_targets__"] = targets
                 idempotent = False
 
+            prior_ownership = target_guard.execution_ownership_record(
+                registry, controller_id=controller_id
+            )
+            if prior_ownership is None:
+                ownership_generation = 0
+                ownership_host = None
+                ownership_target = None
+            else:
+                ownership_host, ownership_target, ownership_generation = (
+                    target_guard.validate_execution_ownership_record(prior_ownership)
+                )
+            if (
+                isinstance(expected_ownership_generation, bool)
+                or not isinstance(expected_ownership_generation, int)
+                or expected_ownership_generation < 0
+            ):
+                raise ValueError("expected_ownership_generation must be a non-negative integer")
+            if ownership_generation != expected_ownership_generation:
+                raise PermissionError(
+                    f"expected ownership generation {expected_ownership_generation} does not match current ownership generation {ownership_generation}"
+                )
+            if ownership_host == "web" and ownership_target == web_session_id:
+                next_ownership_generation = ownership_generation
+            else:
+                ownership_receipt = target_guard._claim_controller_host_in_registry(
+                    registry,
+                    controller_id=controller_id,
+                    requested_host="web",
+                    requested_target_session_id=web_session_id,
+                    expected_generation=expected_ownership_generation,
+                    provenance="manual_user_authorized",
+                )
+                next_ownership_generation = int(ownership_receipt["generation"])
+
             lease_lock_path = lease_path.with_suffix(lease_path.suffix + ".lock")
             lease_lock_path.parent.mkdir(parents=True, exist_ok=True)
             with lease_lock_path.open("a+") as lease_lock:
@@ -331,6 +366,7 @@ def replace_web_session(
         "binding": binding,
         "host_attested": host_attested,
         "resume_lease_rotated": resume_lease_rotated,
+        "ownership_generation": next_ownership_generation,
         "idempotent": idempotent,
     }
 
@@ -341,6 +377,7 @@ def unbind_web_session(
     controller_id: str,
     web_session_id: str,
     expected_generation: int,
+    expected_ownership_generation: int,
     registry_path: Path,
 ) -> dict[str, Any]:
     repo = canonical_root(repo)
@@ -379,6 +416,25 @@ def unbind_web_session(
             generation = _require_expected_web_generation(
                 prior, expected_generation=expected_generation
             )
+            prior_ownership = target_guard.execution_ownership_record(
+                registry, controller_id=controller_id
+            )
+            if prior_ownership is None:
+                ownership_generation = 0
+            else:
+                _ownership_host, _ownership_target, ownership_generation = (
+                    target_guard.validate_execution_ownership_record(prior_ownership)
+                )
+            if (
+                isinstance(expected_ownership_generation, bool)
+                or not isinstance(expected_ownership_generation, int)
+                or expected_ownership_generation < 0
+            ):
+                raise ValueError("expected_ownership_generation must be a non-negative integer")
+            if ownership_generation != expected_ownership_generation:
+                raise PermissionError(
+                    f"expected ownership generation {expected_ownership_generation} does not match current ownership generation {ownership_generation}"
+                )
             current = None
             provenance = "manual_user_authorized"
             binding_mode = "temporary"
@@ -4471,6 +4527,7 @@ def build_parser() -> argparse.ArgumentParser:
     replace_web.add_argument("--controller-id", required=True)
     replace_web.add_argument("--web-session-id", required=True)
     replace_web.add_argument("--expected-generation", type=int, required=True)
+    replace_web.add_argument("--expected-ownership-generation", type=int, required=True)
     replace_web.add_argument("--registry", default=str(DEFAULT_REGISTRY))
     replace_web.add_argument("--lease-file", default=str(DEFAULT_MANUAL_WEB_LEASES))
 
@@ -4479,6 +4536,7 @@ def build_parser() -> argparse.ArgumentParser:
     unbind_web.add_argument("--controller-id", required=True)
     unbind_web.add_argument("--web-session-id", required=True)
     unbind_web.add_argument("--expected-generation", type=int, required=True)
+    unbind_web.add_argument("--expected-ownership-generation", type=int, required=True)
     unbind_web.add_argument("--registry", default=str(DEFAULT_REGISTRY))
 
     authorize_manual = subparsers.add_parser("authorize-manual-web-session")
@@ -4615,8 +4673,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             receipt = replace_web_session(
                 repo=repo, controller_id=args.controller_id, web_session_id=args.web_session_id,
-                expected_generation=args.expected_generation, registry_path=registry_path,
-                lease_path=lease_path,
+                expected_generation=args.expected_generation,
+                expected_ownership_generation=args.expected_ownership_generation,
+                registry_path=registry_path, lease_path=lease_path,
             )
         except PermissionError as exc:
             print(str(exc), file=sys.stderr)
@@ -4633,7 +4692,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             receipt = unbind_web_session(
                 repo=repo, controller_id=args.controller_id, web_session_id=args.web_session_id,
-                expected_generation=args.expected_generation, registry_path=registry_path,
+                expected_generation=args.expected_generation,
+                expected_ownership_generation=args.expected_ownership_generation,
+                registry_path=registry_path,
             )
         except PermissionError as exc:
             print(str(exc), file=sys.stderr)

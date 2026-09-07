@@ -1054,7 +1054,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             result = self.run_bridge(
                 "replace-web-session", "--repo", str(repo),
                 "--controller-id", "controller-1", "--web-session-id", "web-new",
-                "--expected-generation", "0", "--registry", str(registry),
+                "--expected-generation", "0", "--expected-ownership-generation", "0", "--registry", str(registry),
                 "--lease-file", str(lease),
             )
 
@@ -1063,6 +1063,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(receipt["controller_id"], "controller-1")
             self.assertEqual(receipt["execution_target_session_id"], "web-new")
             self.assertEqual(receipt["generation"], 1)
+            self.assertEqual(receipt["ownership_generation"], 1)
             self.assertEqual(receipt["binding"], "temporary")
             self.assertFalse(receipt["host_attested"])
             self.assertTrue(receipt["resume_lease_rotated"])
@@ -1073,6 +1074,11 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(target["generation"], 1)
             self.assertEqual(target["provenance"], "manual_user_authorized")
             self.assertFalse(target["host_attested"])
+            ownership = saved["__controller_execution_ownership__"]["controller-1"]
+            self.assertEqual(ownership["active_host"], "web")
+            self.assertEqual(ownership["execution_target_session_id"], "web-new")
+            self.assertEqual(ownership["generation"], 1)
+            self.assertEqual(ownership["provenance"], "manual_user_authorized")
             rotated = json.loads(lease.read_text())["leases"]["controller-1"]
             self.assertEqual(rotated["web_session_id"], "web-new")
             self.assertEqual(rotated["authorized_at_unix"], 10)
@@ -1103,6 +1109,13 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 web_bridge.require_web_controller_session(
                     controller_id="controller-1", web_session_id="web-new", registry_path=registry
                 )
+            self.assertEqual(
+                web_bridge.resolve_reentry_session(
+                    controller_id="controller-1", repo=repo, registry_path=registry, lease_path=lease,
+                    now_unix=11,
+                ),
+                "web-new",
+            )
 
     def test_replace_web_session_rejects_foreign_session_repo_mismatch_and_active_outbound_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1122,13 +1135,13 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             foreign = self.run_bridge(
                 "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
                 "--web-session-id", "web-foreign", "--expected-generation", "0",
-                "--registry", str(registry), "--lease-file", str(lease),
+                "--expected-ownership-generation", "0", "--registry", str(registry), "--lease-file", str(lease),
             )
             self.assertEqual(foreign.returncode, 78)
             mismatch = self.run_bridge(
                 "replace-web-session", "--repo", str(other), "--controller-id", "controller-1",
                 "--web-session-id", "web-new", "--expected-generation", "0",
-                "--registry", str(registry), "--lease-file", str(lease),
+                "--expected-ownership-generation", "0", "--registry", str(registry), "--lease-file", str(lease),
             )
             self.assertEqual(mismatch.returncode, 78)
 
@@ -1142,7 +1155,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             blocked = self.run_bridge(
                 "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
                 "--web-session-id", "web-new", "--expected-generation", "0",
-                "--registry", str(registry), "--lease-file", str(lease),
+                "--expected-ownership-generation", "0", "--registry", str(registry), "--lease-file", str(lease),
             )
             self.assertEqual(blocked.returncode, 78)
             self.assertIn("outbound", blocked.stderr.lower())
@@ -1164,14 +1177,14 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             lease = root / "manual.json"
             unapproved = self.run_bridge(
                 "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
-                "--web-session-id", "web-unapproved", "--expected-generation", "3",
+                "--web-session-id", "web-unapproved", "--expected-generation", "3", "--expected-ownership-generation", "0",
                 "--registry", str(registry), "--lease-file", str(lease),
             )
             self.assertEqual(unapproved.returncode, 78)
             self.assertIn("lineage", unapproved.stderr)
             stale = self.run_bridge(
                 "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
-                "--web-session-id", "web-approved", "--expected-generation", "2",
+                "--web-session-id", "web-approved", "--expected-generation", "2", "--expected-ownership-generation", "0",
                 "--registry", str(registry), "--lease-file", str(lease),
             )
             self.assertEqual(stale.returncode, 78)
@@ -1181,6 +1194,72 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             )
             self.assertEqual(current["execution_target_session_id"], "web-old")
             self.assertEqual(current["generation"], 3)
+
+    def test_replace_web_session_rolls_back_manual_lease_when_registry_commit_fails(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo),
+                "__controller_sessions__": {"controller-1": {"web": ["web-old", "web-new"]}},
+            }), encoding="utf-8")
+            lease = root / "manual.json"
+            original_lease = {
+                "schema_version": 1,
+                "leases": {"controller-1": {
+                    "repo": str(repo.resolve()), "controller_id": "controller-1",
+                    "web_session_id": "web-old", "authorized_at_unix": 10,
+                    "expires_at_unix": 4102444800,
+                    "provenance": "manual_user_authorized", "mode": "resume_only",
+                }},
+            }
+            lease.write_text(json.dumps(original_lease), encoding="utf-8")
+            original_registry = json.loads(registry.read_text())
+            real_write = web_bridge._write_json_atomic_file
+            def failing_write(path, payload):
+                if Path(path) == registry:
+                    raise OSError("registry commit failed")
+                return real_write(Path(path), payload)
+            with patch.object(web_bridge, "_write_json_atomic_file", side_effect=failing_write):
+                with self.assertRaisesRegex(OSError, "registry commit failed"):
+                    web_bridge.replace_web_session(
+                        repo=repo, controller_id="controller-1", web_session_id="web-new",
+                        expected_generation=0, expected_ownership_generation=0,
+                        registry_path=registry, lease_path=lease,
+                    )
+            self.assertEqual(json.loads(registry.read_text()), original_registry)
+            self.assertEqual(json.loads(lease.read_text()), original_lease)
+
+    def test_replace_web_session_rejects_stale_ownership_generation_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            original = {
+                "controller-1": str(repo),
+                "__controller_sessions__": {"controller-1": {"web": ["web-old", "web-new"]}},
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-old", "generation": 2,
+                    "provenance": "manual_user_authorized", "binding_mode": "temporary", "host_attested": False,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-old", "generation": 4,
+                    "provenance": "manual_user_authorized",
+                }},
+            }
+            registry.write_text(json.dumps(original), encoding="utf-8")
+            result = self.run_bridge(
+                "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
+                "--web-session-id", "web-new", "--expected-generation", "2",
+                "--expected-ownership-generation", "3", "--registry", str(registry),
+            )
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("ownership generation", result.stderr)
+            self.assertEqual(json.loads(registry.read_text()), original)
 
     def test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1195,11 +1274,15 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                     "status": "active", "session_id": "web-current", "generation": 4,
                     "provenance": "manual_user_authorized", "binding_mode": "temporary", "host_attested": False,
                 }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-current", "generation": 1,
+                    "provenance": "manual_user_authorized",
+                }},
             }), encoding="utf-8")
             lease = root / "manual.json"
             same = self.run_bridge(
                 "replace-web-session", "--repo", str(repo), "--controller-id", "controller-1",
-                "--web-session-id", "web-current", "--expected-generation", "4",
+                "--web-session-id", "web-current", "--expected-generation", "4", "--expected-ownership-generation", "1",
                 "--registry", str(registry), "--lease-file", str(lease),
             )
             self.assertEqual(same.returncode, 0, same.stderr)
@@ -1207,7 +1290,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
 
             unbound = self.run_bridge(
                 "unbind-web-session", "--repo", str(repo), "--controller-id", "controller-1",
-                "--web-session-id", "web-current", "--expected-generation", "4",
+                "--web-session-id", "web-current", "--expected-generation", "4", "--expected-ownership-generation", "1",
                 "--registry", str(registry),
             )
             self.assertEqual(unbound.returncode, 0, unbound.stderr)
