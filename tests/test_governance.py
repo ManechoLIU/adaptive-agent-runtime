@@ -128,6 +128,23 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("MINI-READY", output["hookSpecificOutput"]["additionalContext"])
         self.assertTrue(next_state["pending_control_event"])
 
+    def test_project_snapshot_allows_unborn_main_before_first_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            (root / "TASK_LEDGER.md").write_text(
+                (SKILL_ROOT / "assets" / "templates" / "TASK_LEDGER.md").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            snapshot = lifecycle_hook.project_snapshot(root)
+
+            self.assertIsNotNone(snapshot)
+            self.assertIsNone(snapshot["head"])
+            self.assertEqual(snapshot["candidate_revisions"], [])
+            self.assertEqual(control_event_guard.unmerged_worktree_candidates(root), {})
+
     def test_project_snapshot_joins_runtime_liveness_for_active_ledger_task(self) -> None:
         import json
         import subprocess

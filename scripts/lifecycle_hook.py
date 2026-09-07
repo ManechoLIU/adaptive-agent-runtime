@@ -662,11 +662,15 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
         except ModuleNotFoundError:
             from scripts.control_event_guard import open_controller_corrections
         controller_corrections = open_controller_corrections(root, owners[0])
+    try:
+        head = run_git(root, "rev-parse", "HEAD")
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        head = None
     return {
         "root": str(root),
         "git_common_dir": str(common_dir),
         "ledger": str(ledger),
-        "head": run_git(root, "rev-parse", "HEAD"),
+        "head": head,
         "ledger_sha256": sha256_bytes(ledger.read_bytes()),
         "worktree_status_sha256": sha256_bytes(status.encode("utf-8")),
         "ready_ids": ready_ids,

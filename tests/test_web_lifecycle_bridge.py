@@ -5221,6 +5221,23 @@ class WebControllerSessionIdentityTests(unittest.TestCase):
 
 
 class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
+    def test_restore_payload_allows_unborn_main_before_first_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            (repo / "AGENTS.md").write_text("rules\n", encoding="utf-8")
+            (repo / "TASK_LEDGER.md").write_text("task ledger\n", encoding="utf-8")
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+
+            payload = web_bridge.web_session_restore_payload(repo, registry)
+
+        self.assertIsNone(payload["git"]["head"])
+        self.assertEqual(payload["git"]["branch"], "main")
+        self.assertEqual(payload["controller_id"], "controller-1")
+
     def test_restore_payload_binds_unique_controller_and_restores_authoritative_files_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

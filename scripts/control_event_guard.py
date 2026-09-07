@@ -997,7 +997,8 @@ def worktree_candidate_inventory(
     canonical = Path(
         run_git(root, "rev-parse", "--show-toplevel").stdout.strip()
     ).resolve()
-    main_revision = run_git(canonical, "rev-parse", "main").stdout.strip()
+    main_result = run_git(canonical, "rev-parse", "main", check=False)
+    main_revision = main_result.stdout.strip() if main_result.returncode == 0 else ""
     lifecycle = load_candidate_lifecycle(canonical, state_dir)
     retained_records = lifecycle.get("worktrees", {})
     if not isinstance(retained_records, dict):
@@ -1015,7 +1016,7 @@ def worktree_candidate_inventory(
             revision = line.removeprefix("HEAD ").strip()
         elif not line and path is not None and revision:
             if path != canonical:
-                merged = run_git(
+                merged = bool(main_revision) and run_git(
                     canonical,
                     "merge-base",
                     "--is-ancestor",
@@ -2358,7 +2359,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("--affected-task requires --rule-revision")
         repo_root = Path(args.repo).expanduser().resolve() if args.repo else None
         candidates = unmerged_worktree_candidates(repo_root) if repo_root else None
-        main_revision = run_git(repo_root, "rev-parse", "main").stdout.strip() if repo_root else None
+        if repo_root:
+            main_result = run_git(repo_root, "rev-parse", "main", check=False)
+            main_revision = main_result.stdout.strip() if main_result.returncode == 0 else None
+        else:
+            main_revision = None
         integrated_revisions = (
             integrated_candidate_revisions(repo_root, snapshot, main_revision)
             if repo_root and main_revision

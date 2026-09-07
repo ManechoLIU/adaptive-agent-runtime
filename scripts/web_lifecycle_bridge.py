@@ -820,9 +820,10 @@ def web_session_restore_payload(
         item for name in AUTHORITATIVE_DOCUMENT_NAMES
         if (item := _restore_document(root / name)) is not None
     ]
-    head = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
-    ).stdout.strip()
+    head_result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], check=False, capture_output=True, text=True
+    )
+    head = head_result.stdout.strip() if head_result.returncode == 0 else None
     status = subprocess.run(
         ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
         check=True, capture_output=True, text=True,
