@@ -49,6 +49,7 @@ class PeerHostTransientUnavailable(RuntimeError):
 
 _PEER_HOST_TRANSIENT_ERROR_MARKERS = (
     "exact chatgpt conversation target is unavailable",
+    "target has no stable chatgpt conversation route",
     "connect enoent",
     "econnrefused",
     "browser machine command timed out",
