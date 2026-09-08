@@ -76,6 +76,22 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_supervisor_readiness_requires_host_neutral_contract_heartbeat(self):
+        from scripts.web_agent_health_supervisor import (
+            SUPERVISOR_CONTRACT,
+            health_supervisor_ready,
+            write_health_heartbeat,
+        )
+
+        heartbeat = Path(self.tmp.name) / "heartbeat.json"
+        payload = write_health_heartbeat(path=heartbeat, now=T0)
+        self.assertEqual(payload["supervisor_contract"], SUPERVISOR_CONTRACT)
+        self.assertTrue(health_supervisor_ready(path=heartbeat, now=T0))
+
+        payload.pop("supervisor_contract")
+        heartbeat.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertFalse(health_supervisor_ready(path=heartbeat, now=T0))
+
     def assignment(self, **extra):
         value = {
             "assignment_id": "A-WEB",

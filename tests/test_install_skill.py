@@ -388,7 +388,8 @@ class InstallMigrationContractTests(unittest.TestCase):
         (source / "scripts").mkdir()
         for name in (
             "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
-            "web_agent_health_supervisor.py", "web_agent_events.py", "route_contract.py", "reviewer_supervisor.py",
+            "web_agent_health_supervisor.py", "controller_runtime_supervisor.py",
+            "web_agent_events.py", "route_contract.py", "reviewer_supervisor.py",
             "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "assignment_lease_guard.py",
             "controller_scoring_guard.py", "project_context_guard.py", "rule_handshake.py", "evaluation_transaction.py",
         ):
@@ -686,6 +687,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests.test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix",
         }
         self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
+        self.assertIn("scripts/controller_runtime_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("tests/test_web_agent_health_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("tests/test_terminal_continuation.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("scripts/terminal_continuation.py", RUNTIME_RELEASE_REQUIRED_FILES)
@@ -1667,14 +1669,14 @@ class HostAdapterInstallationTests(unittest.TestCase):
 
 
 class WebAgentHealthServiceInstallationTests(unittest.TestCase):
-    def test_health_service_plist_is_keepalive_and_runs_installed_health_only_supervisor(self):
+    def test_health_service_plist_is_keepalive_and_runs_host_neutral_controller_supervisor(self):
         import plistlib
         from scripts.install_skill import install_web_agent_health_service_plist
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             target = root / "adaptive-delivery"
             (target / "scripts").mkdir(parents=True)
-            script = target / "scripts" / "web_agent_health_supervisor.py"
+            script = target / "scripts" / "controller_runtime_supervisor.py"
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             plist = root / "LaunchAgents" / "web-agent-health.plist"
             install_web_agent_health_service_plist(
@@ -1688,6 +1690,83 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
         self.assertIn("--registry", payload["ProgramArguments"])
         self.assertNotIn("web_reentry_adapter.py", " ".join(payload["ProgramArguments"]))
 
+    def test_desktop_background_continuation_is_reported_without_ai_bridge(self):
+        import json
+        from datetime import datetime, timezone
+        from scripts.install_skill import (
+            detect_host_capabilities, install_web_agent_health_service_plist,
+        )
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / "adaptive-delivery"
+            (target / "scripts").mkdir(parents=True)
+            (target / "scripts" / "controller_runtime_supervisor.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            plist = root / "controller-runtime.plist"
+            heartbeat = root / "controller-runtime-heartbeat.json"
+            install_web_agent_health_service_plist(
+                plist, target, python_executable="/usr/bin/python3",
+                registry_path=root / "controllers.json",
+            )
+            report = detect_host_capabilities(
+                codex_executable=root / "missing-codex",
+                skill_root=target,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=root / "hooks.json",
+                zshenv_file=root / ".zshenv",
+                health_service_plist=plist,
+                runtime_supervisor_heartbeat=heartbeat,
+            )
+
+            self.assertEqual(
+                report["desktop_adapter"]["background_continuation"],
+                "configured_unverified",
+            )
+            self.assertTrue(
+                report["desktop_adapter"]["continuation_independent_of_ai_bridge"]
+            )
+            self.assertEqual(report["web_local_adapter"]["status"], "degraded")
+
+            heartbeat.write_text(json.dumps({
+                "schema_version": 1,
+                "state": "ready",
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "pid": 42,
+            }), encoding="utf-8")
+            legacy_report = detect_host_capabilities(
+                codex_executable=root / "missing-codex",
+                skill_root=target,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=root / "hooks.json",
+                zshenv_file=root / ".zshenv",
+                health_service_plist=plist,
+                runtime_supervisor_heartbeat=heartbeat,
+            )
+            self.assertEqual(
+                legacy_report["desktop_adapter"]["background_continuation"],
+                "configured_unverified",
+            )
+            heartbeat.write_text(json.dumps({
+                "schema_version": 1,
+                "state": "ready",
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "pid": 43,
+                "supervisor_contract": "host_neutral_controller_runtime_v1",
+            }), encoding="utf-8")
+            live_report = detect_host_capabilities(
+                codex_executable=root / "missing-codex",
+                skill_root=target,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=root / "hooks.json",
+                zshenv_file=root / ".zshenv",
+                health_service_plist=plist,
+                runtime_supervisor_heartbeat=heartbeat,
+            )
+            self.assertEqual(
+                live_report["desktop_adapter"]["background_continuation"], "ready"
+            )
+
     def test_web_agent_execution_capability_requires_matching_health_service(self):
         from scripts.install_skill import (
             detect_host_capabilities, install_web_agent_health_service_plist,
@@ -1696,7 +1775,7 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
             root = Path(d)
             target = root / "adaptive-delivery"
             (target / "scripts").mkdir(parents=True)
-            script = target / "scripts" / "web_agent_health_supervisor.py"
+            script = target / "scripts" / "controller_runtime_supervisor.py"
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             plist = root / "health.plist"
             before = detect_host_capabilities(
@@ -1732,7 +1811,7 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
             root = Path(d)
             target = root / "adaptive-delivery"
             (target / "scripts").mkdir(parents=True)
-            script = target / "scripts" / "web_agent_health_supervisor.py"
+            script = target / "scripts" / "controller_runtime_supervisor.py"
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             plist = root / "health.plist"
             source_receipt = root / "event-source.json"
@@ -1767,7 +1846,7 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
             root = Path(d)
             target = root / "adaptive-delivery"
             (target / "scripts").mkdir(parents=True)
-            (target / "scripts" / "web_agent_health_supervisor.py").write_text(
+            (target / "scripts" / "controller_runtime_supervisor.py").write_text(
                 "#!/usr/bin/env python3\n", encoding="utf-8"
             )
             plist = root / "LaunchAgents" / "health.plist"

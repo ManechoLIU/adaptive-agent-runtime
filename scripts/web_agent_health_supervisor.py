@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""KeepAlive scheduler for Runtime-managed Web Assignment health.
+"""Compatibility implementation for the host-neutral Controller Runtime supervisor.
 
 This service does not implement a second wake/reentry path. It writes a local readiness
-heartbeat and periodically invokes the existing Web lifecycle reconciliation entrypoint,
-which in turn hands terminal/health continuation to terminal_continuation and the existing
-same-Controller Web reentry supervisor.
+heartbeat and periodically invokes the existing reconciliation entrypoint. Canonical
+Controller continuation and rule wake are host-neutral; Web Assignment events remain
+gated on a trusted Web machine-event source.
 """
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ DEFAULT_HEARTBEAT = (
     Path.home() / ".codex" / "state" / "adaptive-delivery-web-agent-health" / "heartbeat.json"
 )
 HEARTBEAT_MAX_AGE_SECONDS = 90.0
+SUPERVISOR_CONTRACT = "host_neutral_controller_runtime_v1"
 
 
 def _iso(value: datetime) -> str:
@@ -69,6 +70,7 @@ def write_health_heartbeat(
         "state": "ready",
         "observed_at": _iso(now),
         "pid": os.getpid(),
+        "supervisor_contract": SUPERVISOR_CONTRACT,
     }
     _atomic_json(Path(path).expanduser(), payload)
     return payload
@@ -89,7 +91,11 @@ def health_supervisor_ready(
     if observed.tzinfo is None:
         observed = observed.replace(tzinfo=UTC)
     age = (now.astimezone(UTC) - observed.astimezone(UTC)).total_seconds()
-    return payload.get("state") == "ready" and 0 <= age <= max_age_seconds
+    return (
+        payload.get("state") == "ready"
+        and payload.get("supervisor_contract") == SUPERVISOR_CONTRACT
+        and 0 <= age <= max_age_seconds
+    )
 
 
 def reconcile_web_agent_health_once(
@@ -212,7 +218,7 @@ def run_health_supervisor(
 def main(argv: list[str] | None = None) -> int:
     import argparse
     parser = argparse.ArgumentParser(
-        description="KeepAlive scheduler for Runtime-managed Web Assignment health"
+        description="Host-neutral Adaptive Agent Runtime continuation supervisor"
     )
     parser.add_argument("--registry", default=str(DEFAULT_REGISTRY))
     parser.add_argument("--heartbeat", default=str(DEFAULT_HEARTBEAT))

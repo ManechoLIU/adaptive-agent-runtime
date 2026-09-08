@@ -30,6 +30,10 @@ DEFAULT_CONTROLLER_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-contro
 DEFAULT_WEB_AGENT_EVENT_SOURCE = (
     Path.home() / ".codex" / "state" / "adaptive-delivery-web-agent-health" / "event-source.json"
 )
+DEFAULT_CONTROLLER_RUNTIME_HEARTBEAT = (
+    Path.home() / ".codex" / "state" / "adaptive-delivery-web-agent-health" / "heartbeat.json"
+)
+CONTROLLER_RUNTIME_SUPERVISOR_CONTRACT = "host_neutral_controller_runtime_v1"
 DEFAULT_WEB_AGENT_HEALTH_PLIST = (
     Path.home() / "Library" / "LaunchAgents"
     / "com.openai.adaptive-agent-runtime.web-agent-health.plist"
@@ -435,6 +439,7 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "fresh legacy v1 assignment ACK cannot launch external provider",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
+    "scripts/controller_runtime_supervisor.py",
     "scripts/web_agent_execution.py",
     "scripts/web_agent_events.py",
     "scripts/web_agent_health_supervisor.py",
@@ -669,9 +674,9 @@ def install_web_agent_health_service_plist(
 ) -> Path:
     path = Path(plist_file).expanduser().resolve(strict=False)
     target_path = Path(target).expanduser().resolve()
-    script = (target_path / "scripts" / "web_agent_health_supervisor.py").resolve()
+    script = (target_path / "scripts" / "controller_runtime_supervisor.py").resolve()
     if not script.is_file():
-        raise ValueError("installed Web Agent health supervisor script is missing")
+        raise ValueError("installed Controller Runtime supervisor script is missing")
     python = str(Path(python_executable or sys.executable).expanduser().resolve())
     log_root = Path.home() / ".codex" / "state" / "adaptive-delivery-web-agent-health"
     log_root.mkdir(parents=True, exist_ok=True)
@@ -713,7 +718,7 @@ def _health_service_plist_matches(
 ) -> bool:
     if skill_root is None:
         return False
-    expected = (skill_root / "scripts" / "web_agent_health_supervisor.py").resolve()
+    expected = (skill_root / "scripts" / "controller_runtime_supervisor.py").resolve()
     if not expected.is_file():
         return False
     try:
@@ -727,6 +732,27 @@ def _health_service_plist_matches(
         and payload.get("KeepAlive") is True
         and isinstance(args, list)
         and str(expected) in [str(item) for item in args]
+    )
+
+
+def _runtime_supervisor_heartbeat_ready(
+    path: Path, *, max_age_seconds: float = 90.0
+) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        observed = datetime.fromisoformat(
+            str(payload.get("observed_at") or "").replace("Z", "+00:00")
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=UTC)
+    age = (datetime.now(UTC) - observed.astimezone(UTC)).total_seconds()
+    return (
+        payload.get("state") == "ready"
+        and payload.get("supervisor_contract")
+        == CONTROLLER_RUNTIME_SUPERVISOR_CONTRACT
+        and 0 <= age <= max_age_seconds
     )
 
 
@@ -879,6 +905,7 @@ def detect_host_capabilities(
     desktop_canary_file: str | Path = DEFAULT_DESKTOP_CANARY,
     health_service_plist: str | Path = DEFAULT_WEB_AGENT_HEALTH_PLIST,
     web_event_source_receipt: str | Path = DEFAULT_WEB_AGENT_EVENT_SOURCE,
+    runtime_supervisor_heartbeat: str | Path = DEFAULT_CONTROLLER_RUNTIME_HEARTBEAT,
 ) -> dict[str, dict[str, Any]]:
     codex_path = Path(codex_executable).expanduser() if codex_executable else None
     if codex_path is None:
@@ -892,6 +919,9 @@ def detect_host_capabilities(
     health_service_path = Path(health_service_plist).expanduser().resolve(strict=False)
     health_service_configured = _health_service_plist_matches(
         health_service_path, skill_root=skill_root_path
+    )
+    runtime_supervisor_ready = _runtime_supervisor_heartbeat_ready(
+        Path(runtime_supervisor_heartbeat).expanduser().resolve(strict=False)
     )
     web_event_source_path = Path(web_event_source_receipt).expanduser().resolve(strict=False)
     machine_event_source_ready = _machine_web_event_source_ready(web_event_source_path)
@@ -954,6 +984,17 @@ def detect_host_capabilities(
             "status": "degraded", "adapter": "codex-native", "configured": False,
             "reason": "codex detected; lifecycle/scoring/project-context hooks are not fully configured",
         }
+    desktop["background_continuation"] = (
+        "ready"
+        if health_service_configured and runtime_supervisor_ready
+        else "configured_unverified"
+        if health_service_configured
+        else "not_configured"
+    )
+    desktop["background_continuation_ready"] = bool(
+        health_service_configured and runtime_supervisor_ready
+    )
+    desktop["continuation_independent_of_ai_bridge"] = health_service_configured
 
     bridge_available = bridge_path.is_file() and os.access(bridge_path, os.X_OK)
     bridge_configured = _zshenv_has_web_bridge(
