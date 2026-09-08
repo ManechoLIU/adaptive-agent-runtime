@@ -32,6 +32,23 @@ class InstallCapabilityTests(unittest.TestCase):
                 script.chmod(0o755)
             hooks = root / "hooks.json"
             install_codex_hooks(hooks, skill_root, python_executable="/usr/bin/python3")
+            repo = root / "repo"
+            repo.mkdir()
+            registry = root / "controllers.json"
+            registry_value = {
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active",
+                    "session_id": "desktop-current",
+                    "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }
+            registry.write_text(json.dumps(registry_value), encoding="utf-8")
             canary = root / "desktop-canary.json"
             receipt = {
                 "schema_version": 4,
@@ -41,6 +58,8 @@ class InstallCapabilityTests(unittest.TestCase):
                 "execution_target_session_id": "desktop-current",
                 "target_generation": 4,
                 "ownership_generation": 7,
+                "canonical_repo": str(repo.resolve()),
+                "controller_registry_path": str(registry.resolve()),
                 "run_id": "0123456789abcdef0123456789abcdef",
                 "sequence_index": 8,
                 "skill_root": str(skill_root.resolve()),
@@ -82,6 +101,24 @@ class InstallCapabilityTests(unittest.TestCase):
                 report["web_local_adapter"]["goal_display_sync"],
                 "degraded_host_capability_unavailable",
             )
+
+            moved_registry = json.loads(json.dumps(registry_value))
+            moved_registry["__controller_execution_ownership__"]["controller-1"] = {
+                "active_host": "web",
+                "execution_target_session_id": "web-current",
+                "generation": 8,
+            }
+            registry.write_text(json.dumps(moved_registry), encoding="utf-8")
+            ownership_moved = detect_host_capabilities(
+                codex_executable=codex,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=hooks,
+                zshenv_file=root / ".zshenv",
+                skill_root=skill_root,
+                desktop_canary_file=canary,
+            )
+            self.assertEqual(ownership_moved["desktop_adapter"]["status"], "degraded")
+            registry.write_text(json.dumps(registry_value), encoding="utf-8")
 
             (skill_root / "scripts" / "controller_target_guard.py").write_text(
                 "#!/usr/bin/env python3\n# changed target guard\n", encoding="utf-8"
@@ -137,6 +174,20 @@ class InstallCapabilityTests(unittest.TestCase):
                 script.chmod(0o755)
             hooks = root / "hooks.json"
             install_codex_hooks(hooks, skill_root, python_executable="/usr/bin/python3")
+            repo = root / "repo"
+            repo.mkdir()
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }), encoding="utf-8")
             canary = root / "desktop-canary.json"
             canary.write_text(
                 json.dumps(
@@ -148,6 +199,8 @@ class InstallCapabilityTests(unittest.TestCase):
                         "execution_target_session_id": "desktop-current",
                         "target_generation": 4,
                         "ownership_generation": 7,
+                        "canonical_repo": str(repo.resolve()),
+                        "controller_registry_path": str(registry.resolve()),
                         "run_id": "0123456789abcdef0123456789abcdef",
                         "sequence_index": 8,
                         "skill_root": str(skill_root.resolve()),

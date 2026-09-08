@@ -2259,6 +2259,7 @@ def desktop_host_reload_required(
     repo: Path,
     canary_path: Path = DEFAULT_DESKTOP_CANARY,
     hooks_path: Path = DEFAULT_CODEX_HOOKS,
+    registry_path: Path = DEFAULT_REGISTRY,
 ) -> bool:
     """Require a fresh Desktop process when an exact armed canary has not started."""
     canary = load_json(canary_path)
@@ -2289,12 +2290,41 @@ def desktop_host_reload_required(
     )
     hooks_sha256 = _file_sha256(hooks_path)
     installed_revision = str(handshake.get("installed_revision") or "").strip()
+    registry = load_json(registry_path)
+    target = target_guard.target_record(
+        registry, controller_id=session_id, host=target_guard.DESKTOP_SESSION_HOST
+    )
+    ownership = target_guard.execution_ownership_record(
+        registry, controller_id=session_id
+    )
+    try:
+        target_status, target_session_id, target_generation = (
+            target_guard.validate_target_record(
+                target or {}, host=target_guard.DESKTOP_SESSION_HOST
+            )
+        )
+        ownership_host, ownership_target, ownership_generation = (
+            target_guard.validate_execution_ownership_record(ownership or {})
+        )
+    except (PermissionError, ValueError):
+        return False
     return (
         handshake.get("live_e2e_required") is True
         and bool(installed_revision)
         and installed_revision
         == str(handshake.get("loaded_revision") or "").strip()
+        and canary.get("schema_version") == 4
+        and str(canary.get("controller_id") or "").strip() == session_id
         and str(canary.get("controller_session_id") or "").strip() == session_id
+        and str(canary.get("canonical_repo") or "").strip() == str(repo.resolve())
+        and str(canary.get("controller_registry_path") or "").strip()
+        == str(registry_path.expanduser().resolve())
+        and target_status == "active"
+        and target_session_id == canary.get("execution_target_session_id")
+        and target_generation == canary.get("target_generation")
+        and ownership_host == target_guard.DESKTOP_SESSION_HOST
+        and ownership_target == target_session_id
+        and ownership_generation == canary.get("ownership_generation")
         and canary.get("status") == "armed"
         and canary.get("sequence_index") == 0
         and canary.get("observations") == []

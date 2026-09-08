@@ -696,6 +696,53 @@ DESKTOP_CANARY_SEQUENCE = (
 DESKTOP_CANARY_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
+def _desktop_canary_registry_fence_current(receipt: dict[str, Any]) -> bool:
+    controller_id = str(receipt.get("controller_id") or "").strip()
+    target_session_id = str(receipt.get("execution_target_session_id") or "").strip()
+    repo_value = str(receipt.get("canonical_repo") or "").strip()
+    registry_value = str(receipt.get("controller_registry_path") or "").strip()
+    if not controller_id or not target_session_id or not repo_value or not registry_value:
+        return False
+    try:
+        repo = Path(repo_value).expanduser().resolve()
+        registry = json.loads(
+            Path(registry_value).expanduser().read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(registry, dict):
+        return False
+    registered_repo = registry.get(controller_id)
+    if not isinstance(registered_repo, str):
+        return False
+    try:
+        if Path(registered_repo).expanduser().resolve() != repo:
+            return False
+    except OSError:
+        return False
+    targets = registry.get("__controller_targets__")
+    ownership = registry.get("__controller_execution_ownership__")
+    if not isinstance(targets, dict) or not isinstance(ownership, dict):
+        return False
+    controller_targets = targets.get(controller_id)
+    target = (
+        controller_targets.get("desktop_codex")
+        if isinstance(controller_targets, dict)
+        else None
+    )
+    owner = ownership.get(controller_id)
+    return (
+        isinstance(target, dict)
+        and target.get("status") == "active"
+        and target.get("session_id") == target_session_id
+        and target.get("generation") == receipt.get("target_generation")
+        and isinstance(owner, dict)
+        and owner.get("active_host") == "desktop_codex"
+        and owner.get("execution_target_session_id") == target_session_id
+        and owner.get("generation") == receipt.get("ownership_generation")
+    )
+
+
 def _valid_desktop_canary(
     path: Path, *, hooks_path: Path, skill_root: Path | None
 ) -> bool:
@@ -748,6 +795,7 @@ def _valid_desktop_canary(
         and receipt.get("lifecycle_sha256") == lifecycle_sha256
         and receipt.get("controller_target_guard_sha256") == target_guard_sha256
         and observations == list(DESKTOP_CANARY_SEQUENCE)
+        and _desktop_canary_registry_fence_current(receipt)
     )
 
 

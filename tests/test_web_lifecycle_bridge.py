@@ -2656,6 +2656,18 @@ class WebLifecycleAuditTests(unittest.TestCase):
             }), encoding="utf-8")
             hooks = root / "hooks.json"
             hooks.write_text('{"hooks":{}}\n', encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }), encoding="utf-8")
             canary = root / "desktop-canary.json"
             value = {
                 "controller_session_id": "controller-1",
@@ -2666,16 +2678,30 @@ class WebLifecycleAuditTests(unittest.TestCase):
             }
             canary.write_text(json.dumps(value), encoding="utf-8")
 
-            self.assertTrue(web_bridge.desktop_host_reload_required(
+            self.assertFalse(web_bridge.desktop_host_reload_required(
                 session_id="controller-1", repo=repo,
                 canary_path=canary, hooks_path=hooks,
+            ))
+            value.update({
+                "schema_version": 4,
+                "controller_id": "controller-1",
+                "execution_target_session_id": "desktop-current",
+                "target_generation": 4,
+                "ownership_generation": 7,
+                "canonical_repo": str(repo.resolve()),
+                "controller_registry_path": str(registry.resolve()),
+            })
+            canary.write_text(json.dumps(value), encoding="utf-8")
+            self.assertTrue(web_bridge.desktop_host_reload_required(
+                session_id="controller-1", repo=repo,
+                canary_path=canary, hooks_path=hooks, registry_path=registry,
             ))
             value["sequence_index"] = 1
             value["observations"] = ["session_started"]
             canary.write_text(json.dumps(value), encoding="utf-8")
             self.assertFalse(web_bridge.desktop_host_reload_required(
                 session_id="controller-1", repo=repo,
-                canary_path=canary, hooks_path=hooks,
+                canary_path=canary, hooks_path=hooks, registry_path=registry,
             ))
 
     def test_mocked_active_writer_without_host_observation_still_rearms(self) -> None:

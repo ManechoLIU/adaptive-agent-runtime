@@ -1005,6 +1005,11 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
                 "__controller_targets__": {"controller-1": {"desktop_codex": {
                     "status": "active", "session_id": "desktop-current", "generation": 4,
                 }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 4,
+                }},
             }), encoding="utf-8")
             old_registry, old_state_root = lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
             lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = registry, root / "state"
@@ -1406,9 +1411,159 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
 
 
 class DesktopLifecycleCanaryTests(unittest.TestCase):
+    def test_schema_four_arm_rejects_missing_target_generation_fences(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            skill_root = root / "adaptive-delivery"
+            (skill_root / "scripts").mkdir(parents=True)
+            (skill_root / "scripts" / "lifecycle_hook.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            (skill_root / "scripts" / "controller_target_guard.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            hooks = root / "hooks.json"
+            hooks.write_text('{"hooks": {"SessionStart": []}}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "target and ownership generations"):
+                lifecycle_hook.arm_desktop_canary(
+                    "controller-1",
+                    canary_path=root / "desktop-canary.json",
+                    hooks_path=hooks,
+                    skill_root=skill_root,
+                )
+
+    def test_run_hook_records_actual_execution_target_not_logical_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                }},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 4,
+                }},
+            }), encoding="utf-8")
+            skill_root = root / "adaptive-delivery"
+            (skill_root / "scripts").mkdir(parents=True)
+            (skill_root / "scripts" / "lifecycle_hook.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            (skill_root / "scripts" / "controller_target_guard.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            hooks = root / "hooks.json"
+            hooks.write_text('{"hooks": {"SessionStart": []}}\n', encoding="utf-8")
+            canary = root / "desktop-canary.json"
+            lifecycle_hook.arm_desktop_canary(
+                "controller-1",
+                execution_target_session_id="desktop-current",
+                target_generation=4,
+                ownership_generation=4,
+                canary_path=canary,
+                hooks_path=hooks,
+                skill_root=skill_root,
+            )
+
+            actual_record = lifecycle_hook.record_desktop_canary_observation
+
+            def record(event, output, state):
+                return actual_record(
+                    event,
+                    output,
+                    state,
+                    canary_path=canary,
+                    hooks_path=hooks,
+                    skill_root=skill_root,
+                )
+
+            event = {
+                "hook_event_name": "SessionStart",
+                "session_id": "desktop-current",
+                "turn_id": "turn-1",
+                "cwd": str(repo),
+            }
+            with patch.object(lifecycle_hook, "REGISTRY_PATH", registry), patch.object(
+                lifecycle_hook, "project_snapshot", return_value={"root": str(repo.resolve())}
+            ), patch.object(
+                lifecycle_hook, "controller_event_is_managed", return_value=True
+            ), patch.object(
+                lifecycle_hook,
+                "persist_event_state",
+                return_value=({}, {"active_turn_id": "turn-1", "must_yield": False}),
+            ), patch.object(
+                lifecycle_hook, "record_desktop_canary_observation", side_effect=record
+            ), patch.object(
+                sys, "stdin", StringIO(json.dumps(event))
+            ):
+                code = lifecycle_hook.run_hook()
+
+            receipt = json.loads(canary.read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertEqual(receipt["sequence_index"], 1)
+            self.assertEqual(receipt["observations"], ["session_started"])
+
+            registry_value = json.loads(registry.read_text(encoding="utf-8"))
+            registry_value["__controller_execution_ownership__"]["controller-1"] = {
+                "active_host": "web",
+                "execution_target_session_id": "web-current",
+                "generation": 5,
+            }
+            registry.write_text(json.dumps(registry_value), encoding="utf-8")
+            next_event = {
+                "hook_event_name": "PreToolUse",
+                "session_id": "desktop-current",
+                "turn_id": "turn-1",
+                "cwd": str(repo),
+                "tool_name": "exec_command",
+                "tool_input": {"cmd": "pwd"},
+            }
+            with patch.object(lifecycle_hook, "REGISTRY_PATH", registry), patch.object(
+                lifecycle_hook, "project_snapshot", return_value={"root": str(repo.resolve())}
+            ), patch.object(
+                lifecycle_hook, "controller_event_is_managed", return_value=True
+            ), patch.object(
+                lifecycle_hook,
+                "persist_event_state",
+                return_value=({}, {"active_turn_id": "turn-1", "must_yield": False}),
+            ), patch.object(
+                lifecycle_hook, "record_desktop_canary_observation", side_effect=record
+            ), patch.object(
+                sys, "stdin", StringIO(json.dumps(next_event))
+            ):
+                lifecycle_hook.run_hook()
+
+            after_handoff = json.loads(canary.read_text(encoding="utf-8"))
+            self.assertEqual(after_handoff["sequence_index"], 1)
+
     def test_arm_canary_cli_accepts_exact_execution_target_fences(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }), encoding="utf-8")
             hooks = root / "hooks.json"
             hooks.write_text('{"hooks": {"SessionStart": []}}\n', encoding="utf-8")
             canary = root / "desktop-canary.json"
@@ -1416,6 +1571,7 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             env.update({
                 "AD_CODEX_HOOKS_PATH": str(hooks),
                 "AD_DESKTOP_CANARY_PATH": str(canary),
+                "AD_CONTROLLER_REGISTRY": str(registry),
             })
 
             completed = subprocess.run(
@@ -1424,12 +1580,8 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                     str(SKILL_ROOT / "scripts" / "lifecycle_hook.py"),
                     "--arm-desktop-canary",
                     "controller-1",
-                    "--execution-target-session-id",
-                    "desktop-current",
-                    "--target-generation",
-                    "4",
-                    "--ownership-generation",
-                    "7",
+                    "--repo",
+                    str(repo),
                 ],
                 check=False,
                 capture_output=True,
@@ -1491,23 +1643,21 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
 
             armed = lifecycle_hook.arm_desktop_canary(
                 "controller-1",
+                execution_target_session_id="desktop-current",
+                target_generation=4,
+                ownership_generation=4,
                 canary_path=canary,
                 hooks_path=hooks,
                 skill_root=skill_root,
             )
-            armed.update({
-                "controller_id": "controller-1",
-                "execution_target_session_id": "desktop-current",
-                "target_generation": 4,
-                "ownership_generation": 4,
-            })
-            canary.write_text(json.dumps(armed), encoding="utf-8")
             ignored = lifecycle_hook.record_desktop_canary_observation(
                 {
                     "hook_event_name": "SessionStart",
                     "session_id": "controller-1",
+                    "controller_session_id": "controller-1",
                     "turn_id": "t-logical",
                     "controller_target_generation": 4,
+                    "controller_ownership_generation": 4,
                 },
                 {},
                 {"active_turn_id": "t-logical"},
@@ -1519,8 +1669,10 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 {
                     "hook_event_name": "SessionStart",
                     "session_id": "desktop-current",
+                    "controller_session_id": "controller-1",
                     "turn_id": "t-target",
                     "controller_target_generation": 4,
+                    "controller_ownership_generation": 4,
                 },
                 {},
                 {"active_turn_id": "t-target"},
@@ -1553,6 +1705,9 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
 
             lifecycle_hook.arm_desktop_canary(
                 "c1",
+                execution_target_session_id="c1",
+                target_generation=1,
+                ownership_generation=1,
                 canary_path=canary,
                 hooks_path=hooks,
                 skill_root=skill_root,
@@ -1600,6 +1755,11 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 ),
             ]
             for event, output, state in sequence:
+                event.update({
+                    "controller_session_id": "c1",
+                    "controller_target_generation": 1,
+                    "controller_ownership_generation": 1,
+                })
                 receipt = lifecycle_hook.record_desktop_canary_observation(
                     event,
                     output,
@@ -1616,7 +1776,10 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 {
                     "hook_event_name": "SubagentStop",
                     "session_id": "c1",
+                    "controller_session_id": "c1",
                     "turn_id": "t2",
+                    "controller_target_generation": 1,
+                    "controller_ownership_generation": 1,
                 },
                 {},
                 {"active_turn_id": "t2", "must_yield": False},
@@ -1648,11 +1811,24 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             hooks.write_text('{"hooks": {"PreToolUse": []}}\n', encoding="utf-8")
             canary = root / "desktop-canary.json"
             lifecycle_hook.arm_desktop_canary(
-                "c1", canary_path=canary, hooks_path=hooks, skill_root=skill_root
+                "c1",
+                execution_target_session_id="c1",
+                target_generation=1,
+                ownership_generation=1,
+                canary_path=canary,
+                hooks_path=hooks,
+                skill_root=skill_root,
             )
 
             wrong_session = lifecycle_hook.record_desktop_canary_observation(
-                {"hook_event_name": "SessionStart", "session_id": "c2", "turn_id": "t1"},
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "c2",
+                    "controller_session_id": "c1",
+                    "turn_id": "t1",
+                    "controller_target_generation": 1,
+                    "controller_ownership_generation": 1,
+                },
                 {},
                 {"active_turn_id": "t1"},
                 canary_path=canary,
@@ -1660,7 +1836,14 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 skill_root=skill_root,
             )
             wrong_order = lifecycle_hook.record_desktop_canary_observation(
-                {"hook_event_name": "SubagentStop", "session_id": "c1", "turn_id": "t1"},
+                {
+                    "hook_event_name": "SubagentStop",
+                    "session_id": "c1",
+                    "controller_session_id": "c1",
+                    "turn_id": "t1",
+                    "controller_target_generation": 1,
+                    "controller_ownership_generation": 1,
+                },
                 {},
                 {"active_turn_id": "t1"},
                 canary_path=canary,
