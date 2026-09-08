@@ -6907,6 +6907,42 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
             self.assertEqual(saved["target_generation"], 2)
             self.assertFalse(saved["pending_control_event"])
 
+    def test_desktop_target_replacement_uses_requested_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-bad"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {"desktop_codex": {
+                        "status": "active",
+                        "session_id": "desktop-bad",
+                        "generation": 1,
+                    }}
+                },
+            }), encoding="utf-8")
+
+            receipt = web_bridge.replace_desktop_execution_target(
+                controller_id="controller-1",
+                desktop_session_id="desktop-good",
+                repo=repo,
+                expected_generation=1,
+                registry=registry,
+            )
+
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            target = saved["__controller_targets__"]["controller-1"]["desktop_codex"]
+            self.assertEqual(target["session_id"], "desktop-good")
+            self.assertEqual(target["generation"], 2)
+            self.assertEqual(receipt["execution_target_session_id"], "desktop-good")
+            self.assertEqual(receipt["generation"], 2)
+
     def test_recover_incompatible_target_replaces_only_execution_target_then_resumes(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
