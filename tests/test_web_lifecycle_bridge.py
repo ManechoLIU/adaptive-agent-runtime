@@ -687,6 +687,41 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                         expected_ownership_generation=8,
                     )
 
+    def test_registered_web_verifier_classifies_transient_spa_route_as_retryable(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "print(json.dumps({'ok':False,'error_code':'RUNTIME_HOST_VERIFIER_FAILED',"
+                "'error':'target has no stable ChatGPT conversation route'}))\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+                "protocol":"runtime_host_verifier_cli_v1","executable":str(executable),
+                "sha256":digest,"bundle_sha256":{str(executable):digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(
+                web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True
+            ):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                with self.assertRaises(web_bridge.PeerHostTransientUnavailable):
+                    verifier(
+                        phase="pre_delivery",
+                        controller_id="controller-1",
+                        host="web",
+                        expected_target_session_id="web-current",
+                        expected_target_generation=4,
+                        expected_ownership_generation=8,
+                    )
+
     def test_registered_web_verifier_keeps_unrecognized_runtime_failure_permanent(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
@@ -7656,12 +7691,13 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
                 )
             self.assertEqual(code, 0)
             reentry.assert_called_once()
-            schedule.assert_called_once()
-            self.assertGreaterEqual(schedule.call_args.kwargs["delay_seconds"], 5)
+            schedule.assert_not_called()
             saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["state"], "WEB_REENTRY_SUBMITTED")
+            self.assertEqual(saved["state"], "WAITING_FOR_CONTROLLER_PROGRESS")
             self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
             self.assertEqual(saved["continuation_count"], 1)
+            self.assertEqual(saved["delivery_terminal_receipt_id"], "web-r1")
+            self.assertEqual(saved["delivery_terminal_outcome"], "submit_confirmed")
 
     def test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target(self) -> None:
         from unittest.mock import patch
@@ -7743,11 +7779,13 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
                 )
             self.assertEqual(code, 0)
             self.assertEqual([kind for kind, _ in calls], ["verify", "submit"])
-            schedule.assert_called_once()
+            schedule.assert_not_called()
             saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["state"], "WEB_REENTRY_SUBMITTED")
+            self.assertEqual(saved["state"], "WAITING_FOR_CONTROLLER_PROGRESS")
             self.assertTrue(saved["host_attested"])
             self.assertTrue(saved["strong_web_identity_established"])
+            self.assertEqual(saved["delivery_terminal_receipt_id"], "web-host-r1")
+            self.assertEqual(saved["delivery_terminal_outcome"], "submit_confirmed")
 
     def test_detached_supervisor_retries_transient_registered_host_attestation_failure(self) -> None:
         from unittest.mock import patch
@@ -8812,3 +8850,428 @@ def _session_start_foreign_or_alias_never_becomes_current(self):
 
 WebControllerSessionIdentityTests.test_session_start_accepts_only_bound_web_controller_session = _session_start_requires_explicit_verified_current_target
 WebControllerSessionIdentityTests.test_session_start_refuses_web_session_bound_to_another_controller = _session_start_foreign_or_alias_never_becomes_current
+
+
+def _nonretryable_web_failure_same_event_and_fence_stays_quiet(self):
+    lifecycle = {
+        "pending_control_event": True,
+        "requires_user": False,
+        "wake_generation": 12,
+        "triggers": ["rule_update_pending:rev-x"],
+        "snapshot": {"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+    }
+    fingerprint = web_bridge._wake_event_fingerprint(lifecycle)
+    fence = {
+        "execution_target_session_id": "web-current",
+        "target_generation": 4,
+        "ownership_generation": 8,
+        "target_provenance": "host_attested_same_controller_recovery",
+        "target_binding_mode": "resume_only",
+        "target_host_attested": None,
+        "ownership_provenance": "web_entry",
+    }
+    for state_name, failure_class in (
+        ("WEB_REENTRY_FAILED_BEFORE_DISPATCH", "web_reentry_failed_before_dispatch"),
+        ("WEB_REENTRY_RESULT_UNKNOWN", "web_reentry_result_unknown"),
+    ):
+        supervisor = {
+            "state": state_name,
+            "failure_class": failure_class,
+            "pending_control_event": True,
+            "last_lifecycle_fingerprint": fingerprint,
+            "blocked_controller_fence": dict(fence),
+        }
+        self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle, supervisor, current_controller_wait_fence=dict(fence)
+        ))
+        changed_lifecycle = json.loads(json.dumps(lifecycle))
+        changed_lifecycle["triggers"].append("NEW_EVENT")
+        self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+            changed_lifecycle, supervisor, current_controller_wait_fence=dict(fence)
+        ))
+        changed_fence = dict(fence)
+        changed_fence["target_generation"] = 5
+        changed_fence["ownership_generation"] = 9
+        self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle, supervisor, current_controller_wait_fence=changed_fence
+        ))
+        self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle, supervisor, current_controller_wait_fence=None
+        ))
+
+
+def _registered_host_nonretryable_failure_persists_quiet_fence(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "host_attested_same_controller_recovery",
+            "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 8, "provenance": "web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id":"host-fail","session_id":"controller-1","repo":str(repo.resolve()),
+            "state":"RESUME_PENDING","pending_control_event":True,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 12, "triggers": ["rule_update_pending:rev-x"],
+            "snapshot": {"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+        }
+        attempt = {
+            "operation":"web_reentry", "result":"FAILED",
+            "state":"WEB_REENTRY_FAILED_BEFORE_DISPATCH", "returncode":1,
+            "failure_class":"web_reentry_failed_before_dispatch",
+            "error_code":"WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+            "execution_target_session_id":"web-current", "target_generation":4,
+            "ownership_generation":8, "target_mode":"explicit_current",
+            "delivery_authorization":"host_attested", "host_attested":True,
+            "strong_web_identity_established":True,
+        }
+        def verifier(**_kwargs):
+            return {"call_receipt":"host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry", return_value=attempt
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="host-fail", registry=registry,
+                codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        current_fence = web_bridge._controller_web_wait_fence(
+            registry=registry, controller_id="controller-1"
+        )
+    self.assertEqual(code, 1)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WEB_REENTRY_FAILED_BEFORE_DISPATCH")
+    self.assertEqual(saved["failure_class"], "web_reentry_failed_before_dispatch")
+    self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
+    self.assertEqual(saved["blocked_controller_fence"], current_fence)
+    self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+        lifecycle, saved, current_controller_wait_fence=current_fence
+    ))
+
+
+WebContinuationSupervisorBootstrapTests.test_nonretryable_web_failure_same_event_and_fence_stays_quiet = _nonretryable_web_failure_same_event_and_fence_stays_quiet
+WebLocalReentryIntegrationTests.test_registered_host_nonretryable_failure_persists_quiet_fence = _registered_host_nonretryable_failure_persists_quiet_fence
+
+
+def _registered_host_result_unknown_persists_quiet_fence(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "host_attested_same_controller_recovery",
+            "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 8, "provenance": "web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id":"host-unknown","session_id":"controller-1","repo":str(repo.resolve()),
+            "state":"RESUME_PENDING","pending_control_event":True,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 13, "triggers": ["terminal_receipt_pending"],
+            "snapshot": {"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+        }
+        attempt = {
+            "operation":"web_reentry", "result":"BLOCKED",
+            "state":"WEB_REENTRY_RESULT_UNKNOWN", "returncode":78,
+            "failure_class":"web_reentry_result_unknown",
+            "error_code":"WEB_REENTRY_RESULT_UNKNOWN",
+            "stderr_tail":"Host dispatch occurred but submit confirmation is unknown; automatic retry is forbidden",
+            "execution_target_session_id":"web-current", "target_generation":4,
+            "ownership_generation":8, "target_mode":"explicit_current",
+            "delivery_authorization":"host_attested", "host_attested":True,
+            "strong_web_identity_established":True,
+        }
+        def verifier(**_kwargs):
+            return {"call_receipt":"host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry", return_value=attempt
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="host-unknown", registry=registry,
+                codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        current_fence = web_bridge._controller_web_wait_fence(
+            registry=registry, controller_id="controller-1"
+        )
+    self.assertEqual(code, 78)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+    self.assertEqual(saved["failure_class"], "web_reentry_result_unknown")
+    self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
+    self.assertEqual(saved["blocked_controller_fence"], current_fence)
+    self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+        lifecycle, saved, current_controller_wait_fence=current_fence
+    ))
+
+
+WebLocalReentryIntegrationTests.test_registered_host_result_unknown_persists_quiet_fence = _registered_host_result_unknown_persists_quiet_fence
+
+
+def _confirmed_web_reentry_clears_stale_nonretryable_block_evidence(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "manual_user_authorized", "binding_mode": "temporary",
+            "host_attested": False,
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 4, "provenance": "manual_user_authorized",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        stale_fence = web_bridge._controller_web_wait_fence(
+            registry=registry, controller_id="controller-1"
+        )
+        state_path.write_text(json.dumps({
+            "receipt_id": "recover-confirmed", "session_id": "controller-1",
+            "repo": str(repo.resolve()), "state": "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+            "pending_control_event": True,
+            "failure_class": "web_reentry_failed_before_dispatch",
+            "error_code": "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+            "blocked_controller_fence": stale_fence,
+            "blocked_since_unix_ms": 123,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 14, "triggers": ["NEW_EVENT"],
+            "snapshot": {"head":"h2","ledger_sha256":"l2","worktree_status_sha256":"w2","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+        }
+        confirmed = {
+            "operation":"web_reentry", "result":"CONFIRMED",
+            "state":"WEB_REENTRY_MANUAL_FENCED_SUBMITTED", "returncode":0,
+            "execution_target_session_id":"web-current", "target_generation":4,
+            "ownership_generation":4, "target_mode":"explicit_current",
+            "delivery_authorization":"manual_fenced", "host_attested":False,
+            "strong_web_identity_established":False,
+        }
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "execute_web_reentry", return_value=confirmed
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="recover-confirmed",
+                registry=registry, codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 0)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WAITING_FOR_CONTROLLER_PROGRESS")
+    self.assertNotIn("failure_class", saved)
+    self.assertNotIn("error_code", saved)
+    self.assertNotIn("blocked_controller_fence", saved)
+    self.assertNotIn("blocked_since_unix_ms", saved)
+
+
+WebLocalReentryIntegrationTests.test_confirmed_web_reentry_clears_stale_nonretryable_block_evidence = _confirmed_web_reentry_clears_stale_nonretryable_block_evidence
+
+
+def _strong_host_confirmed_submit_waits_without_rearm(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status":"active","session_id":"web-current","generation":4,
+            "provenance":"host_attested_same_controller_recovery","binding_mode":"resume_only",
+            "identity_proof":"host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host":"web","execution_target_session_id":"web-current",
+            "generation":4,"provenance":"web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id":"rule-update:rev-confirmed","session_id":"controller-1",
+            "repo":str(repo.resolve()),"state":"RESUME_PENDING","pending_control_event":True,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event":True,"requires_user":False,"controller_host":"web",
+            "wake_generation":7,"triggers":["rule_update_pending:rev-confirmed"],
+            "snapshot":{"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[],
+                "rule_handshake":{"installed_revision":"rev-confirmed","state":"pending_ack","blocking":True}},
+        }
+        confirmed = {
+            "operation":"web_reentry","result":"CONFIRMED","state":"WEB_REENTRY_SUBMITTED","returncode":0,
+            "execution_target_session_id":"web-current","target_generation":4,"ownership_generation":4,
+            "target_mode":"explicit_current","delivery_authorization":"host_attested",
+            "host_attested":True,"strong_web_identity_established":True,
+        }
+        def verifier(**_kwargs): return {"call_receipt":"host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        with patch.object(web_bridge,"_load_lifecycle_state",return_value=lifecycle), patch.object(
+            web_bridge,"_registered_peer_attestation_verifier",return_value=verifier
+        ), patch.object(web_bridge,"_execute_registered_web_host_reentry",return_value=confirmed), patch.object(
+            web_bridge,"schedule_auto_native_stop"
+        ) as schedule:
+            code=web_bridge.run_auto_native_stop(
+                session_id="controller-1",repo=repo,receipt_id="rule-update:rev-confirmed",
+                registry=registry,codex="codex",delay_seconds=0,state_path=state_path,
+            )
+        saved=json.loads(state_path.read_text())
+    self.assertEqual(code,0)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"],"WAITING_FOR_CONTROLLER_PROGRESS")
+    self.assertEqual(saved["delivery_terminal_receipt_id"],"rule-update:rev-confirmed")
+    self.assertEqual(saved["delivery_terminal_outcome"],"submit_confirmed")
+
+
+def _terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes(self):
+    base = {
+        "pending_control_event":True,"requires_user":False,"wake_generation":7,
+        "triggers":["rule_update_pending:rev-confirmed"],
+        "snapshot":{"head":"h1","ledger_sha256":"l1","worktree_status_sha256":"w1","ready_ids":[],"runnable_ids":[],"candidate_revisions":[],
+            "rule_handshake":{"installed_revision":"rev-confirmed","state":"pending_ack","blocking":True}},
+    }
+    changed=json.loads(json.dumps(base))
+    changed["snapshot"]["head"]="h2"
+    changed["triggers"].append("main_head_changed")
+    state={
+        "state":"WAITING_FOR_CONTROLLER_PROGRESS","receipt_id":"rule-update:rev-confirmed",
+        "delivery_terminal_receipt_id":"rule-update:rev-confirmed",
+        "delivery_terminal_key":"rule-update:rev-confirmed","delivery_terminal_outcome":"submit_confirmed",
+    }
+    self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(base,state))
+    self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(changed,state))
+    newer=json.loads(json.dumps(changed))
+    newer["triggers"]=["rule_update_pending:rev-new"]
+    newer["snapshot"]["rule_handshake"]["installed_revision"]="rev-new"
+    self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(newer,state))
+
+
+def _same_terminal_receipt_cannot_be_rescheduled(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        root=Path(tmp); repo=root/"repo"; repo.mkdir(); subprocess.run(["git","init","-q","-b","main",str(repo)],check=True)
+        registry=root/"registry.json"; registry.write_text("{}")
+        state=root/"auto.json"
+        state.write_text(json.dumps({
+            "receipt_id":"rule-update:rev1","state":"WEB_REENTRY_RESULT_UNKNOWN",
+            "delivery_terminal_receipt_id":"rule-update:rev1","delivery_terminal_key":"rule-update:rev1",
+            "delivery_terminal_outcome":"result_unknown","continuation_count":1,"retry_count":0,
+        }))
+        with patch.object(web_bridge.subprocess,"Popen") as popen:
+            same=web_bridge.schedule_auto_native_stop(
+                session_id="controller-1",repo=repo,receipt_id="rule-update:rev1",registry=registry,
+                codex="codex",delay_seconds=1,state_path=state,
+            )
+        self.assertFalse(same)
+        popen.assert_not_called()
+        preserved=json.loads(state.read_text())
+        self.assertEqual(preserved["state"],"WEB_REENTRY_RESULT_UNKNOWN")
+        self.assertEqual(preserved["delivery_terminal_receipt_id"],"rule-update:rev1")
+
+
+WebLocalReentryIntegrationTests.test_strong_host_confirmed_submit_waits_without_rearm = _strong_host_confirmed_submit_waits_without_rearm
+WebContinuationSupervisorBootstrapTests.test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes = _terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes
+WebAutoStopSupervisorCoalescingTests.test_same_terminal_receipt_cannot_be_rescheduled = _same_terminal_receipt_cannot_be_rescheduled
+
+
+def _non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot(self):
+    lifecycle = {
+        "pending_control_event": True,
+        "requires_user": False,
+        "wake_generation": 22,
+        "triggers": ["READY:F2", "main_worktree_changed"],
+        "snapshot": {
+            "head": "h2", "ledger_sha256": "l2", "worktree_status_sha256": "w2",
+            "ready_ids": ["F2"], "runnable_ids": ["F2"], "candidate_revisions": [],
+            "rule_handshake": {
+                "installed_revision": "rev-current", "loaded_revision": "rev-current",
+                "state": "current", "blocking": False,
+            },
+        },
+    }
+    self.assertEqual(web_bridge._lifecycle_delivery_key(lifecycle), "wake-generation:22")
+    prior = {
+        "state": "WAITING_FOR_CONTROLLER_PROGRESS",
+        "receipt_id": "rule-update:rev-current",
+        "delivery_terminal_receipt_id": "rule-update:rev-current",
+        "delivery_terminal_key": "rule-update:rev-current",
+        "delivery_terminal_outcome": "submit_confirmed",
+    }
+    self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(lifecycle, prior))
+
+
+def _transient_web_reentry_retry_budget_exhausts_without_rearm(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "host_attested_same_controller_recovery", "binding_mode": "resume_only",
+            "identity_proof": "host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 8, "provenance": "web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id": "web-transient-budget", "session_id": "controller-1",
+            "repo": str(repo.resolve()), "state": "WEB_REENTRY_PENDING",
+            "pending_control_event": True,
+            "retry_count": web_bridge.WEB_REENTRY_TRANSIENT_RETRY_LIMIT - 1,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 23, "triggers": ["READY:F3"],
+            "snapshot": {"head":"h3","ledger_sha256":"l3","worktree_status_sha256":"w3","ready_ids":["F3"],"runnable_ids":["F3"],"candidate_revisions":[]},
+        }
+        attempt = {
+            "operation": "web_reentry", "result": "DEFERRED", "state": "WEB_REENTRY_PENDING",
+            "returncode": 78, "failure_class": "web_reentry_unavailable",
+            "error_code": "WEB_REENTRY_UNAVAILABLE", "stderr_tail": "temporary route gap",
+            "execution_target_session_id": "web-current", "target_generation": 4,
+            "ownership_generation": 8, "target_mode": "explicit_current",
+            "delivery_authorization": "host_attested", "host_attested": True,
+            "strong_web_identity_established": True,
+        }
+        def verifier(**_kwargs): return {"call_receipt": "host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(web_bridge, "_execute_registered_web_host_reentry", return_value=attempt), patch.object(
+            web_bridge, "schedule_auto_native_stop"
+        ) as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="web-transient-budget",
+                registry=registry, codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 78)
+    schedule.assert_not_called()
+    self.assertEqual(saved["retry_count"], web_bridge.WEB_REENTRY_TRANSIENT_RETRY_LIMIT)
+    self.assertEqual(saved["state"], "WEB_REENTRY_RETRY_EXHAUSTED")
+    self.assertEqual(saved["failure_class"], "web_reentry_retry_exhausted")
+    self.assertEqual(saved["delivery_terminal_outcome"], "retry_exhausted")
+    self.assertEqual(saved["delivery_terminal_key"], "wake-generation:23")
+
+
+WebContinuationSupervisorBootstrapTests.test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot = _non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot
+WebLocalReentryIntegrationTests.test_transient_web_reentry_retry_budget_exhausts_without_rearm = _transient_web_reentry_retry_budget_exhausts_without_rearm
