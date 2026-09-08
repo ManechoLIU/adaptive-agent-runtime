@@ -86,6 +86,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_registered_web_verifier_rechecks_bundle_before_each_execution",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
     "test_registered_external_web_host_submit_adapter_is_used_without_caller_injection",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_detached_supervisor_retries_transient_registered_host_attestation_failure",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_malformed_registered_web_verifier_config_fails_closed_without_manual_fallback",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
