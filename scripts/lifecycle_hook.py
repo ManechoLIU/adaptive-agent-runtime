@@ -730,10 +730,39 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
     return remaining
 
 
+def _timeout_execution_payload(tokens: list[str]) -> list[str]:
+    index = 1
+    no_value = {"--preserve-status", "--foreground", "-v", "--verbose"}
+    with_value = {"-k", "--kill-after", "-s", "--signal"}
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token in no_value:
+            index += 1
+            continue
+        if token in with_value:
+            index += 2 if index + 1 < len(tokens) else 1
+            continue
+        if token.startswith(("--kill-after=", "--signal=")):
+            index += 1
+            continue
+        if token.startswith("-"):
+            return []
+        break
+    if index >= len(tokens) or _TIMEOUT_DURATION.fullmatch(tokens[index]) is None:
+        return []
+    return tokens[index + 1 :]
+
+
 def _unwrap_execution_target(tokens: list[str]) -> list[str]:
     remaining = _strip_command_prefix(tokens)
     while remaining:
         executable = Path(remaining[0]).name.lower()
+        if executable in {"timeout", "gtimeout"}:
+            remaining = _strip_command_prefix(_timeout_execution_payload(remaining))
+            continue
         if executable == "command" and len(remaining) > 1 and remaining[1] in {"-v", "-V"}:
             return []
         if executable not in {
@@ -805,6 +834,10 @@ def _shell_reads_pipeline_stdin(tokens: list[str]) -> bool:
             break
         if token in {"-c", "--command"} or (
             token.startswith("-") and not token.startswith("--") and "c" in token[1:]
+        ):
+            return False
+        if token == "-n" or (
+            token.startswith("-") and not token.startswith("--") and "n" in token[1:]
         ):
             return False
         if token == "-s" or (
@@ -1111,6 +1144,12 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         return _persistent_signature_anywhere(tokens)
     if executable in {"bash", "sh", "zsh"}:
         for index, token in enumerate(tokens[1:], start=1):
+            if token == "-n" or (
+                token.startswith("-")
+                and not token.startswith("--")
+                and "n" in token[1:]
+            ):
+                return False
             if (
                 token.startswith("-")
                 and not token.startswith("--")
