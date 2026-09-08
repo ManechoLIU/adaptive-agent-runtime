@@ -669,21 +669,18 @@ def install_web_agent_health_service_plist(
     plist_file: str | Path,
     target: str | Path,
     *,
-    python_executable: str | None = None,
     registry_path: str | Path = DEFAULT_CONTROLLER_REGISTRY,
 ) -> Path:
     path = Path(plist_file).expanduser().resolve(strict=False)
     target_path = Path(target).expanduser().resolve()
     script = (target_path / "scripts" / "controller_runtime_supervisor.py").resolve()
-    if not script.is_file():
+    if not script.is_file() or not os.access(script, os.X_OK):
         raise ValueError("installed Controller Runtime supervisor script is missing")
-    python = str(Path(python_executable or sys.executable).expanduser().resolve())
     log_root = Path.home() / ".codex" / "state" / "adaptive-delivery-web-agent-health"
     log_root.mkdir(parents=True, exist_ok=True)
     payload = {
         "Label": WEB_AGENT_HEALTH_LABEL,
         "ProgramArguments": [
-            python,
             str(script),
             "--registry",
             str(Path(registry_path).expanduser().resolve(strict=False)),
@@ -728,28 +725,30 @@ def _health_service_plist_matches(
     args = payload.get("ProgramArguments") if isinstance(payload, dict) else None
     if (
         not isinstance(args, list)
-        or len(args) != 6
+        or len(args) != 5
         or not all(isinstance(item, str) and item for item in args)
     ):
         return False
-    python = Path(args[0]).expanduser().resolve(strict=False)
     program = payload.get("Program")
+    if program is not None and (not isinstance(program, str) or not program):
+        return False
     try:
-        poll_seconds = float(args[5])
+        poll_seconds = float(args[4])
     except ValueError:
         return False
     return (
         payload.get("Label") == WEB_AGENT_HEALTH_LABEL
         and payload.get("RunAtLoad") is True
         and payload.get("KeepAlive") is True
-        and python.is_file()
-        and os.access(python, os.X_OK)
-        and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", python.name) is not None
-        and (program is None or Path(program).expanduser().resolve(strict=False) == python)
-        and Path(args[1]).expanduser().resolve(strict=False) == expected
-        and args[2] == "--registry"
-        and Path(args[3]).expanduser().is_absolute()
-        and args[4] == "--poll-seconds"
+        and os.access(expected, os.X_OK)
+        and Path(args[0]).expanduser().resolve(strict=False) == expected
+        and (
+            program is None
+            or Path(program).expanduser().resolve(strict=False) == expected
+        )
+        and args[1] == "--registry"
+        and Path(args[2]).expanduser().is_absolute()
+        and args[3] == "--poll-seconds"
         and poll_seconds >= 1.0
     )
 
@@ -819,14 +818,12 @@ def configure_runtime_services(
     *,
     health_service_plist: str | Path = DEFAULT_WEB_AGENT_HEALTH_PLIST,
     registry_path: str | Path = DEFAULT_CONTROLLER_REGISTRY,
-    python_executable: str | None = None,
     service_loader: Any | None = None,
 ) -> dict[str, Any]:
     target_path = Path(target).expanduser().resolve()
     plist_path = install_web_agent_health_service_plist(
         health_service_plist,
         target_path,
-        python_executable=python_executable,
         registry_path=registry_path,
     )
     loader = service_loader or _load_web_agent_health_service

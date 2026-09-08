@@ -1678,15 +1678,16 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
             (target / "scripts").mkdir(parents=True)
             script = target / "scripts" / "controller_runtime_supervisor.py"
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            script.chmod(0o755)
             plist = root / "LaunchAgents" / "web-agent-health.plist"
             install_web_agent_health_service_plist(
-                plist, target, python_executable="/usr/bin/python3",
+                plist, target,
                 registry_path=root / "controllers.json",
             )
             payload = plistlib.loads(plist.read_bytes())
         self.assertTrue(payload["RunAtLoad"])
         self.assertTrue(payload["KeepAlive"])
-        self.assertIn(str(script.resolve()), payload["ProgramArguments"])
+        self.assertEqual(payload["ProgramArguments"][0], str(script.resolve()))
         self.assertIn("--registry", payload["ProgramArguments"])
         self.assertNotIn("web_reentry_adapter.py", " ".join(payload["ProgramArguments"]))
 
@@ -1704,10 +1705,11 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
             (target / "scripts").mkdir(parents=True)
             script = target / "scripts" / "controller_runtime_supervisor.py"
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            script.chmod(0o755)
             plist = root / "controller-runtime.plist"
             heartbeat = root / "controller-runtime-heartbeat.json"
             install_web_agent_health_service_plist(
-                plist, target, python_executable="/usr/bin/python3",
+                plist, target,
                 registry_path=root / "controllers.json",
             )
             heartbeat.write_text(json.dumps({
@@ -1718,7 +1720,7 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
                 "supervisor_contract": "host_neutral_controller_runtime_v1",
             }), encoding="utf-8")
             canonical = plistlib.loads(plist.read_bytes())
-            installed_script = canonical["ProgramArguments"][1]
+            installed_script = canonical["ProgramArguments"][0]
 
             invalid_arguments = (
                 [
@@ -1726,8 +1728,8 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
                     "--registry", str(root / "controllers.json"),
                 ],
                 [
-                    "/usr/bin/python3", "--registry",
-                    str(root / "controllers.json"), installed_script,
+                    "--registry", str(root / "controllers.json"),
+                    installed_script, "--poll-seconds", "15",
                 ],
                 [*canonical["ProgramArguments"], "--once"],
             )
@@ -1753,6 +1755,23 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
                         report["desktop_adapter"]["background_continuation_ready"]
                     )
 
+            payload = dict(canonical)
+            payload["Program"] = False
+            plist.write_bytes(plistlib.dumps(payload))
+            malformed_program_report = detect_host_capabilities(
+                codex_executable=root / "missing-codex",
+                skill_root=target,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=root / "hooks.json",
+                zshenv_file=root / ".zshenv",
+                health_service_plist=plist,
+                runtime_supervisor_heartbeat=heartbeat,
+            )
+            self.assertEqual(
+                malformed_program_report["desktop_adapter"]["background_continuation"],
+                "not_configured",
+            )
+
     def test_desktop_background_continuation_is_reported_without_ai_bridge(self):
         import json
         from datetime import datetime, timedelta, timezone
@@ -1763,13 +1782,13 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
             root = Path(d)
             target = root / "adaptive-delivery"
             (target / "scripts").mkdir(parents=True)
-            (target / "scripts" / "controller_runtime_supervisor.py").write_text(
-                "#!/usr/bin/env python3\n", encoding="utf-8"
-            )
+            script = target / "scripts" / "controller_runtime_supervisor.py"
+            script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            script.chmod(0o755)
             plist = root / "controller-runtime.plist"
             heartbeat = root / "controller-runtime-heartbeat.json"
             install_web_agent_health_service_plist(
-                plist, target, python_executable="/usr/bin/python3",
+                plist, target,
                 registry_path=root / "controllers.json",
             )
             report = detect_host_capabilities(
@@ -1862,6 +1881,7 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
             (target / "scripts").mkdir(parents=True)
             script = target / "scripts" / "controller_runtime_supervisor.py"
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            script.chmod(0o755)
             plist = root / "health.plist"
             before = detect_host_capabilities(
                 skill_root=target,
@@ -1870,7 +1890,7 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
                 health_service_plist=plist,
             )
             install_web_agent_health_service_plist(
-                plist, target, python_executable="/usr/bin/python3",
+                plist, target,
                 registry_path=root / "controllers.json",
             )
             after = detect_host_capabilities(
@@ -1898,10 +1918,11 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
             (target / "scripts").mkdir(parents=True)
             script = target / "scripts" / "controller_runtime_supervisor.py"
             script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            script.chmod(0o755)
             plist = root / "health.plist"
             source_receipt = root / "event-source.json"
             install_web_agent_health_service_plist(
-                plist, target, python_executable="/usr/bin/python3",
+                plist, target,
                 registry_path=root / "controllers.json",
             )
             source_receipt.write_text(json.dumps({
@@ -1931,16 +1952,15 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
             root = Path(d)
             target = root / "adaptive-delivery"
             (target / "scripts").mkdir(parents=True)
-            (target / "scripts" / "controller_runtime_supervisor.py").write_text(
-                "#!/usr/bin/env python3\n", encoding="utf-8"
-            )
+            script = target / "scripts" / "controller_runtime_supervisor.py"
+            script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            script.chmod(0o755)
             plist = root / "LaunchAgents" / "health.plist"
             loaded = []
             report = configure_runtime_services(
                 target,
                 health_service_plist=plist,
                 registry_path=root / "controllers.json",
-                python_executable="/usr/bin/python3",
                 service_loader=lambda path: loaded.append(path) or {"state": "loaded"},
             )
         self.assertEqual(loaded, [plist.resolve()])
