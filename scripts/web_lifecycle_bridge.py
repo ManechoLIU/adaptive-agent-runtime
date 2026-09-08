@@ -2435,7 +2435,7 @@ def _thread_id_from_json_lines(output: str) -> str | None:
 
 def replace_desktop_execution_target(
     *, controller_id: str, desktop_session_id: str, repo: Path,
-    expected_generation: int, registry: Path,
+    expected_generation: int, expected_ownership_generation: int, registry: Path,
 ) -> dict[str, Any]:
     lifecycle = _lifecycle_module()
     return lifecycle.replace_desktop_session(
@@ -2443,6 +2443,7 @@ def replace_desktop_execution_target(
         desktop_session_id=desktop_session_id,
         repo=repo,
         expected_generation=expected_generation,
+        expected_ownership_generation=expected_ownership_generation,
         registry_path=registry,
     )
 
@@ -2450,6 +2451,7 @@ def replace_desktop_execution_target(
 def recover_incompatible_native_target(
     *, session_id: str, repo: Path, registry: Path, codex: str,
     failed_target_session_id: str, expected_generation: int,
+    expected_ownership_generation: int,
     runtime_path: str | None = None,
     terminal_receipts: Sequence[str] | None = None,
     next_action: str | None = None,
@@ -2582,12 +2584,16 @@ def recover_incompatible_native_target(
                     }
                 replacement = replace_desktop_execution_target(
                     controller_id=session_id, desktop_session_id=new_target, repo=repo,
-                    expected_generation=expected_generation, registry=registry,
+                    expected_generation=expected_generation,
+                    expected_ownership_generation=expected_ownership_generation,
+                    registry=registry,
                 )
         else:
             replacement = replace_desktop_execution_target(
                 controller_id=session_id, desktop_session_id=new_target, repo=repo,
-                expected_generation=expected_generation, registry=registry,
+                expected_generation=expected_generation,
+                expected_ownership_generation=expected_ownership_generation,
+                registry=registry,
             )
     except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
         return {
@@ -2613,6 +2619,9 @@ def recover_incompatible_native_target(
     resumed["recovered_from_execution_target_session_id"] = failed_target_session_id
     resumed["replacement_execution_target_session_id"] = new_target
     resumed["target_generation"] = replacement.get("generation", resumed.get("target_generation"))
+    resumed["ownership_generation"] = replacement.get(
+        "ownership_generation", resumed.get("ownership_generation")
+    )
     return resumed
 
 
@@ -5333,10 +5342,20 @@ def _run_auto_native_stop_impl(
     ):
         failed_target = str(attempt.get("execution_target_session_id") or "").strip()
         failed_generation = attempt.get("target_generation")
-        if failed_target and isinstance(failed_generation, int) and not isinstance(failed_generation, bool):
+        failed_ownership_generation = (
+            ownership_fence.get("generation") if isinstance(ownership_fence, dict) else None
+        )
+        if (
+            failed_target
+            and isinstance(failed_generation, int)
+            and not isinstance(failed_generation, bool)
+            and isinstance(failed_ownership_generation, int)
+            and not isinstance(failed_ownership_generation, bool)
+        ):
             attempt = recover_incompatible_native_target(
                 session_id=session_id, repo=repo, registry=registry, codex=codex,
                 failed_target_session_id=failed_target, expected_generation=failed_generation,
+                expected_ownership_generation=failed_ownership_generation,
                 runtime_path=runtime_path,
                 terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []) if isinstance(lifecycle_state, dict) else [],
                 next_action=str(lifecycle_state.get("next_action") or "").strip() or None if isinstance(lifecycle_state, dict) else None,
@@ -5344,6 +5363,23 @@ def _run_auto_native_stop_impl(
                 supervisor_receipt_id=receipt_id,
                 supervisor_token=supervisor_token,
             )
+
+    replacement_target = str(
+        attempt.get("replacement_execution_target_session_id") or ""
+    ).strip()
+    replacement_ownership_generation = attempt.get("ownership_generation")
+    if (
+        attempt.get("operation") == "native_target_recovery"
+        and replacement_target
+        and isinstance(replacement_ownership_generation, int)
+        and not isinstance(replacement_ownership_generation, bool)
+    ):
+        ownership_fence = {
+            "controller_id": session_id,
+            "active_host": target_guard.DESKTOP_SESSION_HOST,
+            "execution_target_session_id": replacement_target,
+            "generation": replacement_ownership_generation,
+        }
 
     if ownership_fence is not None:
         attempt["ownership_host"] = ownership_fence.get("active_host")

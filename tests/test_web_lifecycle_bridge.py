@@ -4319,6 +4319,7 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                 result = web_bridge.recover_incompatible_native_target(
                     session_id="controller-1", repo=repo, registry=registry, codex="codex",
                     failed_target_session_id="desktop-bad", expected_generation=1,
+                    expected_ownership_generation=1,
                     supervisor_state_path=state, supervisor_receipt_id="r1",
                     supervisor_token=old_token,
                 )
@@ -4448,6 +4449,7 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                 result = web_bridge.recover_incompatible_native_target(
                     session_id="controller-1", repo=repo, registry=registry, codex="codex",
                     failed_target_session_id="desktop-bad", expected_generation=1,
+                    expected_ownership_generation=1,
                     runtime_path="/usr/bin:/bin", terminal_receipts=["terminal.json"],
                     next_action="continue", supervisor_state_path=state,
                     supervisor_receipt_id="r1", supervisor_token=old_token,
@@ -6864,6 +6866,13 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                         "status": "active", "session_id": "desktop-bad", "generation": 1,
                     }}
                 },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "desktop_codex",
+                        "execution_target_session_id": "desktop-bad",
+                        "generation": 1,
+                    }
+                },
             }), encoding="utf-8")
             state = root / "auto-stop.json"
             state.write_text(json.dumps({
@@ -6881,7 +6890,26 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 "operation": "native_target_recovery", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
                 "pending_control_event": True, "returncode": 0, "stdout_tail": "continued", "stderr_tail": "",
                 "execution_target_session_id": "desktop-good", "target_generation": 2,
+                "replacement_execution_target_session_id": "desktop-good",
+                "ownership_generation": 2,
             }
+
+            def recover_and_rotate(**_kwargs):
+                saved_registry = json.loads(registry.read_text(encoding="utf-8"))
+                saved_registry["__controller_sessions__"]["controller-1"]["desktop_codex"].append(
+                    "desktop-good"
+                )
+                saved_registry["__controller_targets__"]["controller-1"]["desktop_codex"] = {
+                    "status": "active", "session_id": "desktop-good", "generation": 2,
+                }
+                saved_registry["__controller_execution_ownership__"]["controller-1"] = {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-good",
+                    "generation": 2,
+                }
+                registry.write_text(json.dumps(saved_registry), encoding="utf-8")
+                return recovered
+
             with patch.object(web_bridge, "_load_lifecycle_state", side_effect=[{
                 "pending_control_event": True,
                 "requires_user": False,
@@ -6891,7 +6919,7 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 "requires_user": False,
                 "controller_host": "desktop_codex",
             }]), patch.object(web_bridge, "execute_native_resume", return_value=incompatible), patch.object(
-                web_bridge, "recover_incompatible_native_target", return_value=recovered
+                web_bridge, "recover_incompatible_native_target", side_effect=recover_and_rotate
             ) as recover, patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
                 code = web_bridge.run_auto_native_stop(
                     session_id="controller-1", repo=repo, receipt_id="pending-schema-1",
@@ -6900,6 +6928,7 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 )
             self.assertEqual(code, 0)
             recover.assert_called_once()
+            self.assertEqual(recover.call_args.kwargs["expected_ownership_generation"], 1)
             schedule.assert_not_called()
             saved = json.loads(state.read_text())
             self.assertEqual(saved["state"], "CONTINUATION_CLOSED")
@@ -6926,6 +6955,13 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                         "generation": 1,
                     }}
                 },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "desktop_codex",
+                        "execution_target_session_id": "desktop-bad",
+                        "generation": 1,
+                    }
+                },
             }), encoding="utf-8")
 
             receipt = web_bridge.replace_desktop_execution_target(
@@ -6933,15 +6969,20 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 desktop_session_id="desktop-good",
                 repo=repo,
                 expected_generation=1,
+                expected_ownership_generation=1,
                 registry=registry,
             )
 
             saved = json.loads(registry.read_text(encoding="utf-8"))
             target = saved["__controller_targets__"]["controller-1"]["desktop_codex"]
+            ownership = saved["__controller_execution_ownership__"]["controller-1"]
             self.assertEqual(target["session_id"], "desktop-good")
             self.assertEqual(target["generation"], 2)
+            self.assertEqual(ownership["execution_target_session_id"], "desktop-good")
+            self.assertEqual(ownership["generation"], 2)
             self.assertEqual(receipt["execution_target_session_id"], "desktop-good")
             self.assertEqual(receipt["generation"], 2)
+            self.assertEqual(receipt["ownership_generation"], 2)
 
     def test_recover_incompatible_target_replaces_only_execution_target_then_resumes(self) -> None:
         from unittest.mock import patch
@@ -6970,7 +7011,7 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
             codex.chmod(0o755)
             replacement_receipt = {
                 "controller_id": "controller-1", "execution_target_session_id": "desktop-good",
-                "status": "active", "generation": 2,
+                "status": "active", "generation": 2, "ownership_generation": 2,
             }
             resumed = {
                 "operation": "native_resume", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
@@ -6984,6 +7025,7 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 result = web_bridge.recover_incompatible_native_target(
                     session_id="controller-1", repo=repo, registry=registry, codex=str(codex),
                     failed_target_session_id="desktop-bad", expected_generation=1,
+                    expected_ownership_generation=1,
                     runtime_path="/usr/bin:/bin", terminal_receipts=["terminal.json"],
                     next_action="execute step 2",
                 )
@@ -6992,11 +7034,12 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
             self.assertEqual(result["target_generation"], 2)
             replace.assert_called_once_with(
                 controller_id="controller-1", desktop_session_id="desktop-good", repo=repo,
-                expected_generation=1, registry=registry,
+                expected_generation=1, expected_ownership_generation=1, registry=registry,
             )
             resume.assert_called_once()
             self.assertEqual(resume.call_args.kwargs["session_id"], "controller-1")
             self.assertEqual(resume.call_args.kwargs["next_action"], "execute step 2")
+            self.assertEqual(result["ownership_generation"], 2)
 
     def test_active_writer_message_without_thread_store_prefix_is_still_deferred(self) -> None:
         classified = web_bridge.classify_native_resume_failure(
