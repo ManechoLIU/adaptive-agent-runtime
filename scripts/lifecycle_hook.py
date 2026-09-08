@@ -524,7 +524,7 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
             if token in {"-i", "--ignore-environment", "-0", "--null"}:
                 remaining.pop(0)
                 continue
-            if token in {"-u", "--unset", "-C", "--chdir"}:
+            if token in {"-u", "--unset", "-C", "--chdir", "-P"}:
                 remaining = remaining[2:] if len(remaining) > 1 else []
                 continue
             if token.startswith(("--unset=", "--chdir=")):
@@ -551,7 +551,8 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
 def _persistent_runner_payload(tokens: list[str]) -> bool:
     remaining = list(tokens)
     value_options = {
-        "-p", "--package", "--cache", "--cwd", "--dir", "--prefix", "--workspace"
+        "-p", "--package", "--cache", "--cwd", "--dir", "--prefix", "--workspace",
+        "--script-shell",
     }
     while remaining:
         token = remaining[0].lower()
@@ -570,6 +571,37 @@ def _persistent_runner_payload(tokens: list[str]) -> bool:
             continue
         break
     return _persistent_foreground_segment(remaining)
+
+
+def _persistent_signature_anywhere(tokens: list[str]) -> bool:
+    """Conservatively catch explicit server signatures behind unknown wrappers."""
+    if not tokens:
+        return False
+    names = [Path(token).name.lower() for token in tokens]
+    if names[0] in {
+        "awk", "cat", "echo", "find", "git", "grep", "head", "ls", "printf",
+        "rg", "sed", "tail", "type", "whereis", "which",
+    }:
+        return False
+    for index, name in enumerate(names):
+        if name == "--watch":
+            return True
+        if name in _PERSISTENT_EXECUTABLES:
+            if index + 1 < len(tokens) and tokens[index + 1] in {
+                "--help", "-h", "--version", "-v", "-V"
+            }:
+                continue
+            return True
+        if index > 0 and name in {"pnpm", "npm", "yarn", "bun", "npx", "bunx"}:
+            if _persistent_foreground_segment(tokens[index:]):
+                return True
+        if name == "tsx" and "watch" in names[index + 1 :]:
+            return True
+        if name.startswith("python") and names[index + 1 : index + 3] == ["-m", "http.server"]:
+            return True
+        if name == "next" and index + 1 < len(names) and names[index + 1] == "dev":
+            return True
+    return False
 
 
 def _persistent_foreground_segment(tokens: list[str]) -> bool:
@@ -669,7 +701,8 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
             return True
         if command in {"exec", "dlx", "x"} and index + 1 < len(tokens):
             return _persistent_runner_payload(tokens[index + 1 :])
-    return False
+        return False
+    return _persistent_signature_anywhere(tokens)
 
 
 def _persistent_foreground_command(command: str) -> bool:
