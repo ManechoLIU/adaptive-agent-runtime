@@ -1291,6 +1291,7 @@ test("assignment-bound external terminal receipt carries current attempt and lea
 
 test("Grok execution transports prompts through a private prompt file and removes it", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-prompt-file-"));
+  const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
@@ -1298,7 +1299,7 @@ test("Grok execution transports prompts through a private prompt file and remove
   const prompt = "bounded prompt must never be exposed in argv";
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "medium", "--cwd", skillRoot,
+    "--model", "grok-4.6", "--reasoning-effort", "medium", "--cwd", repo,
   ], { encoding: "utf8", input: prompt, env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
   assert.equal(result.status, 0, result.stderr);
   const call = JSON.parse(result.stdout.trim());
@@ -1347,6 +1348,7 @@ test("oversized Grok reviewer prompt fails before provider spawn with sharding e
 
 test("Grok first-output timeout terminates a silent provider attempt", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-first-output-timeout-"));
+  const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
@@ -1354,7 +1356,7 @@ test("Grok first-output timeout terminates a silent provider attempt", async () 
   const started = Date.now();
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
   ], {
     encoding: "utf8", input: "bounded",
     env: {
@@ -1371,13 +1373,14 @@ test("Grok first-output timeout terminates a silent provider attempt", async () 
 
 test("Grok generation stall timeout terminates after structured output stops", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-stall-timeout-"));
+  const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
   ], {
     encoding: "utf8", input: "bounded",
     env: {
@@ -1393,6 +1396,7 @@ test("Grok generation stall timeout terminates after structured output stops", a
 
 test("Grok absolute deadline kills the entire provider process group", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-process-group-timeout-"));
+  const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   const descendantMarker = path.join(bin, "descendant-survived.txt");
   await mkdir(grokHome, { recursive: true });
@@ -1412,7 +1416,7 @@ if (process.argv[2] === "version") {
   await chmod(runner, 0o755);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
   ], {
     encoding: "utf8", input: "bounded",
     env: {
@@ -1472,13 +1476,14 @@ test("Grok stall timeout persists structured canonical terminal classification",
 
 test("Grok failed attempt uses 0600 prompt file and removes it", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-prompt-permission-"));
+  const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
   ], {
     encoding: "utf8", input: "private bounded prompt",
     env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, FAKE_RUNNER_EXIT_CODE: "7" },
