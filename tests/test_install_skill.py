@@ -25,6 +25,7 @@ class InstallCapabilityTests(unittest.TestCase):
                 "controller_target_guard.py",
                 "controller_scoring_hook.py",
                 "project_context_guard.py",
+                "goal_display_sync.py",
             ):
                 script = skill_root / "scripts" / name
                 script.write_text(f"#!/usr/bin/env python3\n# {name}\n", encoding="utf-8")
@@ -70,6 +71,11 @@ class InstallCapabilityTests(unittest.TestCase):
             )
 
             self.assertEqual(report["desktop_adapter"]["status"], "enabled")
+            self.assertEqual(report["desktop_adapter"]["goal_display_sync"], "ready")
+            self.assertEqual(
+                report["web_local_adapter"]["goal_display_sync"],
+                "degraded_host_capability_unavailable",
+            )
 
             (skill_root / "scripts" / "controller_target_guard.py").write_text(
                 "#!/usr/bin/env python3\n# changed target guard\n", encoding="utf-8"
@@ -641,6 +647,12 @@ class InstallMigrationContractTests(unittest.TestCase):
         from scripts.install_skill import RUNTIME_RELEASE_REGRESSION_TESTS, RUNTIME_RELEASE_REQUIRED_FILES
 
         required_tests = {
+            "tests.test_goal_display_sync.GoalDisplaySyncTests.test_rolled_happy_path_records_exact_host_sequence_and_binding",
+            "tests.test_goal_display_sync.GoalDisplaySyncTests.test_successful_rolled_control_receipt_activates_display_sync_debt",
+            "tests.test_goal_display_sync.GoalDisplaySyncTests.test_title_failure_recovers_without_recreating_goal",
+            "tests.test_goal_display_sync.GoalDisplaySyncTests.test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced",
+            "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_managed_controller_rejects_unbounded_dev_commands_before_state_write",
+            "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions",
             "tests.test_controller_target_guard.ControllerTargetGuardTests.test_claim_controller_host_desktop_after_web_increments_one_cross_host_generation",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_direct_wake_rejects_confirmed_web_result_after_desktop_handoff",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_desktop_result_cannot_persist_or_rearm_after_web_handoff",
@@ -656,6 +668,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_browser_tab_receipt_cannot_recover_an_unverified_web_session",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_manual_web_mutations_cannot_downgrade_host_attested_current_target",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_legacy_quarantined_target_keeps_trusted_host_recovery_exit",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_legacy_quarantined_target_keeps_manual_replacement_exit",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_resolve_reentry_session_strong_host_target_does_not_require_manual_lease",
@@ -692,6 +706,8 @@ class InstallMigrationContractTests(unittest.TestCase):
         }
         self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
         self.assertIn("scripts/controller_runtime_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("scripts/goal_display_sync.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("tests/test_goal_display_sync.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("tests/test_web_agent_health_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("tests/test_terminal_continuation.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("scripts/terminal_continuation.py", RUNTIME_RELEASE_REQUIRED_FILES)
@@ -711,7 +727,7 @@ class InstallMigrationContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source = self.make_source(root)
-            for name in ("web_agent_execution.py", "web_reentry_adapter.py", "terminal_continuation.py"):
+            for name in ("web_agent_execution.py", "web_reentry_adapter.py", "terminal_continuation.py", "goal_display_sync.py"):
                 (source / "scripts" / name).write_text("# runtime\n", encoding="utf-8")
             (source / "scripts" / "run_external_agent.mjs").write_text(
                 "export const marker = 'external-agent-routing';\n",
@@ -875,6 +891,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_replace_web_session_bootstrap_rotates_target_and_manual_lease_without_host_attestation(self): self.assertTrue(True)\n"
                 "    def test_manual_web_mutations_cannot_downgrade_host_attested_current_target(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target(self): self.assertTrue(True)\n"
+                "    def test_legacy_quarantined_target_keeps_trusted_host_recovery_exit(self): self.assertTrue(True)\n"
+                "    def test_legacy_quarantined_target_keeps_manual_replacement_exit(self): self.assertTrue(True)\n"
                 "    def test_replace_web_session_rejects_unapproved_session_and_stale_generation(self): self.assertTrue(True)\n"
                 "    def test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target(self): self.assertTrue(True)\n"
@@ -982,7 +1000,19 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_successful_receipt_is_invalidated_when_same_turn_continuation_executes(self): self.assertTrue(True)\n"
                 "    def test_status_query_does_not_clear_existing_controller_continuation(self): self.assertTrue(True)\n"
                 "    def test_hard_yield_gate_rejects_declared_next_action_when_work_is_runnable(self): self.assertTrue(True)\n"
-                "    def test_hard_yield_gate_does_not_invent_work_from_status_only_message(self): self.assertTrue(True)\n",
+                "    def test_hard_yield_gate_does_not_invent_work_from_status_only_message(self): self.assertTrue(True)\n"
+                "class DesktopOutboundLeaseHookTests(unittest.TestCase):\n"
+                "    def test_managed_controller_rejects_unbounded_dev_commands_before_state_write(self): self.assertTrue(True)\n"
+                "    def test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_goal_display_sync.py").write_text(
+                "import unittest\n"
+                "class GoalDisplaySyncTests(unittest.TestCase):\n"
+                "    def test_rolled_happy_path_records_exact_host_sequence_and_binding(self): self.assertTrue(True)\n"
+                "    def test_successful_rolled_control_receipt_activates_display_sync_debt(self): self.assertTrue(True)\n"
+                "    def test_title_failure_recovers_without_recreating_goal(self): self.assertTrue(True)\n"
+                "    def test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_web_agent_execution.py").write_text(
@@ -1033,7 +1063,7 @@ class InstallMigrationContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source = self.make_source(root)
-            for name in ("web_agent_execution.py", "web_reentry_adapter.py", "terminal_continuation.py"):
+            for name in ("web_agent_execution.py", "web_reentry_adapter.py", "terminal_continuation.py", "goal_display_sync.py"):
                 (source / "scripts" / name).write_text("# runtime\n", encoding="utf-8")
             (source / "scripts" / "run_external_agent.mjs").write_text(
                 "export const marker = 'external-agent-routing';\n",
@@ -1163,6 +1193,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_replace_web_session_bootstrap_rotates_target_and_manual_lease_without_host_attestation(self): self.assertTrue(True)\n"
                 "    def test_manual_web_mutations_cannot_downgrade_host_attested_current_target(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target(self): self.assertTrue(True)\n"
+                "    def test_legacy_quarantined_target_keeps_trusted_host_recovery_exit(self): self.assertTrue(True)\n"
+                "    def test_legacy_quarantined_target_keeps_manual_replacement_exit(self): self.assertTrue(True)\n"
                 "    def test_replace_web_session_rejects_unapproved_session_and_stale_generation(self): self.assertTrue(True)\n"
                 "    def test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
@@ -1231,7 +1263,19 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_successful_receipt_is_invalidated_when_same_turn_continuation_executes(self): self.assertTrue(True)\n"
                 "    def test_status_query_does_not_clear_existing_controller_continuation(self): self.assertTrue(True)\n"
                 "    def test_hard_yield_gate_rejects_declared_next_action_when_work_is_runnable(self): self.assertTrue(True)\n"
-                "    def test_hard_yield_gate_does_not_invent_work_from_status_only_message(self): self.assertTrue(True)\n",
+                "    def test_hard_yield_gate_does_not_invent_work_from_status_only_message(self): self.assertTrue(True)\n"
+                "class DesktopOutboundLeaseHookTests(unittest.TestCase):\n"
+                "    def test_managed_controller_rejects_unbounded_dev_commands_before_state_write(self): self.assertTrue(True)\n"
+                "    def test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_goal_display_sync.py").write_text(
+                "import unittest\n"
+                "class GoalDisplaySyncTests(unittest.TestCase):\n"
+                "    def test_rolled_happy_path_records_exact_host_sequence_and_binding(self): self.assertTrue(True)\n"
+                "    def test_successful_rolled_control_receipt_activates_display_sync_debt(self): self.assertTrue(True)\n"
+                "    def test_title_failure_recovers_without_recreating_goal(self): self.assertTrue(True)\n"
+                "    def test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_web_agent_execution.py").write_text(

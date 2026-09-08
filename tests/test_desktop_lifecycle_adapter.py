@@ -631,6 +631,192 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             code = lifecycle_hook.run_hook()
         return code, output.getvalue()
 
+    def test_managed_controller_rejects_unbounded_dev_commands_before_state_write(self) -> None:
+        commands = (
+            ("Bash", "pnpm --filter @selfalone/server dev"),
+            ("exec_command", "DATABASE_URL=postgres://localhost/selfalone pnpm --filter @selfalone/server exec tsx watch src/index.ts"),
+            ("exec_command", "cd apps/server && pnpm dev"),
+            ("exec_command", "bash -lc 'pnpm --filter @selfalone/server dev'"),
+            ("exec_command", "npm run dev"),
+            ("exec_command", "pnpm test -- --watch"),
+            ("exec_command", "pnpm dev -v"),
+            ("exec_command", "vite"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            old_registry, old_state_root = lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
+            lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = (
+                root / "controllers.json",
+                root / "state",
+            )
+            original_state = {
+                "active_turn_id": "turn-1",
+                "tool_trace": [],
+                "inflight_tool_use_ids": [],
+                "pending_control_event": True,
+            }
+            lifecycle_hook.write_json(
+                lifecycle_hook.state_path("controller-1"), original_state
+            )
+            try:
+                for index, (tool_name, command) in enumerate(commands, start=1):
+                    with self.subTest(tool_name=tool_name, command=command), patch.object(
+                        lifecycle_hook, "registered_controller_id", return_value="controller-1"
+                    ), patch.object(
+                        lifecycle_hook, "registered_root", return_value=repo
+                    ), patch.object(
+                        lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)
+                    ), patch.object(
+                        lifecycle_hook, "controller_event_is_managed", return_value=True
+                    ), patch.object(
+                        lifecycle_hook.target_guard, "locked_registry"
+                    ) as locked_registry, patch.object(
+                        lifecycle_hook.target_guard,
+                        "active_source_controller_id",
+                        return_value="controller-1",
+                    ), patch.object(
+                        lifecycle_hook, "registry_controller_root_matches", return_value=True
+                    ), patch.object(
+                        lifecycle_hook,
+                        "persist_event_state",
+                        return_value=({}, original_state),
+                    ) as persist:
+                        locked_registry.return_value.__enter__.return_value = {}
+                        code, output = self.invoke_hook({
+                            "hook_event_name": "PreToolUse",
+                            "session_id": "desktop-current",
+                            "turn_id": "turn-1",
+                            "tool_name": tool_name,
+                            "tool_use_id": f"foreground-{index}",
+                            "tool_input": {"command": command},
+                            "cwd": str(repo),
+                        })
+                    self.assertEqual(code, 0)
+                    self.assertTrue(output, "unbounded command was allowed")
+                    denial = json.loads(output)
+                    self.assertEqual(
+                        denial["hookSpecificOutput"]["permissionDecision"], "deny"
+                    )
+                    self.assertIn(
+                        "persistent terminal",
+                        denial["hookSpecificOutput"]["permissionDecisionReason"],
+                    )
+                    self.assertEqual(
+                        lifecycle_hook.load_json(
+                            lifecycle_hook.state_path("controller-1")
+                        ),
+                        original_state,
+                    )
+                    persist.assert_not_called()
+            finally:
+                lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = (
+                    old_registry,
+                    old_state_root,
+                )
+
+    def test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions(self) -> None:
+        allowed_inputs = (
+            {"command": "pnpm --filter @selfalone/server dev", "yield_time_ms": 1000},
+            {"cmd": "timeout 5s pnpm --filter @selfalone/server dev"},
+            {"command": "pnpm --filter @selfalone/server dev -- --once"},
+            {"command": "pnpm --filter @selfalone/server test"},
+            {"command": "pnpm build"},
+            {"command": "pnpm typecheck"},
+            {"command": "vite --help"},
+            {"command": "tsx scripts/smoke.ts"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            for index, tool_input in enumerate(allowed_inputs, start=1):
+                with self.subTest(tool_input=tool_input), patch.object(
+                    lifecycle_hook, "registered_controller_id", return_value="controller-1"
+                ), patch.object(
+                    lifecycle_hook, "registered_root", return_value=repo
+                ), patch.object(
+                    lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)
+                ), patch.object(
+                    lifecycle_hook, "controller_event_is_managed", return_value=True
+                ), patch.object(
+                    lifecycle_hook.target_guard, "locked_registry"
+                ) as locked_registry, patch.object(
+                    lifecycle_hook.target_guard,
+                    "active_source_controller_id",
+                    return_value="controller-1",
+                ), patch.object(
+                    lifecycle_hook, "registry_controller_root_matches", return_value=True
+                ), patch.object(
+                    lifecycle_hook, "persist_event_state", return_value=({}, {})
+                ) as persist:
+                    locked_registry.return_value.__enter__.return_value = {}
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "PreToolUse",
+                        "session_id": "desktop-current",
+                        "turn_id": "turn-1",
+                        "tool_name": "exec_command",
+                        "tool_use_id": f"allowed-{index}",
+                        "tool_input": tool_input,
+                        "cwd": str(repo),
+                    })
+                self.assertEqual(code, 0)
+                self.assertEqual(output, "")
+                persist.assert_called_once()
+
+            with patch.object(
+                lifecycle_hook, "registered_controller_id", return_value=None
+            ), patch.object(
+                lifecycle_hook,
+                "persist_event_state",
+                side_effect=AssertionError("unmanaged Writer/Reviewer must stay outside Controller gate"),
+            ):
+                code, output = self.invoke_hook({
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "writer-session",
+                    "turn_id": "turn-1",
+                    "tool_name": "exec_command",
+                    "tool_use_id": "writer-dev",
+                    "tool_input": {"command": "pnpm --filter @selfalone/server dev"},
+                    "cwd": str(repo),
+                })
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            with patch.object(
+                lifecycle_hook, "registered_controller_id", return_value="controller-1"
+            ), patch.object(
+                lifecycle_hook, "registered_root", return_value=repo
+            ), patch.object(
+                lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)
+            ), patch.object(
+                lifecycle_hook, "controller_event_is_managed", return_value=True
+            ), patch.object(
+                lifecycle_hook.target_guard, "locked_registry"
+            ) as locked_registry, patch.object(
+                lifecycle_hook.target_guard,
+                "active_source_controller_id",
+                return_value=None,
+            ), patch.object(
+                lifecycle_hook,
+                "persist_event_state",
+                side_effect=AssertionError("non-current alias must not enter Controller state"),
+            ):
+                locked_registry.return_value.__enter__.return_value = {}
+                code, output = self.invoke_hook({
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "desktop-old",
+                    "turn_id": "turn-1",
+                    "tool_name": "exec_command",
+                    "tool_use_id": "old-alias-dev",
+                    "tool_input": {"command": "pnpm dev"},
+                    "cwd": str(repo),
+                })
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+
     def test_non_controller_session_spawn_still_runs_runtime_dispatch_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -925,6 +1111,7 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             lifecycle_hook.REGISTRY_PATH = registry
             try:
                 def persist(_path, _event, _snapshot):
+                    self.assertEqual(_event["controller_target_generation"], 1)
                     entered.set()
                     self.assertTrue(release.wait(1))
                     return {}, {}

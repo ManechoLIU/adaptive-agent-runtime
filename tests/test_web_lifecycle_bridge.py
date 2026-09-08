@@ -976,6 +976,106 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(verifier_calls, [])
             self.assertEqual(json.loads(registry.read_text()), original)
 
+    def test_legacy_quarantined_target_keeps_trusted_host_recovery_exit(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-legacy", "web-new"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {"web": {
+                        "status": "active",
+                        "session_id": "web-legacy",
+                        "generation": 4,
+                        "provenance": "host_attested_same_controller_recovery",
+                        "binding_mode": "resume_only",
+                        "host_identity_receipt_sha256": "a" * 64,
+                    }}
+                },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "web",
+                        "execution_target_session_id": "web-legacy",
+                        "generation": 4,
+                        "provenance": "web_entry",
+                    }
+                },
+            }), encoding="utf-8")
+            verifier_calls = []
+
+            def verifier(**kwargs: object) -> bool:
+                verifier_calls.append(kwargs)
+                return True
+
+            with patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+            ):
+                result = web_bridge.recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id="web-new",
+                    registry_path=registry,
+                    host_identity_receipt={"attested": True},
+                )
+
+            self.assertEqual(result["result"], "RECOVERED")
+            self.assertEqual(len(verifier_calls), 1)
+            saved = json.loads(registry.read_text())
+            current = saved["__controller_targets__"]["controller-1"]["web"]
+            self.assertEqual(current["session_id"], "web-new")
+            self.assertEqual(current["generation"], 5)
+            self.assertEqual(current["identity_proof"], "host_attested_origin")
+
+    def test_legacy_quarantined_target_keeps_manual_replacement_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-legacy", "web-manual"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {"web": {
+                        "status": "active", "session_id": "web-legacy", "generation": 4,
+                        "provenance": "host_attested_same_controller_recovery",
+                        "binding_mode": "resume_only",
+                        "host_identity_receipt_sha256": "a" * 64,
+                    }}
+                },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "web",
+                        "execution_target_session_id": "web-legacy",
+                        "generation": 4,
+                        "provenance": "web_entry",
+                    }
+                },
+            }), encoding="utf-8")
+            result = web_bridge.replace_web_session(
+                repo=repo,
+                controller_id="controller-1",
+                web_session_id="web-manual",
+                expected_generation=4,
+                expected_ownership_generation=4,
+                registry_path=registry,
+                lease_path=root / "leases.json",
+            )
+            saved = json.loads(registry.read_text())
+
+        self.assertEqual(result["execution_target_session_id"], "web-manual")
+        self.assertFalse(result["host_attested"])
+        self.assertEqual(
+            saved["__controller_targets__"]["controller-1"]["web"]["generation"], 5
+        )
+
     def test_same_controller_web_recovery_rejects_attestation_if_target_generation_changes_before_lock(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:

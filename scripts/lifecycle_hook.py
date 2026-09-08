@@ -39,6 +39,10 @@ try:
     import controller_target_guard as target_guard
 except ModuleNotFoundError:
     from scripts import controller_target_guard as target_guard
+try:
+    import goal_display_sync
+except ModuleNotFoundError:
+    from scripts import goal_display_sync
 
 
 STATE_ROOT = Path(
@@ -274,7 +278,7 @@ def _goal_block_request(event: dict[str, Any]) -> bool:
     )
 
 
-def _control_guard_proposal(command: str, *, cwd: str | Path | None) -> dict[str, str] | None:
+def _control_guard_proposal(command: str, *, cwd: str | Path | None) -> dict[str, Any] | None:
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -292,11 +296,73 @@ def _control_guard_proposal(command: str, *, cwd: str | Path | None) -> dict[str
     rollover = snapshot.get("goal_rollover") if isinstance(snapshot, dict) else None
     if not isinstance(rollover, dict):
         return None
-    return {
+    proposal: dict[str, Any] = {
         "snapshot_path": str(snapshot_path),
         "snapshot_sha256": sha256_bytes(raw),
         "goal_rollover_status": str(rollover.get("status", "")).strip().lower(),
     }
+    if proposal["goal_rollover_status"] != "rolled":
+        return proposal
+    try:
+        ledger_index = tokens.index("--ledger")
+        ledger_path = Path(tokens[ledger_index + 1]).expanduser()
+        if not ledger_path.is_absolute():
+            ledger_path = (Path(cwd or ".").expanduser().resolve() / ledger_path).resolve()
+        ledger_raw = ledger_path.read_bytes()
+        ledger_sha256 = sha256_bytes(ledger_raw)
+        if ledger_sha256 != str(snapshot.get("ledger_sha256", "")).strip():
+            return proposal
+        ledger_text = ledger_raw.decode("utf-8")
+        current_match = re.search(r"^- 当前 Goal：\s*(.+?)\s*$", ledger_text, re.MULTILINE)
+        current_goal_id = str(rollover.get("current_goal_id", "")).strip()
+        if current_match is None or not current_goal_id:
+            return proposal
+        current_goal_display = current_match.group(1).strip()
+        if not re.search(
+            rf"(?<![A-Za-z0-9_-]){re.escape(current_goal_id)}(?![A-Za-z0-9_-])",
+            current_goal_display,
+        ):
+            return proposal
+        project_root = Path(str(snapshot.get("root") or cwd or ".")).expanduser().resolve()
+        proposal["goal_rollover"] = {
+            "status": "rolled",
+            "project_recomputed": rollover.get("project_recomputed") is True,
+            "ledger_sha256": ledger_sha256,
+            "closed_goal_id": str(rollover.get("closed_goal_id", "")).strip(),
+            "current_goal_id": current_goal_id,
+            "current_goal_display": current_goal_display,
+            "project_name": ledger_path.parent.name or project_root.name,
+        }
+        proposal["ledger_path"] = str(ledger_path)
+    except (OSError, UnicodeDecodeError, ValueError, IndexError):
+        pass
+    return proposal
+
+
+def _verified_goal_rollover_proposal(
+    proposal: object, *, tool_use_id: str
+) -> dict[str, Any] | None:
+    if not isinstance(proposal, dict):
+        return None
+    if str(proposal.get("tool_use_id", "")) != tool_use_id:
+        return None
+    rollover = proposal.get("goal_rollover")
+    if not isinstance(rollover, dict) or rollover.get("status") != "rolled":
+        return None
+    snapshot_path = Path(str(proposal.get("snapshot_path", ""))).expanduser()
+    ledger_path = Path(str(proposal.get("ledger_path", ""))).expanduser()
+    try:
+        snapshot_matches = (
+            bool(proposal.get("snapshot_sha256"))
+            and sha256_bytes(snapshot_path.read_bytes()) == proposal.get("snapshot_sha256")
+        )
+        ledger_matches = (
+            bool(rollover.get("ledger_sha256"))
+            and sha256_bytes(ledger_path.read_bytes()) == rollover.get("ledger_sha256")
+        )
+    except OSError:
+        return None
+    return dict(rollover) if snapshot_matches and ledger_matches else None
 
 
 def _verified_project_block_proposal(
@@ -400,6 +466,131 @@ def _pre_tool_denial(reason: str) -> dict[str, Any]:
             "permissionDecisionReason": reason,
         }
     }
+
+
+_COMMAND_EXECUTION_TOOLS = {
+    "bash",
+    "exec_command",
+    "shell",
+    "shell_command",
+}
+_PERSISTENT_SCRIPT_NAMES = {"dev", "serve", "start", "watch"}
+_PERSISTENT_EXECUTABLES = {
+    "nodemon",
+    "vite",
+    "webpack-dev-server",
+}
+_BOUNDED_COMMAND_FLAGS = {"--once", "--run", "--help", "--version"}
+_SHELL_SEPARATORS = {";", "&&", "||", "|", "&"}
+
+
+def _command_segments(command: str) -> list[list[str]]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _SHELL_SEPARATORS or (
+            token and set(token) <= {";", "&", "|"}
+        ):
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _strip_command_prefix(tokens: list[str]) -> list[str]:
+    remaining = list(tokens)
+    if remaining and remaining[0] == "env":
+        remaining.pop(0)
+    while remaining and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", remaining[0]):
+        remaining.pop(0)
+    return remaining
+
+
+def _persistent_foreground_segment(tokens: list[str]) -> bool:
+    tokens = _strip_command_prefix(tokens)
+    if not tokens:
+        return False
+    executable = Path(tokens[0]).name.lower()
+    if executable in {"timeout", "gtimeout"}:
+        return False
+    if any(token.lower() in _BOUNDED_COMMAND_FLAGS for token in tokens[1:]) or (
+        len(tokens) == 2 and tokens[1] in {"-h", "-v", "-V"}
+    ):
+        return False
+    if executable in {"bash", "sh", "zsh"}:
+        for index, token in enumerate(tokens[1:], start=1):
+            if token in {"-c", "-lc"} and index + 1 < len(tokens):
+                return _persistent_foreground_command(tokens[index + 1])
+        return False
+    lowered = [token.lower() for token in tokens]
+    if "--watch" in lowered or executable in _PERSISTENT_EXECUTABLES:
+        return True
+    if executable == "tsx" and "watch" in lowered[1:]:
+        return True
+    if executable in {"pnpm", "npm", "yarn", "bun"}:
+        index = 1
+        while index < len(lowered):
+            token = lowered[index]
+            if token in {"--filter", "--dir", "-c", "--cwd"} and index + 1 < len(lowered):
+                index += 2
+                continue
+            if token.startswith("-"):
+                index += 1
+                continue
+            break
+        command = lowered[index] if index < len(lowered) else ""
+        if command == "run" and index + 1 < len(lowered):
+            command = lowered[index + 1]
+        if command in _PERSISTENT_SCRIPT_NAMES:
+            return True
+        if command == "exec" and index + 1 < len(tokens):
+            return _persistent_foreground_segment(tokens[index + 1 :])
+    return False
+
+
+def _persistent_foreground_command(command: str) -> bool:
+    return any(
+        _persistent_foreground_segment(segment)
+        for segment in _command_segments(command)
+    )
+
+
+def registered_controller_foreground_denial(
+    tool_name: Any, tool_input: Any
+) -> str | None:
+    """Reject an unbounded foreground server only for the current Controller.
+
+    The caller performs the exact current-target fence before using this result.
+    The reason is deliberately constant so command contents never enter receipts.
+    """
+    normalized_tool = Path(str(tool_name or "")).name.lower()
+    if normalized_tool not in _COMMAND_EXECUTION_TOOLS or not isinstance(tool_input, dict):
+        return None
+    initial_yield = tool_input.get("yield_time_ms")
+    if isinstance(initial_yield, (int, float)) and not isinstance(initial_yield, bool):
+        if 0 < initial_yield <= 5000:
+            return None
+    command = tool_input.get("command", tool_input.get("cmd"))
+    if not isinstance(command, str) or not command.strip():
+        return None
+    if not _persistent_foreground_command(command):
+        return None
+    return (
+        "Registered Controller cannot run an unbounded development/watch process "
+        "in foreground command execution; use a persistent terminal, an initial "
+        "yield of at most 5000 ms, or an explicitly bounded exit."
+    )
 
 
 def _desktop_canary_identity(
@@ -1058,6 +1249,17 @@ def evaluate_event(
         }
         return {"systemMessage": "Adaptive Agent Runtime: unmatched tool result; current turn evidence was not changed."}, state
     if event_name == "PreToolUse":
+        pending_display_sync = state.get("goal_display_sync")
+        if (
+            isinstance(pending_display_sync, dict)
+            and pending_display_sync.get("status") not in {None, "completed"}
+        ):
+            authorized_sync, denial = goal_display_sync.authorize_goal_display_sync_tool(
+                pending_display_sync, event
+            )
+            if denial:
+                return _pre_tool_denial(denial), state
+            state["goal_display_sync"] = authorized_sync
         if _goal_block_request(event):
             turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
             authorization = state.get("goal_block_authorization")
@@ -1140,6 +1342,14 @@ def evaluate_event(
         ]
         if str(state.get("control_receipt_inflight", "")) == tool_use_id:
             state.pop("control_receipt_inflight", None)
+        pending_display_sync = state.get("goal_display_sync")
+        if (
+            isinstance(pending_display_sync, dict)
+            and pending_display_sync.get("status") not in {None, "completed", "degraded"}
+        ):
+            state["goal_display_sync"] = goal_display_sync.observe_goal_display_sync_result(
+                pending_display_sync, event
+            )
     _record_tool_trace(state, event)
     event_next_action = str(event.get("next_action") or "").strip()
     event_requires_user = event.get("requires_user")
@@ -1242,8 +1452,9 @@ def evaluate_event(
 
     if successful_control_receipt(event, snapshot):
         receipt_turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
+        control_receipt_proposal = state.get("control_receipt_proposal")
         project_block_authorized = _verified_project_block_proposal(
-            state.get("control_receipt_proposal"), tool_use_id=_tool_use_id(event)
+            control_receipt_proposal, tool_use_id=_tool_use_id(event)
         )
         state.pop("control_receipt_proposal", None)
         state["must_yield"] = True
@@ -1255,6 +1466,73 @@ def evaluate_event(
             }
         else:
             state.pop("goal_block_authorization", None)
+        activated_display_sync: dict[str, Any] | None = None
+        if (
+            isinstance(control_receipt_proposal, dict)
+            and control_receipt_proposal.get("goal_rollover_status") == "rolled"
+        ):
+            rollover_contract = _verified_goal_rollover_proposal(
+                control_receipt_proposal, tool_use_id=_tool_use_id(event)
+            )
+            try:
+                if rollover_contract is None:
+                    raise ValueError("validated ledger Goal display is unavailable")
+                activated_display_sync = goal_display_sync.start_goal_display_sync(
+                    state.get("goal_display_sync")
+                    if isinstance(state.get("goal_display_sync"), dict)
+                    else None,
+                    rollover_contract,
+                    controller_id=str(event.get("controller_session_id", "")).strip(),
+                    source_session_id=str(event.get("source_session_id", "")).strip(),
+                    host=str(event.get("controller_host", "")).strip(),
+                    target_generation=event.get("controller_target_generation"),
+                    turn_id=receipt_turn_id,
+                    host_capabilities={"update_goal", "create_goal", "set_thread_title"}
+                    if event.get("controller_host") == DESKTOP_SESSION_HOST
+                    else set(),
+                )
+            except ValueError as exc:
+                activated_display_sync = {
+                    "schema_version": 1,
+                    "receipt_id": "goal-display-sync:degraded",
+                    "status": "degraded",
+                    "reason": "GOAL_DISPLAY_CONTRACT_UNAVAILABLE",
+                    "detail_sha256": _json_sha256(str(exc)),
+                    "controller_id": str(event.get("controller_session_id", "")).strip(),
+                    "execution_target_session_id": str(event.get("source_session_id", "")).strip(),
+                    "host": str(event.get("controller_host", "")).strip(),
+                    "target_generation": event.get("controller_target_generation"),
+                    "rollover_turn_id": receipt_turn_id,
+                    "steps": [],
+                }
+            if activated_display_sync is not None:
+                state["goal_display_sync"] = activated_display_sync
+        if (
+            isinstance(activated_display_sync, dict)
+            and activated_display_sync.get("status") != "completed"
+        ):
+            trigger = "goal_display_sync:" + str(
+                activated_display_sync.get("receipt_id", "pending")
+            )
+            state.update({
+                "pending_control_event": True,
+                "triggers": [trigger],
+                "stop_continuations": 0,
+                "pending_terminal_receipts": [],
+                "next_action": "",
+                "requires_user": False,
+            })
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": (
+                        "Ledger Goal rollover 已验证，但宿主显示同步仍是 Continuation Debt。"
+                        "按顺序完成旧系统 Goal update_goal(status=complete)、"
+                        "用台账当前 Goal 精确文本 create_goal、再为当前总控任务 set_thread_title；"
+                        "每步必须由同一 exact Controller target/generation 的 PostToolUse 回执闭合。"
+                    ),
+                }
+            }, state
         if wake_policy == "after_event" and str(handshake.get("state", "")) == "pending_ack":
             rule_triggers = [item for item in lifecycle_triggers(snapshot, None) if item.startswith("rule_update_pending:")]
             state.update({
@@ -1921,6 +2199,25 @@ def run_hook() -> int:
     normalized_event["controller_session_id"] = controller_id
     normalized_event["session_id"] = controller_id
     normalized_event["controller_host"] = DESKTOP_SESSION_HOST
+    foreground_denial = None
+    if normalized_event.get("hook_event_name") == "PreToolUse":
+        foreground_denial = registered_controller_foreground_denial(
+            normalized_event.get("tool_name"), normalized_event.get("tool_input")
+        )
+    if foreground_denial is not None:
+        # Fence the alias before denying. Writer/Reviewer and stale Controller
+        # aliases stay outside this Controller-only host-execution policy.
+        with target_guard.locked_registry(REGISTRY_PATH) as registry:
+            if target_guard.active_source_controller_id(
+                registry,
+                source_session_id=source_session_id,
+                host=DESKTOP_SESSION_HOST,
+            ) != controller_id or not registry_controller_root_matches(
+                registry, controller_id=controller_id, expected_root=expected_root
+            ):
+                return 0
+        print(json.dumps(_pre_tool_denial(foreground_denial), ensure_ascii=False))
+        return 0
     outbound_lease_acquired = False
     post_outbound_request: tuple[str, str] | None = None
     if normalized_event.get("hook_event_name") == "PreToolUse":
@@ -1986,6 +2283,21 @@ def run_hook() -> int:
             registry, controller_id=controller_id, expected_root=expected_root
         ):
             return 0
+        target_record = target_guard.target_record(
+            registry, controller_id=controller_id, host=DESKTOP_SESSION_HOST
+        )
+        if target_record is not None:
+            try:
+                target_status, target_session_id, target_generation = (
+                    target_guard.validate_target_record(
+                        target_record, host=DESKTOP_SESSION_HOST
+                    )
+                )
+            except (PermissionError, ValueError):
+                return 0
+            if target_status != "active" or target_session_id != source_session_id:
+                return 0
+            normalized_event["controller_target_generation"] = target_generation
         output, next_state = persist_event_state(path, normalized_event, snapshot)
     if post_outbound_request is not None and _tool_use_id(normalized_event):
         action, target_session_id = post_outbound_request

@@ -207,8 +207,10 @@ def _is_strong_web_target_record(record: object) -> bool:
         return False
     return (
         record.get("host_attested") is True
-        or record.get("identity_proof") == "host_attested_origin"
-        or record.get("provenance") == "host_attested_same_controller_recovery"
+        or (
+            record.get("provenance") == "host_attested_same_controller_recovery"
+            and record.get("identity_proof") == "host_attested_origin"
+        )
     )
 
 

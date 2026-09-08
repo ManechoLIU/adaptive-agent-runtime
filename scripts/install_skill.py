@@ -97,6 +97,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_legacy_quarantined_target_keeps_trusted_host_recovery_exit",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_legacy_quarantined_target_keeps_manual_replacement_exit",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_replace_web_session_rejects_unapproved_session_and_stale_generation",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history",
@@ -318,6 +322,18 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_hard_yield_gate_rejects_declared_next_action_when_work_is_runnable",
     "tests.test_desktop_lifecycle_adapter.DesktopLifecycleTurnGateTests."
     "test_hard_yield_gate_does_not_invent_work_from_status_only_message",
+    "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests."
+    "test_managed_controller_rejects_unbounded_dev_commands_before_state_write",
+    "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests."
+    "test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions",
+    "tests.test_goal_display_sync.GoalDisplaySyncTests."
+    "test_rolled_happy_path_records_exact_host_sequence_and_binding",
+    "tests.test_goal_display_sync.GoalDisplaySyncTests."
+    "test_successful_rolled_control_receipt_activates_display_sync_debt",
+    "tests.test_goal_display_sync.GoalDisplaySyncTests."
+    "test_title_failure_recovers_without_recreating_goal",
+    "tests.test_goal_display_sync.GoalDisplaySyncTests."
+    "test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced",
     "tests.test_web_agent_execution.WebAgentExecutionTests."
     "test_direct_start_web_assignment_is_rejected_even_with_forged_readiness_probe",
     "tests.test_web_agent_execution.WebAgentExecutionTests."
@@ -455,6 +471,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/web_lifecycle_bridge.py",
     "scripts/web_reentry_adapter.py",
     "scripts/lifecycle_hook.py",
+    "scripts/goal_display_sync.py",
     "scripts/control_event_guard.py",
     "scripts/event_scope_guard.py",
     "scripts/controller_state.py",
@@ -475,6 +492,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_web_collaboration_continuation.py",
     "tests/test_governance.py",
     "tests/test_desktop_lifecycle_adapter.py",
+    "tests/test_goal_display_sync.py",
     "tests/test_controller_scoring_hook.py",
     "tests/test_project_context_guard.py",
     "tests/test_rule_handshake.py",
@@ -1021,6 +1039,14 @@ def detect_host_capabilities(
         health_service_configured and runtime_supervisor_ready
     )
     desktop["continuation_independent_of_ai_bridge"] = health_service_configured
+    goal_display_sync_ready = bool(
+        lifecycle_configured
+        and skill_root_path is not None
+        and (skill_root_path / "scripts" / "goal_display_sync.py").is_file()
+    )
+    desktop["goal_display_sync"] = (
+        "ready" if goal_display_sync_ready else "degraded_runtime_hook_unavailable"
+    )
 
     bridge_available = bridge_path.is_file() and os.access(bridge_path, os.X_OK)
     bridge_configured = _zshenv_has_web_bridge(
@@ -1041,6 +1067,7 @@ def detect_host_capabilities(
             "status": "degraded", "adapter": "none", "mode": "pure_web_file",
             "configured": False, "reason": "AI-Bridge not detected; local repo/runtime access is unavailable",
         }
+    web["goal_display_sync"] = "degraded_host_capability_unavailable"
     return {
         "core": {"status": "enabled", "adapter": "adaptive-agent-runtime", "configured": True, "reason": "core governance is host-neutral"},
         "controller_identity": _installed_controller_identity_capability(skill_root_path),
