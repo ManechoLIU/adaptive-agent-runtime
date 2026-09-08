@@ -486,6 +486,7 @@ _PERSISTENT_EXECUTABLES = {
     "webpack-dev-server",
 }
 _SHELL_SEPARATORS = {";", "&&", "||", "|", "&"}
+_TIMEOUT_DURATION = re.compile(r"\d+(?:\.\d+)?(?:ms|s|m|h|d)?")
 
 
 def _command_segments(command: str) -> list[list[str]]:
@@ -573,6 +574,42 @@ def _persistent_runner_payload(tokens: list[str]) -> bool:
     return _persistent_foreground_segment(remaining)
 
 
+def _persistent_script_name(value: str) -> bool:
+    parts = {
+        part for part in re.split(r"[:/._-]+", value.strip().lower()) if part
+    }
+    return bool(parts & _PERSISTENT_SCRIPT_NAMES)
+
+
+def _bounded_timeout_command(tokens: list[str]) -> bool:
+    index = 1
+    no_value = {"--preserve-status", "--foreground", "-v", "--verbose"}
+    with_value = {"-k", "--kill-after", "-s", "--signal"}
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token in no_value:
+            index += 1
+            continue
+        if token in with_value:
+            if index + 1 >= len(tokens):
+                return False
+            index += 2
+            continue
+        if token.startswith(("--kill-after=", "--signal=")):
+            index += 1
+            continue
+        if token.startswith("-"):
+            return False
+        break
+    return (
+        index + 1 < len(tokens)
+        and _TIMEOUT_DURATION.fullmatch(tokens[index]) is not None
+    )
+
+
 def _persistent_signature_anywhere(tokens: list[str]) -> bool:
     """Conservatively catch explicit server signatures behind unknown wrappers."""
     if not tokens:
@@ -601,6 +638,18 @@ def _persistent_signature_anywhere(tokens: list[str]) -> bool:
             return True
         if name == "next" and index + 1 < len(names) and names[index + 1] == "dev":
             return True
+        if name == "next" and index + 1 < len(names) and names[index + 1] == "start":
+            return True
+        if name == "webpack" and index + 1 < len(names) and names[index + 1] in {"serve", "watch"}:
+            return True
+        if name == "flask" and index + 1 < len(names) and names[index + 1] == "run":
+            return True
+        if name == "make" and any(
+            _persistent_script_name(candidate)
+            for candidate in names[index + 1 :]
+            if not candidate.startswith("-")
+        ):
+            return True
     return False
 
 
@@ -610,9 +659,9 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         return False
     executable = Path(tokens[0]).name.lower()
     if executable in {"timeout", "gtimeout"}:
-        if len(tokens) >= 3 and re.fullmatch(r"\d+(?:\.\d+)?(?:ms|s|m|h|d)?", tokens[1]):
+        if _bounded_timeout_command(tokens):
             return False
-        return _persistent_foreground_segment(tokens[1:]) if len(tokens) > 1 else False
+        return _persistent_signature_anywhere(tokens)
     if executable in {"bash", "sh", "zsh"}:
         for index, token in enumerate(tokens[1:], start=1):
             if (
@@ -674,7 +723,17 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         and lowered[1:3] == ["-m", "http.server"]
     ):
         return True
-    if executable == "next" and len(lowered) > 1 and lowered[1] == "dev":
+    if executable == "next" and len(lowered) > 1 and lowered[1] in {"dev", "start"}:
+        return True
+    if executable == "webpack" and len(lowered) > 1 and lowered[1] in {"serve", "watch"}:
+        return True
+    if executable == "flask" and len(lowered) > 1 and lowered[1] == "run":
+        return True
+    if executable == "make" and any(
+        _persistent_script_name(token)
+        for token in lowered[1:]
+        if not token.startswith("-")
+    ):
         return True
     if "--watch" in lowered or executable in _PERSISTENT_EXECUTABLES:
         return True
@@ -697,7 +756,7 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         command = lowered[index] if index < len(lowered) else ""
         if command == "run" and index + 1 < len(lowered):
             command = lowered[index + 1]
-        if command in _PERSISTENT_SCRIPT_NAMES:
+        if _persistent_script_name(command):
             return True
         if command in {"exec", "dlx", "x"} and index + 1 < len(tokens):
             return _persistent_runner_payload(tokens[index + 1 :])

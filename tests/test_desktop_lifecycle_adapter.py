@@ -678,6 +678,13 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             ("exec_command", "npm --prefix=apps/server run dev"),
             ("exec_command", "pnpm -C apps/server dev"),
             ("exec_command", "pnpm --dir apps/server dev"),
+            ("exec_command", "pnpm run dev:server"),
+            ("exec_command", "npm run start:dev"),
+            ("exec_command", "pnpm watch:server"),
+            ("exec_command", "next start"),
+            ("exec_command", "webpack serve"),
+            ("exec_command", "flask run"),
+            ("exec_command", "make dev"),
             ("exec_command", "pnpm dev -v"),
             ("exec_command", "vite"),
         )
@@ -758,6 +765,9 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
         allowed_inputs = (
             {"command": "pnpm --filter @selfalone/server dev", "yield_time_ms": 1000},
             {"cmd": "timeout 5s pnpm --filter @selfalone/server dev"},
+            {"cmd": "timeout --signal=KILL 5s pnpm dev"},
+            {"cmd": "gtimeout --foreground 5s pnpm dev"},
+            {"cmd": "timeout -- 5s pnpm dev"},
             {"command": "pnpm --filter @selfalone/server test"},
             {"command": "pnpm build"},
             {"command": "pnpm typecheck"},
