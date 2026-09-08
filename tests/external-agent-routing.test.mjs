@@ -1978,3 +1978,25 @@ test("Grok prompt write plus cleanup failure is fail closed", async () => {
     (error) => error?.failureClass === "cleanup_failed" && error?.retrySafe === false && error?.resultUnknown === true,
   );
 });
+
+test("cleanup failure preserves prior Grok provider exit evidence", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?provider-exit-cleanup=${Date.now()}`);
+  const prior = new Error("provider_exit: external agent exited 7");
+  prior.failureClass = "provider_exit";
+  prior.retrySafe = true;
+  prior.resultUnknown = false;
+  prior.details = { provider_exit_code: 7 };
+  assert.throws(
+    () => runtimeModule.runCleanupStack([
+      { label: "prompt_file", cleanup: () => { throw new Error("cleanup denied"); } },
+    ], prior),
+    (error) => {
+      assert.equal(error?.failureClass, "cleanup_failed");
+      assert.equal(error?.retrySafe, false);
+      assert.equal(error?.resultUnknown, true);
+      assert.equal(error?.details?.prior_failure_class, "provider_exit");
+      assert.equal(error?.details?.prior_failure_details?.provider_exit_code, 7);
+      return true;
+    },
+  );
+});

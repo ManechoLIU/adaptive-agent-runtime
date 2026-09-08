@@ -571,6 +571,7 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok payload or data wrappers cannot spoof ACP model progress",
     "Grok prompt preparation cleans a temp directory when prompt write fails",
     "Grok prompt write plus cleanup failure is fail closed",
+    "cleanup failure preserves prior Grok provider exit evidence",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_runtime_supervisor.py",

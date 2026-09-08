@@ -154,6 +154,11 @@ export function runCleanupStack(cleanups, priorError = null) {
         ...(priorError ? {
           prior_failure_class: String(priorError?.failureClass || "transport_error"),
           prior_error: String(priorError?.message || priorError),
+          prior_retry_safe: priorError?.retrySafe !== false,
+          prior_result_unknown: Boolean(priorError?.resultUnknown),
+          ...(priorError?.details && typeof priorError.details === "object" && !Array.isArray(priorError.details)
+            ? { prior_failure_details: { ...priorError.details } }
+            : {}),
         } : {}),
       },
     },
@@ -1350,9 +1355,18 @@ async function executeExternalAgent({
       env.ADAPTIVE_AGENT_IDEMPOTENCY_KEY = idempotencyKey;
     }
     if (engine === "grok-build") {
-      return await runMonitoredGrok(executable, args, {
+      const code = await runMonitoredGrok(executable, args, {
         cwd, env, progressDeadlineMinutes, onStructuredProgress,
       });
+      if (code !== 0) {
+        executionError = new ExternalAgentExecutionError(`provider_exit: external agent exited ${code}`, {
+          failureClass: "provider_exit",
+          retrySafe: true,
+          resultUnknown: Boolean(sideEffect),
+          details: { provider_exit_code: code },
+        });
+      }
+      return code;
     }
     return await runAttached(executable, args, { cwd, env });
   } catch (error) {
