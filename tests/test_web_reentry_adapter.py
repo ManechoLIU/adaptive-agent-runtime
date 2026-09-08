@@ -666,3 +666,183 @@ class WebReentryContinuationRegressionTests(unittest.TestCase):
             schedule.assert_called_once()
             self.assertGreaterEqual(schedule.call_args.kwargs["delay_seconds"], 1.0)
             self.assertLessEqual(schedule.call_args.kwargs["delay_seconds"], 60.0)
+
+class ManualFencedWebReentryTests(unittest.TestCase):
+    def make_manual_identity(self, root: Path) -> tuple[Path, Path, Path]:
+        repo = root / "repo"
+        repo.mkdir()
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps({
+            "controller-1": str(repo.resolve()),
+            "__controller_sessions__": {"controller-1": {"web": ["web-current", "web-old"]}},
+            "__controller_targets__": {"controller-1": {"web": {
+                "status": "active",
+                "session_id": "web-current",
+                "generation": 4,
+                "provenance": "manual_user_authorized",
+                "binding_mode": "temporary",
+                "host_attested": False,
+            }}},
+            "__controller_execution_ownership__": {"controller-1": {
+                "active_host": "web",
+                "execution_target_session_id": "web-current",
+                "generation": 4,
+                "provenance": "manual_user_authorized",
+            }},
+        }), encoding="utf-8")
+        lease = root / "web-leases.json"
+        now = int(time.time())
+        lease.write_text(json.dumps({
+            "schema_version": 1,
+            "leases": {"controller-1": {
+                "repo": str(repo.resolve()),
+                "controller_id": "controller-1",
+                "web_session_id": "web-current",
+                "authorized_at_unix": now - 100,
+                "rotated_at_unix": now - 10,
+                "expires_at_unix": now + 3600,
+                "provenance": "manual_user_authorized",
+                "mode": "resume_only",
+            }},
+        }), encoding="utf-8")
+        return repo, registry, lease
+
+    def browser_success(self, calls: list[dict]):
+        def browser_call(arguments: dict) -> dict:
+            calls.append(dict(arguments))
+            action = arguments["action"]
+            if action == "list_tabs":
+                return {"tabs": [{
+                    "tab_id": "tab-controller",
+                    "url": "https://chatgpt.com/g/g-p-project/c/web-current",
+                    "title": "Controller",
+                }]}
+            if action == "snapshot":
+                return {"nodes": [{
+                    "node_id": "composer",
+                    "role": "textbox",
+                    "name": "Chat with ChatGPT",
+                }]}
+            return {"ok": True}
+        return browser_call
+
+    def test_missing_host_verifier_allows_only_manual_fenced_exact_current_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, lease = self.make_manual_identity(Path(tmp))
+            calls: list[dict] = []
+            with patch.object(
+                web_reentry_adapter,
+                "_registered_web_origin_attestation_verifier",
+                return_value=None,
+            ):
+                result = web_reentry_adapter.execute_web_reentry(
+                    controller_id="controller-1", repo=repo,
+                    registry_path=registry, lease_path=lease,
+                    lifecycle_state={"pending_control_event": True, "requires_user": False, "wake_generation": 12},
+                    browser_call=self.browser_success(calls),
+                )
+        self.assertEqual(result["result"], "CONFIRMED")
+        self.assertEqual(result["state"], "WEB_REENTRY_MANUAL_FENCED_SUBMITTED")
+        self.assertEqual(result["delivery_authorization"], "manual_fenced")
+        self.assertFalse(result["host_attested"])
+        self.assertFalse(result["strong_web_identity_established"])
+        self.assertEqual(result["execution_target_session_id"], "web-current")
+        self.assertEqual(result["target_generation"], 4)
+        self.assertEqual(result["ownership_generation"], 4)
+        self.assertEqual([item["action"] for item in calls], ["list_tabs", "focus_tab", "snapshot", "type"])
+        receipt = result["host_execution_receipt"]
+        self.assertEqual(receipt["authorization"], "manual_fenced")
+        self.assertFalse(receipt["host_attested"])
+        self.assertNotIn("call_receipt", receipt)
+
+    def test_manual_fenced_reentry_rejects_generation_or_lease_mismatch_before_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, lease = self.make_manual_identity(root)
+            payload = json.loads(registry.read_text())
+            payload["__controller_execution_ownership__"]["controller-1"]["generation"] = 5
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            calls: list[dict] = []
+            with patch.object(web_reentry_adapter, "_registered_web_origin_attestation_verifier", return_value=None):
+                result = web_reentry_adapter.execute_web_reentry(
+                    controller_id="controller-1", repo=repo, registry_path=registry, lease_path=lease,
+                    lifecycle_state={"pending_control_event": True, "requires_user": False},
+                    browser_call=lambda args: calls.append(dict(args)) or {},
+                )
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(result["error_code"], "WEB_HOST_ATTESTATION_VERIFIER_UNAVAILABLE")
+            self.assertEqual(calls, [])
+
+            payload["__controller_execution_ownership__"]["controller-1"]["generation"] = 4
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            lease_payload = json.loads(lease.read_text())
+            lease_payload["leases"]["controller-1"]["web_session_id"] = "web-old"
+            lease.write_text(json.dumps(lease_payload), encoding="utf-8")
+            with patch.object(web_reentry_adapter, "_registered_web_origin_attestation_verifier", return_value=None):
+                result = web_reentry_adapter.execute_web_reentry(
+                    controller_id="controller-1", repo=repo, registry_path=registry, lease_path=lease,
+                    lifecycle_state={"pending_control_event": True, "requires_user": False},
+                    browser_call=lambda args: calls.append(dict(args)) or {},
+                )
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(calls, [])
+
+    def test_invalid_registered_host_verifier_never_falls_back_to_manual_fenced_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, lease = self.make_manual_identity(Path(tmp))
+            calls: list[dict] = []
+            with patch.object(
+                web_reentry_adapter,
+                "_registered_web_origin_attestation_verifier",
+                return_value=lambda **_kwargs: {"origin_attested": False},
+            ):
+                result = web_reentry_adapter.execute_web_reentry(
+                    controller_id="controller-1", repo=repo,
+                    registry_path=registry, lease_path=lease,
+                    lifecycle_state={"pending_control_event": True, "requires_user": False},
+                    browser_call=lambda args: calls.append(dict(args)) or {},
+                )
+        self.assertEqual(result["result"], "DEFERRED")
+        self.assertEqual(result["error_code"], "WEB_HOST_ATTESTATION_INVALID")
+        self.assertEqual(calls, [])
+
+    def test_manual_fenced_submit_holds_registry_and_lease_fences(self) -> None:
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, lease = self.make_manual_identity(Path(tmp))
+            fence_observed: list[tuple[bool, bool]] = []
+
+            def browser_call(arguments: dict) -> dict:
+                if arguments["action"] == "list_tabs":
+                    return {"tabs": [{"tab_id": "tab-1", "url": "https://chatgpt.com/c/web-current"}]}
+                if arguments["action"] == "snapshot":
+                    return {"nodes": [{"node_id": "composer", "role": "textbox", "name": "Chat with ChatGPT"}]}
+                if arguments["action"] == "type":
+                    reg_blocked = lease_blocked = False
+                    reg_lock_path = web_reentry_adapter.target_guard.registry_lock_path(registry)
+                    lease_lock_path = lease.with_suffix(lease.suffix + ".lock")
+                    with reg_lock_path.open("a+") as contender:
+                        try:
+                            fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            reg_blocked = True
+                        else:
+                            fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
+                    with lease_lock_path.open("a+") as contender:
+                        try:
+                            fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            lease_blocked = True
+                        else:
+                            fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
+                    fence_observed.append((reg_blocked, lease_blocked))
+                return {"ok": True}
+
+            with patch.object(web_reentry_adapter, "_registered_web_origin_attestation_verifier", return_value=None):
+                result = web_reentry_adapter.execute_web_reentry(
+                    controller_id="controller-1", repo=repo, registry_path=registry, lease_path=lease,
+                    lifecycle_state={"pending_control_event": True, "requires_user": False},
+                    browser_call=browser_call,
+                )
+        self.assertEqual(result["result"], "CONFIRMED")
+        self.assertEqual(fence_observed, [(True, True)])

@@ -101,6 +101,18 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_web_supervisor_rejects_confirmed_receipt_for_noncanonical_target",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_builtin_web_reentry_without_registered_origin_verifier_never_calls_browser_adapter",
+    "tests.test_web_reentry_adapter.ManualFencedWebReentryTests."
+    "test_missing_host_verifier_allows_only_manual_fenced_exact_current_target",
+    "tests.test_web_reentry_adapter.ManualFencedWebReentryTests."
+    "test_manual_fenced_reentry_rejects_generation_or_lease_mismatch_before_browser",
+    "tests.test_web_reentry_adapter.ManualFencedWebReentryTests."
+    "test_invalid_registered_host_verifier_never_falls_back_to_manual_fenced_delivery",
+    "tests.test_web_reentry_adapter.ManualFencedWebReentryTests."
+    "test_manual_fenced_submit_holds_registry_and_lease_fences",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_manual_fenced_direct_wake_uses_builtin_adapter_without_peer_verifier",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_manual_fenced_supervisor_persists_unverified_delivery_evidence",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."

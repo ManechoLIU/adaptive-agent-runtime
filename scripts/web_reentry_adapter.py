@@ -394,6 +394,122 @@ def build_reentry_prompt(
     return prompt[:7800]
 
 
+
+def _manual_fenced_reentry_authorization(
+    *,
+    controller_id: str,
+    repo: Path,
+    registry: dict[str, Any],
+    lease_path: Path,
+    web_session_id: str,
+    target_generation: int,
+    ownership_generation: int,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Authorize only continuation delivery to a user-selected current Web target.
+
+    This is deliberately not Host identity attestation. It grants no VERIFIED
+    identity and is valid only while the exact manual target, ownership
+    generation, and resume-only lease remain current under the outer fences.
+    """
+    target = target_guard.target_record(
+        registry, controller_id=controller_id, host="web"
+    )
+    if not isinstance(target, dict):
+        raise PermissionError("manual-fenced re-entry requires an explicit current Web target")
+    status, target_session, current_target_generation = (
+        target_guard.validate_target_record(target, host="web")
+    )
+    if (
+        status != "active"
+        or target_session != web_session_id
+        or current_target_generation != target_generation
+    ):
+        raise PermissionError("manual-fenced re-entry target is stale or mismatched")
+    if (
+        target.get("provenance") != "manual_user_authorized"
+        or target.get("binding_mode") != "temporary"
+        or target.get("host_attested") is not False
+    ):
+        raise PermissionError(
+            "manual-fenced re-entry requires manual_user_authorized temporary non-host-attested target"
+        )
+    if target_generation != ownership_generation:
+        raise PermissionError(
+            "manual-fenced re-entry requires matching target and ownership generations"
+        )
+    if (
+        target_guard.active_source_controller_id(
+            registry, source_session_id=web_session_id, host="web"
+        )
+        != controller_id
+    ):
+        raise PermissionError("manual-fenced re-entry target is not in the current Controller lineage")
+
+    ownership = target_guard.execution_ownership_record(
+        registry, controller_id=controller_id
+    )
+    if ownership is None:
+        raise PermissionError("manual-fenced re-entry requires canonical execution ownership")
+    ownership_host, ownership_target, current_ownership_generation = (
+        target_guard.validate_execution_ownership_record(ownership)
+    )
+    if (
+        ownership_host != "web"
+        or ownership_target != web_session_id
+        or current_ownership_generation != ownership_generation
+    ):
+        raise PermissionError("manual-fenced re-entry ownership is stale or mismatched")
+
+    lease_payload = _load_json(Path(lease_path).expanduser())
+    leases = lease_payload.get("leases")
+    lease = leases.get(controller_id) if isinstance(leases, dict) else None
+    if not isinstance(lease, dict):
+        raise PermissionError("manual-fenced re-entry requires a current manual resume lease")
+    if (
+        lease.get("controller_id") not in (None, controller_id)
+        or lease.get("provenance") != "manual_user_authorized"
+        or lease.get("mode") != "resume_only"
+        or str(lease.get("web_session_id") or "").strip() != web_session_id
+    ):
+        raise PermissionError("manual-fenced re-entry lease does not match the current target")
+    lease_repo = str(lease.get("repo") or "").strip()
+    if not lease_repo or Path(lease_repo).expanduser().resolve() != Path(repo).expanduser().resolve():
+        raise PermissionError("manual-fenced re-entry lease belongs to another repository")
+    now = int(time.time()) if now_unix is None else int(now_unix)
+    authorized_at = lease.get("authorized_at_unix")
+    expires_at = lease.get("expires_at_unix")
+    if (
+        isinstance(authorized_at, bool)
+        or not isinstance(authorized_at, int)
+        or authorized_at <= 0
+        or isinstance(expires_at, bool)
+        or not isinstance(expires_at, int)
+        or expires_at <= now
+        or authorized_at > now
+    ):
+        raise PermissionError("manual-fenced re-entry lease is expired or invalid")
+    rotated_at = lease.get("rotated_at_unix")
+    if rotated_at is not None:
+        if (
+            isinstance(rotated_at, bool)
+            or not isinstance(rotated_at, int)
+            or rotated_at <= 0
+            or rotated_at > now
+        ):
+            raise PermissionError("manual-fenced re-entry lease rotation timestamp is invalid")
+        effective_at = max(authorized_at, rotated_at)
+    else:
+        effective_at = authorized_at
+    return {
+        "delivery_authorization": "manual_fenced",
+        "host_attested": False,
+        "strong_web_identity_established": False,
+        "manual_lease_effective_at_unix": effective_at,
+        "manual_lease_expires_at_unix": expires_at,
+    }
+
+
 def _execute_web_reentry_under_registry_fence(
     *,
     controller_id: str,
@@ -443,47 +559,69 @@ def _execute_web_reentry_under_registry_fence(
         }
 
     verifier = _registered_web_origin_attestation_verifier()
+    delivery_authorization: dict[str, Any]
+    origin_attestation: dict[str, Any] | None = None
     if not callable(verifier):
-        return {
-            "operation": "web_reentry",
-            "result": "DEFERRED",
-            "state": "WEB_REENTRY_IDENTITY_UNAVAILABLE",
-            "returncode": 78,
-            "failure_class": "web_reentry_identity_unavailable",
-            "error_code": "WEB_HOST_ATTESTATION_VERIFIER_UNAVAILABLE",
-            "stderr_tail": "trusted Web Host origin attestation verifier is unavailable",
-            "execution_target_session_id": web_session_id,
-            "target_generation": target_generation,
-            "ownership_generation": ownership_generation,
-            "target_mode": target_mode,
-        }
-    try:
-        origin_attestation = _validated_web_origin_attestation(
-            verifier(
-                phase="pre_delivery",
+        try:
+            delivery_authorization = _manual_fenced_reentry_authorization(
                 controller_id=controller_id,
-                host="web",
+                repo=Path(repo),
+                registry=registry,
+                lease_path=Path(lease_path),
+                web_session_id=web_session_id,
+                target_generation=target_generation,
+                ownership_generation=ownership_generation,
+            )
+        except Exception as exc:
+            return {
+                "operation": "web_reentry",
+                "result": "DEFERRED",
+                "state": "WEB_REENTRY_IDENTITY_UNAVAILABLE",
+                "returncode": 78,
+                "failure_class": "web_reentry_identity_unavailable",
+                "error_code": "WEB_HOST_ATTESTATION_VERIFIER_UNAVAILABLE",
+                "stderr_tail": (
+                    "trusted Web Host origin attestation verifier is unavailable; "
+                    f"manual-fenced re-entry is not eligible: {exc}"
+                )[:1024],
+                "execution_target_session_id": web_session_id,
+                "target_generation": target_generation,
+                "ownership_generation": ownership_generation,
+                "target_mode": target_mode,
+            }
+    else:
+        try:
+            origin_attestation = _validated_web_origin_attestation(
+                verifier(
+                    phase="pre_delivery",
+                    controller_id=controller_id,
+                    host="web",
+                    expected_target_session_id=web_session_id,
+                    expected_target_generation=target_generation,
+                    expected_target_mode=target_mode,
+                    expected_ownership_generation=ownership_generation,
+                ),
                 expected_target_session_id=web_session_id,
-                expected_target_generation=target_generation,
-                expected_target_mode=target_mode,
-                expected_ownership_generation=ownership_generation,
-            ),
-            expected_target_session_id=web_session_id,
-        )
-    except Exception as exc:
-        return {
-            "operation": "web_reentry",
-            "result": "DEFERRED",
-            "state": "WEB_REENTRY_IDENTITY_UNAVAILABLE",
-            "returncode": 78,
-            "failure_class": "web_reentry_identity_unavailable",
-            "error_code": "WEB_HOST_ATTESTATION_INVALID",
-            "stderr_tail": str(exc)[:1024],
-            "execution_target_session_id": web_session_id,
-            "target_generation": target_generation,
-            "ownership_generation": ownership_generation,
-            "target_mode": target_mode,
-        }
+            )
+            delivery_authorization = {
+                "delivery_authorization": "host_attested",
+                "host_attested": True,
+                "strong_web_identity_established": True,
+            }
+        except Exception as exc:
+            return {
+                "operation": "web_reentry",
+                "result": "DEFERRED",
+                "state": "WEB_REENTRY_IDENTITY_UNAVAILABLE",
+                "returncode": 78,
+                "failure_class": "web_reentry_identity_unavailable",
+                "error_code": "WEB_HOST_ATTESTATION_INVALID",
+                "stderr_tail": str(exc)[:1024],
+                "execution_target_session_id": web_session_id,
+                "target_generation": target_generation,
+                "ownership_generation": ownership_generation,
+                "target_mode": target_mode,
+            }
 
     if browser_call is None:
         client = _McpSession(discover_ai_bridge_mcp_url())
@@ -590,18 +728,27 @@ def _execute_web_reentry_under_registry_fence(
             "tab_id": tab_id,
             "source": "ai_bridge_browser",
             "submitted": True,
-            "call_receipt": origin_attestation["call_receipt"],
+            "authorization": delivery_authorization["delivery_authorization"],
+            "host_attested": bool(delivery_authorization["host_attested"]),
         }
+        if origin_attestation is not None:
+            host_receipt["call_receipt"] = origin_attestation["call_receipt"]
         observed_url = str((tab or {}).get("url") or "").strip() if tab is not None else ""
         if observed_url:
             host_receipt["url"] = observed_url
+        result_state = (
+            "WEB_REENTRY_SUBMITTED"
+            if delivery_authorization["delivery_authorization"] == "host_attested"
+            else "WEB_REENTRY_MANUAL_FENCED_SUBMITTED"
+        )
         return {
-            "operation": "web_reentry", "result": "CONFIRMED", "state": "WEB_REENTRY_SUBMITTED",
+            "operation": "web_reentry", "result": "CONFIRMED", "state": result_state,
             "returncode": 0, "controller_id": controller_id,
             "execution_target_session_id": web_session_id,
             "target_generation": target_generation,
             "ownership_generation": ownership_generation,
             "target_mode": target_mode, "pending_control_event": True,
+            **delivery_authorization,
             "host_execution_receipt": host_receipt,
         }
     except Exception as exc:
@@ -629,17 +776,25 @@ def execute_web_reentry(
     registry_path = Path(registry_path).expanduser()
     lock_path = target_guard.registry_lock_path(registry_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path = Path(lease_path).expanduser()
+    lease_lock_path = lease_path.with_suffix(lease_path.suffix + ".lock")
+    lease_lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
         try:
-            return _execute_web_reentry_under_registry_fence(
-                controller_id=controller_id,
-                repo=repo,
-                lifecycle_state=lifecycle_state,
-                registry_path=registry_path,
-                lease_path=lease_path,
-                browser_call=browser_call,
-                approval_id=approval_id,
-            )
+            with lease_lock_path.open("a+") as lease_lock:
+                fcntl.flock(lease_lock.fileno(), fcntl.LOCK_SH)
+                try:
+                    return _execute_web_reentry_under_registry_fence(
+                        controller_id=controller_id,
+                        repo=repo,
+                        lifecycle_state=lifecycle_state,
+                        registry_path=registry_path,
+                        lease_path=lease_path,
+                        browser_call=browser_call,
+                        approval_id=approval_id,
+                    )
+                finally:
+                    fcntl.flock(lease_lock.fileno(), fcntl.LOCK_UN)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

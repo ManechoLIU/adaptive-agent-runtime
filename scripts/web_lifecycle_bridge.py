@@ -2507,6 +2507,9 @@ def _wake_receipt(
     target_generation: int | None = None,
     ownership_generation: int | None = None,
     target_mode: str | None = None,
+    delivery_authorization: str | None = None,
+    host_attested: bool | None = None,
+    strong_web_identity_established: bool | None = None,
 ) -> dict[str, Any]:
     now = int(time.time() * 1000)
     receipt: dict[str, Any] = {
@@ -2539,6 +2542,12 @@ def _wake_receipt(
         receipt["ownership_generation"] = ownership_generation
     if isinstance(target_mode, str) and target_mode.strip():
         receipt["target_mode"] = target_mode.strip()
+    if isinstance(delivery_authorization, str) and delivery_authorization.strip():
+        receipt["delivery_authorization"] = delivery_authorization.strip()
+    if isinstance(host_attested, bool):
+        receipt["host_attested"] = host_attested
+    if isinstance(strong_web_identity_established, bool):
+        receipt["strong_web_identity_established"] = strong_web_identity_established
     normalized_command = _bounded_adapter_command(command)
     if normalized_command is not None:
         receipt["command"] = normalized_command
@@ -2548,6 +2557,48 @@ def _wake_receipt(
     if isinstance(error_code, str) and error_code.strip():
         receipt["error_code"] = _bounded_text(error_code.strip(), 128)[0]
     return receipt
+
+
+
+def _manual_fenced_web_target_candidate(
+    *, registry_data: dict[str, Any], controller_id: str
+) -> bool:
+    """Return whether the current registry target may enter built-in manual re-entry.
+
+    This is only a narrow preflight. The Web re-entry adapter still performs the
+    authoritative lease, lineage, target, and generation validation under locks.
+    """
+    target = target_guard.target_record(
+        registry_data, controller_id=controller_id, host="web"
+    )
+    ownership = target_guard.execution_ownership_record(
+        registry_data, controller_id=controller_id
+    )
+    if not isinstance(target, dict) or ownership is None:
+        return False
+    try:
+        status, target_session, target_generation = target_guard.validate_target_record(
+            target, host="web"
+        )
+        ownership_host, ownership_target, ownership_generation = (
+            target_guard.validate_execution_ownership_record(ownership)
+        )
+    except (ValueError, PermissionError):
+        return False
+    return bool(
+        status == "active"
+        and target_session
+        and target.get("provenance") == "manual_user_authorized"
+        and target.get("binding_mode") == "temporary"
+        and target.get("host_attested") is False
+        and ownership_host == "web"
+        and ownership_target == target_session
+        and ownership_generation == target_generation
+        and target_guard.active_source_controller_id(
+            registry_data, source_session_id=target_session, host="web"
+        )
+        == controller_id
+    )
 
 
 def wake_existing_controller(
@@ -2652,7 +2703,14 @@ def wake_existing_controller(
                 elif selected_host == "web":
                     adapter = (resume_adapters or {}).get("web")
                     verifier = _registered_peer_attestation_verifier("web")
-                    if not callable(verifier):
+                    current_registry_for_web = load_json(registry)
+                    manual_builtin_candidate = (
+                        adapter is None
+                        and _manual_fenced_web_target_candidate(
+                            registry_data=current_registry_for_web, controller_id=session_id
+                        )
+                    )
+                    if not callable(verifier) and not manual_builtin_candidate:
                         attempt = {
                             "operation": None,
                             "result": "DEFERRED",
@@ -2675,6 +2733,10 @@ def wake_existing_controller(
                                     lifecycle_state=lifecycle_state,
                                 )
                             else:
+                                if not callable(verifier):
+                                    raise PermissionError(
+                                        "custom Web host adapter requires registered Host attestation verifier"
+                                    )
                                 with target_guard.locked_execution_target(
                                     repo=repo,
                                     host="web",
@@ -2986,6 +3048,9 @@ def wake_existing_controller(
                     else attempt.get("ownership_generation")
                 ),
                 target_mode=attempt.get("target_mode"),
+                delivery_authorization=attempt.get("delivery_authorization"),
+                host_attested=attempt.get("host_attested"),
+                strong_web_identity_established=attempt.get("strong_web_identity_established"),
             )
         _write_json_atomic_file(receipt_path, receipt)
         return receipt
@@ -3742,6 +3807,7 @@ def continuation_supervisor_needs_bootstrap(
         "RESUME_DEFERRED_ACTIVE_WRITER",
         "RESUME_RETRY_BACKOFF",
         "WEB_REENTRY_SUBMITTED",
+        "WEB_REENTRY_MANUAL_FENCED_SUBMITTED",
         "WEB_REENTRY_DEFERRED_ACTIVE",
     }
     if str(supervisor_state.get("state") or "") not in active_states:
@@ -4208,7 +4274,13 @@ def _run_auto_native_stop_impl(
                 write_auto_stop_state(state_path, current)
                 return 0
             for evidence_key in (
-                "execution_target_session_id", "target_generation", "target_mode",
+                "execution_target_session_id",
+                "target_generation",
+                "ownership_generation",
+                "target_mode",
+                "delivery_authorization",
+                "host_attested",
+                "strong_web_identity_established",
             ):
                 if evidence_key in attempt:
                     current[evidence_key] = attempt[evidence_key]
@@ -4259,8 +4331,13 @@ def _run_auto_native_stop_impl(
                 unchanged = int(current.get("unchanged_continuation_count", 0) or 0)
                 unchanged = unchanged + 1 if previous_fingerprint == fingerprint else 0
                 continuation_count = int(current.get("continuation_count", 0) or 0) + 1
+                confirmed_state = (
+                    "WEB_REENTRY_MANUAL_FENCED_SUBMITTED"
+                    if attempt.get("delivery_authorization") == "manual_fenced"
+                    else "WEB_REENTRY_SUBMITTED"
+                )
                 current.update({
-                    "state": "WEB_REENTRY_SUBMITTED",
+                    "state": confirmed_state,
                     "pending_control_event": True,
                     "continuation_count": continuation_count,
                     "unchanged_continuation_count": unchanged,

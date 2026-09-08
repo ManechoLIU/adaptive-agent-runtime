@@ -658,6 +658,12 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_target_generation_change_before_submit_never_types",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_web_supervisor_rejects_confirmed_receipt_for_noncanonical_target",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_builtin_web_reentry_without_registered_origin_verifier_never_calls_browser_adapter",
+            "tests.test_web_reentry_adapter.ManualFencedWebReentryTests.test_missing_host_verifier_allows_only_manual_fenced_exact_current_target",
+            "tests.test_web_reentry_adapter.ManualFencedWebReentryTests.test_manual_fenced_reentry_rejects_generation_or_lease_mismatch_before_browser",
+            "tests.test_web_reentry_adapter.ManualFencedWebReentryTests.test_invalid_registered_host_verifier_never_falls_back_to_manual_fenced_delivery",
+            "tests.test_web_reentry_adapter.ManualFencedWebReentryTests.test_manual_fenced_submit_holds_registry_and_lease_fences",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_manual_fenced_direct_wake_uses_builtin_adapter_without_peer_verifier",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_manual_fenced_supervisor_persists_unverified_delivery_evidence",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_identity_blocked_event_retries_after_registry_changes",
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_registered_current_web_adapter_is_fenced_and_host_attested",
@@ -730,6 +736,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_legacy_browser_attested_target_is_quarantined_before_browser_use(self): self.assertTrue(True)\n"
                 "    def test_submit_holds_registry_fence_against_target_rotation(self): self.assertTrue(True)\n"
                 "    def test_target_generation_change_before_submit_never_types(self): self.assertTrue(True)\n"
+                "class ManualFencedWebReentryTests(unittest.TestCase):\n"
+                "    def test_missing_host_verifier_allows_only_manual_fenced_exact_current_target(self): self.assertTrue(True)\n"
+                "    def test_manual_fenced_reentry_rejects_generation_or_lease_mismatch_before_browser(self): self.assertTrue(True)\n"
+                "    def test_invalid_registered_host_verifier_never_falls_back_to_manual_fenced_delivery(self): self.assertTrue(True)\n"
+                "    def test_manual_fenced_submit_holds_registry_and_lease_fences(self): self.assertTrue(True)\n"
                 "class AiBridgeMcpDiscoveryTests(unittest.TestCase):\n"
                 "    def test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix(self): self.assertTrue(True)\n",
                 encoding="utf-8",
@@ -872,6 +883,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_desktop_result_cannot_persist_or_rearm_after_web_handoff(self): self.assertTrue(True)\n"
                 "    def test_web_supervisor_rejects_confirmed_receipt_for_noncanonical_target(self): self.assertTrue(True)\n"
                 "    def test_builtin_web_reentry_without_registered_origin_verifier_never_calls_browser_adapter(self): self.assertTrue(True)\n"
+                "    def test_manual_fenced_direct_wake_uses_builtin_adapter_without_peer_verifier(self): self.assertTrue(True)\n"
+                "    def test_manual_fenced_supervisor_persists_unverified_delivery_evidence(self): self.assertTrue(True)\n"
                 "class WebReentryDebounceTests(unittest.TestCase):\n"
                 "    def test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim(self): self.assertTrue(True)\n",
                 encoding="utf-8",

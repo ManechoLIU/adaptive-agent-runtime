@@ -7251,3 +7251,107 @@ class WebReentryApprovalSupervisorTests(WebLocalReentryIntegrationTests):
             self.assertEqual(saved["approval_id"],"approval-1")
             self.assertEqual(saved["approval_retry_count"],1)
             self.assertEqual(reentry.call_args.kwargs.get("approval_id"),None)
+
+
+def _manual_fenced_direct_wake_uses_builtin_adapter_without_peer_verifier(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo, registry, _state_path = self.make_repo(root)
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "manual_user_authorized", "binding_mode": "temporary",
+            "host_attested": False,
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 4, "provenance": "manual_user_authorized",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        receipt_path = root / "wake.json"
+        confirmed = {
+            "operation": "web_reentry", "result": "CONFIRMED",
+            "state": "WEB_REENTRY_MANUAL_FENCED_SUBMITTED", "returncode": 0,
+            "execution_target_session_id": "web-current", "target_generation": 4,
+            "ownership_generation": 4, "target_mode": "explicit_current",
+            "delivery_authorization": "manual_fenced", "host_attested": False,
+            "strong_web_identity_established": False,
+            "host_execution_receipt": {
+                "host": "web", "web_session_id": "web-current", "tab_id": "tab-1",
+                "source": "ai_bridge_browser", "submitted": True,
+                "authorization": "manual_fenced", "host_attested": False,
+            },
+        }
+        with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=None), patch.object(
+            web_bridge, "execute_web_reentry", return_value=confirmed
+        ) as reentry, patch.object(
+            web_bridge, "execute_native_resume", side_effect=AssertionError("web wake must not invoke desktop Codex")
+        ):
+            receipt = web_bridge.wake_existing_controller(
+                lifecycle_state={"pending_control_event": True, "controller_host": "web", "wake_generation": 4},
+                session_id="controller-1", repo=repo, registry=registry, codex="codex",
+                receipt_path=receipt_path,
+                host_facts={"controller_host": "web", "resume_actionable": True},
+            )
+    self.assertEqual(receipt["result"], "CONFIRMED")
+    self.assertEqual(receipt["delivery_authorization"], "manual_fenced")
+    self.assertFalse(receipt["host_attested"])
+    self.assertFalse(receipt["strong_web_identity_established"])
+    reentry.assert_called_once()
+
+
+def _manual_fenced_supervisor_persists_unverified_delivery_evidence(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "manual_user_authorized", "binding_mode": "temporary",
+            "host_attested": False,
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 4, "provenance": "manual_user_authorized",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id": "manual-r1", "session_id": "controller-1", "repo": str(repo.resolve()),
+            "state": "RESUME_PENDING", "pending_control_event": True,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 8, "triggers": ["READY:F1"],
+            "snapshot": {"head":"h1","ledger_sha256":"l1","worktree_status_sha256":"w1","ready_ids":["F1"],"runnable_ids":["F1"],"candidate_revisions":[]},
+        }
+        confirmed = {
+            "operation": "web_reentry", "result": "CONFIRMED",
+            "state": "WEB_REENTRY_MANUAL_FENCED_SUBMITTED", "returncode": 0,
+            "execution_target_session_id": "web-current", "target_generation": 4,
+            "ownership_generation": 4, "target_mode": "explicit_current",
+            "delivery_authorization": "manual_fenced", "host_attested": False,
+            "strong_web_identity_established": False,
+        }
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "execute_web_reentry", return_value=confirmed
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule, patch.object(
+            web_bridge, "execute_native_resume", side_effect=AssertionError("web supervisor must not invoke desktop Codex")
+        ):
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="manual-r1", registry=registry,
+                codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 0)
+    self.assertEqual(saved["state"], "WEB_REENTRY_MANUAL_FENCED_SUBMITTED")
+    self.assertEqual(saved["delivery_authorization"], "manual_fenced")
+    self.assertFalse(saved["host_attested"])
+    self.assertFalse(saved["strong_web_identity_established"])
+    self.assertEqual(saved["target_generation"], 4)
+    self.assertEqual(saved["ownership_generation"], 4)
+    schedule.assert_called_once()
+
+
+WebLocalReentryIntegrationTests.test_manual_fenced_direct_wake_uses_builtin_adapter_without_peer_verifier = _manual_fenced_direct_wake_uses_builtin_adapter_without_peer_verifier
+WebLocalReentryIntegrationTests.test_manual_fenced_supervisor_persists_unverified_delivery_evidence = _manual_fenced_supervisor_persists_unverified_delivery_evidence
