@@ -7355,3 +7355,72 @@ def _manual_fenced_supervisor_persists_unverified_delivery_evidence(self):
 
 WebLocalReentryIntegrationTests.test_manual_fenced_direct_wake_uses_builtin_adapter_without_peer_verifier = _manual_fenced_direct_wake_uses_builtin_adapter_without_peer_verifier
 WebLocalReentryIntegrationTests.test_manual_fenced_supervisor_persists_unverified_delivery_evidence = _manual_fenced_supervisor_persists_unverified_delivery_evidence
+
+def _manual_fenced_direct_wake_passes_bridge_verifier_into_builtin_adapter(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo, registry, _state_path = self.make_repo(root)
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "manual_user_authorized", "binding_mode": "temporary", "host_attested": False,
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current", "generation": 4,
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        verifier = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("reject"))
+        seen = []
+        def builtin(**kwargs):
+            seen.append(kwargs.get("origin_verifier", "missing"))
+            return {"operation":"web_reentry","result":"DEFERRED","state":"WEB_REENTRY_IDENTITY_UNAVAILABLE","returncode":78,"error_code":"WEB_HOST_ATTESTATION_INVALID"}
+        with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), patch.object(
+            web_bridge, "execute_web_reentry", side_effect=builtin
+        ):
+            receipt = web_bridge.wake_existing_controller(
+                lifecycle_state={"pending_control_event":True,"controller_host":"web","wake_generation":4},
+                session_id="controller-1", repo=repo, registry=registry, codex="codex",
+                receipt_path=root/"wake.json", host_facts={"controller_host":"web","resume_actionable":True},
+            )
+    self.assertEqual(seen, [verifier])
+    self.assertEqual(receipt["result"], "DEFERRED")
+    self.assertEqual(receipt["error_code"], "WEB_HOST_ATTESTATION_INVALID")
+
+
+def _manual_fenced_supervisor_passes_bridge_verifier_into_builtin_adapter(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status":"active","session_id":"web-current","generation":4,
+            "provenance":"manual_user_authorized","binding_mode":"temporary","host_attested":False,
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host":"web","execution_target_session_id":"web-current","generation":4,
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id":"manual-v1","session_id":"controller-1","repo":str(repo.resolve()),
+            "state":"RESUME_PENDING","pending_control_event":True,
+        }), encoding="utf-8")
+        lifecycle={"pending_control_event":True,"requires_user":False,"controller_host":"web","wake_generation":8}
+        verifier=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("reject"))
+        seen=[]
+        def builtin(**kwargs):
+            seen.append(kwargs.get("origin_verifier", "missing"))
+            return {"operation":"web_reentry","result":"DEFERRED","state":"WEB_REENTRY_IDENTITY_UNAVAILABLE","returncode":78,"failure_class":"web_reentry_identity_unavailable","error_code":"WEB_HOST_ATTESTATION_INVALID"}
+        with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), patch.object(
+            web_bridge, "_load_lifecycle_state", return_value=lifecycle
+        ), patch.object(web_bridge, "execute_web_reentry", side_effect=builtin), patch.object(
+            web_bridge, "schedule_auto_native_stop"
+        ):
+            web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="manual-v1", registry=registry,
+                codex="codex", delay_seconds=0, state_path=state_path,
+            )
+    self.assertEqual(seen, [verifier])
+
+WebLocalReentryIntegrationTests.test_manual_fenced_direct_wake_passes_bridge_verifier_into_builtin_adapter = _manual_fenced_direct_wake_passes_bridge_verifier_into_builtin_adapter
+WebLocalReentryIntegrationTests.test_manual_fenced_supervisor_passes_bridge_verifier_into_builtin_adapter = _manual_fenced_supervisor_passes_bridge_verifier_into_builtin_adapter

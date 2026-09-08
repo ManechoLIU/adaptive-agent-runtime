@@ -22,6 +22,7 @@ DEFAULT_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-
 MCP_PROTOCOL_VERSION = "2025-03-26"
 MCP_TIMEOUT_SECONDS = 8
 _WEB_ORIGIN_ATTESTATION_VERIFIER: Callable[..., Any] | None = None
+_ORIGIN_VERIFIER_UNSET = object()
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -519,6 +520,7 @@ def _execute_web_reentry_under_registry_fence(
     lease_path: Path = DEFAULT_WEB_LEASES,
     browser_call: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     approval_id: str | None = None,
+    origin_verifier: Any = _ORIGIN_VERIFIER_UNSET,
 ) -> dict[str, Any]:
     if lifecycle_state.get("pending_control_event") is not True:
         return {"operation": "web_reentry", "result": "DEFERRED", "state": "WEB_REENTRY_CLOSED", "returncode": 0}
@@ -558,7 +560,25 @@ def _execute_web_reentry_under_registry_fence(
             "error_code": "WEB_REENTRY_IDENTITY_UNAVAILABLE", "stderr_tail": str(exc)[:1024],
         }
 
-    verifier = _registered_web_origin_attestation_verifier()
+    verifier_explicit = origin_verifier is not _ORIGIN_VERIFIER_UNSET
+    if verifier_explicit:
+        if origin_verifier is not None and not callable(origin_verifier):
+            return {
+                "operation": "web_reentry",
+                "result": "DEFERRED",
+                "state": "WEB_REENTRY_IDENTITY_UNAVAILABLE",
+                "returncode": 78,
+                "failure_class": "web_reentry_identity_unavailable",
+                "error_code": "WEB_HOST_ATTESTATION_INVALID",
+                "stderr_tail": "explicit Web Host origin verifier is malformed",
+                "execution_target_session_id": web_session_id,
+                "target_generation": target_generation,
+                "ownership_generation": ownership_generation,
+                "target_mode": target_mode,
+            }
+        verifier = origin_verifier
+    else:
+        verifier = _registered_web_origin_attestation_verifier()
     delivery_authorization: dict[str, Any]
     origin_attestation: dict[str, Any] | None = None
     if not callable(verifier):
@@ -772,6 +792,7 @@ def execute_web_reentry(
     lease_path: Path = DEFAULT_WEB_LEASES,
     browser_call: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     approval_id: str | None = None,
+    origin_verifier: Any = _ORIGIN_VERIFIER_UNSET,
 ) -> dict[str, Any]:
     registry_path = Path(registry_path).expanduser()
     lock_path = target_guard.registry_lock_path(registry_path)
@@ -793,6 +814,7 @@ def execute_web_reentry(
                         lease_path=lease_path,
                         browser_call=browser_call,
                         approval_id=approval_id,
+                        origin_verifier=origin_verifier,
                     )
                 finally:
                     fcntl.flock(lease_lock.fileno(), fcntl.LOCK_UN)

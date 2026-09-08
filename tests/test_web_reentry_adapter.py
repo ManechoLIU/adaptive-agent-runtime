@@ -846,3 +846,24 @@ class ManualFencedWebReentryTests(unittest.TestCase):
                 )
         self.assertEqual(result["result"], "CONFIRMED")
         self.assertEqual(fence_observed, [(True, True)])
+
+def _explicit_bridge_verifier_rejection_never_falls_back_when_module_verifier_missing(self):
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, lease = self.make_manual_identity(Path(tmp))
+        calls: list[dict] = []
+        def reject(**_kwargs):
+            raise RuntimeError("bridge verifier rejected")
+        with patch.object(web_reentry_adapter, "_registered_web_origin_attestation_verifier", return_value=None):
+            result = web_reentry_adapter.execute_web_reentry(
+                controller_id="controller-1", repo=repo,
+                registry_path=registry, lease_path=lease,
+                lifecycle_state={"pending_control_event": True, "requires_user": False},
+                browser_call=lambda args: calls.append(dict(args)) or {},
+                origin_verifier=reject,
+            )
+    self.assertEqual(result["result"], "DEFERRED")
+    self.assertEqual(result["error_code"], "WEB_HOST_ATTESTATION_INVALID")
+    self.assertIn("bridge verifier rejected", result["stderr_tail"])
+    self.assertEqual(calls, [])
+
+ManualFencedWebReentryTests.test_explicit_bridge_verifier_rejection_never_falls_back_when_module_verifier_missing = _explicit_bridge_verifier_rejection_never_falls_back_when_module_verifier_missing

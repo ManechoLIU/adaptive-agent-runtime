@@ -2731,6 +2731,7 @@ def wake_existing_controller(
                                     registry_path=registry,
                                     lease_path=DEFAULT_MANUAL_WEB_LEASES,
                                     lifecycle_state=lifecycle_state,
+                                    origin_verifier=verifier,
                                 )
                             else:
                                 if not callable(verifier):
@@ -4229,6 +4230,7 @@ def _run_auto_native_stop_impl(
             controller_id=session_id, repo=repo, registry_path=registry,
             lease_path=DEFAULT_MANUAL_WEB_LEASES, lifecycle_state=lifecycle_state,
             approval_id=approval_id,
+            origin_verifier=_registered_peer_attestation_verifier("web"),
         )
         if attempt.get("result") == "CONFIRMED":
             try:

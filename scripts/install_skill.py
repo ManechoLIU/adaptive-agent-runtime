@@ -113,6 +113,12 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_manual_fenced_direct_wake_uses_builtin_adapter_without_peer_verifier",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_manual_fenced_supervisor_persists_unverified_delivery_evidence",
+    "tests.test_web_reentry_adapter.ManualFencedWebReentryTests."
+    "test_explicit_bridge_verifier_rejection_never_falls_back_when_module_verifier_missing",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_manual_fenced_direct_wake_passes_bridge_verifier_into_builtin_adapter",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_manual_fenced_supervisor_passes_bridge_verifier_into_builtin_adapter",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
