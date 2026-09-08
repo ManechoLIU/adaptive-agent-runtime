@@ -515,7 +515,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
             "web_agent_health_supervisor.py", "controller_runtime_supervisor.py",
             "web_agent_events.py", "route_contract.py", "reviewer_supervisor.py",
-            "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "assignment_lease_guard.py",
+            "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "assignment_lease_guard.py", "assignment_runtime.py",
             "controller_scoring_guard.py", "project_context_guard.py", "rule_handshake.py", "evaluation_transaction.py",
         ):
             script = source / "scripts" / name
@@ -864,6 +864,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_governance.ControllerActionSourcePromptTests.test_live_e2e_accept_prompt_carries_actual_execution_source",
             "tests.test_governance.ControllerActionSourcePromptTests.test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source",
             "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests.test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix",
+            "tests.test_assignment_runtime.ExternalFailureEvidencePersistenceTests.test_terminal_persists_external_failure_class_retry_safety_and_details",
         }
         self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
         self.assertIn("scripts/controller_runtime_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
@@ -872,6 +873,8 @@ class InstallMigrationContractTests(unittest.TestCase):
         self.assertIn("tests/test_web_agent_health_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("tests/test_terminal_continuation.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("scripts/terminal_continuation.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("scripts/assignment_runtime.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("tests/test_assignment_runtime.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn(
             "tests.test_terminal_continuation.PendingTerminalReconcileTests.test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks",
             RUNTIME_RELEASE_REGRESSION_TESTS,
@@ -904,10 +907,40 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('assignment-bound safe fallback requires canonical prior terminal before provider spawn', () => { assert.equal(1, 1); });\n"
                 "test('assignment-bound external start persists exact canonical route contract', () => { assert.equal(1, 1); });\n"
                 "test('short assignment-bound execution reconciles final Git progress before terminal', () => { assert.equal(1, 1); });\n"
-                "test('fresh legacy v1 assignment ACK cannot launch external provider', () => { assert.equal(1, 1); });\n",
+                "test('fresh legacy v1 assignment ACK cannot launch external provider', () => { assert.equal(1, 1); });\n"
+                "test('Grok execution transports prompts through a private prompt file and removes it', () => { assert.equal(1, 1); });\n"
+                "test('oversized Grok reviewer prompt fails before provider spawn with sharding evidence', () => { assert.equal(1, 1); });\n"
+                "test('Grok first-output timeout terminates a silent provider attempt', () => { assert.equal(1, 1); });\n"
+                "test('Grok generation stall timeout terminates after structured output stops', () => { assert.equal(1, 1); });\n"
+                "test('Grok absolute deadline kills the entire provider process group', () => { assert.equal(1, 1); });\n"
+                "test('Grok stall timeout persists structured canonical terminal classification', () => { assert.equal(1, 1); });\n"
+                "test('Grok failed attempt uses 0600 prompt file and removes it', () => { assert.equal(1, 1); });\n"
+                "test('oversized non-reviewer Grok prompt fails before spawn without sharding', () => { assert.equal(1, 1); });\n"
+                "test('Grok stderr and assignment heartbeat do not satisfy first stdout progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok unstructured stdout does not satisfy structured first-output progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok malformed stdout after one structured event does not prevent generation stall', () => { assert.equal(1, 1); });\n"
+                "test('Grok structured metadata stdout does not satisfy model first-output progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok metadata after agent activity does not prevent generation stall', () => { assert.equal(1, 1); });\n"
+                "test('Grok misleading type or event fields do not count as ACP model progress', () => { assert.equal(1, 1); });\n"
+                "test('ordinary Grok provider exit and invalid delivery persist durable failure classification', () => { assert.equal(1, 1); });\n"
+                "test('Grok reviewer shard cannot finalize and synthesis binds exact candidate head', () => { assert.equal(1, 1); });\n"
+                "test('Grok reviewer requires explicit phase and immutable candidate commit', () => { assert.equal(1, 1); });\n"
+                "test('Grok synthesis validates canonical same-candidate shard receipts', () => { assert.equal(1, 1); });\n"
+                "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n"
+                "test('cleanup uncertainty is fail closed and result unknown', () => { assert.equal(1, 1); });\n"
+                "test('Grok payload or data wrappers cannot spoof ACP model progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok prompt preparation cleans a temp directory when prompt write fails', () => { assert.equal(1, 1); });\n"
+                "test('Grok prompt write plus cleanup failure is fail closed', () => { assert.equal(1, 1); });\n"
+                "test('cleanup failure preserves prior Grok provider exit evidence', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+            (tests_dir / "test_assignment_runtime.py").write_text(
+                "import unittest\n"
+                "class ExternalFailureEvidencePersistenceTests(unittest.TestCase):\n"
+                "    def test_terminal_persists_external_failure_class_retry_safety_and_details(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_reviewer_supervisor.py").write_text(
                 "import unittest\n"
                 "class ReviewerSupervisorRoutingTests(unittest.TestCase):\n"
@@ -1296,10 +1329,40 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('assignment-bound safe fallback requires canonical prior terminal before provider spawn', () => { assert.equal(1, 1); });\n"
                 "test('assignment-bound external start persists exact canonical route contract', () => { assert.equal(1, 1); });\n"
                 "test('short assignment-bound execution reconciles final Git progress before terminal', () => { assert.equal(1, 1); });\n"
-                "test('fresh legacy v1 assignment ACK cannot launch external provider', () => { assert.equal(1, 1); });\n",
+                "test('fresh legacy v1 assignment ACK cannot launch external provider', () => { assert.equal(1, 1); });\n"
+                "test('Grok execution transports prompts through a private prompt file and removes it', () => { assert.equal(1, 1); });\n"
+                "test('oversized Grok reviewer prompt fails before provider spawn with sharding evidence', () => { assert.equal(1, 1); });\n"
+                "test('Grok first-output timeout terminates a silent provider attempt', () => { assert.equal(1, 1); });\n"
+                "test('Grok generation stall timeout terminates after structured output stops', () => { assert.equal(1, 1); });\n"
+                "test('Grok absolute deadline kills the entire provider process group', () => { assert.equal(1, 1); });\n"
+                "test('Grok stall timeout persists structured canonical terminal classification', () => { assert.equal(1, 1); });\n"
+                "test('Grok failed attempt uses 0600 prompt file and removes it', () => { assert.equal(1, 1); });\n"
+                "test('oversized non-reviewer Grok prompt fails before spawn without sharding', () => { assert.equal(1, 1); });\n"
+                "test('Grok stderr and assignment heartbeat do not satisfy first stdout progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok unstructured stdout does not satisfy structured first-output progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok malformed stdout after one structured event does not prevent generation stall', () => { assert.equal(1, 1); });\n"
+                "test('Grok structured metadata stdout does not satisfy model first-output progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok metadata after agent activity does not prevent generation stall', () => { assert.equal(1, 1); });\n"
+                "test('Grok misleading type or event fields do not count as ACP model progress', () => { assert.equal(1, 1); });\n"
+                "test('ordinary Grok provider exit and invalid delivery persist durable failure classification', () => { assert.equal(1, 1); });\n"
+                "test('Grok reviewer shard cannot finalize and synthesis binds exact candidate head', () => { assert.equal(1, 1); });\n"
+                "test('Grok reviewer requires explicit phase and immutable candidate commit', () => { assert.equal(1, 1); });\n"
+                "test('Grok synthesis validates canonical same-candidate shard receipts', () => { assert.equal(1, 1); });\n"
+                "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n"
+                "test('cleanup uncertainty is fail closed and result unknown', () => { assert.equal(1, 1); });\n"
+                "test('Grok payload or data wrappers cannot spoof ACP model progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok prompt preparation cleans a temp directory when prompt write fails', () => { assert.equal(1, 1); });\n"
+                "test('Grok prompt write plus cleanup failure is fail closed', () => { assert.equal(1, 1); });\n"
+                "test('cleanup failure preserves prior Grok provider exit evidence', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+            (tests_dir / "test_assignment_runtime.py").write_text(
+                "import unittest\n"
+                "class ExternalFailureEvidencePersistenceTests(unittest.TestCase):\n"
+                "    def test_terminal_persists_external_failure_class_retry_safety_and_details(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_reviewer_supervisor.py").write_text(
                 "import unittest\n"
                 "class ReviewerSupervisorRoutingTests(unittest.TestCase):\n"

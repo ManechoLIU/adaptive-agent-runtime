@@ -12,6 +12,7 @@ const KIMI_KEYCHAIN_SERVICE = "adaptive-delivery-kimi-k3";
 const XAI_KEYCHAIN_SERVICE = "adaptive-delivery-xai-grok";
 const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 const CARD_CATEGORIES = new Set(["frontend", "backend", "general"]);
+const REVIEW_PHASES = new Set(["full", "shard", "synthesis"]);
 const CARD_STATUSES = {
   running: { icon: "🟢", label: "运行中" },
   returned: { icon: "🟡", label: "已返回" },
@@ -35,6 +36,279 @@ const CURRENT_HOST_FALLBACK_FAILURES = new Set([
   "auth_invalid",
   "runtime_unavailable",
 ]);
+
+const DEFAULT_GROK_MAX_PROMPT_BYTES = 128 * 1024;
+const DEFAULT_GROK_REVIEW_SHARD_TARGET_BYTES = 64 * 1024;
+const DEFAULT_GROK_FIRST_OUTPUT_TIMEOUT_MS = 90_000;
+const DEFAULT_GROK_STALL_TIMEOUT_MS = 180_000;
+const DEFAULT_EXTERNAL_ATTEMPT_TIMEOUT_MS = 600_000;
+const DEFAULT_EXTERNAL_KILL_GRACE_MS = 5_000;
+const GROK_MODEL_PROGRESS_SESSION_UPDATES = new Set([
+  "agent_message_chunk",
+  "agent_thought_chunk",
+  "tool_call",
+  "tool_call_update",
+]);
+
+class ExternalAgentExecutionError extends Error {
+  constructor(message, { failureClass = "transport_error", retrySafe = true, resultUnknown = false, details = {} } = {}) {
+    super(message);
+    this.name = "ExternalAgentExecutionError";
+    this.failureClass = failureClass;
+    this.retrySafe = Boolean(retrySafe);
+    this.resultUnknown = Boolean(resultUnknown);
+    this.details = details && typeof details === "object" && !Array.isArray(details) ? details : {};
+  }
+}
+
+function boundedEnvInteger(name, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer within ${min}..${max}`);
+  }
+  return value;
+}
+
+function grokMaxPromptBytes() {
+  return boundedEnvInteger("AD_GROK_MAX_PROMPT_BYTES", DEFAULT_GROK_MAX_PROMPT_BYTES, { min: 64, max: 1024 * 1024 });
+}
+
+function grokReviewShardTargetBytes(maxBytes = grokMaxPromptBytes()) {
+  const fallback = Math.min(DEFAULT_GROK_REVIEW_SHARD_TARGET_BYTES, maxBytes);
+  return boundedEnvInteger("AD_GROK_REVIEW_SHARD_TARGET_BYTES", fallback, { min: 32, max: maxBytes });
+}
+
+function grokFirstOutputTimeoutMs() {
+  return boundedEnvInteger("AD_GROK_FIRST_OUTPUT_TIMEOUT_MS", DEFAULT_GROK_FIRST_OUTPUT_TIMEOUT_MS, { min: 10, max: 30 * 60 * 1000 });
+}
+
+function grokStallTimeoutMs() {
+  return boundedEnvInteger("AD_GROK_STALL_TIMEOUT_MS", DEFAULT_GROK_STALL_TIMEOUT_MS, { min: 10, max: 30 * 60 * 1000 });
+}
+
+function externalAttemptTimeoutMs(progressDeadlineMinutes) {
+  const assignmentBound = Number.isInteger(progressDeadlineMinutes) && progressDeadlineMinutes > 0
+    ? progressDeadlineMinutes * 60 * 1000
+    : DEFAULT_EXTERNAL_ATTEMPT_TIMEOUT_MS;
+  const configured = boundedEnvInteger(
+    "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS", assignmentBound, { min: 10, max: 30 * 60 * 1000 },
+  );
+  return Math.min(configured, assignmentBound);
+}
+
+function externalKillGraceMs() {
+  return boundedEnvInteger("AD_EXTERNAL_KILL_GRACE_MS", DEFAULT_EXTERNAL_KILL_GRACE_MS, { min: 10, max: 60_000 });
+}
+
+function grokModelProgressKind(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return null;
+  const sessionId = [event.sessionId, event.session_id].find(
+    (value) => typeof value === "string" && value.trim(),
+  );
+  if (!sessionId) return null;
+  const update = event.update;
+  if (!update || typeof update !== "object" || Array.isArray(update)) return null;
+  for (const key of ["sessionUpdate", "session_update"]) {
+    const value = update[key];
+    if (typeof value === "string" && GROK_MODEL_PROGRESS_SESSION_UPDATES.has(value.trim())) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+function removeDirectoryConfirmed(directory) {
+  rmSync(directory, { recursive: true, force: true });
+  if (existsSync(directory)) {
+    throw new Error(`resource still exists after cleanup: ${directory}`);
+  }
+}
+
+export function runCleanupStack(cleanups, priorError = null) {
+  const failures = [];
+  for (const entry of [...cleanups].reverse()) {
+    const label = typeof entry === "function" ? "external_resource" : String(entry?.label || "external_resource");
+    const cleanup = typeof entry === "function" ? entry : entry?.cleanup;
+    if (typeof cleanup !== "function") {
+      failures.push({ label, error: "cleanup callback unavailable" });
+      continue;
+    }
+    try {
+      cleanup();
+    } catch (error) {
+      failures.push({ label, error: String(error?.message || error) });
+    }
+  }
+  if (!failures.length) return;
+  throw new ExternalAgentExecutionError(
+    `cleanup_failed: ${failures.map((item) => `${item.label}: ${item.error}`).join("; ")}`,
+    {
+      failureClass: "cleanup_failed",
+      retrySafe: false,
+      resultUnknown: true,
+      details: {
+        failed_resources: failures.map((item) => item.label),
+        cleanup_failures: failures,
+        ...(priorError ? {
+          prior_failure_class: String(priorError?.failureClass || "transport_error"),
+          prior_error: String(priorError?.message || priorError),
+          prior_retry_safe: priorError?.retrySafe !== false,
+          prior_result_unknown: Boolean(priorError?.resultUnknown),
+          ...(priorError?.details && typeof priorError.details === "object" && !Array.isArray(priorError.details)
+            ? { prior_failure_details: { ...priorError.details } }
+            : {}),
+        } : {}),
+      },
+    },
+  );
+}
+
+export function prepareGrokPrompt(prompt, {
+  assignmentRole = null,
+  createTempDir = mkdtempSync,
+  writePrompt = writeFileSync,
+  cleanupDirectory = removeDirectoryConfirmed,
+} = {}) {
+  const observedBytes = Buffer.byteLength(prompt, "utf8");
+  const maxBytes = grokMaxPromptBytes();
+  if (observedBytes > maxBytes) {
+    const reviewer = String(assignmentRole || "").trim().toLowerCase() === "reviewer";
+    const shardTargetBytes = grokReviewShardTargetBytes(maxBytes);
+    const failureClass = reviewer ? "review_sharding_required" : "prompt_too_large";
+    throw new ExternalAgentExecutionError(
+      `${failureClass}: observed_bytes=${observedBytes} max_bytes=${maxBytes}`
+        + (reviewer ? ` shard_target_bytes=${shardTargetBytes}; split the immutable review into bounded shards plus one final synthesis review` : ""),
+      {
+        failureClass,
+        retrySafe: true,
+        details: { observed_bytes: observedBytes, max_bytes: maxBytes, shard_target_bytes: reviewer ? shardTargetBytes : null },
+      },
+    );
+  }
+  let directory;
+  try {
+    directory = createTempDir(path.join(tmpdir(), "adaptive-delivery-grok-prompt-"));
+  } catch (error) {
+    throw new ExternalAgentExecutionError(`prompt_file_prepare_failed: ${error.message}`, {
+      failureClass: "prompt_file_prepare_failed", retrySafe: true, resultUnknown: false,
+      details: { prepare_error: String(error?.message || error) },
+    });
+  }
+  const promptPath = path.join(directory, "prompt.txt");
+  try {
+    writePrompt(promptPath, prompt, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  } catch (error) {
+    const writeError = new ExternalAgentExecutionError(`prompt_file_write_failed: ${error.message}`, {
+      failureClass: "prompt_file_write_failed", retrySafe: true, resultUnknown: false,
+      details: { write_error: String(error?.message || error) },
+    });
+    try {
+      cleanupDirectory(directory);
+    } catch (cleanupError) {
+      throw new ExternalAgentExecutionError(
+        `cleanup_failed: prompt_file: ${cleanupError.message}; prior=${writeError.message}`,
+        {
+          failureClass: "cleanup_failed", retrySafe: false, resultUnknown: true,
+          details: {
+            failed_resources: ["prompt_file"],
+            cleanup_failures: [{ label: "prompt_file", error: String(cleanupError?.message || cleanupError) }],
+            prior_failure_class: writeError.failureClass,
+            prior_error: writeError.message,
+          },
+        },
+      );
+    }
+    throw writeError;
+  }
+  return {
+    path: promptPath,
+    bytes: observedBytes,
+    cleanup: () => cleanupDirectory(directory),
+  };
+}
+
+function childExited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function processGroupExists(pid) {
+  if (!pid || process.platform === "win32") return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    if (error && error.code === "ESRCH") return false;
+    if (error && error.code === "EPERM") return true;
+    throw error;
+  }
+}
+
+function signalProcessGroup(child, signal) {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    child.kill(signal);
+    return;
+  }
+  try {
+    process.kill(-child.pid, signal);
+  } catch (error) {
+    if (error && error.code === "ESRCH") return;
+    throw error;
+  }
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (childExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      resolve(value);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(childExited(child)), Math.max(0, timeoutMs));
+    child.once("exit", onExit);
+  });
+}
+
+async function terminateProcessGroup(child, graceMs) {
+  const notes = [];
+  try {
+    signalProcessGroup(child, "SIGTERM");
+    notes.push("SIGTERM");
+  } catch (error) {
+    return { confirmed: false, diagnostic: `SIGTERM failed: ${error.message}` };
+  }
+  await waitForChildExit(child, graceMs);
+  let groupAlive;
+  try {
+    groupAlive = process.platform === "win32" ? !childExited(child) : processGroupExists(child.pid);
+  } catch (error) {
+    return { confirmed: false, diagnostic: `process-group probe failed after SIGTERM: ${error.message}` };
+  }
+  if (!groupAlive && childExited(child)) return { confirmed: true, diagnostic: notes.join(";") };
+  try {
+    signalProcessGroup(child, "SIGKILL");
+    notes.push("SIGKILL");
+  } catch (error) {
+    return { confirmed: false, diagnostic: `${notes.join(";")}; SIGKILL failed: ${error.message}` };
+  }
+  await waitForChildExit(child, graceMs);
+  try {
+    groupAlive = process.platform === "win32" ? !childExited(child) : processGroupExists(child.pid);
+  } catch (error) {
+    return { confirmed: false, diagnostic: `${notes.join(";")}; final process-group probe failed: ${error.message}` };
+  }
+  return {
+    confirmed: !groupAlive && childExited(child),
+    diagnostic: !groupAlive && childExited(child) ? notes.join(";") : `${notes.join(";")}; process group still alive`,
+  };
+}
 
 function peerHost(controllerHost) {
   return controllerHost === "web" ? "desktop_codex" : "web";
@@ -387,6 +661,53 @@ function validateAssignmentLaunch(options) {
   }
   assignment.assignment_contract_version = contractVersion;
   assignment.progress_deadline_minutes = assignmentProgressDeadlineMinutes(assignment);
+  const assignmentRole = String(assignment.role || "").trim().toLowerCase();
+  const candidateRevision = String(assignment.candidate_revision || "").trim();
+  if (assignmentRole === "reviewer") {
+    if (!candidateRevision) {
+      throw new Error("reviewer assignment-ack requires immutable candidate_revision");
+    }
+    let resolvedCandidate;
+    try {
+      resolvedCandidate = gitFact(options.cwd, ["rev-parse", "--verify", `${candidateRevision}^{commit}`], "reviewer candidate revision");
+    } catch (error) {
+      throw new Error(`reviewer candidate_revision must resolve to an immutable commit: ${error.message}`);
+    }
+    if (resolvedCandidate !== candidateRevision) {
+      throw new Error("reviewer candidate_revision must be the exact immutable commit, not a branch, tag, or abbreviation");
+    }
+    const reviewPhase = String(assignment.review_phase || "").trim().toLowerCase();
+    if (!REVIEW_PHASES.has(reviewPhase)) {
+      throw new Error("reviewer assignment-ack review_phase must be explicit full|shard|synthesis");
+    }
+    const rawShardReceipts = assignment.review_shard_receipts;
+    let reviewShardReceipts = [];
+    if (reviewPhase === "synthesis") {
+      if (!Array.isArray(rawShardReceipts) || rawShardReceipts.length === 0) {
+        throw new Error("reviewer synthesis requires non-empty review_shard_receipts");
+      }
+      reviewShardReceipts = rawShardReceipts.map((item) => String(item || "").trim());
+      if (reviewShardReceipts.some((item) => !item.startsWith("receipt:") || item.slice(8).trim().length === 0)) {
+        throw new Error("review_shard_receipts must contain receipt: locators only");
+      }
+      if (new Set(reviewShardReceipts).size !== reviewShardReceipts.length) {
+        throw new Error("review_shard_receipts must be unique");
+      }
+    } else if (rawShardReceipts !== undefined && rawShardReceipts !== null && !(Array.isArray(rawShardReceipts) && rawShardReceipts.length === 0)) {
+      throw new Error("review_shard_receipts are valid only for synthesis reviewer assignments");
+    }
+    assignment.review_phase = reviewPhase;
+    assignment.review_shard_receipts = reviewShardReceipts;
+  } else {
+    if (assignment.review_phase !== undefined && assignment.review_phase !== null) {
+      throw new Error("assignment-ack review_phase is valid only for reviewer assignments");
+    }
+    if (assignment.review_shard_receipts !== undefined && assignment.review_shard_receipts !== null) {
+      throw new Error("assignment-ack review_shard_receipts are valid only for reviewer assignments");
+    }
+    assignment.review_phase = null;
+    assignment.review_shard_receipts = [];
+  }
   const repositoryRoot = gitFact(options.cwd, ["rev-parse", "--show-toplevel"], "launch repository");
   const branch = gitFact(options.cwd, ["branch", "--show-current"], "launch branch");
   const head = gitFact(options.cwd, ["rev-parse", "HEAD"], "launch revision");
@@ -476,7 +797,7 @@ function isTraceableLocator(value, schemes) {
   return schemes.has(token.slice(0, separator)) && token.slice(separator + 1).trim().length > 0;
 }
 
-function readDeliveryReceipt(pathname) {
+function readDeliveryReceipt(pathname, { assignmentRole = null, candidateRevision = null, reviewPhase = null } = {}) {
   if (!pathname) return null;
   let receipt;
   try {
@@ -524,7 +845,31 @@ function readDeliveryReceipt(pathname) {
     }
     const expectedOutcome = verdict.verdict === "PASS" ? "pass" : "fail";
     if (deliveryOutcome !== expectedOutcome) throw new Error("delivery-receipt review_verdict conflicts with delivery_outcome");
+    const normalizedRole = String(assignmentRole || "").trim().toLowerCase();
+    const normalizedPhase = String(reviewPhase || "full").trim().toLowerCase();
+    const expectedHead = String(candidateRevision || "").trim();
+    if (normalizedRole !== "reviewer") {
+      throw new Error("delivery-receipt review_verdict is valid only for reviewer assignments");
+    }
+    if (!expectedHead) {
+      throw new Error("delivery-receipt review_verdict requires immutable candidate_revision");
+    }
+    if (verdict.reviewed_head !== expectedHead) {
+      throw new Error("delivery-receipt review_verdict reviewed_head must equal assignment candidate_revision");
+    }
+    if (normalizedPhase === "shard") {
+      throw new Error("reviewer shard cannot publish a final review_verdict; one final synthesis review is required");
+    }
+    if (normalizedPhase === "synthesis" && !receipt.evidence.some((item) => typeof item === "string" && item.startsWith("receipt:"))) {
+      throw new Error("reviewer synthesis review requires shard receipt evidence");
+    }
     reviewVerdict = verdict;
+  }
+  const normalizedRole = String(assignmentRole || "").trim().toLowerCase();
+  const normalizedPhase = String(reviewPhase || "full").trim().toLowerCase();
+  if (normalizedRole === "reviewer" && normalizedPhase !== "shard"
+      && new Set(["pass", "fail"]).has(deliveryOutcome) && !reviewVerdict) {
+    throw new Error("full or synthesis reviewer delivery requires structured review_verdict");
   }
   return {
     delivery_outcome: deliveryOutcome, summary, evidence: receipt.evidence, artifacts: receipt.artifacts,
@@ -563,6 +908,8 @@ function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
       execution_transport: "external_process",
       execution_role: options.assignmentRole || null,
       candidate_revision: options.candidateRevision || null,
+      review_phase: options.reviewPhase || null,
+      review_shard_receipts: options.reviewShardReceipts || [],
       model: options.model,
       agent_type: options.agentType || `external-${options.engine}`,
       auth_mode: options.authMode,
@@ -595,7 +942,10 @@ function atomicWriteJson(pathname, payload) {
   return target;
 }
 
-function persistExternalTerminalReceipt(options, { exitCode, summary, deliveryOutcome = "unresolved" }) {
+function persistExternalTerminalReceipt(options, {
+  exitCode, summary, deliveryOutcome = "unresolved", failureClass = null, retryClass = null,
+  retrySafe = null, resultUnknown = null, failureDetails = null,
+}) {
   if (!options.terminalReceipt) return null;
   const target = atomicWriteJson(options.terminalReceipt, {
     schema_version: 1,
@@ -614,6 +964,15 @@ function persistExternalTerminalReceipt(options, { exitCode, summary, deliveryOu
     session_id: options.sessionId || null,
     attempt: options.assignmentId ? options.attempt : null,
     lease_id: options.assignmentId ? options.leaseId : null,
+    ...(failureClass ? { failure_class: failureClass } : {}),
+    ...(retryClass ? { retry_class: retryClass } : {}),
+    ...(options.assignmentRole ? { execution_role: options.assignmentRole } : {}),
+    ...(options.candidateRevision ? { candidate_revision: options.candidateRevision } : {}),
+    ...(options.reviewPhase ? { review_phase: options.reviewPhase } : {}),
+    ...(options.reviewShardReceipts?.length ? { review_shard_receipts: options.reviewShardReceipts } : {}),
+    ...(typeof retrySafe === "boolean" ? { retry_safe: retrySafe } : {}),
+    ...(typeof resultUnknown === "boolean" ? { result_unknown: resultUnknown } : {}),
+    ...(failureDetails && typeof failureDetails === "object" && !Array.isArray(failureDetails) ? { failure_details: failureDetails } : {}),
     completed_at: new Date().toISOString(),
   });
   const helper = process.env.AD_TERMINAL_CONTINUATION_HELPER || fileURLToPath(new URL("./terminal_continuation.py", import.meta.url));
@@ -734,10 +1093,10 @@ function kimiApiBaseUrl() {
   return "https://api.moonshot.ai/v1";
 }
 
-function commonGrokArgs(model, prompt, reasoningEffort) {
+function commonGrokArgs(model, promptFile, reasoningEffort) {
   return [
     "--no-auto-update", "--no-subagents", "--no-memory", "--sandbox", "workspace",
-    "--always-approve", "-m", model, "-p", prompt, "--output-format", "streaming-json",
+    "--always-approve", "-m", model, "--prompt-file", promptFile, "--output-format", "streaming-json",
     "--reasoning-effort", reasoningEffort,
   ];
 }
@@ -749,6 +1108,124 @@ function runAttached(executable, args, { cwd, env }) {
     child.once("exit", (code, signal) => {
       if (signal) reject(new Error(`${executable} terminated by signal ${signal}`));
       else resolve(code ?? 1);
+    });
+  });
+}
+
+export function runMonitoredGrok(executable, args, {
+  cwd, env, progressDeadlineMinutes = null, onStructuredProgress = null,
+  terminateGroup = terminateProcessGroup,
+}) {
+  const absoluteTimeoutMs = externalAttemptTimeoutMs(progressDeadlineMinutes);
+  const firstOutputTimeoutMs = grokFirstOutputTimeoutMs();
+  const stallTimeoutMs = grokStallTimeoutMs();
+  const killGraceMs = externalKillGraceMs();
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(executable, args, {
+        cwd, env,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: process.platform !== "win32",
+      });
+    } catch (error) {
+      reject(new ExternalAgentExecutionError(`cli_launch_failed: ${error.message}`, { failureClass: "cli_launch_failed", retrySafe: true }));
+      return;
+    }
+    const startedAt = Date.now();
+    let firstStructuredOutputAt = null;
+    let lastStructuredOutputAt = startedAt;
+    let stdoutBuffer = "";
+    let terminating = false;
+    let settled = false;
+
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(watchdog);
+      fn(value);
+    };
+
+    const observeStructuredLines = (text) => {
+      stdoutBuffer += text;
+      while (true) {
+        const newline = stdoutBuffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = stdoutBuffer.slice(0, newline).trim();
+        stdoutBuffer = stdoutBuffer.slice(newline + 1);
+        if (!line) continue;
+        try {
+          const event = JSON.parse(line);
+          if (event && typeof event === "object" && !Array.isArray(event)) {
+            const progressKind = grokModelProgressKind(event);
+            if (progressKind) {
+              const now = Date.now();
+              if (firstStructuredOutputAt === null) firstStructuredOutputAt = now;
+              lastStructuredOutputAt = now;
+              if (typeof onStructuredProgress === "function") {
+                onStructuredProgress(event, progressKind);
+              }
+            }
+          }
+        } catch {}
+      }
+    };
+
+    child.stdout?.on("data", (chunk) => {
+      process.stdout.write(chunk);
+      observeStructuredLines(chunk.toString("utf8"));
+    });
+    child.stderr?.on("data", (chunk) => {
+      process.stderr.write(chunk);
+    });
+
+    const terminateFor = async (failureClass, message) => {
+      if (terminating || settled) return;
+      terminating = true;
+      clearInterval(watchdog);
+      const cleanup = await terminateGroup(child, killGraceMs);
+      const finalClass = cleanup.confirmed ? failureClass : "process_group_cleanup_failed";
+      const diagnostic = `${message}; cleanup=${cleanup.diagnostic}`;
+      finish(reject, new ExternalAgentExecutionError(`${finalClass}: ${diagnostic}`, {
+        failureClass: finalClass,
+        retrySafe: cleanup.confirmed,
+        resultUnknown: !cleanup.confirmed,
+        details: { cleanup_confirmed: cleanup.confirmed, cleanup_diagnostic: cleanup.diagnostic },
+      }));
+    };
+
+    const smallestDeadline = Math.max(10, Math.min(firstOutputTimeoutMs, stallTimeoutMs, absoluteTimeoutMs));
+    const watchdogIntervalMs = Math.max(10, Math.min(250, Math.floor(smallestDeadline / 4)));
+    const watchdog = setInterval(() => {
+      if (settled || terminating) return;
+      const now = Date.now();
+      if (now - startedAt >= absoluteTimeoutMs) {
+        void terminateFor("attempt_deadline_exceeded", `absolute deadline ${absoluteTimeoutMs}ms exceeded`);
+        return;
+      }
+      if (firstStructuredOutputAt === null && now - startedAt >= firstOutputTimeoutMs) {
+        void terminateFor("first_output_timeout", `no structured Grok stdout within ${firstOutputTimeoutMs}ms`);
+        return;
+      }
+      if (firstStructuredOutputAt !== null && now - lastStructuredOutputAt >= stallTimeoutMs) {
+        void terminateFor("generation_stalled", `no structured Grok stdout progress within ${stallTimeoutMs}ms`);
+      }
+    }, watchdogIntervalMs);
+    watchdog.unref();
+
+    child.once("error", (error) => {
+      if (terminating || settled) return;
+      finish(reject, new ExternalAgentExecutionError(`cli_launch_failed: ${error.message}`, { failureClass: "cli_launch_failed", retrySafe: true }));
+    });
+    child.once("exit", (code, signal) => {
+      if (terminating || settled) return;
+      if (signal) {
+        finish(reject, new ExternalAgentExecutionError(`provider_terminated_by_signal: ${signal}`, {
+          failureClass: "provider_terminated_by_signal", retrySafe: true,
+        }));
+      } else {
+        finish(resolve, code ?? 1);
+      }
     });
   });
 }
@@ -801,7 +1278,10 @@ async function loginExternalAgent({ cwd, engine, region, deviceAuth }) {
   return await runAttached(executable, args, { cwd, env: process.env });
 }
 
-async function executeExternalAgent({ cwd, engine, model, reasoningEffort, authMode, sideEffect, idempotencyKey }) {
+async function executeExternalAgent({
+  cwd, engine, model, reasoningEffort, authMode, sideEffect, idempotencyKey,
+  assignmentRole = null, progressDeadlineMinutes = null, onStructuredProgress = null,
+}) {
   assertDirectory(cwd);
   const rawPrompt = await readStdin();
   if (!rawPrompt) throw new Error("A bounded routing contract prompt is required on stdin");
@@ -812,69 +1292,91 @@ async function executeExternalAgent({ cwd, engine, model, reasoningEffort, authM
   const executable = resolveExecutable(routes[engine]);
   let args;
   let env;
-  let cleanup = () => {};
-
-  if (engine === "kimi-code" && authMode === "api") {
-    const apiKey = readApiKey(engine);
-    if (!apiKey) {
-      throw new Error(
-        `Kimi K3 API key not found; set KIMI_MODEL_API_KEY or store it in macOS Keychain service ${kimiKeychainService()}`,
-      );
-    }
-    args = ["-p", prompt, "--output-format", "stream-json"];
-    env = {
-      ...process.env,
-      KIMI_MODEL_NAME: model,
-      KIMI_MODEL_API_KEY: apiKey,
-      // Kimi K3's Platform API uses the standard Chat Completions
-      // `reasoning_effort` field. Kimi Code's `kimi` provider emits the
-      // legacy `thinking` object, which the K3 route rejects behind a
-      // Kimi-Api-Version compatibility gate. The `openai` provider keeps the
-      // same official Moonshot endpoint while encoding K3's wire contract.
-      KIMI_MODEL_PROVIDER_TYPE: "openai",
-      KIMI_MODEL_BASE_URL: kimiApiBaseUrl(),
-      KIMI_MODEL_MAX_CONTEXT_SIZE: "1048576",
-      KIMI_MODEL_CAPABILITIES: "image_in,video_in,thinking,always_thinking,tool_use",
-      KIMI_MODEL_DISPLAY_NAME: "Kimi K3 API",
-      KIMI_MODEL_THINKING_EFFORT: reasoningEffort,
-    };
-  } else if (engine === "kimi-code") {
-    if (!credentialState(engine, authMode).configured) {
-      throw new Error("Kimi Code OAuth session not found; run the Adaptive Agent Runtime login command first");
-    }
-    args = ["-m", model, "-p", prompt, "--output-format", "stream-json"];
-    env = {
-      ...sanitizedEnvironment(["KIMI_MODEL_"], ["MOONSHOT_API_KEY"]),
-      KIMI_MODEL_THINKING_EFFORT: reasoningEffort,
-    };
-  } else if (authMode === "api") {
-    const apiKey = readApiKey(engine);
-    if (!apiKey) {
-      throw new Error(
-        `xAI API key not found; set XAI_API_KEY or store it in macOS Keychain service ${xaiKeychainService()}`,
-      );
-    }
-    const isolatedHome = mkdtempSync(path.join(tmpdir(), "adaptive-delivery-grok-api-"));
-    cleanup = () => rmSync(isolatedHome, { recursive: true, force: true });
-    args = commonGrokArgs(model, prompt, reasoningEffort);
-    env = { ...process.env, GROK_HOME: isolatedHome, XAI_API_KEY: apiKey };
-  } else {
-    if (!credentialState(engine, authMode).configured) {
-      throw new Error("Grok OAuth session not found; run the Adaptive Agent Runtime login command first");
-    }
-    args = commonGrokArgs(model, prompt, reasoningEffort);
-    env = sanitizedEnvironment([], ["XAI_API_KEY"]);
-  }
-
-  if (sideEffect && idempotencyKey) {
-    env.ADAPTIVE_AGENT_IDEMPOTENCY_KEY = idempotencyKey;
-  }
+  const cleanups = [];
+  let executionError = null;
   try {
+    if (engine === "kimi-code" && authMode === "api") {
+      const apiKey = readApiKey(engine);
+      if (!apiKey) {
+        throw new Error(
+          `Kimi K3 API key not found; set KIMI_MODEL_API_KEY or store it in macOS Keychain service ${kimiKeychainService()}`,
+        );
+      }
+      args = ["-p", prompt, "--output-format", "stream-json"];
+      env = {
+        ...process.env,
+        KIMI_MODEL_NAME: model,
+        KIMI_MODEL_API_KEY: apiKey,
+        // Kimi K3's Platform API uses the standard Chat Completions
+        // `reasoning_effort` field. Kimi Code's `kimi` provider emits the
+        // legacy `thinking` object, which the K3 route rejects behind a
+        // Kimi-Api-Version compatibility gate. The `openai` provider keeps the
+        // same official Moonshot endpoint while encoding K3's wire contract.
+        KIMI_MODEL_PROVIDER_TYPE: "openai",
+        KIMI_MODEL_BASE_URL: kimiApiBaseUrl(),
+        KIMI_MODEL_MAX_CONTEXT_SIZE: "1048576",
+        KIMI_MODEL_CAPABILITIES: "image_in,video_in,thinking,always_thinking,tool_use",
+        KIMI_MODEL_DISPLAY_NAME: "Kimi K3 API",
+        KIMI_MODEL_THINKING_EFFORT: reasoningEffort,
+      };
+    } else if (engine === "kimi-code") {
+      if (!credentialState(engine, authMode).configured) {
+        throw new Error("Kimi Code OAuth session not found; run the Adaptive Agent Runtime login command first");
+      }
+      args = ["-m", model, "-p", prompt, "--output-format", "stream-json"];
+      env = {
+        ...sanitizedEnvironment(["KIMI_MODEL_"], ["MOONSHOT_API_KEY"]),
+        KIMI_MODEL_THINKING_EFFORT: reasoningEffort,
+      };
+    } else if (authMode === "api") {
+      const apiKey = readApiKey(engine);
+      if (!apiKey) {
+        throw new Error(
+          `xAI API key not found; set XAI_API_KEY or store it in macOS Keychain service ${xaiKeychainService()}`,
+        );
+      }
+      const grokPrompt = prepareGrokPrompt(prompt, { assignmentRole });
+      cleanups.push({ label: "prompt_file", cleanup: grokPrompt.cleanup });
+      const isolatedHome = mkdtempSync(path.join(tmpdir(), "adaptive-delivery-grok-api-"));
+      cleanups.push({ label: "grok_home", cleanup: () => removeDirectoryConfirmed(isolatedHome) });
+      args = commonGrokArgs(model, grokPrompt.path, reasoningEffort);
+      env = { ...process.env, GROK_HOME: isolatedHome, XAI_API_KEY: apiKey };
+    } else {
+      if (!credentialState(engine, authMode).configured) {
+        throw new Error("Grok OAuth session not found; run the Adaptive Agent Runtime login command first");
+      }
+      const grokPrompt = prepareGrokPrompt(prompt, { assignmentRole });
+      cleanups.push({ label: "prompt_file", cleanup: grokPrompt.cleanup });
+      args = commonGrokArgs(model, grokPrompt.path, reasoningEffort);
+      env = sanitizedEnvironment([], ["XAI_API_KEY"]);
+    }
+
+    if (sideEffect && idempotencyKey) {
+      env.ADAPTIVE_AGENT_IDEMPOTENCY_KEY = idempotencyKey;
+    }
+    if (engine === "grok-build") {
+      const code = await runMonitoredGrok(executable, args, {
+        cwd, env, progressDeadlineMinutes, onStructuredProgress,
+      });
+      if (code !== 0) {
+        executionError = new ExternalAgentExecutionError(`provider_exit: external agent exited ${code}`, {
+          failureClass: "provider_exit",
+          retrySafe: true,
+          resultUnknown: Boolean(sideEffect),
+          details: { provider_exit_code: code },
+        });
+      }
+      return code;
+    }
     return await runAttached(executable, args, { cwd, env });
+  } catch (error) {
+    executionError = error;
+    throw error;
   } finally {
-    cleanup();
+    runCleanupStack(cleanups, executionError);
   }
 }
+
 
 async function main() {
   try {
@@ -914,6 +1416,12 @@ async function main() {
       options.candidateRevision = typeof assignment.candidate_revision === "string" && assignment.candidate_revision.trim()
         ? assignment.candidate_revision.trim()
         : null;
+      options.reviewPhase = typeof assignment.review_phase === "string" && assignment.review_phase.trim()
+        ? assignment.review_phase.trim().toLowerCase()
+        : null;
+      options.reviewShardReceipts = Array.isArray(assignment.review_shard_receipts)
+        ? assignment.review_shard_receipts.slice()
+        : [];
       options.executionLineage = deriveExecutionLineage(options, assignment);
     }
     validateRuleHandshake(options);
@@ -949,9 +1457,30 @@ async function main() {
       code = await executeExternalAgent(options);
     } catch (error) {
       if (heartbeat) clearInterval(heartbeat);
+      const failureClass = String(error?.failureClass || "transport_error");
+      const retrySafe = error?.retrySafe !== false;
+      const resultUnknown = Boolean(options.sideEffect) || Boolean(error?.resultUnknown);
+      const failureDetails = error?.details && typeof error.details === "object" && !Array.isArray(error.details)
+        ? error.details
+        : {};
+      const nextAction = failureClass === "review_sharding_required"
+        ? "split the immutable Reviewer contract into bounded shards and one final synthesis review"
+        : failureClass === "prompt_too_large"
+          ? "reduce the external Agent prompt scope before retrying"
+          : retrySafe
+            ? "inspect bounded external agent failure before any retry"
+            : "do not retry automatically; reconcile provider/process state first";
       eventSeq += 1;
-      recordRuntimeReceipt(options, "assignment_terminal", eventSeq, { terminal_state: "failed", transport_outcome: "failed", delivery_outcome: "unresolved", summary: error.message, evidence: [], artifacts: [], next_action: "inspect external agent failure", retry_class: "transport_error", result_unknown: Boolean(options.sideEffect) });
-      persistExternalTerminalReceipt(options, { exitCode: 1, summary: error.message, deliveryOutcome: "unresolved" });
+      recordRuntimeReceipt(options, "assignment_terminal", eventSeq, {
+        terminal_state: "failed", transport_outcome: "failed", delivery_outcome: "unresolved",
+        summary: error.message, evidence: [], artifacts: [], next_action: nextAction,
+        retry_class: failureClass, failure_class: failureClass, retry_safe: retrySafe,
+        failure_details: failureDetails, result_unknown: resultUnknown,
+      });
+      persistExternalTerminalReceipt(options, {
+        exitCode: 1, summary: error.message, deliveryOutcome: "unresolved",
+        failureClass, retryClass: failureClass, retrySafe, resultUnknown, failureDetails,
+      });
       throw error;
     }
     if (heartbeat) clearInterval(heartbeat);
@@ -975,27 +1504,59 @@ async function main() {
     let deliveryError = null;
     if (code === 0) {
       try {
-        delivery = readDeliveryReceipt(options.deliveryReceipt);
+        delivery = readDeliveryReceipt(options.deliveryReceipt, {
+          assignmentRole: options.assignmentRole,
+          candidateRevision: options.candidateRevision,
+          reviewPhase: options.reviewPhase,
+        });
       } catch (error) {
         deliveryError = error;
       }
     }
+    const finalFailureClass = deliveryError
+      ? "delivery_receipt_invalid"
+      : code === 0
+        ? null
+        : "provider_exit";
+    const finalRetryClass = delivery?.retry_class || finalFailureClass || "none";
+    const finalRetrySafe = finalFailureClass === "delivery_receipt_invalid"
+      ? false
+      : finalFailureClass === "provider_exit"
+        ? !Boolean(options.sideEffect)
+        : null;
+    const finalResultUnknown = Boolean(options.sideEffect)
+      && (code !== 0 || deliveryError !== null || delivery?.delivery_outcome === "unresolved" || delivery === null);
+    const finalFailureDetails = deliveryError
+      ? { validation_error: deliveryError.message }
+      : code !== 0
+        ? { provider_exit_code: code }
+        : null;
+    const finalSummary = delivery?.summary || deliveryError?.message
+      || (code === 0 ? "external agent process completed" : `external agent exited ${code}`);
     recordRuntimeReceipt(options, "assignment_terminal", eventSeq, {
       terminal_state: code === 0 ? "completed" : "failed",
       transport_outcome: code === 0 ? "completed" : "failed",
       delivery_outcome: delivery?.delivery_outcome || "unresolved",
-      summary: delivery?.summary || deliveryError?.message || (code === 0 ? "external agent process completed" : `external agent exited ${code}`),
+      summary: finalSummary,
       evidence: delivery?.evidence || [], artifacts: delivery?.artifacts || [],
       next_action: delivery?.next_action || (deliveryError ? "repair delivery receipt" : code === 0 ? "inspect delivery" : "inspect external agent output"),
-      retry_class: delivery?.retry_class || (deliveryError ? "none" : code === 0 ? "none" : "provider_exit"),
+      retry_class: finalRetryClass,
+      ...(finalFailureClass ? { failure_class: finalFailureClass } : {}),
+      ...(typeof finalRetrySafe === "boolean" ? { retry_safe: finalRetrySafe } : {}),
+      ...(finalFailureDetails ? { failure_details: finalFailureDetails } : {}),
       reconciliation_evidence: delivery?.reconciliation_evidence || [],
       ...(delivery?.review_verdict ? { review_verdict: delivery.review_verdict } : {}),
-      result_unknown: Boolean(options.sideEffect) && (code !== 0 || deliveryError !== null || delivery?.delivery_outcome === "unresolved" || delivery === null),
+      result_unknown: finalResultUnknown,
     });
     persistExternalTerminalReceipt(options, {
       exitCode: code,
-      summary: delivery?.summary || deliveryError?.message || (code === 0 ? "external agent process completed" : `external agent exited ${code}`),
+      summary: finalSummary,
       deliveryOutcome: delivery?.delivery_outcome || "unresolved",
+      failureClass: finalFailureClass,
+      retryClass: finalRetryClass,
+      retrySafe: finalRetrySafe,
+      resultUnknown: finalResultUnknown,
+      failureDetails: finalFailureDetails,
     });
     if (deliveryError) throw deliveryError;
     process.exitCode = code;

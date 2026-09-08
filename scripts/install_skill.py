@@ -53,6 +53,8 @@ WEB_BLOCK_END = "# <<< adaptive-delivery web lifecycle bridge <<<"
 MANIFEST_NAME = ".adaptive-delivery-install.json"
 IMPACTS = {"none", "live_assignments"}
 RUNTIME_RELEASE_REGRESSION_TESTS = (
+    "tests.test_assignment_runtime.ExternalFailureEvidencePersistenceTests."
+    "test_terminal_persists_external_failure_class_retry_safety_and_details",
     "tests.test_reviewer_supervisor.ReviewerSupervisorRoutingTests."
     "test_web_controller_review_does_not_launch_codex_directly",
     "tests.test_reviewer_supervisor.ReviewerSupervisorWebHandoffTests."
@@ -551,6 +553,30 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "assignment-bound external start persists exact canonical route contract",
     "short assignment-bound execution reconciles final Git progress before terminal",
     "fresh legacy v1 assignment ACK cannot launch external provider",
+    "Grok execution transports prompts through a private prompt file and removes it",
+    "oversized Grok reviewer prompt fails before provider spawn with sharding evidence",
+    "Grok first-output timeout terminates a silent provider attempt",
+    "Grok generation stall timeout terminates after structured output stops",
+    "Grok absolute deadline kills the entire provider process group",
+    "Grok stall timeout persists structured canonical terminal classification",
+    "Grok failed attempt uses 0600 prompt file and removes it",
+    "oversized non-reviewer Grok prompt fails before spawn without sharding",
+    "Grok stderr and assignment heartbeat do not satisfy first stdout progress",
+    "Grok unstructured stdout does not satisfy structured first-output progress",
+    "Grok malformed stdout after one structured event does not prevent generation stall",
+    "Grok structured metadata stdout does not satisfy model first-output progress",
+    "Grok metadata after agent activity does not prevent generation stall",
+    "Grok misleading type or event fields do not count as ACP model progress",
+    "ordinary Grok provider exit and invalid delivery persist durable failure classification",
+    "Grok reviewer shard cannot finalize and synthesis binds exact candidate head",
+    "Grok reviewer requires explicit phase and immutable candidate commit",
+    "Grok synthesis validates canonical same-candidate shard receipts",
+    "Grok cleanup uncertainty is result unknown and not retry safe",
+    "cleanup uncertainty is fail closed and result unknown",
+    "Grok payload or data wrappers cannot spoof ACP model progress",
+    "Grok prompt preparation cleans a temp directory when prompt write fails",
+    "Grok prompt write plus cleanup failure is fail closed",
+    "cleanup failure preserves prior Grok provider exit evidence",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_runtime_supervisor.py",
@@ -573,6 +599,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/route_contract.py",
     "scripts/reviewer_supervisor.py",
     "scripts/assignment_lease_guard.py",
+    "scripts/assignment_runtime.py",
     "scripts/run_external_agent.mjs",
     "scripts/terminal_continuation.py",
     "tests/test_web_agent_execution.py",
@@ -591,6 +618,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_terminal_continuation.py",
     "tests/test_web_agent_events.py",
     "tests/test_evaluation_transaction.py",
+    "tests/test_assignment_runtime.py",
     "tests/external-agent-routing.test.mjs",
 )
 

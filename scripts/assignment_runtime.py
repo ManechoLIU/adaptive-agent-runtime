@@ -44,6 +44,7 @@ LINEAGE_WHITESPACE_RE = re.compile(r"[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u16
 PASS_EVIDENCE_SCHEMES = {"test-log", "green-test", "receipt", "git", "file", "artifact"}
 PASS_ARTIFACT_SCHEMES = {"git", "file", "artifact"}
 RECONCILIATION_EVIDENCE_SCHEMES = {"receipt", "artifact"}
+REVIEW_PHASES = {"full", "shard", "synthesis"}
 
 @dataclass(frozen=True)
 class RuntimePolicy:
@@ -261,6 +262,38 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
         health_mode = str(receipt.get("health_mode") or "heartbeat_progress").strip()
         if health_mode not in HEALTH_MODES:
             raise ValueError("unsupported runtime health_mode")
+        execution_role = str(receipt.get("execution_role") or "").strip() or None
+        execution_transport = str(receipt.get("execution_transport") or "").strip() or None
+        candidate_revision = str(receipt.get("candidate_revision") or "").strip() or None
+        review_phase = str(receipt.get("review_phase") or "").strip().lower() or None
+        raw_review_shards = receipt.get("review_shard_receipts")
+        if execution_role == "reviewer":
+            if not candidate_revision:
+                raise ValueError("reviewer runtime start requires candidate_revision")
+            if review_phase is None:
+                if execution_transport == "external_process":
+                    raise ValueError("external reviewer runtime start requires explicit review_phase=full|shard|synthesis")
+                review_phase = "full"
+            if review_phase not in REVIEW_PHASES:
+                raise ValueError("reviewer runtime start requires review_phase=full|shard|synthesis")
+            if review_phase == "synthesis":
+                if (
+                    not isinstance(raw_review_shards, list)
+                    or not raw_review_shards
+                    or any(not _traceable_locator(item, {"receipt"}) for item in raw_review_shards)
+                ):
+                    raise ValueError("reviewer synthesis requires non-empty review_shard_receipts")
+                review_shard_receipts = [str(item).strip() for item in raw_review_shards]
+                if len(set(review_shard_receipts)) != len(review_shard_receipts):
+                    raise ValueError("review_shard_receipts must be unique")
+            else:
+                if raw_review_shards not in (None, []):
+                    raise ValueError("review_shard_receipts are valid only for synthesis reviewer assignments")
+                review_shard_receipts = []
+        else:
+            if review_phase is not None or raw_review_shards not in (None, []):
+                raise ValueError("review_phase/review_shard_receipts are valid only for reviewer assignments")
+            review_shard_receipts = []
         exclusive_key = str(receipt.get("exclusive_execution_key") or "").strip() or None
         raw_exclusive_keys = receipt.get("exclusive_execution_keys")
         if raw_exclusive_keys is None:
@@ -323,8 +356,10 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "progress_deadline_at": _iso(issued + timedelta(minutes=deadline_minutes)),
             "last_progress_phase": "STARTED",
             "runtime_receipt_id": receipt.get("receipt_id"),
-            "execution_transport": str(receipt.get("execution_transport") or "").strip() or None,
-            "execution_role": str(receipt.get("execution_role") or "").strip() or None,
+            "execution_transport": execution_transport,
+            "execution_role": execution_role,
+            "review_phase": review_phase,
+            "review_shard_receipts": list(review_shard_receipts),
             "delegation_owner_kind": str(receipt.get("delegation_owner_kind") or "").strip() or None,
             "delegation_owner_id": str(receipt.get("delegation_owner_id") or "").strip() or None,
             "model": str(receipt.get("model") or "").strip() or None,
@@ -470,10 +505,69 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             lease["transport_outcome"] = transport_outcome
             lease["delivery_outcome"] = delivery_outcome
         lease["evidence"] = receipt["evidence"]; lease["artifacts"] = receipt["artifacts"]; lease["next_action"] = receipt["next_action"]; lease["retry_class"] = receipt["retry_class"]
+        failure_class = receipt.get("failure_class")
+        if failure_class is not None:
+            if not isinstance(failure_class, str) or not failure_class.strip():
+                raise ValueError("failure_class must be a non-empty string when provided")
+            lease["failure_class"] = failure_class.strip()
+        else:
+            lease.pop("failure_class", None)
+        retry_safe = receipt.get("retry_safe")
+        if retry_safe is not None:
+            if not isinstance(retry_safe, bool):
+                raise ValueError("retry_safe must be a boolean when provided")
+            lease["retry_safe"] = retry_safe
+        else:
+            lease.pop("retry_safe", None)
+        failure_details = receipt.get("failure_details")
+        if failure_details is not None:
+            if not isinstance(failure_details, dict):
+                raise ValueError("failure_details must be an object when provided")
+            lease["failure_details"] = dict(failure_details)
+        else:
+            lease.pop("failure_details", None)
         if receipt.get("review_verdict") is not None:
-            if lease.get("execution_role") != "reviewer" or not isinstance(receipt.get("review_verdict"), dict):
+            verdict = receipt.get("review_verdict")
+            if lease.get("execution_role") != "reviewer" or not isinstance(verdict, dict):
                 raise ValueError("review_verdict is only valid for a reviewer Assignment")
-            lease["review_verdict"] = json.loads(json.dumps(receipt["review_verdict"]))
+            phase = str(lease.get("review_phase") or "").strip().lower()
+            candidate = str(lease.get("candidate_revision") or "").strip()
+            if phase == "shard":
+                raise ValueError("reviewer shard cannot publish canonical review_verdict")
+            if phase not in {"full", "synthesis"}:
+                raise ValueError("reviewer canonical verdict requires full or synthesis review_phase")
+            if str(verdict.get("reviewed_head") or "").strip() != candidate:
+                raise ValueError("review_verdict reviewed_head must match candidate_revision")
+            if phase == "synthesis":
+                expected = list(lease.get("review_shard_receipts") or [])
+                evidence_receipts = [
+                    str(item).strip() for item in receipt.get("evidence", [])
+                    if isinstance(item, str) and item.strip().startswith("receipt:")
+                ]
+                if sorted(evidence_receipts) != sorted(expected):
+                    raise ValueError("synthesis evidence must exactly match review_shard_receipts")
+                for locator in expected:
+                    receipt_id = locator.split(":", 1)[1].strip()
+                    matches = [
+                        item for other_id, item in leases.items()
+                        if other_id != aid and isinstance(item, dict)
+                        and str(item.get("runtime_receipt_id") or "").strip() == receipt_id
+                    ]
+                    if len(matches) != 1:
+                        raise ValueError("synthesis shard receipt is not a unique canonical runtime receipt")
+                    shard = matches[0]
+                    if (
+                        shard.get("execution_role") != "reviewer"
+                        or shard.get("review_phase") != "shard"
+                        or str(shard.get("candidate_revision") or "").strip() != candidate
+                        or shard.get("terminal_state") != "completed"
+                        or shard.get("transport_outcome") != "completed"
+                        or shard.get("delivery_outcome") not in {"pass", "fail"}
+                        or bool(shard.get("result_unknown"))
+                        or shard.get("review_verdict") is not None
+                    ):
+                        raise ValueError("synthesis shard receipt is not a completed same-candidate shard review")
+            lease["review_verdict"] = json.loads(json.dumps(verdict))
         lease["last_progress_phase"] = "DELIVERY"
     lease["runtime_receipt_id"] = receipt.get("receipt_id") or lease.get("runtime_receipt_id")
     return out
