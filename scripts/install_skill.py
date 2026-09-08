@@ -136,6 +136,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups",
     "tests.test_install_skill.HostAdapterInstallationTests."
     "test_configure_host_adapters_can_update_codex_hooks_without_touching_ai_bridge",
+    "tests.test_install_skill.HostAdapterInstallationTests."
+    "test_install_cli_skip_ai_bridge_never_rolls_back_concurrent_zshenv_update",
     "tests.test_install_skill.WebAgentHealthServiceInstallationTests."
     "test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load",
     "tests.test_install_skill.WebAgentHealthServiceInstallationTests."
@@ -1859,13 +1861,19 @@ def _rollback_install_transaction(states: list[dict[str, Any]]) -> list[str]:
 
 
 def _install_resource_lock_paths(
-    target: Path, hooks: Path, zshenv: Path, health_service_plist: Path | None = None
+    target: Path,
+    hooks: Path,
+    zshenv: Path,
+    health_service_plist: Path | None = None,
+    *,
+    include_zshenv: bool = True,
 ) -> list[Path]:
     paths = [
         target.parent / f".{target.name}.install.lock",
         hooks.parent / f".{hooks.name}.adaptive-agent-runtime.lock",
-        zshenv.parent / f".{zshenv.name}.adaptive-agent-runtime.lock",
     ]
+    if include_zshenv:
+        paths.append(zshenv.parent / f".{zshenv.name}.adaptive-agent-runtime.lock")
     if health_service_plist is not None:
         paths.append(
             health_service_plist.parent
@@ -1937,6 +1945,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         hooks_path,
         zshenv_path,
         None if args.no_configure_runtime_services else health_service_path,
+        include_zshenv=(
+            not args.no_configure_host_adapters and not args.no_configure_ai_bridge
+        ),
     )
     try:
         try:
@@ -1974,10 +1985,9 @@ def _run_install_transaction(
         backup_root = Path(backup_dir)
         snapshots = [_snapshot_path(target_path, backup_root, "target")]
         if not args.no_configure_host_adapters:
-            snapshots.extend([
-                _snapshot_path(hooks_path, backup_root, "hooks"),
-                _snapshot_path(zshenv_path, backup_root, "zshenv"),
-            ])
+            snapshots.append(_snapshot_path(hooks_path, backup_root, "hooks"))
+            if not args.no_configure_ai_bridge:
+                snapshots.append(_snapshot_path(zshenv_path, backup_root, "zshenv"))
         prior_health_snapshot = None
         if not args.no_configure_runtime_services:
             prior_health_snapshot = _snapshot_path(

@@ -696,6 +696,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_install_skill.ProjectContextHookInstallationTests.test_runtime_hooks_keep_trust_stable_legacy_indices",
             "tests.test_install_skill.ProjectContextHookInstallationTests.test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups",
             "tests.test_install_skill.HostAdapterInstallationTests.test_configure_host_adapters_can_update_codex_hooks_without_touching_ai_bridge",
+            "tests.test_install_skill.HostAdapterInstallationTests.test_install_cli_skip_ai_bridge_never_rolls_back_concurrent_zshenv_update",
             "tests.test_install_skill.WebAgentHealthServiceInstallationTests.test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load",
             "tests.test_install_skill.WebAgentHealthServiceInstallationTests.test_runtime_service_load_failure_preserves_legacy_web_audit",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_resolve_reentry_session_strong_host_target_does_not_require_manual_lease",
@@ -1130,6 +1131,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups(self): self.assertTrue(True)\n"
                 "class HostAdapterInstallationTests(unittest.TestCase):\n"
                 "    def test_configure_host_adapters_can_update_codex_hooks_without_touching_ai_bridge(self): self.assertTrue(True)\n"
+                "    def test_install_cli_skip_ai_bridge_never_rolls_back_concurrent_zshenv_update(self): self.assertTrue(True)\n"
                 "class WebAgentHealthServiceInstallationTests(unittest.TestCase):\n"
                 "    def test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load(self): self.assertTrue(True)\n"
                 "    def test_runtime_service_load_failure_preserves_legacy_web_audit(self): self.assertTrue(True)\n",
@@ -1438,6 +1440,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups(self): self.assertTrue(True)\n"
                 "class HostAdapterInstallationTests(unittest.TestCase):\n"
                 "    def test_configure_host_adapters_can_update_codex_hooks_without_touching_ai_bridge(self): self.assertTrue(True)\n"
+                "    def test_install_cli_skip_ai_bridge_never_rolls_back_concurrent_zshenv_update(self): self.assertTrue(True)\n"
                 "class WebAgentHealthServiceInstallationTests(unittest.TestCase):\n"
                 "    def test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load(self): self.assertTrue(True)\n"
                 "    def test_runtime_service_load_failure_preserves_legacy_web_audit(self): self.assertTrue(True)\n",
@@ -1822,6 +1825,42 @@ class HostAdapterInstallationTests(unittest.TestCase):
             self.assertEqual(hooks.read_text(encoding="utf-8"), '{"keep":"hooks"}\n')
             self.assertEqual(zshenv.read_text(encoding="utf-8"), "export KEEP=1\n")
             self.assertIn("rolled back", output.getvalue().lower())
+
+    def test_install_cli_skip_ai_bridge_never_rolls_back_concurrent_zshenv_update(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from scripts.install_skill import main
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = InstallMigrationContractTests().make_source(root)
+            target = root / "installed" / "adaptive-delivery"
+            target.mkdir(parents=True)
+            (target / "old.txt").write_text("old install", encoding="utf-8")
+            hooks = root / "hooks.json"; hooks.write_text('{"keep":"hooks"}\n', encoding="utf-8")
+            zshenv = root / ".zshenv"; zshenv.write_text("export USER_OLD=1\n", encoding="utf-8")
+            output = io.StringIO()
+
+            def desktop_hook_failure(*args, **kwargs):
+                self.assertFalse(kwargs["configure_ai_bridge"])
+                hooks.write_text('{"mutated":true}\n', encoding="utf-8")
+                zshenv.write_text("export USER_NEW=1\n", encoding="utf-8")
+                raise OSError("desktop hook failure after concurrent zshenv update")
+
+            with patch("scripts.install_skill.configure_host_adapters", side_effect=desktop_hook_failure):
+                with contextlib.redirect_stdout(output):
+                    code = main([
+                        "--source", str(source), "--target", str(target),
+                        "--summary", "desktop only rollback", "--impact", "none",
+                        "--stop-condition", "ready", "--no-configure-runtime-services",
+                        "--no-configure-ai-bridge", "--hooks-file", str(hooks),
+                        "--zshenv-file", str(zshenv),
+                    ])
+
+            self.assertNotEqual(code, 0)
+            self.assertEqual((target / "old.txt").read_text(encoding="utf-8"), "old install")
+            self.assertEqual(hooks.read_text(encoding="utf-8"), '{"keep":"hooks"}\n')
+            self.assertEqual(zshenv.read_text(encoding="utf-8"), "export USER_NEW=1\n")
 
     def test_different_targets_sharing_host_files_use_common_resource_lock(self):
         import subprocess, sys, time
