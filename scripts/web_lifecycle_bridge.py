@@ -4067,6 +4067,14 @@ def _rule_revision_from_state(lifecycle_state: dict[str, Any]) -> str | None:
     return None
 
 
+def _lifecycle_delivery_key(lifecycle_state: dict[str, Any]) -> str:
+    revision = _rule_revision_from_state(lifecycle_state)
+    if revision:
+        return f"rule-update:{revision}"
+    generation = int(lifecycle_state.get("wake_generation", 0) or 0)
+    return f"wake-generation:{generation}"
+
+
 def schedule_guarded_rule_wake(
     *,
     lifecycle_state: dict[str, Any],
@@ -4131,13 +4139,20 @@ def maybe_schedule_rule_wake(
         return "none"
     receipt_id = f"rule-update:{revision}"
     existing = load_json(state_path)
-    if existing.get("receipt_id") == receipt_id and existing.get("state") in {"RESUME_PENDING", "RESUME_CONFIRMED"}:
+    if existing.get("receipt_id") == receipt_id and existing.get("state") in {
+        "RESUME_PENDING",
+        "RESUME_CONFIRMED",
+        "WAITING_FOR_CONTROLLER_PROGRESS",
+        "WEB_REENTRY_SUBMITTED",
+        "WEB_REENTRY_RESULT_UNKNOWN",
+        "RESUME_STALLED_NO_PROGRESS",
+    }:
         return "already_scheduled"
-    schedule_auto_native_stop(
+    scheduled = schedule_auto_native_stop(
         session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry, codex=codex,
         delay_seconds=delay_seconds, state_path=state_path, capture_path=capture_path, runtime_path=runtime_path,
     )
-    return "scheduled"
+    return "scheduled" if scheduled else "already_scheduled"
 
 
 def refresh_rule_wake_state(*, session_id: str, repo: Path) -> dict[str, Any]:
@@ -4301,6 +4316,28 @@ def continuation_supervisor_needs_bootstrap(
     if lifecycle_state.get("requires_user") is True:
         return False
     lifecycle_fingerprint = _wake_event_fingerprint(lifecycle_state)
+    delivery_key = _lifecycle_delivery_key(lifecycle_state)
+    terminal_key = str(supervisor_state.get("delivery_terminal_key") or "").strip()
+    terminal_receipt = str(supervisor_state.get("delivery_terminal_receipt_id") or "").strip()
+    terminal_outcome = str(supervisor_state.get("delivery_terminal_outcome") or "").strip()
+    if (
+        terminal_key == delivery_key
+        and terminal_receipt
+        and terminal_outcome in {"submit_confirmed", "result_unknown"}
+    ):
+        return False
+    legacy_receipt = str(supervisor_state.get("receipt_id") or "").strip()
+    if (
+        delivery_key.startswith("rule-update:")
+        and legacy_receipt == delivery_key
+        and str(supervisor_state.get("state") or "") in {
+            "WAITING_FOR_CONTROLLER_PROGRESS",
+            "WEB_REENTRY_SUBMITTED",
+            "WEB_REENTRY_RESULT_UNKNOWN",
+            "RESUME_STALLED_NO_PROGRESS",
+        }
+    ):
+        return False
     if (
         str(supervisor_state.get("state") or "") == "WAITING_FOR_CONTROLLER_PROGRESS"
         and str(supervisor_state.get("last_lifecycle_fingerprint") or "") == lifecycle_fingerprint
@@ -4457,6 +4494,25 @@ def _schedule_auto_native_stop_locked(
 ) -> bool:
     """Schedule while the caller holds the supervisor lock."""
     prior = load_json(state_path)
+    same_receipt = prior.get("receipt_id") == receipt_id
+    terminal_receipt = str(prior.get("delivery_terminal_receipt_id") or "").strip()
+    terminal_outcome = str(prior.get("delivery_terminal_outcome") or "").strip()
+    legacy_terminal = str(prior.get("state") or "") in {
+        "WAITING_FOR_CONTROLLER_PROGRESS",
+        "WEB_REENTRY_SUBMITTED",
+        "WEB_REENTRY_RESULT_UNKNOWN",
+        "RESUME_STALLED_NO_PROGRESS",
+    }
+    if same_receipt and (
+        (terminal_receipt == receipt_id and terminal_outcome in {"submit_confirmed", "result_unknown"})
+        or legacy_terminal
+    ):
+        prior["last_coalesced_at_unix_ms"] = int(time.time() * 1000)
+        prior["terminal_delivery_coalesced_count"] = int(
+            prior.get("terminal_delivery_coalesced_count", 0) or 0
+        ) + 1
+        write_auto_stop_state(state_path, prior)
+        return False
     current_token = str(prior.get("supervisor_token") or "").strip()
     current_receipt = str(prior.get("supervisor_receipt_id") or "").strip()
     current_live = (
@@ -4479,7 +4535,6 @@ def _schedule_auto_native_stop_locked(
         write_auto_stop_state(state_path, prior)
         return False
 
-    same_receipt = prior.get("receipt_id") == receipt_id
     now_ms = int(time.time() * 1000)
     supervisor_token = secrets.token_hex(16)
     value = {
@@ -4963,56 +5018,38 @@ def _run_auto_native_stop_impl(
                 unchanged = int(current.get("unchanged_continuation_count", 0) or 0)
                 unchanged = unchanged + 1 if previous_fingerprint == fingerprint else 0
                 continuation_count = int(current.get("continuation_count", 0) or 0) + 1
-                manual_fenced = attempt.get("delivery_authorization") == "manual_fenced"
-                confirmed_state = (
-                    "WAITING_FOR_CONTROLLER_PROGRESS"
-                    if manual_fenced
-                    else "WEB_REENTRY_SUBMITTED"
-                )
+                now_ms = int(time.time() * 1000)
                 current.update({
-                    "state": confirmed_state,
+                    "state": "WAITING_FOR_CONTROLLER_PROGRESS",
                     "pending_control_event": True,
                     "continuation_count": continuation_count,
                     "unchanged_continuation_count": unchanged,
                     "last_lifecycle_fingerprint": fingerprint,
-                    "completed_at_unix_ms": int(time.time() * 1000),
+                    "completed_at_unix_ms": now_ms,
                     "returncode": 0,
+                    "delivery_terminal_receipt_id": receipt_id,
+                    "delivery_terminal_key": _lifecycle_delivery_key(lifecycle_state),
+                    "delivery_terminal_outcome": "submit_confirmed",
+                    "delivery_terminal_at_unix_ms": now_ms,
                 })
                 current.pop("failure_class", None)
                 current.pop("error_code", None)
                 current.pop("blocked_registry_sha256", None)
                 current.pop("blocked_controller_fence", None)
                 current.pop("blocked_since_unix_ms", None)
-                if manual_fenced:
-                    try:
-                        waiting_controller_fence = _controller_web_wait_fence(
-                            registry=registry, controller_id=session_id
-                        )
-                    except (OSError, ValueError, PermissionError):
-                        waiting_controller_fence = None
-                    if isinstance(waiting_controller_fence, dict):
-                        current["waiting_controller_fence"] = waiting_controller_fence
-                    else:
-                        current.pop("waiting_controller_fence", None)
-                    current.pop("waiting_registry_sha256", None)
-                    current["waiting_since_unix_ms"] = int(time.time() * 1000)
-                    write_auto_stop_state(state_path, current)
-                    return 0
-                if unchanged >= AUTO_CONTINUATION_STALL_LIMIT:
-                    current.update({
-                        "state": "RESUME_STALLED_NO_PROGRESS",
-                        "failure_class": "confirmed_web_reentry_without_machine_progress",
-                        "error_code": "WEB_LIFECYCLE_CONTINUATION_STALLED",
-                    })
-                    write_auto_stop_state(state_path, current)
-                    return 78
+                try:
+                    waiting_controller_fence = _controller_web_wait_fence(
+                        registry=registry, controller_id=session_id
+                    )
+                except (OSError, ValueError, PermissionError):
+                    waiting_controller_fence = None
+                if isinstance(waiting_controller_fence, dict):
+                    current["waiting_controller_fence"] = waiting_controller_fence
+                else:
+                    current.pop("waiting_controller_fence", None)
+                current.pop("waiting_registry_sha256", None)
+                current["waiting_since_unix_ms"] = now_ms
                 write_auto_stop_state(state_path, current)
-                _rearm_auto_native_stop(
-                    session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,
-                    codex=codex, delay_seconds=10.0, state_path=state_path, runtime_path=runtime_path,
-                    supervisor_token=supervisor_token,
-                    supervisor_lock_held=owned_lock_held,
-                )
                 return 0
             failure_class = str(attempt.get("failure_class") or "web_reentry_unavailable")
             retry_count = int(current.get("retry_count", 0) or 0)
@@ -5038,6 +5075,14 @@ def _run_auto_native_stop_impl(
                 "web_reentry_result_unknown",
             }:
                 current["last_lifecycle_fingerprint"] = fingerprint
+                if failure_class == "web_reentry_result_unknown":
+                    terminal_now_ms = int(time.time() * 1000)
+                    current.update({
+                        "delivery_terminal_receipt_id": receipt_id,
+                        "delivery_terminal_key": _lifecycle_delivery_key(lifecycle_state),
+                        "delivery_terminal_outcome": "result_unknown",
+                        "delivery_terminal_at_unix_ms": terminal_now_ms,
+                    })
                 try:
                     blocked_controller_fence = _controller_web_wait_fence(
                         registry=registry, controller_id=session_id

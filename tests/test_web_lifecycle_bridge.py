@@ -7595,12 +7595,13 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
                 )
             self.assertEqual(code, 0)
             reentry.assert_called_once()
-            schedule.assert_called_once()
-            self.assertGreaterEqual(schedule.call_args.kwargs["delay_seconds"], 5)
+            schedule.assert_not_called()
             saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["state"], "WEB_REENTRY_SUBMITTED")
+            self.assertEqual(saved["state"], "WAITING_FOR_CONTROLLER_PROGRESS")
             self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
             self.assertEqual(saved["continuation_count"], 1)
+            self.assertEqual(saved["delivery_terminal_receipt_id"], "web-r1")
+            self.assertEqual(saved["delivery_terminal_outcome"], "submit_confirmed")
 
     def test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target(self) -> None:
         from unittest.mock import patch
@@ -7682,11 +7683,13 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
                 )
             self.assertEqual(code, 0)
             self.assertEqual([kind for kind, _ in calls], ["verify", "submit"])
-            schedule.assert_called_once()
+            schedule.assert_not_called()
             saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["state"], "WEB_REENTRY_SUBMITTED")
+            self.assertEqual(saved["state"], "WAITING_FOR_CONTROLLER_PROGRESS")
             self.assertTrue(saved["host_attested"])
             self.assertTrue(saved["strong_web_identity_established"])
+            self.assertEqual(saved["delivery_terminal_receipt_id"], "web-host-r1")
+            self.assertEqual(saved["delivery_terminal_outcome"], "submit_confirmed")
 
     def test_detached_supervisor_retries_transient_registered_host_attestation_failure(self) -> None:
         from unittest.mock import patch
@@ -8989,3 +8992,104 @@ def _confirmed_web_reentry_clears_stale_nonretryable_block_evidence(self):
 
 
 WebLocalReentryIntegrationTests.test_confirmed_web_reentry_clears_stale_nonretryable_block_evidence = _confirmed_web_reentry_clears_stale_nonretryable_block_evidence
+
+
+def _strong_host_confirmed_submit_waits_without_rearm(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status":"active","session_id":"web-current","generation":4,
+            "provenance":"host_attested_same_controller_recovery","binding_mode":"resume_only",
+            "identity_proof":"host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host":"web","execution_target_session_id":"web-current",
+            "generation":4,"provenance":"web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id":"rule-update:rev-confirmed","session_id":"controller-1",
+            "repo":str(repo.resolve()),"state":"RESUME_PENDING","pending_control_event":True,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event":True,"requires_user":False,"controller_host":"web",
+            "wake_generation":7,"triggers":["rule_update_pending:rev-confirmed"],
+            "snapshot":{"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[],
+                "rule_handshake":{"installed_revision":"rev-confirmed","state":"pending_ack","blocking":True}},
+        }
+        confirmed = {
+            "operation":"web_reentry","result":"CONFIRMED","state":"WEB_REENTRY_SUBMITTED","returncode":0,
+            "execution_target_session_id":"web-current","target_generation":4,"ownership_generation":4,
+            "target_mode":"explicit_current","delivery_authorization":"host_attested",
+            "host_attested":True,"strong_web_identity_established":True,
+        }
+        def verifier(**_kwargs): return {"call_receipt":"host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        with patch.object(web_bridge,"_load_lifecycle_state",return_value=lifecycle), patch.object(
+            web_bridge,"_registered_peer_attestation_verifier",return_value=verifier
+        ), patch.object(web_bridge,"_execute_registered_web_host_reentry",return_value=confirmed), patch.object(
+            web_bridge,"schedule_auto_native_stop"
+        ) as schedule:
+            code=web_bridge.run_auto_native_stop(
+                session_id="controller-1",repo=repo,receipt_id="rule-update:rev-confirmed",
+                registry=registry,codex="codex",delay_seconds=0,state_path=state_path,
+            )
+        saved=json.loads(state_path.read_text())
+    self.assertEqual(code,0)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"],"WAITING_FOR_CONTROLLER_PROGRESS")
+    self.assertEqual(saved["delivery_terminal_receipt_id"],"rule-update:rev-confirmed")
+    self.assertEqual(saved["delivery_terminal_outcome"],"submit_confirmed")
+
+
+def _terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes(self):
+    base = {
+        "pending_control_event":True,"requires_user":False,"wake_generation":7,
+        "triggers":["rule_update_pending:rev-confirmed"],
+        "snapshot":{"head":"h1","ledger_sha256":"l1","worktree_status_sha256":"w1","ready_ids":[],"runnable_ids":[],"candidate_revisions":[],
+            "rule_handshake":{"installed_revision":"rev-confirmed","state":"pending_ack","blocking":True}},
+    }
+    changed=json.loads(json.dumps(base))
+    changed["snapshot"]["head"]="h2"
+    changed["triggers"].append("main_head_changed")
+    state={
+        "state":"WAITING_FOR_CONTROLLER_PROGRESS","receipt_id":"rule-update:rev-confirmed",
+        "delivery_terminal_receipt_id":"rule-update:rev-confirmed",
+        "delivery_terminal_key":"rule-update:rev-confirmed","delivery_terminal_outcome":"submit_confirmed",
+    }
+    self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(base,state))
+    self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(changed,state))
+    newer=json.loads(json.dumps(changed))
+    newer["triggers"]=["rule_update_pending:rev-new"]
+    newer["snapshot"]["rule_handshake"]["installed_revision"]="rev-new"
+    self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(newer,state))
+
+
+def _same_terminal_receipt_cannot_be_rescheduled(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        root=Path(tmp); repo=root/"repo"; repo.mkdir(); subprocess.run(["git","init","-q","-b","main",str(repo)],check=True)
+        registry=root/"registry.json"; registry.write_text("{}")
+        state=root/"auto.json"
+        state.write_text(json.dumps({
+            "receipt_id":"rule-update:rev1","state":"WEB_REENTRY_RESULT_UNKNOWN",
+            "delivery_terminal_receipt_id":"rule-update:rev1","delivery_terminal_key":"rule-update:rev1",
+            "delivery_terminal_outcome":"result_unknown","continuation_count":1,"retry_count":0,
+        }))
+        with patch.object(web_bridge.subprocess,"Popen") as popen:
+            same=web_bridge.schedule_auto_native_stop(
+                session_id="controller-1",repo=repo,receipt_id="rule-update:rev1",registry=registry,
+                codex="codex",delay_seconds=1,state_path=state,
+            )
+        self.assertFalse(same)
+        popen.assert_not_called()
+        preserved=json.loads(state.read_text())
+        self.assertEqual(preserved["state"],"WEB_REENTRY_RESULT_UNKNOWN")
+        self.assertEqual(preserved["delivery_terminal_receipt_id"],"rule-update:rev1")
+
+
+WebLocalReentryIntegrationTests.test_strong_host_confirmed_submit_waits_without_rearm = _strong_host_confirmed_submit_waits_without_rearm
+WebContinuationSupervisorBootstrapTests.test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes = _terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes
+WebAutoStopSupervisorCoalescingTests.test_same_terminal_receipt_cannot_be_rescheduled = _same_terminal_receipt_cannot_be_rescheduled
