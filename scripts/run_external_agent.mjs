@@ -104,15 +104,16 @@ function externalKillGraceMs() {
 
 function grokModelProgressKind(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return null;
-  const candidates = [event, event.update, event.payload, event.data].filter(
-    (value) => value && typeof value === "object" && !Array.isArray(value),
+  const sessionId = [event.sessionId, event.session_id].find(
+    (value) => typeof value === "string" && value.trim(),
   );
-  for (const candidate of candidates) {
-    for (const key of ["sessionUpdate", "session_update"]) {
-      const value = candidate[key];
-      if (typeof value === "string" && GROK_MODEL_PROGRESS_SESSION_UPDATES.has(value.trim())) {
-        return value.trim();
-      }
+  if (!sessionId) return null;
+  const update = event.update;
+  if (!update || typeof update !== "object" || Array.isArray(update)) return null;
+  for (const key of ["sessionUpdate", "session_update"]) {
+    const value = update[key];
+    if (typeof value === "string" && GROK_MODEL_PROGRESS_SESSION_UPDATES.has(value.trim())) {
+      return value.trim();
     }
   }
   return null;
@@ -159,7 +160,12 @@ export function runCleanupStack(cleanups, priorError = null) {
   );
 }
 
-function prepareGrokPrompt(prompt, { assignmentRole = null } = {}) {
+export function prepareGrokPrompt(prompt, {
+  assignmentRole = null,
+  createTempDir = mkdtempSync,
+  writePrompt = writeFileSync,
+  cleanupDirectory = removeDirectoryConfirmed,
+} = {}) {
   const observedBytes = Buffer.byteLength(prompt, "utf8");
   const maxBytes = grokMaxPromptBytes();
   if (observedBytes > maxBytes) {
@@ -176,13 +182,45 @@ function prepareGrokPrompt(prompt, { assignmentRole = null } = {}) {
       },
     );
   }
-  const directory = mkdtempSync(path.join(tmpdir(), "adaptive-delivery-grok-prompt-"));
+  let directory;
+  try {
+    directory = createTempDir(path.join(tmpdir(), "adaptive-delivery-grok-prompt-"));
+  } catch (error) {
+    throw new ExternalAgentExecutionError(`prompt_file_prepare_failed: ${error.message}`, {
+      failureClass: "prompt_file_prepare_failed", retrySafe: true, resultUnknown: false,
+      details: { prepare_error: String(error?.message || error) },
+    });
+  }
   const promptPath = path.join(directory, "prompt.txt");
-  writeFileSync(promptPath, prompt, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  try {
+    writePrompt(promptPath, prompt, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  } catch (error) {
+    const writeError = new ExternalAgentExecutionError(`prompt_file_write_failed: ${error.message}`, {
+      failureClass: "prompt_file_write_failed", retrySafe: true, resultUnknown: false,
+      details: { write_error: String(error?.message || error) },
+    });
+    try {
+      cleanupDirectory(directory);
+    } catch (cleanupError) {
+      throw new ExternalAgentExecutionError(
+        `cleanup_failed: prompt_file: ${cleanupError.message}; prior=${writeError.message}`,
+        {
+          failureClass: "cleanup_failed", retrySafe: false, resultUnknown: true,
+          details: {
+            failed_resources: ["prompt_file"],
+            cleanup_failures: [{ label: "prompt_file", error: String(cleanupError?.message || cleanupError) }],
+            prior_failure_class: writeError.failureClass,
+            prior_error: writeError.message,
+          },
+        },
+      );
+    }
+    throw writeError;
+  }
   return {
     path: promptPath,
     bytes: observedBytes,
-    cleanup: () => removeDirectoryConfirmed(directory),
+    cleanup: () => cleanupDirectory(directory),
   };
 }
 

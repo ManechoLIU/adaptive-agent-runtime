@@ -568,6 +568,9 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok synthesis validates canonical same-candidate shard receipts",
     "Grok cleanup uncertainty is result unknown and not retry safe",
     "cleanup uncertainty is fail closed and result unknown",
+    "Grok payload or data wrappers cannot spoof ACP model progress",
+    "Grok prompt preparation cleans a temp directory when prompt write fails",
+    "Grok prompt write plus cleanup failure is fail closed",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_runtime_supervisor.py",

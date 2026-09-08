@@ -1922,3 +1922,59 @@ test("cleanup uncertainty is fail closed and result unknown", async () => {
     },
   );
 });
+
+test("Grok payload or data wrappers cannot spoof ACP model progress", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?acp-envelope=${Date.now()}`);
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-fake-acp-wrapper-"));
+  const code = 'let flip=false; const timer=setInterval(()=>{flip=!flip; process.stdout.write(JSON.stringify(flip?{payload:{sessionUpdate:"tool_call"}}:{data:{session_update:"agent_message_chunk"}})+"\\n")},25); setTimeout(()=>{clearInterval(timer);process.exit(0)},1000);';
+  const previous = {
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "120";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "1000";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1500";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      (error) => error?.failureClass === "first_output_timeout",
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      const envName = key === "first" ? "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS" : key === "stall" ? "AD_GROK_STALL_TIMEOUT_MS" : key === "absolute" ? "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS" : "AD_EXTERNAL_KILL_GRACE_MS";
+      if (value === undefined) delete process.env[envName]; else process.env[envName] = value;
+    }
+  }
+});
+
+test("Grok prompt preparation cleans a temp directory when prompt write fails", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?prompt-write-fail=${Date.now()}`);
+  assert.equal(typeof runtimeModule.prepareGrokPrompt, "function");
+  const created = "/tmp/fake-grok-prompt-dir";
+  let cleaned = false;
+  assert.throws(
+    () => runtimeModule.prepareGrokPrompt("secret prompt", {
+      createTempDir: () => created,
+      writePrompt: () => { throw new Error("disk write failed"); },
+      cleanupDirectory: (directory) => { assert.equal(directory, created); cleaned = true; },
+    }),
+    (error) => error?.failureClass === "prompt_file_write_failed" && error?.retrySafe === true && error?.resultUnknown === false,
+  );
+  assert.equal(cleaned, true);
+});
+
+test("Grok prompt write plus cleanup failure is fail closed", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?prompt-cleanup-fail=${Date.now()}`);
+  assert.equal(typeof runtimeModule.prepareGrokPrompt, "function");
+  assert.throws(
+    () => runtimeModule.prepareGrokPrompt("secret prompt", {
+      createTempDir: () => "/tmp/fake-grok-prompt-dir",
+      writePrompt: () => { throw new Error("disk write failed"); },
+      cleanupDirectory: () => { throw new Error("cleanup denied"); },
+    }),
+    (error) => error?.failureClass === "cleanup_failed" && error?.retrySafe === false && error?.resultUnknown === true,
+  );
+});

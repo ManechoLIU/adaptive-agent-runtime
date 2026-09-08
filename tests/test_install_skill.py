@@ -810,7 +810,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok reviewer requires explicit phase and immutable candidate commit', () => { assert.equal(1, 1); });\n"
                 "test('Grok synthesis validates canonical same-candidate shard receipts', () => { assert.equal(1, 1); });\n"
                 "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n"
-                "test('cleanup uncertainty is fail closed and result unknown', () => { assert.equal(1, 1); });\n",
+                "test('cleanup uncertainty is fail closed and result unknown', () => { assert.equal(1, 1); });\n"
+                "test('Grok payload or data wrappers cannot spoof ACP model progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok prompt preparation cleans a temp directory when prompt write fails', () => { assert.equal(1, 1); });\n"
+                "test('Grok prompt write plus cleanup failure is fail closed', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
@@ -1228,7 +1231,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok reviewer requires explicit phase and immutable candidate commit', () => { assert.equal(1, 1); });\n"
                 "test('Grok synthesis validates canonical same-candidate shard receipts', () => { assert.equal(1, 1); });\n"
                 "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n"
-                "test('cleanup uncertainty is fail closed and result unknown', () => { assert.equal(1, 1); });\n",
+                "test('cleanup uncertainty is fail closed and result unknown', () => { assert.equal(1, 1); });\n"
+                "test('Grok payload or data wrappers cannot spoof ACP model progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok prompt preparation cleans a temp directory when prompt write fails', () => { assert.equal(1, 1); });\n"
+                "test('Grok prompt write plus cleanup failure is fail closed', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
