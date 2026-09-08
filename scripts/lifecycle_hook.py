@@ -730,20 +730,15 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
     return remaining
 
 
-def _shell_reads_pipeline_stdin(tokens: list[str]) -> bool:
+def _unwrap_execution_target(tokens: list[str]) -> list[str]:
     remaining = _strip_command_prefix(tokens)
-    while remaining and remaining[0] in {"(", "{"}:
-        remaining.pop(0)
-        remaining = _strip_command_prefix(remaining)
-    if not remaining:
-        return False
-    executable = Path(remaining[0]).name.lower()
-    if executable in {"timeout", "gtimeout"} and _bounded_timeout_command(remaining):
-        return False
-    if executable in {"command", "exec", "nohup", "time", "nice"}:
-        index = 1
+    while remaining:
+        executable = Path(remaining[0]).name.lower()
         if executable == "command" and len(remaining) > 1 and remaining[1] in {"-v", "-V"}:
-            return False
+            return []
+        if executable not in {"arch", "command", "exec", "nohup", "time", "nice"}:
+            return remaining
+        index = 1
         while index < len(remaining) and remaining[index].startswith("-"):
             token = remaining[index]
             if token == "--":
@@ -758,10 +753,28 @@ def _shell_reads_pipeline_stdin(tokens: list[str]) -> bool:
                 index += 2
                 continue
             index += 1
-        return _shell_reads_pipeline_stdin(remaining[index:])
+        remaining = _strip_command_prefix(remaining[index:])
+    return []
+
+
+def _shell_reads_pipeline_stdin(tokens: list[str]) -> bool:
+    remaining = _strip_command_prefix(tokens)
+    while remaining and remaining[0] in {"(", "{"}:
+        remaining.pop(0)
+        remaining = _strip_command_prefix(remaining)
+    if not remaining:
+        return False
+    executable = Path(remaining[0]).name.lower()
+    if executable in {"timeout", "gtimeout"} and _bounded_timeout_command(remaining):
+        return False
+    remaining = _unwrap_execution_target(remaining)
+    if not remaining:
+        return False
+    executable = Path(remaining[0]).name.lower()
     if executable not in {"bash", "sh", "zsh"}:
         return False
     index = 1
+    force_stdin = False
     while index < len(remaining):
         token = remaining[index]
         if token in {")", "}"}:
@@ -774,14 +787,22 @@ def _shell_reads_pipeline_stdin(tokens: list[str]) -> bool:
             token.startswith("-") and not token.startswith("--") and "c" in token[1:]
         ):
             return False
+        if token == "-s" or (
+            token.startswith("-") and not token.startswith("--") and "s" in token[1:]
+        ):
+            force_stdin = True
+            index += 1
+            continue
         if token in {"-O", "-o"} and index + 1 < len(remaining):
             index += 2
             continue
         if token.startswith("-"):
             index += 1
             continue
-        return False
-    return index >= len(remaining) or all(token in {")", "}"} for token in remaining[index:])
+        return force_stdin
+    return force_stdin or index >= len(remaining) or all(
+        token in {")", "}"} for token in remaining[index:]
+    )
 
 
 def _pipeline_executes_shell_input(command: str) -> bool:
@@ -809,7 +830,7 @@ def _pipeline_executes_shell_input(command: str) -> bool:
 
 def _redirection_executes_shell_input(command: str) -> bool:
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>=")
         lexer.whitespace_split = True
         lexer.commenters = ""
         tokens = list(lexer)
@@ -817,6 +838,20 @@ def _redirection_executes_shell_input(command: str) -> bool:
         return False
     for index, token in enumerate(tokens):
         if token not in {"<(", ">(", "=("}:
+            continue
+        prefix: list[str] = []
+        for candidate in reversed(tokens[:index]):
+            if candidate in _SHELL_SEPARATORS or (
+                candidate and set(candidate) <= {";", "&", "|"}
+            ):
+                break
+            prefix.insert(0, candidate)
+        target = _unwrap_execution_target(prefix)
+        code_file_sink = bool(target) and (
+            target[0] == "."
+            or Path(target[0]).name.lower() in {"bash", "sh", "source", "zsh"}
+        )
+        if token == "=(" and not code_file_sink:
             continue
         inner: list[str] = []
         depth = 1
@@ -828,7 +863,7 @@ def _redirection_executes_shell_input(command: str) -> bool:
                 if depth == 0:
                     break
             inner.append(candidate)
-        if _shell_reads_pipeline_stdin(inner) or _persistent_foreground_command(
+        if code_file_sink or _shell_reads_pipeline_stdin(inner) or _persistent_foreground_command(
             " ".join(inner)
         ):
             return True
@@ -839,7 +874,8 @@ def _redirection_executes_shell_input(command: str) -> bool:
         ):
             segment = []
             continue
-        if token.startswith("<") and _shell_reads_pipeline_stdin(segment):
+        input_target = segment[:-1] if segment and segment[-1].isdigit() else segment
+        if token.startswith("<") and _shell_reads_pipeline_stdin(input_target):
             return True
         segment.append(token)
     return False
@@ -857,9 +893,14 @@ def _persistent_runner_payload(tokens: list[str]) -> bool:
             remaining.pop(0)
             break
         if token in {"-c", "--call"} and len(remaining) > 1:
-            return _persistent_foreground_command(remaining[1])
+            return (
+                "$" in remaining[1]
+                or "`" in remaining[1]
+                or _persistent_foreground_command(remaining[1])
+            )
         if token.startswith(("--call=", "-c=")):
-            return _persistent_foreground_command(remaining[0].split("=", 1)[1])
+            payload = remaining[0].split("=", 1)[1]
+            return "$" in payload or "`" in payload or _persistent_foreground_command(payload)
         if token in value_options:
             remaining = remaining[2:] if len(remaining) > 1 else []
             continue
@@ -1006,7 +1047,7 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
             return True
         return _persistent_foreground_command(" ".join(payload))
     if executable == "xargs":
-        payload = _strip_command_prefix(_xargs_execution_payload(tokens))
+        payload = _unwrap_execution_target(_xargs_execution_payload(tokens))
         if not payload:
             return False
         if Path(payload[0]).name.lower() in {"bash", "sh", "zsh"}:
@@ -1024,7 +1065,12 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
                 and "c" in token[1:]
                 and index + 1 < len(tokens)
             ):
-                return _persistent_foreground_command(tokens[index + 1])
+                payload = tokens[index + 1]
+                return (
+                    "$" in payload
+                    or "`" in payload
+                    or _persistent_foreground_command(payload)
+                )
         return False
     lowered = [token.lower() for token in tokens]
     if len(tokens) == 2 and tokens[1] in {
