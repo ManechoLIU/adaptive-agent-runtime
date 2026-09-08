@@ -202,6 +202,16 @@ def _reject_cross_controller_web_owner(
         raise PermissionError("Web Controller Session is already bound to another Controller")
 
 
+def _is_strong_web_target_record(record: object) -> bool:
+    if not isinstance(record, dict):
+        return False
+    return (
+        record.get("host_attested") is True
+        or record.get("identity_proof") == "host_attested_origin"
+        or record.get("provenance") == "host_attested_same_controller_recovery"
+    )
+
+
 def replace_web_session(
     *,
     repo: Path,
@@ -275,6 +285,11 @@ def replace_web_session(
                     )
                 except PermissionError as exc:
                     raise ValueError(str(exc)) from exc
+                if prior_status == "active" and _is_strong_web_target_record(prior):
+                    raise PermissionError(
+                        "manual Web session replacement cannot modify a Host-attested current target; "
+                        "use canonical Host-attested session-start recovery"
+                    )
             else:
                 prior_status, prior_target = None, None
             if prior_status == "active" and prior_target == web_session_id:
@@ -458,6 +473,11 @@ def unbind_web_session(
             binding_mode = "temporary"
             if isinstance(prior, dict):
                 status, current, _ = target_guard.validate_target_record(prior, host="web")
+                if status == "active" and _is_strong_web_target_record(prior):
+                    raise PermissionError(
+                        "manual Web session unbind cannot modify a Host-attested current target; "
+                        "use canonical Host-attested session recovery"
+                    )
                 if status != "active":
                     current = None
                 provenance = str(prior.get("provenance") or provenance)

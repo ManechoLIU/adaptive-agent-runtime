@@ -654,6 +654,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_registered_external_web_host_submit_adapter_is_used_without_caller_injection",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_malformed_registered_web_verifier_config_fails_closed_without_manual_fallback",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_browser_tab_receipt_cannot_recover_an_unverified_web_session",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_manual_web_mutations_cannot_downgrade_host_attested_current_target",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_reentry_without_canonical_web_ownership_never_calls_browser",

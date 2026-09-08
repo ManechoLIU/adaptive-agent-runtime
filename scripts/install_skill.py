@@ -93,6 +93,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_replace_web_session_bootstrap_rotates_target_and_manual_lease_without_host_attestation",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_manual_web_mutations_cannot_downgrade_host_attested_current_target",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_replace_web_session_rejects_unapproved_session_and_stale_generation",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history",

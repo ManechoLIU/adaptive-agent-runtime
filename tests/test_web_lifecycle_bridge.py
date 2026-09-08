@@ -1342,6 +1342,74 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "web-new",
             )
 
+    def test_manual_web_mutations_cannot_downgrade_host_attested_current_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            original_registry = {
+                "controller-1": str(repo),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-strong", "web-manual"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {"web": {
+                        "status": "active",
+                        "session_id": "web-strong",
+                        "generation": 4,
+                        "provenance": "host_attested_same_controller_recovery",
+                        "binding_mode": "resume_only",
+                        "identity_proof": "host_attested_origin",
+                    }}
+                },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "web",
+                        "execution_target_session_id": "web-strong",
+                        "generation": 4,
+                        "provenance": "web_entry",
+                    }
+                },
+            }
+            registry.write_text(json.dumps(original_registry), encoding="utf-8")
+            lease = root / "manual.json"
+            original_lease = {
+                "schema_version": 1,
+                "leases": {"controller-1": {
+                    "repo": str(repo.resolve()),
+                    "controller_id": "controller-1",
+                    "web_session_id": "web-manual",
+                    "authorized_at_unix": 10,
+                    "expires_at_unix": 4102444800,
+                    "provenance": "manual_user_authorized",
+                    "mode": "resume_only",
+                }},
+            }
+            lease.write_text(json.dumps(original_lease), encoding="utf-8")
+
+            replace = self.run_bridge(
+                "replace-web-session", "--repo", str(repo),
+                "--controller-id", "controller-1", "--web-session-id", "web-manual",
+                "--expected-generation", "4", "--expected-ownership-generation", "4",
+                "--registry", str(registry), "--lease-file", str(lease),
+            )
+            self.assertEqual(replace.returncode, 78)
+            self.assertIn("Host-attested current target", replace.stderr)
+            self.assertEqual(json.loads(registry.read_text()), original_registry)
+            self.assertEqual(json.loads(lease.read_text()), original_lease)
+
+            unbind = self.run_bridge(
+                "unbind-web-session", "--repo", str(repo),
+                "--controller-id", "controller-1", "--web-session-id", "web-strong",
+                "--expected-generation", "4", "--expected-ownership-generation", "4",
+                "--registry", str(registry),
+            )
+            self.assertEqual(unbind.returncode, 78)
+            self.assertIn("Host-attested current target", unbind.stderr)
+            self.assertEqual(json.loads(registry.read_text()), original_registry)
+            self.assertEqual(json.loads(lease.read_text()), original_lease)
+
     def test_replace_web_session_rejects_foreign_session_repo_mismatch_and_active_outbound_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
