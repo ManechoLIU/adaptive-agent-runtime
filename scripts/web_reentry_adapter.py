@@ -79,6 +79,51 @@ def resolve_reentry_session(
         web_sessions = [web_sessions]
     bound = {value for value in web_sessions or [] if isinstance(value, str) and value.strip()}
 
+    target = target_guard.target_record(
+        registry, controller_id=controller_id, host="web"
+    )
+    if target is None:
+        raise PermissionError(
+            "Web re-entry requires an explicit canonical current Web target"
+        )
+    try:
+        target_status, target_session_id, _target_generation = (
+            target_guard.validate_target_record(target, host="web")
+        )
+    except PermissionError as exc:
+        raise PermissionError(str(exc)) from exc
+    if target_status != "active" or not target_session_id:
+        raise PermissionError("Web re-entry requires an active canonical current Web target")
+    if target_session_id not in bound:
+        raise PermissionError(
+            "canonical Web re-entry target is not bound to the registered Controller"
+        )
+    if (
+        target.get("provenance") == "host_attested_same_controller_recovery"
+        and target.get("identity_proof") != "host_attested_origin"
+    ):
+        raise PermissionError(
+            "legacy browser-tab Web identity record is not a trusted Host origin attestation"
+        )
+
+    ownership = target_guard.execution_ownership_record(
+        registry, controller_id=controller_id
+    )
+    if ownership is None:
+        raise PermissionError("canonical Controller execution ownership is missing")
+    active_host, ownership_target, _ownership_generation = (
+        target_guard.validate_execution_ownership_record(ownership)
+    )
+    if active_host != "web" or ownership_target != target_session_id:
+        raise PermissionError(
+            "canonical Web target does not match Controller execution ownership"
+        )
+    if (
+        target.get("provenance") == "host_attested_same_controller_recovery"
+        and target.get("identity_proof") == "host_attested_origin"
+    ):
+        return target_session_id
+
     payload = _load_json(Path(lease_path).expanduser())
     leases = payload.get("leases")
     record = leases.get(controller_id) if isinstance(leases, dict) else None
@@ -96,46 +141,15 @@ def resolve_reentry_session(
     if not isinstance(expires_at, int) or expires_at <= now:
         raise PermissionError("Web re-entry lease is expired")
     session_id = record.get("web_session_id")
-    if not isinstance(session_id, str) or not session_id.strip() or session_id not in bound:
-        raise PermissionError("Web re-entry lease session is not bound to the registered Controller")
-    session_id = session_id.strip()
-    target = target_guard.target_record(
-        registry, controller_id=controller_id, host="web"
-    )
     if (
-        isinstance(target, dict)
-        and target.get("provenance") == "host_attested_same_controller_recovery"
-        and target.get("identity_proof") != "host_attested_origin"
+        not isinstance(session_id, str)
+        or not session_id.strip()
+        or session_id.strip() != target_session_id
     ):
         raise PermissionError(
-            "legacy browser-tab Web identity record is not a trusted Host origin attestation"
+            "Web re-entry lease session does not match the canonical current Web target"
         )
-    if target is None:
-        raise PermissionError(
-            "Web re-entry requires an explicit canonical current Web target"
-        )
-    elif (
-        target_guard.active_source_controller_id(
-            registry, source_session_id=session_id, host="web"
-        )
-        != controller_id
-    ):
-        raise PermissionError(
-            "Web re-entry lease session is not the current verified Controller entry"
-        )
-    ownership = target_guard.execution_ownership_record(
-        registry, controller_id=controller_id
-    )
-    if ownership is None:
-        raise PermissionError("canonical Controller execution ownership is missing")
-    active_host, ownership_target, _ownership_generation = (
-        target_guard.validate_execution_ownership_record(ownership)
-    )
-    if active_host != "web" or ownership_target != session_id:
-        raise PermissionError(
-            "Web re-entry lease does not match canonical Controller execution ownership"
-        )
-    return session_id
+    return target_session_id
 
 
 def _loopback_mcp_endpoint_live(url: str) -> bool:

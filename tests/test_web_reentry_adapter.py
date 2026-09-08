@@ -84,6 +84,70 @@ class WebReentryAdapterTests(unittest.TestCase):
                 "web-current",
             )
 
+    def test_resolve_reentry_session_strong_host_target_does_not_require_manual_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, lease = self.make_identity(root)
+            data = json.loads(registry.read_text())
+            target = data["__controller_targets__"]["controller-1"]["web"]
+            target.update({
+                "provenance": "host_attested_same_controller_recovery",
+                "binding_mode": "resume_only",
+                "identity_proof": "host_attested_origin",
+            })
+            registry.write_text(json.dumps(data), encoding="utf-8")
+
+            lease.unlink()
+            self.assertEqual(
+                web_reentry_adapter.resolve_reentry_session(
+                    controller_id="controller-1", repo=repo,
+                    registry_path=registry, lease_path=lease,
+                ),
+                "web-current",
+            )
+
+            lease.write_text(json.dumps({
+                "schema_version": 1,
+                "leases": {"controller-1": {
+                    "repo": str(repo.resolve()),
+                    "controller_id": "controller-1",
+                    "web_session_id": "web-old",
+                    "authorized_at_unix": 1,
+                    "expires_at_unix": 2,
+                    "provenance": "manual_user_authorized",
+                    "mode": "resume_only",
+                }},
+            }), encoding="utf-8")
+            self.assertEqual(
+                web_reentry_adapter.resolve_reentry_session(
+                    controller_id="controller-1", repo=repo,
+                    registry_path=registry, lease_path=lease, now_unix=100,
+                ),
+                "web-current",
+            )
+
+    def test_resolve_reentry_session_strong_host_target_requires_matching_web_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, lease = self.make_identity(root)
+            data = json.loads(registry.read_text())
+            target = data["__controller_targets__"]["controller-1"]["web"]
+            target.update({
+                "provenance": "host_attested_same_controller_recovery",
+                "binding_mode": "resume_only",
+                "identity_proof": "host_attested_origin",
+            })
+            data["__controller_execution_ownership__"]["controller-1"].update({
+                "execution_target_session_id": "web-old",
+                "generation": 8,
+            })
+            registry.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "execution ownership"):
+                web_reentry_adapter.resolve_reentry_session(
+                    controller_id="controller-1", repo=repo,
+                    registry_path=registry, lease_path=lease,
+                )
+
     def test_resolve_reentry_session_refuses_expired_or_unbound_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

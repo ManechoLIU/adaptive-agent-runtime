@@ -105,6 +105,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim",
     "tests.test_web_reentry_adapter.WebReentryAdapterTests."
+    "test_resolve_reentry_session_strong_host_target_does_not_require_manual_lease",
+    "tests.test_web_reentry_adapter.WebReentryAdapterTests."
+    "test_resolve_reentry_session_strong_host_target_requires_matching_web_ownership",
+    "tests.test_web_reentry_adapter.WebReentryAdapterTests."
     "test_reentry_without_canonical_web_ownership_never_calls_browser",
     "tests.test_web_reentry_adapter.WebReentryAdapterTests."
     "test_reentry_without_explicit_canonical_web_target_never_calls_browser",

@@ -658,6 +658,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim",
+            "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_resolve_reentry_session_strong_host_target_does_not_require_manual_lease",
+            "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_resolve_reentry_session_strong_host_target_requires_matching_web_ownership",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_reentry_without_canonical_web_ownership_never_calls_browser",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_reentry_without_explicit_canonical_web_target_never_calls_browser",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_reentry_without_registered_host_origin_verifier_never_calls_browser",
@@ -744,6 +746,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_transient_web_reentry_failure_rearms_existing_continuation_supervisor(self):\n"
                 "        self.assertTrue(True)\n"
                 "class WebReentryAdapterTests(unittest.TestCase):\n"
+                "    def test_resolve_reentry_session_strong_host_target_does_not_require_manual_lease(self): self.assertTrue(True)\n"
+                "    def test_resolve_reentry_session_strong_host_target_requires_matching_web_ownership(self): self.assertTrue(True)\n"
                 "    def test_reentry_without_canonical_web_ownership_never_calls_browser(self): self.assertTrue(True)\n"
                 "    def test_reentry_without_explicit_canonical_web_target_never_calls_browser(self): self.assertTrue(True)\n"
                 "    def test_reentry_without_registered_host_origin_verifier_never_calls_browser(self): self.assertTrue(True)\n"
