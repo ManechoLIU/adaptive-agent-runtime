@@ -39,7 +39,7 @@ DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 DEFAULT_MANUAL_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
 DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG = Path.home() / ".codex" / "adaptive-delivery-host-attestation-verifiers.json"
 _PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., Any]] = {}
-PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS = 8
+PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS = 15
 PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT = 64 * 1024
 
 

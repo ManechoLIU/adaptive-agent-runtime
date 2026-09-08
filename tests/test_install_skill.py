@@ -666,6 +666,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection",
             "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests.test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_production_bridge_has_no_trusted_web_attestation_verifier",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_timeout_covers_product_host_request_budget",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_loads_pinned_external_runtime_host_cli",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_exposes_pinned_host_submit_adapter",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_rechecks_bundle_before_each_execution",
@@ -943,6 +944,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_web_recovery_preserves_desktop_target_and_only_advances_web_generation(self): self.assertTrue(True)\n"
                 "    def test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection(self): self.assertTrue(True)\n"
                 "    def test_production_bridge_has_no_trusted_web_attestation_verifier(self): self.assertTrue(True)\n"
+                "    def test_registered_web_verifier_timeout_covers_product_host_request_budget(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_loads_pinned_external_runtime_host_cli(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_exposes_pinned_host_submit_adapter(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_rechecks_bundle_before_each_execution(self): self.assertTrue(True)\n"

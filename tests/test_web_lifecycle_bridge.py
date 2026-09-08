@@ -585,6 +585,12 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "controller-1",
             )
 
+    def test_registered_web_verifier_timeout_covers_product_host_request_budget(self) -> None:
+        self.assertGreaterEqual(
+            web_bridge.PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS,
+            15,
+        )
+
     def test_registered_web_verifier_loads_pinned_external_runtime_host_cli(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:

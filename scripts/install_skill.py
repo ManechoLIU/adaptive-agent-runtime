@@ -79,6 +79,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_production_bridge_has_no_trusted_web_attestation_verifier",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_registered_web_verifier_timeout_covers_product_host_request_budget",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_loads_pinned_external_runtime_host_cli",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_exposes_pinned_host_submit_adapter",
