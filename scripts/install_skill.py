@@ -119,6 +119,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_manual_fenced_direct_wake_passes_bridge_verifier_into_builtin_adapter",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_manual_fenced_supervisor_passes_bridge_verifier_into_builtin_adapter",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_manual_fenced_confirmed_waits_for_progress_without_resubmit",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_waiting_for_controller_progress_does_not_bootstrap_until_machine_facts_change",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."

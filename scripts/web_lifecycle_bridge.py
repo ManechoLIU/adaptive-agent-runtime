@@ -3783,10 +3783,20 @@ def continuation_supervisor_needs_bootstrap(
         return False
     if lifecycle_state.get("requires_user") is True:
         return False
+    lifecycle_fingerprint = _wake_event_fingerprint(lifecycle_state)
+    if (
+        str(supervisor_state.get("state") or "") == "WAITING_FOR_CONTROLLER_PROGRESS"
+        and str(supervisor_state.get("last_lifecycle_fingerprint") or "") == lifecycle_fingerprint
+    ):
+        waiting_registry_sha256 = str(supervisor_state.get("waiting_registry_sha256") or "")
+        if current_registry_sha256 is None or (
+            waiting_registry_sha256 and waiting_registry_sha256 == current_registry_sha256
+        ):
+            return False
     if (
         str(supervisor_state.get("state") or "") == "RESUME_STALLED_NO_PROGRESS"
         and str(supervisor_state.get("last_lifecycle_fingerprint") or "")
-        == _wake_event_fingerprint(lifecycle_state)
+        == lifecycle_fingerprint
     ):
         return False
     if (
@@ -4333,9 +4343,10 @@ def _run_auto_native_stop_impl(
                 unchanged = int(current.get("unchanged_continuation_count", 0) or 0)
                 unchanged = unchanged + 1 if previous_fingerprint == fingerprint else 0
                 continuation_count = int(current.get("continuation_count", 0) or 0) + 1
+                manual_fenced = attempt.get("delivery_authorization") == "manual_fenced"
                 confirmed_state = (
-                    "WEB_REENTRY_MANUAL_FENCED_SUBMITTED"
-                    if attempt.get("delivery_authorization") == "manual_fenced"
+                    "WAITING_FOR_CONTROLLER_PROGRESS"
+                    if manual_fenced
                     else "WEB_REENTRY_SUBMITTED"
                 )
                 current.update({
@@ -4350,6 +4361,11 @@ def _run_auto_native_stop_impl(
                 current.pop("failure_class", None)
                 current.pop("error_code", None)
                 current.pop("blocked_registry_sha256", None)
+                if manual_fenced:
+                    current["waiting_registry_sha256"] = _file_sha256(registry)
+                    current["waiting_since_unix_ms"] = int(time.time() * 1000)
+                    write_auto_stop_state(state_path, current)
+                    return 0
                 if unchanged >= AUTO_CONTINUATION_STALL_LIMIT:
                     current.update({
                         "state": "RESUME_STALLED_NO_PROGRESS",

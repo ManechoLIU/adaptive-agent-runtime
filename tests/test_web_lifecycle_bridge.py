@@ -7344,13 +7344,13 @@ def _manual_fenced_supervisor_persists_unverified_delivery_evidence(self):
             )
         saved = json.loads(state_path.read_text(encoding="utf-8"))
     self.assertEqual(code, 0)
-    self.assertEqual(saved["state"], "WEB_REENTRY_MANUAL_FENCED_SUBMITTED")
+    self.assertEqual(saved["state"], "WAITING_FOR_CONTROLLER_PROGRESS")
     self.assertEqual(saved["delivery_authorization"], "manual_fenced")
     self.assertFalse(saved["host_attested"])
     self.assertFalse(saved["strong_web_identity_established"])
     self.assertEqual(saved["target_generation"], 4)
     self.assertEqual(saved["ownership_generation"], 4)
-    schedule.assert_called_once()
+    schedule.assert_not_called()
 
 
 WebLocalReentryIntegrationTests.test_manual_fenced_direct_wake_uses_builtin_adapter_without_peer_verifier = _manual_fenced_direct_wake_uses_builtin_adapter_without_peer_verifier
@@ -7424,3 +7424,87 @@ def _manual_fenced_supervisor_passes_bridge_verifier_into_builtin_adapter(self):
 
 WebLocalReentryIntegrationTests.test_manual_fenced_direct_wake_passes_bridge_verifier_into_builtin_adapter = _manual_fenced_direct_wake_passes_bridge_verifier_into_builtin_adapter
 WebLocalReentryIntegrationTests.test_manual_fenced_supervisor_passes_bridge_verifier_into_builtin_adapter = _manual_fenced_supervisor_passes_bridge_verifier_into_builtin_adapter
+
+
+def _manual_fenced_confirmed_waits_for_progress_without_resubmit(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "manual_user_authorized", "binding_mode": "temporary",
+            "host_attested": False,
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 4, "provenance": "manual_user_authorized",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id": "manual-once", "session_id": "controller-1", "repo": str(repo.resolve()),
+            "state": "RESUME_PENDING", "pending_control_event": True,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 8, "triggers": ["READY:F1"],
+            "snapshot": {"head":"h1","ledger_sha256":"l1","worktree_status_sha256":"w1","ready_ids":["F1"],"runnable_ids":["F1"],"candidate_revisions":[]},
+        }
+        confirmed = {
+            "operation": "web_reentry", "result": "CONFIRMED",
+            "state": "WEB_REENTRY_MANUAL_FENCED_SUBMITTED", "returncode": 0,
+            "execution_target_session_id": "web-current", "target_generation": 4,
+            "ownership_generation": 4, "target_mode": "explicit_current",
+            "delivery_authorization": "manual_fenced", "host_attested": False,
+            "strong_web_identity_established": False,
+        }
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "execute_web_reentry", return_value=confirmed
+        ) as reentry, patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="manual-once", registry=registry,
+                codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        registry_sha256 = web_bridge._file_sha256(registry)
+    self.assertEqual(code, 0)
+    reentry.assert_called_once()
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WAITING_FOR_CONTROLLER_PROGRESS")
+    self.assertEqual(saved["delivery_authorization"], "manual_fenced")
+    self.assertFalse(saved["host_attested"])
+    self.assertFalse(saved["strong_web_identity_established"])
+    self.assertEqual(saved["continuation_count"], 1)
+    self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
+    self.assertEqual(saved["waiting_registry_sha256"], registry_sha256)
+
+
+def _waiting_for_controller_progress_does_not_bootstrap_until_machine_facts_change(self):
+    lifecycle = {
+        "pending_control_event": True, "requires_user": False, "wake_generation": 8,
+        "triggers": ["READY:F1"],
+        "snapshot": {"head":"h1","ledger_sha256":"l1","worktree_status_sha256":"w1","ready_ids":["F1"],"runnable_ids":["F1"],"candidate_revisions":[]},
+    }
+    fingerprint = web_bridge._wake_event_fingerprint(lifecycle)
+    waiting = {
+        "state": "WAITING_FOR_CONTROLLER_PROGRESS",
+        "pending_control_event": True,
+        "last_lifecycle_fingerprint": fingerprint,
+        "waiting_registry_sha256": "registry-a",
+        "delivery_authorization": "manual_fenced",
+    }
+    self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+        lifecycle, waiting, current_registry_sha256="registry-a"
+    ))
+    changed_lifecycle = json.loads(json.dumps(lifecycle))
+    changed_lifecycle["triggers"].append("LEDGER_CHANGED")
+    self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+        changed_lifecycle, waiting, current_registry_sha256="registry-a"
+    ))
+    self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+        lifecycle, waiting, current_registry_sha256="registry-b"
+    ))
+
+
+WebLocalReentryIntegrationTests.test_manual_fenced_confirmed_waits_for_progress_without_resubmit = _manual_fenced_confirmed_waits_for_progress_without_resubmit
+WebLocalReentryIntegrationTests.test_waiting_for_controller_progress_does_not_bootstrap_until_machine_facts_change = _waiting_for_controller_progress_does_not_bootstrap_until_machine_facts_change

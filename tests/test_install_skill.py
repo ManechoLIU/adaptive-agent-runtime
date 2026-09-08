@@ -667,6 +667,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_reentry_adapter.ManualFencedWebReentryTests.test_explicit_bridge_verifier_rejection_never_falls_back_when_module_verifier_missing",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_manual_fenced_direct_wake_passes_bridge_verifier_into_builtin_adapter",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_manual_fenced_supervisor_passes_bridge_verifier_into_builtin_adapter",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_manual_fenced_confirmed_waits_for_progress_without_resubmit",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_waiting_for_controller_progress_does_not_bootstrap_until_machine_facts_change",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_identity_blocked_event_retries_after_registry_changes",
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_registered_current_web_adapter_is_fenced_and_host_attested",
@@ -891,6 +893,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_manual_fenced_supervisor_persists_unverified_delivery_evidence(self): self.assertTrue(True)\n"
                 "    def test_manual_fenced_direct_wake_passes_bridge_verifier_into_builtin_adapter(self): self.assertTrue(True)\n"
                 "    def test_manual_fenced_supervisor_passes_bridge_verifier_into_builtin_adapter(self): self.assertTrue(True)\n"
+                "    def test_manual_fenced_confirmed_waits_for_progress_without_resubmit(self): self.assertTrue(True)\n"
+                "    def test_waiting_for_controller_progress_does_not_bootstrap_until_machine_facts_change(self): self.assertTrue(True)\n"
                 "class WebReentryDebounceTests(unittest.TestCase):\n"
                 "    def test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim(self): self.assertTrue(True)\n",
                 encoding="utf-8",
