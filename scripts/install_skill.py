@@ -130,6 +130,12 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_audit_once_never_uses_manual_resume_lease_as_caller_identity",
     "tests.test_install_skill.InstallCapabilityTests."
     "test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence",
+    "tests.test_install_skill.ProjectContextHookInstallationTests."
+    "test_runtime_hooks_keep_trust_stable_legacy_indices",
+    "tests.test_install_skill.ProjectContextHookInstallationTests."
+    "test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups",
+    "tests.test_install_skill.HostAdapterInstallationTests."
+    "test_configure_host_adapters_can_update_codex_hooks_without_touching_ai_bridge",
     "tests.test_install_skill.WebAgentHealthServiceInstallationTests."
     "test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load",
     "tests.test_install_skill.WebAgentHealthServiceInstallationTests."
@@ -1233,19 +1239,84 @@ def _write_text_atomic(path: Path, text: str) -> None:
             os.unlink(temporary)
 
 
-def _remove_matching_handlers(entries: list[Any], needle: str) -> list[Any]:
-    kept: list[Any] = []
+def _upsert_hook_handler_in_place(
+    entries: list[Any],
+    *,
+    needle: str,
+    handler: dict[str, Any],
+    matcher: str | None,
+) -> None:
+    """Replace a Runtime handler without moving its trust-key group index."""
+    found = False
+    updated: list[Any] = []
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
             if needle not in str(entry):
-                kept.append(entry)
+                updated.append(entry)
             continue
-        remaining = [handler for handler in entry["hooks"] if needle not in str(handler)]
-        if remaining:
-            preserved = dict(entry)
-            preserved["hooks"] = remaining
-            kept.append(preserved)
-    return kept
+        prior_handlers = entry["hooks"]
+        remaining: list[Any] = []
+        matched_here = False
+        for prior_handler in prior_handlers:
+            if needle in str(prior_handler):
+                matched_here = True
+                if not found:
+                    remaining.append(dict(handler))
+                    found = True
+                continue
+            remaining.append(prior_handler)
+        if not remaining:
+            continue
+        preserved = dict(entry)
+        preserved["hooks"] = remaining
+        if matched_here and len(remaining) == 1 and len(prior_handlers) == 1:
+            if matcher is None:
+                preserved.pop("matcher", None)
+            else:
+                preserved["matcher"] = matcher
+        updated.append(preserved)
+    if not found:
+        group: dict[str, Any] = {"hooks": [dict(handler)]}
+        if matcher is not None:
+            group["matcher"] = matcher
+        updated.append(group)
+    entries[:] = updated
+
+
+def _runtime_hook_group_role(entry: Any) -> str | None:
+    if not isinstance(entry, dict):
+        return None
+    handlers = entry.get("hooks")
+    if not isinstance(handlers, list) or len(handlers) != 1:
+        return None
+    text = str(handlers[0])
+    for role in (
+        "lifecycle_hook.py",
+        "controller_scoring_hook.py",
+        "project_context_guard.py",
+    ):
+        if role in text:
+            return role
+    return None
+
+
+def _stabilize_runtime_hook_group_indices(entries: list[Any]) -> None:
+    """Restore the legacy trusted Runtime slots while leaving user slots fixed."""
+    slots: list[int] = []
+    groups: list[Any] = []
+    priority = {
+        "lifecycle_hook.py": 0,
+        "controller_scoring_hook.py": 1,
+        "project_context_guard.py": 2,
+    }
+    for index, entry in enumerate(entries):
+        if _runtime_hook_group_role(entry) is None:
+            continue
+        slots.append(index)
+        groups.append(entry)
+    groups.sort(key=lambda entry: priority[_runtime_hook_group_role(entry)])
+    for index, entry in zip(slots, groups):
+        entries[index] = entry
 
 
 def install_codex_hooks(
@@ -1272,7 +1343,6 @@ def install_codex_hooks(
         entries = hooks.setdefault(event_name, [])
         if not isinstance(entries, list):
             raise ValueError(f"{event_name} hooks must be a list")
-        entries[:] = _remove_matching_handlers(entries, "project_context_guard.py")
         handler: dict[str, Any] = {
             "type": "command",
             "command": project_context_command,
@@ -1281,10 +1351,12 @@ def install_codex_hooks(
         }
         if inject_context:
             handler["additionalContextLimit"] = 0
-        group: dict[str, Any] = {"hooks": [handler]}
-        if matcher is not None:
-            group["matcher"] = matcher
-        entries.insert(0, group)
+        _upsert_hook_handler_in_place(
+            entries,
+            needle="project_context_guard.py",
+            handler=handler,
+            matcher=matcher,
+        )
 
     lifecycle_specs = {
         "SessionStart": ("startup|resume|clear|compact", "Loading Adaptive Agent Runtime controller state", True),
@@ -1298,29 +1370,38 @@ def install_codex_hooks(
         entries = hooks.setdefault(event_name, [])
         if not isinstance(entries, list):
             raise ValueError(f"{event_name} hooks must be a list")
-        entries[:] = _remove_matching_handlers(entries, "lifecycle_hook.py")
         handler: dict[str, Any] = {
             "type": "command", "command": lifecycle_command, "timeout": 5, "statusMessage": status,
         }
         if inject_context:
             handler["additionalContextLimit"] = 4096
-        group: dict[str, Any] = {"hooks": [handler]}
-        if matcher is not None:
-            group["matcher"] = matcher
-        entries.append(group)
+        _upsert_hook_handler_in_place(
+            entries,
+            needle="lifecycle_hook.py",
+            handler=handler,
+            matcher=matcher,
+        )
 
     for event_name, inject_context in (("UserPromptSubmit", True), ("Stop", False)):
         entries = hooks.setdefault(event_name, [])
         if not isinstance(entries, list):
             raise ValueError(f"{event_name} hooks must be a list")
-        entries[:] = _remove_matching_handlers(entries, "controller_scoring_hook.py")
         handler = {
             "type": "command", "command": scoring_command, "timeout": 5,
             "statusMessage": "Enforcing Adaptive Agent Runtime controller scoring model",
         }
         if inject_context:
             handler["additionalContextLimit"] = 0
-        entries.append({"hooks": [handler]})
+        _upsert_hook_handler_in_place(
+            entries,
+            needle="controller_scoring_hook.py",
+            handler=handler,
+            matcher=None,
+        )
+
+    for entries in hooks.values():
+        if isinstance(entries, list):
+            _stabilize_runtime_hook_group_indices(entries)
 
     _write_text_atomic(path, json.dumps(config, ensure_ascii=False, indent=2) + "\n")
     return config
@@ -1389,6 +1470,7 @@ def configure_host_adapters(
     hooks_file: str | Path = DEFAULT_CODEX_HOOKS,
     zshenv_file: str | Path = DEFAULT_ZSHENV,
     python_executable: str | None = None,
+    configure_ai_bridge: bool = True,
 ) -> dict[str, dict[str, Any]]:
     target_path = Path(target).expanduser().resolve()
     codex_path = Path(codex_executable).expanduser() if codex_executable else None
@@ -1398,7 +1480,7 @@ def configure_host_adapters(
     if codex_path is not None and codex_path.is_file() and os.access(codex_path, os.X_OK):
         install_codex_hooks(hooks_file, target_path, python_executable=python_executable)
     bridge = Path(ai_bridge_executable).expanduser()
-    if bridge.is_file() and os.access(bridge, os.X_OK):
+    if configure_ai_bridge and bridge.is_file() and os.access(bridge, os.X_OK):
         install_ai_bridge_zshenv(zshenv_file, target_path, bridge, python_executable=python_executable)
     return detect_host_capabilities(
         codex_executable=codex_path,
@@ -1831,6 +1913,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--stop-condition", required=True)
     parser.add_argument("--previous-revision")
     parser.add_argument("--no-configure-host-adapters", action="store_true")
+    parser.add_argument("--no-configure-ai-bridge", action="store_true")
     parser.add_argument("--codex")
     parser.add_argument("--ai-bridge", default=str(DEFAULT_AI_BRIDGE_EXECUTABLE))
     parser.add_argument("--hooks-file", default=str(DEFAULT_CODEX_HOOKS))
@@ -1921,6 +2004,7 @@ def _run_install_transaction(
                     ai_bridge_executable=args.ai_bridge,
                     hooks_file=hooks_path,
                     zshenv_file=zshenv_path,
+                    configure_ai_bridge=not args.no_configure_ai_bridge,
                 )
             manifest["capabilities"] = detect_host_capabilities(
                 codex_executable=args.codex,

@@ -693,6 +693,9 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_serialized_active_writer_claim_cannot_confirm_already_foreground",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_execute_native_resume_marks_host_observed_active_writer_process_locally",
             "tests.test_install_skill.InstallCapabilityTests.test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence",
+            "tests.test_install_skill.ProjectContextHookInstallationTests.test_runtime_hooks_keep_trust_stable_legacy_indices",
+            "tests.test_install_skill.ProjectContextHookInstallationTests.test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups",
+            "tests.test_install_skill.HostAdapterInstallationTests.test_configure_host_adapters_can_update_codex_hooks_without_touching_ai_bridge",
             "tests.test_install_skill.WebAgentHealthServiceInstallationTests.test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load",
             "tests.test_install_skill.WebAgentHealthServiceInstallationTests.test_runtime_service_load_failure_preserves_legacy_web_audit",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_resolve_reentry_session_strong_host_target_does_not_require_manual_lease",
@@ -1122,6 +1125,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "import unittest\n"
                 "class InstallCapabilityTests(unittest.TestCase):\n"
                 "    def test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence(self): self.assertTrue(True)\n"
+                "class ProjectContextHookInstallationTests(unittest.TestCase):\n"
+                "    def test_runtime_hooks_keep_trust_stable_legacy_indices(self): self.assertTrue(True)\n"
+                "    def test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups(self): self.assertTrue(True)\n"
+                "class HostAdapterInstallationTests(unittest.TestCase):\n"
+                "    def test_configure_host_adapters_can_update_codex_hooks_without_touching_ai_bridge(self): self.assertTrue(True)\n"
                 "class WebAgentHealthServiceInstallationTests(unittest.TestCase):\n"
                 "    def test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load(self): self.assertTrue(True)\n"
                 "    def test_runtime_service_load_failure_preserves_legacy_web_audit(self): self.assertTrue(True)\n",
@@ -1425,6 +1433,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "import unittest\n"
                 "class InstallCapabilityTests(unittest.TestCase):\n"
                 "    def test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence(self): self.assertTrue(True)\n"
+                "class ProjectContextHookInstallationTests(unittest.TestCase):\n"
+                "    def test_runtime_hooks_keep_trust_stable_legacy_indices(self): self.assertTrue(True)\n"
+                "    def test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups(self): self.assertTrue(True)\n"
+                "class HostAdapterInstallationTests(unittest.TestCase):\n"
+                "    def test_configure_host_adapters_can_update_codex_hooks_without_touching_ai_bridge(self): self.assertTrue(True)\n"
                 "class WebAgentHealthServiceInstallationTests(unittest.TestCase):\n"
                 "    def test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load(self): self.assertTrue(True)\n"
                 "    def test_runtime_service_load_failure_preserves_legacy_web_audit(self): self.assertTrue(True)\n",
@@ -1546,7 +1559,7 @@ class InstallPromotionSafetyTests(unittest.TestCase):
 
 
 class ProjectContextHookInstallationTests(unittest.TestCase):
-    def test_project_context_hooks_are_installed_before_lifecycle_and_scoring(self):
+    def test_runtime_hooks_keep_trust_stable_legacy_indices(self):
         import json
         from scripts.install_skill import install_codex_hooks
         with tempfile.TemporaryDirectory() as d:
@@ -1569,19 +1582,50 @@ class ProjectContextHookInstallationTests(unittest.TestCase):
                     1,
                     sum("project_context_guard.py" in str(item) for item in entries),
                 )
-                self.assertIn("project_context_guard.py", str(entries[0]))
-            self.assertLess(
-                next(i for i,x in enumerate(value["hooks"]["UserPromptSubmit"]) if "project_context_guard.py" in str(x)),
-                next(i for i,x in enumerate(value["hooks"]["UserPromptSubmit"]) if "controller_scoring_hook.py" in str(x)),
+                self.assertIn("lifecycle_hook.py", str(entries[0]))
+            self.assertIn(
+                "project_context_guard.py", str(value["hooks"]["SessionStart"][1])
             )
+            for event in ("UserPromptSubmit", "Stop"):
+                self.assertIn(
+                    "controller_scoring_hook.py", str(value["hooks"][event][1])
+                )
+                self.assertIn(
+                    "project_context_guard.py", str(value["hooks"][event][2])
+                )
             self.assertEqual(
                 "startup|resume|clear|compact",
                 value["hooks"]["SessionStart"][0]["matcher"],
             )
             self.assertEqual(
                 0,
-                value["hooks"]["UserPromptSubmit"][0]["hooks"][0]["additionalContextLimit"],
+                value["hooks"]["UserPromptSubmit"][2]["hooks"][0]["additionalContextLimit"],
             )
+
+    def test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups(self):
+        import json
+        from scripts.install_skill import install_codex_hooks
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / "adaptive-delivery"
+            (target / "scripts").mkdir(parents=True)
+            hooks = root / "hooks.json"
+            hooks.write_text(json.dumps({"hooks": {
+                "UserPromptSubmit": [
+                    {"hooks": [{"type": "command", "command": "/old/project_context_guard.py"}]},
+                    {"hooks": [{"type": "command", "command": "/old/lifecycle_hook.py"}]},
+                    {"hooks": [{"type": "command", "command": "/old/controller_scoring_hook.py"}]},
+                    {"hooks": [{"type": "command", "command": "echo keep-user-hook"}]},
+                ]
+            }}), encoding="utf-8")
+
+            install_codex_hooks(hooks, target, python_executable="/usr/bin/python3")
+            entries = json.loads(hooks.read_text(encoding="utf-8"))["hooks"]["UserPromptSubmit"]
+
+        self.assertIn("lifecycle_hook.py", str(entries[0]))
+        self.assertIn("controller_scoring_hook.py", str(entries[1]))
+        self.assertIn("project_context_guard.py", str(entries[2]))
+        self.assertIn("echo keep-user-hook", str(entries[3]))
 
 
 class HostAdapterInstallationTests(unittest.TestCase):
@@ -1707,6 +1751,38 @@ class HostAdapterInstallationTests(unittest.TestCase):
             self.assertEqual(report["web_local_adapter"]["status"], "enabled")
             self.assertTrue(hooks.is_file())
             self.assertTrue(zshenv.is_file())
+
+    def test_configure_host_adapters_can_update_codex_hooks_without_touching_ai_bridge(self):
+        from scripts.install_skill import configure_host_adapters, install_ai_bridge_zshenv
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / "adaptive-delivery"
+            (target / "scripts").mkdir(parents=True)
+            for name in ("web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py", "project_context_guard.py"):
+                script = target / "scripts" / name
+                script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+                script.chmod(0o755)
+            codex = root / "codex"; codex.write_text("#!/bin/sh\n", encoding="utf-8"); codex.chmod(0o755)
+            bridge = root / "ai-bridge"; bridge.write_text("#!/bin/sh\n", encoding="utf-8"); bridge.chmod(0o755)
+            hooks = root / "hooks.json"
+            zshenv = root / ".zshenv"
+            install_ai_bridge_zshenv(zshenv, target, bridge, python_executable="/usr/bin/python3")
+            zshenv_before = zshenv.read_bytes()
+
+            report = configure_host_adapters(
+                target,
+                codex_executable=codex,
+                ai_bridge_executable=bridge,
+                hooks_file=hooks,
+                zshenv_file=zshenv,
+                python_executable="/usr/bin/python3",
+                configure_ai_bridge=False,
+            )
+
+            self.assertTrue(hooks.is_file())
+            self.assertEqual(zshenv.read_bytes(), zshenv_before)
+            self.assertEqual(report["web_local_adapter"]["status"], "enabled")
+
     def test_install_cli_rolls_back_target_and_host_files_when_adapter_configuration_partially_fails(self):
         import contextlib
         import io
@@ -1842,6 +1918,35 @@ class HostAdapterInstallationTests(unittest.TestCase):
         self.assertEqual(payload["capabilities"]["web_local_adapter"]["status"], "enabled")
         self.assertTrue(hooks_created)
         self.assertTrue(zshenv_created)
+
+    def test_install_cli_can_configure_codex_hooks_without_configuring_ai_bridge(self):
+        import contextlib
+        import io
+        from scripts.install_skill import main
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = InstallMigrationContractTests().make_source(root)
+            target = root / "installed" / "adaptive-delivery"
+            codex = root / "codex"; codex.write_text("#!/bin/sh\n", encoding="utf-8"); codex.chmod(0o755)
+            bridge = root / "ai-bridge"; bridge.write_text("#!/bin/sh\n", encoding="utf-8"); bridge.chmod(0o755)
+            hooks = root / "hooks.json"
+            zshenv = root / ".zshenv"
+            zshenv.write_text("export KEEP_UNCHANGED=1\n", encoding="utf-8")
+            output = io.StringIO()
+
+            with contextlib.redirect_stdout(output):
+                code = main([
+                    "--source", str(source), "--target", str(target),
+                    "--summary", "desktop hooks only", "--impact", "none",
+                    "--stop-condition", "ready", "--no-configure-runtime-services",
+                    "--no-configure-ai-bridge", "--codex", str(codex),
+                    "--ai-bridge", str(bridge), "--hooks-file", str(hooks),
+                    "--zshenv-file", str(zshenv),
+                ])
+
+            self.assertEqual(code, 0, output.getvalue())
+            self.assertTrue(hooks.is_file())
+            self.assertEqual(zshenv.read_text(encoding="utf-8"), "export KEEP_UNCHANGED=1\n")
 
 
 class WebAgentHealthServiceInstallationTests(unittest.TestCase):
