@@ -723,6 +723,8 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
             break
     while remaining and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", remaining[0]):
         remaining.pop(0)
+    while remaining and remaining[0] in {"(", "{"}:
+        remaining.pop(0)
     if remaining and remaining[0] == "--":
         remaining.pop(0)
     return remaining
@@ -740,6 +742,8 @@ def _shell_reads_pipeline_stdin(tokens: list[str]) -> bool:
         return False
     if executable in {"command", "exec", "nohup", "time", "nice"}:
         index = 1
+        if executable == "command" and len(remaining) > 1 and remaining[1] in {"-v", "-V"}:
+            return False
         while index < len(remaining) and remaining[index].startswith("-"):
             token = remaining[index]
             if token == "--":
@@ -800,6 +804,44 @@ def _pipeline_executes_shell_input(command: str) -> bool:
             consumer.append(candidate)
         if _shell_reads_pipeline_stdin(consumer):
             return True
+    return False
+
+
+def _redirection_executes_shell_input(command: str) -> bool:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    for index, token in enumerate(tokens):
+        if token not in {"<(", ">(", "=("}:
+            continue
+        inner: list[str] = []
+        depth = 1
+        for candidate in tokens[index + 1 :]:
+            if candidate in {"(", "<(", ">(", "=("}:
+                depth += 1
+            elif candidate == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            inner.append(candidate)
+        if _shell_reads_pipeline_stdin(inner) or _persistent_foreground_command(
+            " ".join(inner)
+        ):
+            return True
+    segment: list[str] = []
+    for token in tokens:
+        if token in _SHELL_SEPARATORS or (
+            token and set(token) <= {";", "&", "|"}
+        ):
+            segment = []
+            continue
+        if token.startswith("<") and _shell_reads_pipeline_stdin(segment):
+            return True
+        segment.append(token)
     return False
 
 
@@ -870,10 +912,13 @@ def _bounded_timeout_command(tokens: list[str]) -> bool:
         if token.startswith("-"):
             return False
         break
-    return (
-        index + 1 < len(tokens)
-        and _TIMEOUT_DURATION.fullmatch(tokens[index]) is not None
-    )
+    if index + 1 >= len(tokens):
+        return False
+    match = _TIMEOUT_DURATION.fullmatch(tokens[index])
+    if match is None:
+        return False
+    numeric = re.match(r"\d+(?:\.\d+)?", tokens[index])
+    return numeric is not None and float(numeric.group(0)) > 0
 
 
 def _persistent_signature_anywhere(tokens: list[str]) -> bool:
@@ -921,6 +966,29 @@ def _persistent_signature_anywhere(tokens: list[str]) -> bool:
     return False
 
 
+def _xargs_execution_payload(tokens: list[str]) -> list[str]:
+    remaining = list(tokens[1:])
+    value_options = {
+        "-E", "--eof", "-I", "--replace", "-L", "--max-lines", "-n",
+        "--max-args", "-P", "--max-procs", "-s", "--max-chars",
+    }
+    while remaining:
+        token = remaining[0]
+        if token == "--":
+            return remaining[1:]
+        if token in value_options:
+            remaining = remaining[2:] if len(remaining) > 1 else []
+            continue
+        if token.startswith(tuple(f"{option}=" for option in value_options)):
+            remaining.pop(0)
+            continue
+        if token.startswith("-"):
+            remaining.pop(0)
+            continue
+        break
+    return remaining
+
+
 def _persistent_foreground_segment(tokens: list[str]) -> bool:
     tokens = _strip_command_prefix(tokens)
     if not tokens:
@@ -928,13 +996,22 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
     executable = Path(tokens[0]).name.lower()
     if executable in {"[", "[["}:
         return False
+    if executable == "builtin":
+        return _persistent_foreground_segment(tokens[1:])
     if executable == "eval":
         payload = tokens[1:]
         if not payload:
             return False
-        if any("$" in token for token in payload):
+        if any("$" in token or "`" in token for token in payload):
             return True
         return _persistent_foreground_command(" ".join(payload))
+    if executable == "xargs":
+        payload = _strip_command_prefix(_xargs_execution_payload(tokens))
+        if not payload:
+            return False
+        if Path(payload[0]).name.lower() in {"bash", "sh", "zsh"}:
+            return True
+        return _persistent_foreground_segment(payload)
     if executable in {"timeout", "gtimeout"}:
         if _bounded_timeout_command(tokens):
             return False
@@ -1051,7 +1128,7 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
 
 
 def _persistent_foreground_command(command: str) -> bool:
-    if _pipeline_executes_shell_input(command):
+    if _pipeline_executes_shell_input(command) or _redirection_executes_shell_input(command):
         return True
     if any(
         _persistent_foreground_command(substitution)
