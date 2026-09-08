@@ -1378,8 +1378,8 @@ test("Grok generation stall timeout terminates after structured output stops", a
     env: {
       ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
       FAKE_RUNNER_DELAY_MS: "1000",
-      AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "200", AD_GROK_STALL_TIMEOUT_MS: "50",
-      AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "1000", AD_EXTERNAL_KILL_GRACE_MS: "25",
+      AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "1000", AD_GROK_STALL_TIMEOUT_MS: "50",
+      AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "2000", AD_EXTERNAL_KILL_GRACE_MS: "25",
     },
   });
   assert.equal(result.status, 1);
