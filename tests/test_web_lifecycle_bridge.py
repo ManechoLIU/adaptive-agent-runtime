@@ -736,8 +736,12 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                     )
 
     def test_production_bridge_has_no_trusted_web_attestation_verifier(self) -> None:
-        self.assertIsNone(web_bridge._registered_peer_attestation_verifier("web"))
-        self.assertIsNone(web_bridge._registered_peer_attestation_verifier("desktop_codex"))
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing-host-verifiers.json"
+            with patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", missing, create=True):
+                self.assertIsNone(web_bridge._registered_peer_attestation_verifier("web"))
+                self.assertIsNone(web_bridge._registered_peer_attestation_verifier("desktop_codex"))
 
     def test_browser_tab_receipt_cannot_recover_an_unverified_web_session(self) -> None:
         from unittest.mock import patch
@@ -797,6 +801,11 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                         "url": "https://chatgpt.com/c/unverified-web-session",
                     }]
                 },
+            ), patch.object(
+                web_bridge,
+                "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG",
+                root / "missing-host-verifiers.json",
+                create=True,
             ):
                 result = web_bridge.recover_same_controller_web_session(
                     repo=repo,
@@ -7004,6 +7013,11 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
                 side_effect=AssertionError("unattested built-in Web adapter must not run"),
             ) as reentry, patch.object(
                 web_bridge, "execute_native_resume", side_effect=AssertionError("web wake must not invoke desktop Codex")
+            ), patch.object(
+                web_bridge,
+                "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG",
+                Path(tmp) / "missing-host-verifiers.json",
+                create=True,
             ):
                 receipt = web_bridge.wake_existing_controller(
                     lifecycle_state={"pending_control_event": True, "controller_host": "web", "wake_generation": 4},
