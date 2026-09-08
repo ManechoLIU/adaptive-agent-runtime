@@ -228,6 +228,41 @@ class GoalDisplaySyncTests(unittest.TestCase):
         )
         self.assertIn("get_goal", denial or "")
 
+    def test_host_readback_rejects_unrelated_objective_and_split_thread_match(self) -> None:
+        receipt = self.start()
+        for event in (
+            self.event("update_goal", "update-1", {"status": "complete"}),
+            self.event("create_goal", "create-1", {"objective": "M1-F5-B 大纲闭环"}),
+            self.event("set_thread_title", "title-1", {"title": "SelfAlone 总控｜M1-F5-B 大纲闭环"}),
+        ):
+            receipt = self.complete_step(receipt, event)
+        receipt = self.complete_step(
+            receipt,
+            self.event("get_goal", "goal-read-unrelated", {}),
+            response={
+                "objective": "M1-F4 old goal",
+                "diagnostic": "expected M1-F5-B 大纲闭环",
+            },
+        )
+        self.assertEqual(receipt["status"], "pending_goal_readback")
+
+        receipt = self.complete_step(
+            receipt,
+            self.event("get_goal", "goal-read-valid", {}),
+            response={"structuredContent": {"objective": "M1-F5-B 大纲闭环"}},
+        )
+        self.assertEqual(receipt["status"], "pending_title_readback")
+        receipt = self.complete_step(
+            receipt,
+            self.event("list_threads", "title-read-split", {}),
+            response={"threads": [
+                {"threadId": "desktop-current", "title": "old title"},
+                {"threadId": "another-thread", "title": "SelfAlone 总控｜M1-F5-B 大纲闭环"},
+            ]},
+        )
+        self.assertEqual(receipt["status"], "pending_title_readback")
+        self.assertEqual(len(receipt["steps"]), 4)
+
     def test_project_terminal_states_do_not_create_a_display_sync(self) -> None:
         for status in ("project_complete", "project_blocked"):
             with self.subTest(status=status):

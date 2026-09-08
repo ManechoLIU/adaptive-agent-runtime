@@ -50,6 +50,54 @@ def _positive_generation(value: Any) -> int | None:
     return value
 
 
+def _structured_payloads(response: Any) -> list[dict[str, Any]]:
+    """Return only explicit Host result envelopes, never arbitrary nested evidence."""
+    payloads: list[dict[str, Any]] = []
+    queue: list[Any] = [response]
+    seen: set[int] = set()
+    while queue:
+        value = queue.pop(0)
+        if not isinstance(value, dict) or id(value) in seen:
+            continue
+        seen.add(id(value))
+        payloads.append(value)
+        for key in ("structuredContent", "structured_content", "result", "data"):
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                queue.append(nested)
+        content = value.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                    continue
+                try:
+                    parsed = json.loads(item["text"])
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(parsed, dict):
+                    queue.append(parsed)
+    return payloads
+
+
+def _goal_readback_matches(response: Any, objective: str) -> bool:
+    return any(payload.get("objective") == objective for payload in _structured_payloads(response))
+
+
+def _title_readback_matches(response: Any, session_id: str, title: str) -> bool:
+    for payload in _structured_payloads(response):
+        for key in ("threads", "pinnedThreads", "pinned_threads"):
+            records = payload.get(key)
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                record_id = record.get("threadId", record.get("thread_id", record.get("id")))
+                if str(record_id or "").strip() == session_id and record.get("title") == title:
+                    return True
+    return False
+
+
 def _binding_error(receipt: dict[str, Any], event: dict[str, Any]) -> str | None:
     expected = {
         "controller_session_id": receipt.get("controller_id"),
@@ -220,15 +268,19 @@ def observe_goal_display_sync_result(
         and response.get("isError") is not True
         and response.get("exit_code") in (None, 0)
     )
-    response_text = json.dumps(response, ensure_ascii=False, sort_keys=True, default=str)
-    response_text_lower = response_text.lower()
+    response_text_lower = json.dumps(
+        response, ensure_ascii=False, sort_keys=True, default=str
+    ).lower()
     step_name = str(inflight.get("step", ""))
     if success and step_name == "get_goal_readback":
-        success = str(next_receipt.get("objective", "")) in response_text
+        success = _goal_readback_matches(
+            response, str(next_receipt.get("objective", ""))
+        )
     elif success and step_name == "thread_title_readback":
-        success = (
-            str(next_receipt.get("execution_target_session_id", "")) in response_text
-            and str(next_receipt.get("thread_title", "")) in response_text
+        success = _title_readback_matches(
+            response,
+            str(next_receipt.get("execution_target_session_id", "")),
+            str(next_receipt.get("thread_title", "")),
         )
     if not success:
         capability_unavailable = (

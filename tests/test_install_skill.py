@@ -258,7 +258,7 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertIn("ADAPTIVE_DELIVERY_WEB_SESSION_ID", block)
         self.assertIn("-o comm=", block)
         self.assertNotIn('== *\\"', block)
-        self.assertIn("resolve-manual-web-session --cwd \"$PWD\"", block)
+        self.assertNotIn("resolve-manual-web-session", block)
         self.assertIn('--web-session-id "$_ad_web_session_id"', block)
         function = block.split("  _ad_web_lifecycle_exit() {", 1)[1].split("  }\n  trap", 1)[0]
         function = "_ad_web_lifecycle_exit() {" + function + "}"
@@ -653,6 +653,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_goal_display_sync.GoalDisplaySyncTests.test_successful_rolled_control_receipt_activates_display_sync_debt",
             "tests.test_goal_display_sync.GoalDisplaySyncTests.test_title_failure_recovers_without_recreating_goal",
             "tests.test_goal_display_sync.GoalDisplaySyncTests.test_host_readback_mismatch_retries_only_the_failed_read",
+            "tests.test_goal_display_sync.GoalDisplaySyncTests.test_host_readback_rejects_unrelated_objective_and_split_thread_match",
             "tests.test_goal_display_sync.GoalDisplaySyncTests.test_duplicate_rollover_reuses_completed_receipt",
             "tests.test_goal_display_sync.GoalDisplaySyncTests.test_unavailable_host_tool_marks_receipt_degraded",
             "tests.test_goal_display_sync.GoalDisplaySyncTests.test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced",
@@ -669,14 +670,22 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_exposes_pinned_host_submit_adapter",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_rechecks_bundle_before_each_execution",
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_registered_external_web_host_submit_adapter_is_used_without_caller_injection",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_detached_supervisor_retries_transient_registered_host_attestation_failure",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_malformed_registered_web_verifier_config_fails_closed_without_manual_fallback",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_browser_tab_receipt_cannot_recover_an_unverified_web_session",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_manual_web_mutations_cannot_downgrade_host_attested_current_target",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target",
-            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_legacy_quarantined_target_keeps_trusted_host_recovery_exit",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_legacy_quarantined_target_keeps_manual_replacement_exit",
-            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target",
-            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_does_not_rotate_manual_resume_lease",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_session_start_verified_target_does_not_rotate_manual_resume_lease",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_historical_alias_cannot_recover_even_with_trusted_verifier",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_unbound_chat_cannot_recover_even_with_trusted_verifier",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_zshenv_exit_bridge_executes_and_preserves_exit_precedence",
+            "tests.test_web_lifecycle_bridge.WebLifecycleComputerLeaseTests.test_audit_once_never_uses_manual_resume_lease_as_caller_identity",
+            "tests.test_install_skill.InstallCapabilityTests.test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence",
+            "tests.test_install_skill.WebAgentHealthServiceInstallationTests.test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load",
+            "tests.test_install_skill.WebAgentHealthServiceInstallationTests.test_runtime_service_load_failure_preserves_legacy_web_audit",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_resolve_reentry_session_strong_host_target_does_not_require_manual_lease",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_resolve_reentry_session_strong_host_target_requires_matching_web_ownership",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_reentry_without_canonical_web_ownership_never_calls_browser",
@@ -707,6 +716,15 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_registered_current_web_adapter_without_ownership_is_never_called",
             "tests.test_web_lifecycle_bridge.WebReentryDebounceTests.test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim",
             "tests.test_rule_handshake.RuleHandshakeTests.test_live_e2e_rejects_stale_ownership_generation_before_acceptance",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_fake_project_chat_cannot_ack_by_claiming_logical_controller_id",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_current_web_target_ack_records_exact_source_and_generations",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_fake_project_chat_cannot_accept_or_defer_live_e2e",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_ack_revalidates_source_fence_immediately_before_persist",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_defer_revalidates_source_fence_immediately_before_persist",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_accept_revalidates_source_fence_before_freezing_evidence",
+            "tests.test_governance.ControllerActionSourcePromptTests.test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source",
+            "tests.test_governance.ControllerActionSourcePromptTests.test_live_e2e_accept_prompt_carries_actual_execution_source",
+            "tests.test_governance.ControllerActionSourcePromptTests.test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source",
             "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests.test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix",
         }
         self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
@@ -845,7 +863,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_missing_required_identity_capability_reports_contract_drift_without_revoking_controller(self): self.assertTrue(True)\n"
                 "    def test_contract_drift_does_not_upgrade_foreign_unverified_session_to_degraded(self): self.assertTrue(True)\n"
                 "    def test_project_context_separates_unique_controller_from_unverified_web_session(self): self.assertTrue(True)\n"
-                "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n",
+                "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n"
+                "class ControllerActionSourcePromptTests(unittest.TestCase):\n"
+                "    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_accept_prompt_carries_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_rule_handshake.py").write_text(
@@ -857,7 +879,13 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_failed_live_e2e_does_not_freeze_invalid_wake_snapshot(self): self.assertTrue(True)\n"
                 "    def test_live_e2e_debt_survives_later_nonimpacting_install_until_accepted(self): self.assertTrue(True)\n"
                 "    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self): self.assertTrue(True)\n"
-                "    def test_live_e2e_rejects_stale_ownership_generation_before_acceptance(self): self.assertTrue(True)\n",
+                "    def test_live_e2e_rejects_stale_ownership_generation_before_acceptance(self): self.assertTrue(True)\n"
+                "    def test_fake_project_chat_cannot_ack_by_claiming_logical_controller_id(self): self.assertTrue(True)\n"
+                "    def test_current_web_target_ack_records_exact_source_and_generations(self): self.assertTrue(True)\n"
+                "    def test_fake_project_chat_cannot_accept_or_defer_live_e2e(self): self.assertTrue(True)\n"
+                "    def test_ack_revalidates_source_fence_immediately_before_persist(self): self.assertTrue(True)\n"
+                "    def test_defer_revalidates_source_fence_immediately_before_persist(self): self.assertTrue(True)\n"
+                "    def test_accept_revalidates_source_fence_before_freezing_evidence(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_controller_target_guard.py").write_text(
@@ -874,6 +902,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
             (tests_dir / "test_web_lifecycle_bridge.py").write_text(
                 "import unittest\n"
+                "class WebLifecycleComputerLeaseTests(unittest.TestCase):\n"
+                "    def test_audit_once_never_uses_manual_resume_lease_as_caller_identity(self): self.assertTrue(True)\n"
                 "class WebLifecycleAuditTests(unittest.TestCase):\n"
                 "    def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership(self): self.assertTrue(True)\n"
@@ -896,12 +926,14 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_replace_web_session_bootstrap_rotates_target_and_manual_lease_without_host_attestation(self): self.assertTrue(True)\n"
                 "    def test_manual_web_mutations_cannot_downgrade_host_attested_current_target(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target(self): self.assertTrue(True)\n"
-                "    def test_legacy_quarantined_target_keeps_trusted_host_recovery_exit(self): self.assertTrue(True)\n"
                 "    def test_legacy_quarantined_target_keeps_manual_replacement_exit(self): self.assertTrue(True)\n"
                 "    def test_replace_web_session_rejects_unapproved_session_and_stale_generation(self): self.assertTrue(True)\n"
                 "    def test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history(self): self.assertTrue(True)\n"
-                "    def test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target(self): self.assertTrue(True)\n"
-                "    def test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim(self): self.assertTrue(True)\n"
+                "    def test_same_controller_web_recovery_does_not_rotate_manual_resume_lease(self): self.assertTrue(True)\n"
+                "    def test_session_start_verified_target_does_not_rotate_manual_resume_lease(self): self.assertTrue(True)\n"
+                "    def test_historical_alias_cannot_recover_even_with_trusted_verifier(self): self.assertTrue(True)\n"
+                "    def test_unbound_chat_cannot_recover_even_with_trusted_verifier(self): self.assertTrue(True)\n"
+                "    def test_zshenv_exit_bridge_executes_and_preserves_exit_precedence(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_web_reentry(self): self.assertTrue(True)\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume(self): self.assertTrue(True)\n"
@@ -928,6 +960,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again(self): self.assertTrue(True)\n"
                 "    def test_identity_blocked_event_retries_after_registry_changes(self): self.assertTrue(True)\n"
                 "class WebLocalReentryIntegrationTests(unittest.TestCase):\n"
+                "    def test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target(self): self.assertTrue(True)\n"
+                "    def test_detached_supervisor_retries_transient_registered_host_attestation_failure(self): self.assertTrue(True)\n"
                 "    def test_direct_wake_rejects_confirmed_web_result_after_desktop_handoff(self): self.assertTrue(True)\n"
                 "    def test_desktop_result_cannot_persist_or_rearm_after_web_handoff(self): self.assertTrue(True)\n"
                 "    def test_web_supervisor_rejects_confirmed_receipt_for_noncanonical_target(self): self.assertTrue(True)\n"
@@ -996,7 +1030,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_hard_blocked_or_deferred_actions_clear_continuation_debt_and_allow_yield(self): self.assertTrue(True)\n"
                 "    def test_continuation_debt_fingerprint_escalates_through_existing_recurrence_rules(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self): self.assertTrue(True)\n"
-                "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n",
+                "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n"
+                "class ControllerActionSourcePromptTests(unittest.TestCase):\n"
+                "    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_accept_prompt_carries_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_desktop_lifecycle_adapter.py").write_text(
@@ -1018,6 +1056,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_successful_rolled_control_receipt_activates_display_sync_debt(self): self.assertTrue(True)\n"
                 "    def test_title_failure_recovers_without_recreating_goal(self): self.assertTrue(True)\n"
                 "    def test_host_readback_mismatch_retries_only_the_failed_read(self): self.assertTrue(True)\n"
+                "    def test_host_readback_rejects_unrelated_objective_and_split_thread_match(self): self.assertTrue(True)\n"
                 "    def test_duplicate_rollover_reuses_completed_receipt(self): self.assertTrue(True)\n"
                 "    def test_unavailable_host_tool_marks_receipt_degraded(self): self.assertTrue(True)\n"
                 "    def test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced(self): self.assertTrue(True)\n",
@@ -1051,6 +1090,15 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
                 "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n"
                 "    def test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_install_skill.py").write_text(
+                "import unittest\n"
+                "class InstallCapabilityTests(unittest.TestCase):\n"
+                "    def test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence(self): self.assertTrue(True)\n"
+                "class WebAgentHealthServiceInstallationTests(unittest.TestCase):\n"
+                "    def test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load(self): self.assertTrue(True)\n"
+                "    def test_runtime_service_load_failure_preserves_legacy_web_audit(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)
@@ -1163,7 +1211,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n"
                 "    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self): self.assertTrue(True)\n"
                 "    def test_project_context_separates_unique_controller_from_unverified_web_session(self): self.assertTrue(True)\n"
-                "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n",
+                "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n"
+                "class ControllerActionSourcePromptTests(unittest.TestCase):\n"
+                "    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_accept_prompt_carries_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_rule_handshake.py").write_text(
@@ -1174,7 +1226,13 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_real_confirmed_wake_followed_by_closed_cycle_can_finalize_live_e2e(self): self.assertTrue(True)\n"
                 "    def test_failed_live_e2e_does_not_freeze_invalid_wake_snapshot(self): self.assertTrue(True)\n"
                 "    def test_live_e2e_debt_survives_later_nonimpacting_install_until_accepted(self): self.assertTrue(True)\n"
-                "    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self): self.assertTrue(True)\n",
+                "    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self): self.assertTrue(True)\n"
+                "    def test_fake_project_chat_cannot_ack_by_claiming_logical_controller_id(self): self.assertTrue(True)\n"
+                "    def test_current_web_target_ack_records_exact_source_and_generations(self): self.assertTrue(True)\n"
+                "    def test_fake_project_chat_cannot_accept_or_defer_live_e2e(self): self.assertTrue(True)\n"
+                "    def test_ack_revalidates_source_fence_immediately_before_persist(self): self.assertTrue(True)\n"
+                "    def test_defer_revalidates_source_fence_immediately_before_persist(self): self.assertTrue(True)\n"
+                "    def test_accept_revalidates_source_fence_before_freezing_evidence(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_controller_target_guard.py").write_text(
@@ -1188,6 +1246,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
             (tests_dir / "test_web_lifecycle_bridge.py").write_text(
                 "import unittest\n"
+                "class WebLifecycleComputerLeaseTests(unittest.TestCase):\n"
+                "    def test_audit_once_never_uses_manual_resume_lease_as_caller_identity(self): self.assertTrue(True)\n"
                 "class WebLifecycleAuditTests(unittest.TestCase):\n"
                 "    def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership(self): self.assertTrue(True)\n"
@@ -1201,7 +1261,6 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_replace_web_session_bootstrap_rotates_target_and_manual_lease_without_host_attestation(self): self.assertTrue(True)\n"
                 "    def test_manual_web_mutations_cannot_downgrade_host_attested_current_target(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target(self): self.assertTrue(True)\n"
-                "    def test_legacy_quarantined_target_keeps_trusted_host_recovery_exit(self): self.assertTrue(True)\n"
                 "    def test_legacy_quarantined_target_keeps_manual_replacement_exit(self): self.assertTrue(True)\n"
                 "    def test_replace_web_session_rejects_unapproved_session_and_stale_generation(self): self.assertTrue(True)\n"
                 "    def test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history(self): self.assertTrue(True)\n"
@@ -1262,7 +1321,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_hard_blocked_or_deferred_actions_clear_continuation_debt_and_allow_yield(self): self.assertTrue(True)\n"
                 "    def test_continuation_debt_fingerprint_escalates_through_existing_recurrence_rules(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self): self.assertTrue(True)\n"
-                "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n",
+                "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n"
+                "class ControllerActionSourcePromptTests(unittest.TestCase):\n"
+                "    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_accept_prompt_carries_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_desktop_lifecycle_adapter.py").write_text(
@@ -1284,6 +1347,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_successful_rolled_control_receipt_activates_display_sync_debt(self): self.assertTrue(True)\n"
                 "    def test_title_failure_recovers_without_recreating_goal(self): self.assertTrue(True)\n"
                 "    def test_host_readback_mismatch_retries_only_the_failed_read(self): self.assertTrue(True)\n"
+                "    def test_host_readback_rejects_unrelated_objective_and_split_thread_match(self): self.assertTrue(True)\n"
                 "    def test_duplicate_rollover_reuses_completed_receipt(self): self.assertTrue(True)\n"
                 "    def test_unavailable_host_tool_marks_receipt_degraded(self): self.assertTrue(True)\n"
                 "    def test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced(self): self.assertTrue(True)\n",
@@ -1317,6 +1381,15 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
                 "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n"
                 "    def test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_install_skill.py").write_text(
+                "import unittest\n"
+                "class InstallCapabilityTests(unittest.TestCase):\n"
+                "    def test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence(self): self.assertTrue(True)\n"
+                "class WebAgentHealthServiceInstallationTests(unittest.TestCase):\n"
+                "    def test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load(self): self.assertTrue(True)\n"
+                "    def test_runtime_service_load_failure_preserves_legacy_web_audit(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)
@@ -2033,3 +2106,70 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
         self.assertEqual(loaded, [plist.resolve()])
         self.assertEqual(report["state"], "loaded")
         self.assertTrue(report["configured"])
+
+def _runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load(self):
+    import plistlib
+    from scripts.install_skill import configure_runtime_services
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        target = root / "adaptive-delivery"
+        (target / "scripts").mkdir(parents=True)
+        script = target / "scripts" / "controller_runtime_supervisor.py"
+        script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        script.chmod(0o755)
+        launchagents = root / "LaunchAgents"; launchagents.mkdir()
+        health = launchagents / "com.openai.adaptive-agent-runtime.web-agent-health.plist"
+        legacy_a = launchagents / "ai.openai.adaptive-delivery.web-lifecycle.controller-a.plist"
+        legacy_b = launchagents / "com.openai.adaptive-delivery.web-lifecycle.controller-b.plist"
+        unrelated = launchagents / "com.example.keep.plist"
+        for p in (legacy_a, legacy_b, unrelated):
+            p.write_bytes(plistlib.dumps({"Label": p.stem, "ProgramArguments": ["/bin/true"]}))
+        loaded=[]; retired=[]
+        def loader(path):
+            loaded.append(path)
+            return {"state":"loaded"}
+        def retire(path):
+            retired.append(path)
+            path.unlink(missing_ok=True)
+        report = configure_runtime_services(
+            target, health_service_plist=health,
+            registry_path=root / "controllers.json",
+            service_loader=loader,
+            legacy_service_unloader=retire,
+        )
+        exists = {p.name:p.exists() for p in (health, legacy_a, legacy_b, unrelated)}
+    self.assertEqual(loaded, [health.resolve()])
+    self.assertEqual(set(retired), {legacy_a.resolve(), legacy_b.resolve()})
+    self.assertEqual(set(report["retired_legacy_services"]), {str(legacy_a.resolve()), str(legacy_b.resolve())})
+    self.assertTrue(exists[health.name])
+    self.assertFalse(exists[legacy_a.name])
+    self.assertFalse(exists[legacy_b.name])
+    self.assertTrue(exists[unrelated.name])
+
+
+def _runtime_service_load_failure_preserves_legacy_web_audit(self):
+    from scripts.install_skill import configure_runtime_services
+    with tempfile.TemporaryDirectory() as d:
+        root=Path(d)
+        target=root/"adaptive-delivery"; (target/"scripts").mkdir(parents=True)
+        script=target/"scripts"/"controller_runtime_supervisor.py"
+        script.write_text("#!/usr/bin/env python3\n", encoding="utf-8"); script.chmod(0o755)
+        launchagents=root/"LaunchAgents"; launchagents.mkdir()
+        health=launchagents/"com.openai.adaptive-agent-runtime.web-agent-health.plist"
+        legacy=launchagents/"ai.openai.adaptive-delivery.web-lifecycle.controller-a.plist"
+        legacy.write_text("legacy", encoding="utf-8")
+        retired=[]
+        with self.assertRaisesRegex(OSError, "new service failed"):
+            configure_runtime_services(
+                target, health_service_plist=health,
+                registry_path=root/"controllers.json",
+                service_loader=lambda _path: (_ for _ in ()).throw(OSError("new service failed")),
+                legacy_service_unloader=lambda path: retired.append(path),
+            )
+        legacy_exists=legacy.exists()
+    self.assertEqual(retired, [])
+    self.assertTrue(legacy_exists)
+
+
+WebAgentHealthServiceInstallationTests.test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load = _runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load
+WebAgentHealthServiceInstallationTests.test_runtime_service_load_failure_preserves_legacy_web_audit = _runtime_service_load_failure_preserves_legacy_web_audit

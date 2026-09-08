@@ -86,6 +86,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_registered_web_verifier_rechecks_bundle_before_each_execution",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
     "test_registered_external_web_host_submit_adapter_is_used_without_caller_injection",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_detached_supervisor_retries_transient_registered_host_attestation_failure",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_malformed_registered_web_verifier_config_fails_closed_without_manual_fallback",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
@@ -97,17 +101,29 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
-    "test_legacy_quarantined_target_keeps_trusted_host_recovery_exit",
-    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_legacy_quarantined_target_keeps_manual_replacement_exit",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_replace_web_session_rejects_unapproved_session_and_stale_generation",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
-    "test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target",
+    "test_same_controller_web_recovery_does_not_rotate_manual_resume_lease",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
-    "test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim",
+    "test_session_start_verified_target_does_not_rotate_manual_resume_lease",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_historical_alias_cannot_recover_even_with_trusted_verifier",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_unbound_chat_cannot_recover_even_with_trusted_verifier",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_zshenv_exit_bridge_executes_and_preserves_exit_precedence",
+    "tests.test_web_lifecycle_bridge.WebLifecycleComputerLeaseTests."
+    "test_audit_once_never_uses_manual_resume_lease_as_caller_identity",
+    "tests.test_install_skill.InstallCapabilityTests."
+    "test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence",
+    "tests.test_install_skill.WebAgentHealthServiceInstallationTests."
+    "test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load",
+    "tests.test_install_skill.WebAgentHealthServiceInstallationTests."
+    "test_runtime_service_load_failure_preserves_legacy_web_audit",
     "tests.test_web_reentry_adapter.WebReentryAdapterTests."
     "test_resolve_reentry_session_strong_host_target_does_not_require_manual_lease",
     "tests.test_web_reentry_adapter.WebReentryAdapterTests."
@@ -180,6 +196,24 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack",
     "tests.test_rule_handshake.RuleHandshakeTests."
     "test_live_e2e_rejects_stale_ownership_generation_before_acceptance",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_fake_project_chat_cannot_ack_by_claiming_logical_controller_id",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_current_web_target_ack_records_exact_source_and_generations",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_fake_project_chat_cannot_accept_or_defer_live_e2e",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_ack_revalidates_source_fence_immediately_before_persist",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_defer_revalidates_source_fence_immediately_before_persist",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_accept_revalidates_source_fence_before_freezing_evidence",
+    "tests.test_governance.ControllerActionSourcePromptTests."
+    "test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source",
+    "tests.test_governance.ControllerActionSourcePromptTests."
+    "test_live_e2e_accept_prompt_carries_actual_execution_source",
+    "tests.test_governance.ControllerActionSourcePromptTests."
+    "test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source",
     "tests.test_web_lifecycle_bridge.WebReentryDebounceTests."
     "test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
@@ -334,6 +368,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_title_failure_recovers_without_recreating_goal",
     "tests.test_goal_display_sync.GoalDisplaySyncTests."
     "test_host_readback_mismatch_retries_only_the_failed_read",
+    "tests.test_goal_display_sync.GoalDisplaySyncTests."
+    "test_host_readback_rejects_unrelated_objective_and_split_thread_match",
     "tests.test_goal_display_sync.GoalDisplaySyncTests."
     "test_duplicate_rollover_reuses_completed_receipt",
     "tests.test_goal_display_sync.GoalDisplaySyncTests."
@@ -847,12 +883,44 @@ def _unload_web_agent_health_service(plist_path: Path) -> None:
     )
 
 
+LEGACY_WEB_LIFECYCLE_PLIST_GLOBS = (
+    "ai.openai.adaptive-delivery.web-lifecycle.*.plist",
+    "com.openai.adaptive-delivery.web-lifecycle.*.plist",
+)
+
+
+def _unload_legacy_web_lifecycle_service(plist_path: Path) -> None:
+    plist_path = plist_path.expanduser().resolve()
+    launchctl = Path("/bin/launchctl")
+    if launchctl.is_file():
+        subprocess.run(
+            [str(launchctl), "bootout", f"gui/{os.getuid()}", str(plist_path)],
+            capture_output=True, text=True, check=False,
+        )
+    plist_path.unlink(missing_ok=True)
+
+
+def _retire_legacy_web_lifecycle_services(
+    launchagents_dir: Path, *, unloader: Any | None = None
+) -> list[str]:
+    retire = unloader or _unload_legacy_web_lifecycle_service
+    candidates: list[Path] = []
+    for pattern in LEGACY_WEB_LIFECYCLE_PLIST_GLOBS:
+        candidates.extend(launchagents_dir.glob(pattern))
+    retired: list[str] = []
+    for path in sorted({item.expanduser().resolve() for item in candidates}, key=str):
+        retire(path)
+        retired.append(str(path))
+    return retired
+
+
 def configure_runtime_services(
     target: str | Path,
     *,
     health_service_plist: str | Path = DEFAULT_WEB_AGENT_HEALTH_PLIST,
     registry_path: str | Path = DEFAULT_CONTROLLER_REGISTRY,
     service_loader: Any | None = None,
+    legacy_service_unloader: Any | None = None,
 ) -> dict[str, Any]:
     target_path = Path(target).expanduser().resolve()
     plist_path = install_web_agent_health_service_plist(
@@ -864,12 +932,16 @@ def configure_runtime_services(
     result = loader(plist_path)
     if not isinstance(result, dict):
         result = {"state": "loaded"}
+    retired_legacy_services = _retire_legacy_web_lifecycle_services(
+        plist_path.parent, unloader=legacy_service_unloader
+    )
     return {
         **result,
         "configured": _health_service_plist_matches(
             plist_path, skill_root=target_path
         ),
         "plist": str(plist_path),
+        "retired_legacy_services": retired_legacy_services,
     }
 
 
@@ -1237,9 +1309,6 @@ def _web_zshenv_block(target: Path, bridge: Path, python_executable: str) -> str
 _ad_web_bridge_executable={bridge_literal}
 _ad_web_parent=$(/bin/ps -p \"$PPID\" -o comm= 2>/dev/null)
 _ad_web_session_id=\"${{ADAPTIVE_DELIVERY_WEB_SESSION_ID:-}}\"
-if [[ \"$_ad_web_parent\" == \"$_ad_web_bridge_executable\" && -z \"$_ad_web_session_id\" ]]; then
-  _ad_web_session_id=$({python_literal} {script_literal} resolve-manual-web-session --cwd \"$PWD\" 2>/dev/null)
-fi
 if [[ \"$_ad_web_parent\" == \"$_ad_web_bridge_executable\" && -n \"$_ad_web_session_id\" ]]; then
   _ad_web_cwd=\"$PWD\"
   _ad_web_command=\"$ZSH_EXECUTION_STRING\"

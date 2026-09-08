@@ -41,6 +41,29 @@ DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG = Path.home() / ".codex" / "adaptive-de
 _PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., Any]] = {}
 PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS = 8
 PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT = 64 * 1024
+
+
+class PeerHostTransientUnavailable(RuntimeError):
+    """Machine Host boundary exists but is temporarily unable to attest/deliver."""
+
+
+_PEER_HOST_TRANSIENT_ERROR_MARKERS = (
+    "exact chatgpt conversation target is unavailable",
+    "connect enoent",
+    "econnrefused",
+    "browser machine command timed out",
+    "another debugger is already attached",
+    "native host connection closed",
+    "native host is unavailable",
+    "socket hang up",
+)
+
+
+def _peer_host_error_is_transient(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return bool(text) and any(marker in text for marker in _PEER_HOST_TRANSIENT_ERROR_MARKERS)
+
+
 DEFAULT_MANUAL_WEB_LEASE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_AUDIT_LOG = (
     Path.home()
@@ -529,19 +552,10 @@ def require_web_controller_session(
         registry, controller_id=controller_id, host="web"
     )
     if record is None:
-        aliases = target_guard.host_sessions(
-            registry, controller_id=controller_id, host="web"
-        )
-        verified = (
-            len(aliases) == 1
-            and aliases[0] == value
-            and registered_controller_session(
-                controller_id=controller_id,
-                session_id=value,
-                host="web",
-                registry_path=registry_path,
-            )
-        )
+        # Web lineage is historical ownership only. Without an explicit current
+        # target there is no authorized Web execution entry, even if exactly one
+        # alias exists or it matches a legacy logical Controller identifier.
+        verified = False
     else:
         verified = (
             record.get("host_attested") is not False
@@ -633,9 +647,10 @@ def _rotated_manual_web_resume_lease_payload(
         return payload, False
     if record.get("provenance") != "manual_user_authorized" or record.get("mode") != "resume_only":
         return payload, False
+    # Target rotation must not leave a same-Controller manual lease pointing at a
+    # historical alias. Retarget the lease metadata even when it is already
+    # expired/suspended; preserve authorization/expiry exactly and never renew it.
     expires_at = record.get("expires_at_unix")
-    if not isinstance(expires_at, int) or isinstance(expires_at, bool) or expires_at <= now_unix:
-        return payload, False
     lease_repo_value = record.get("repo")
     if not isinstance(lease_repo_value, str) or not lease_repo_value.strip():
         return payload, False
@@ -670,11 +685,11 @@ def rotate_existing_manual_web_resume_lease(
     lease_path: Path | None = None,
     now_unix: int | None = None,
 ) -> bool:
-    """Carry an existing user-authorized resume-only lease across Web target rotation.
+    """Keep an existing manual resume lease aligned with Web target rotation.
 
-    This never creates authorization. It only retargets an unexpired lease that already
-    belongs to the same logical Controller and repository, preserving its original
-    authorization time and expiry.
+    This never creates or renews authorization. It retargets an existing lease record
+    that belongs to the same logical Controller/repository, including an already
+    expired or suspended record, while preserving its authorization time and expiry.
     """
     repo = canonical_root(repo)
     lease_path = Path(lease_path or DEFAULT_MANUAL_WEB_LEASES).expanduser()
@@ -798,6 +813,31 @@ def recover_same_controller_web_session(
     controller_id = str(project.get("controller_id") or "").strip()
     if not controller_id:
         raise PermissionError("same-controller recovery has no existing controller_id")
+
+    # Host attestation proves that a browser conversation exists and matches the
+    # requested generation fence; it does not prove that an arbitrary historical
+    # alias or unrelated project chat is the user's intended successor Controller.
+    # Recovery therefore may only upgrade the already-canonical current Web target
+    # in place. Any target session change requires the explicit replace-web-session
+    # path first, which records a new manual/temporary current target.
+    registry_snapshot = load_json(registry_path)
+    current_target_record = target_guard.target_record(
+        registry_snapshot, controller_id=controller_id, host="web"
+    )
+    if not isinstance(current_target_record, dict):
+        raise PermissionError(
+            "same-controller Web recovery requires an explicit canonical current target; "
+            "use replace-web-session after explicit target authorization"
+        )
+    current_status, current_target_session, _current_target_generation = (
+        target_guard.validate_target_record(current_target_record, host="web")
+    )
+    if current_status != "active" or current_target_session != web_session_id:
+        raise PermissionError(
+            "same-controller Web recovery cannot replace the canonical current target; "
+            "historical/unbound sessions require explicit replace-web-session authorization"
+        )
+
     if binding.get("verification") == "CONFLICT":
         raise PermissionError(
             "verified Web Controller Session identity required; "
@@ -841,18 +881,13 @@ def recover_same_controller_web_session(
             registry_path=registry_path,
             provenance="web_entry",
         )
-        resume_lease_rotated = rotate_existing_manual_web_resume_lease(
-            repo=repo,
-            controller_id=controller_id,
-            web_session_id=web_session_id,
-        )
         return {
             "result": "ALREADY_VERIFIED",
             "state": "VERIFIED",
             "controller_id": controller_id,
             "active_host": ownership["active_host"],
             "ownership_generation": ownership["generation"],
-            "resume_lease_rotated": resume_lease_rotated,
+            "resume_lease_rotated": False,
             "identity": target_guard.controller_identity_projection(
                 repo=repo, host="web", source_session_id=web_session_id,
                 registry_path=registry_path,
@@ -1024,17 +1059,12 @@ def recover_same_controller_web_session(
     )
     if recovered["session_binding_state"].get("verification") != "VERIFIED":
         raise RuntimeError("same-controller recovery did not produce a verified current session")
-    resume_lease_rotated = rotate_existing_manual_web_resume_lease(
-        repo=repo,
-        controller_id=controller_id,
-        web_session_id=web_session_id,
-    )
     return {
         "result": "RECOVERED",
         "state": "VERIFIED",
         "controller_id": controller_id,
         "execution_target_session_id": web_session_id,
-        "resume_lease_rotated": resume_lease_rotated,
+        "resume_lease_rotated": False,
         "active_host": ownership_claim["active_host"],
         "ownership_generation": ownership_claim["generation"],
         "target_generation": recovered["session_binding_state"].get(
@@ -2615,7 +2645,17 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
                 timeout=PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS,
                 env=safe_env,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except subprocess.TimeoutExpired as exc:
+            raise PeerHostTransientUnavailable(
+                f"registered Host verifier execution temporarily unavailable: {exc}"
+            ) from exc
+        except OSError as exc:
+            if _peer_host_error_is_transient(exc):
+                raise PeerHostTransientUnavailable(
+                    f"registered Host verifier execution temporarily unavailable: {exc}"
+                ) from exc
+            raise PermissionError(f"registered Host verifier execution failed: {exc}") from exc
+        except subprocess.SubprocessError as exc:
             raise PermissionError(f"registered Host verifier execution failed: {exc}") from exc
         if len(completed.stdout.encode("utf-8", errors="replace")) > PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT:
             raise PermissionError("registered Host verifier output exceeds limit")
@@ -2624,7 +2664,20 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
         except json.JSONDecodeError as exc:
             raise PermissionError("registered Host verifier returned invalid JSON") from exc
         if completed.returncode != 0 or not isinstance(payload, dict) or payload.get("ok") is not True:
-            raise PermissionError("registered Host verifier rejected machine request")
+            error_detail = payload.get("error") if isinstance(payload, dict) else None
+            if (
+                isinstance(payload, dict)
+                and payload.get("error_code") == "RUNTIME_HOST_VERIFIER_FAILED"
+                and _peer_host_error_is_transient(error_detail)
+            ):
+                raise PeerHostTransientUnavailable(
+                    "registered Host verifier temporarily unavailable: "
+                    + str(error_detail or "machine request unavailable")
+                )
+            raise PermissionError(
+                "registered Host verifier rejected machine request"
+                + (f": {error_detail}" if error_detail else "")
+            )
         return payload
 
     def verify(**kwargs: Any) -> Any:
@@ -2803,6 +2856,110 @@ def _validated_web_origin_attestation(
         "origin_attested": True,
         "call_receipt": call_receipt.strip(),
     }
+
+
+def _execute_registered_web_host_reentry(
+    *,
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    lifecycle_state: dict[str, Any],
+    runtime_path: str | None,
+    ownership_fence: dict[str, Any] | None,
+    verifier: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    verifier = verifier or _registered_peer_attestation_verifier("web")
+    adapter = getattr(verifier, "submit_reentry", None) if callable(verifier) else None
+    if not callable(verifier) or not callable(adapter):
+        raise PermissionError("registered Host verifier/submit adapter is unavailable")
+    if not isinstance(ownership_fence, dict):
+        raise PermissionError("canonical Web execution ownership is missing")
+
+    with target_guard.locked_execution_target(
+        repo=repo,
+        host="web",
+        registry_path=registry,
+    ) as current_target:
+        if current_target.get("controller_id") != session_id:
+            raise PermissionError("Web target does not belong to the registered Controller")
+        current_registry = load_json(registry)
+        current_web_record = target_guard.target_record(
+            current_registry,
+            controller_id=session_id,
+            host="web",
+        )
+        if not isinstance(current_web_record, dict):
+            raise PermissionError("canonical Web target record is missing")
+        if (
+            current_web_record.get("provenance")
+            != "host_attested_same_controller_recovery"
+            or current_web_record.get("identity_proof") != "host_attested_origin"
+        ):
+            raise PermissionError(
+                "registered Host submit requires current Host-attested Web target"
+            )
+
+        expected_target = str(current_target["execution_target_session_id"])
+        expected_generation = current_target.get("generation")
+        expected_mode = current_target.get("target_mode")
+        expected_ownership_generation = ownership_fence.get("generation")
+        if (
+            ownership_fence.get("active_host") != "web"
+            or ownership_fence.get("execution_target_session_id") != expected_target
+            or not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation < 1
+            or not isinstance(expected_ownership_generation, int)
+            or isinstance(expected_ownership_generation, bool)
+            or expected_ownership_generation < 1
+        ):
+            raise PermissionError(
+                "canonical Web execution ownership is missing or mismatched"
+            )
+
+        origin_attestation = _validated_web_origin_attestation(
+            verifier(
+                phase="pre_delivery",
+                controller_id=session_id,
+                host="web",
+                expected_target_session_id=expected_target,
+                expected_target_generation=expected_generation,
+                expected_target_mode=expected_mode,
+                expected_ownership_generation=expected_ownership_generation,
+            ),
+            expected_target_session_id=expected_target,
+        )
+        attempt = adapter(
+            controller_id=session_id,
+            session_id=expected_target,
+            execution_target_session_id=expected_target,
+            target_generation=expected_generation,
+            target_mode=expected_mode,
+            ownership_generation=expected_ownership_generation,
+            repo=repo,
+            registry=registry,
+            lifecycle_state=lifecycle_state,
+            runtime_path=runtime_path,
+            host_origin_attestation=origin_attestation,
+        )
+        if not isinstance(attempt, dict):
+            raise PermissionError(
+                "registered Host submit adapter returned a non-object execution receipt"
+            )
+        host_execution_receipt = attempt.get("host_execution_receipt")
+        if (
+            attempt.get("execution_target_session_id") != expected_target
+            or attempt.get("target_generation") != expected_generation
+            or attempt.get("ownership_generation") != expected_ownership_generation
+            or attempt.get("target_mode") != expected_mode
+            or not isinstance(host_execution_receipt, dict)
+            or host_execution_receipt.get("call_receipt")
+            != origin_attestation["call_receipt"]
+        ):
+            raise PermissionError(
+                "registered Host submit receipt does not match canonical target, ownership, and Host call receipt"
+            )
+        return attempt
 
 
 def _wake_receipt(
@@ -4620,12 +4777,57 @@ def _run_auto_native_stop_impl(
             approval_id = str(current.get("approval_id") or "").strip() or None
 
         fingerprint = _wake_event_fingerprint(lifecycle_state)
-        attempt = execute_web_reentry(
-            controller_id=session_id, repo=repo, registry_path=registry,
-            lease_path=DEFAULT_MANUAL_WEB_LEASES, lifecycle_state=lifecycle_state,
-            approval_id=approval_id,
-            origin_verifier=_registered_peer_attestation_verifier("web"),
+        verifier = _registered_peer_attestation_verifier("web")
+        registry_data_for_web = load_json(registry)
+        current_web_record = target_guard.target_record(
+            registry_data_for_web, controller_id=session_id, host="web"
         )
+        use_registered_host = (
+            isinstance(current_web_record, dict)
+            and current_web_record.get("provenance")
+            == "host_attested_same_controller_recovery"
+            and current_web_record.get("identity_proof") == "host_attested_origin"
+            and callable(verifier)
+            and callable(getattr(verifier, "submit_reentry", None))
+        )
+        if use_registered_host:
+            try:
+                attempt = _execute_registered_web_host_reentry(
+                    session_id=session_id,
+                    repo=repo,
+                    registry=registry,
+                    lifecycle_state=lifecycle_state,
+                    runtime_path=runtime_path,
+                    ownership_fence=ownership_fence,
+                    verifier=verifier,
+                )
+            except PeerHostTransientUnavailable as exc:
+                attempt = {
+                    "operation": "web_reentry",
+                    "result": "DEFERRED",
+                    "state": "WEB_REENTRY_PENDING",
+                    "returncode": 78,
+                    "failure_class": "web_reentry_unavailable",
+                    "error_code": "WEB_HOST_TEMPORARILY_UNAVAILABLE",
+                    "stderr_tail": str(exc),
+                }
+            except Exception as exc:
+                attempt = {
+                    "operation": "web_reentry",
+                    "result": "FAILED",
+                    "state": "WEB_REENTRY_IDENTITY_UNAVAILABLE",
+                    "returncode": 78,
+                    "failure_class": "web_reentry_identity_unavailable",
+                    "error_code": "WEB_HOST_ATTESTATION_INVALID",
+                    "stderr_tail": str(exc),
+                }
+        else:
+            attempt = execute_web_reentry(
+                controller_id=session_id, repo=repo, registry_path=registry,
+                lease_path=DEFAULT_MANUAL_WEB_LEASES, lifecycle_state=lifecycle_state,
+                approval_id=approval_id,
+                origin_verifier=verifier,
+            )
         if attempt.get("result") == "CONFIRMED":
             try:
                 receipt = _validate_confirmed_web_reentry_receipt(
@@ -5078,9 +5280,6 @@ _ad_web_parent=$(/bin/ps -p "$PPID" -o comm= 2>/dev/null)
 _ad_web_session_id="${{ADAPTIVE_DELIVERY_WEB_SESSION_ID:-}}"
 _ad_web_bridge_script="{script}"
 _ad_web_bridge_python="{python}"
-if [[ "$_ad_web_parent" == "{AI_BRIDGE_EXECUTABLE}" && -z "$_ad_web_session_id" ]]; then
-  _ad_web_session_id=$("$_ad_web_bridge_python" "$_ad_web_bridge_script" resolve-manual-web-session --cwd "$PWD" 2>/dev/null)
-fi
 if [[ "$_ad_web_parent" == "{AI_BRIDGE_EXECUTABLE}" && -n "$_ad_web_session_id" ]]; then
   _ad_web_cwd="$PWD"
   _ad_web_command="$ZSH_EXECUTION_STRING"
@@ -5363,11 +5562,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 recovery = {
                     "result": "ALREADY_VERIFIED",
                     "controller_id": controller_id,
-                    "resume_lease_rotated": rotate_existing_manual_web_resume_lease(
-                        repo=repo,
-                        controller_id=controller_id,
-                        web_session_id=web_session_id,
-                    ),
+                    "resume_lease_rotated": False,
                 }
             except PermissionError:
                 recovery = recover_same_controller_web_session(
@@ -5475,9 +5670,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise PermissionError("audit-once controller does not match registered Controller")
             supplied_web_session_id = str(args.web_session_id or "").strip()
             if not supplied_web_session_id:
-                supplied_web_session_id = resolve_manual_web_session(
-                    cwd=repo, registry_path=registry_path, lease_path=DEFAULT_MANUAL_WEB_LEASES
-                ) or ""
+                raise PermissionError(
+                    "audit-once requires explicit Web session identity; manual resume lease cannot prove caller origin"
+                )
             web_session_id = require_web_controller_session(
                 controller_id=registered, web_session_id=supplied_web_session_id, registry_path=registry_path
             )

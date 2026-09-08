@@ -650,6 +650,13 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             ("exec_command", "yarn dlx vite"),
             ("exec_command", "bunx vite"),
             ("exec_command", "python3 -m http.server"),
+            ("exec_command", "env -i pnpm dev"),
+            ("exec_command", "env --unset HOME pnpm dev"),
+            ("exec_command", "env -S 'pnpm dev'"),
+            ("exec_command", "npm --prefix apps/server run dev"),
+            ("exec_command", "npm --prefix=apps/server run dev"),
+            ("exec_command", "pnpm -C apps/server dev"),
+            ("exec_command", "pnpm --dir apps/server dev"),
             ("exec_command", "pnpm dev -v"),
             ("exec_command", "vite"),
         )
