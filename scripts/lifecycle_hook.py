@@ -761,6 +761,8 @@ def _unwrap_execution_target(tokens: list[str]) -> list[str]:
     while remaining:
         executable = Path(remaining[0]).name.lower()
         if executable in {"timeout", "gtimeout"}:
+            if _bounded_timeout_command(remaining):
+                return []
             remaining = _strip_command_prefix(_timeout_execution_payload(remaining))
             continue
         if executable == "command" and len(remaining) > 1 and remaining[1] in {"-v", "-V"}:
