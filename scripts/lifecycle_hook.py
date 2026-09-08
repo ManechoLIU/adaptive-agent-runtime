@@ -533,7 +533,11 @@ def _shell_command_substitutions(command: str) -> list[str]:
             quote = None if quote == '"' else ('"' if quote is None else quote)
             index += 1
             continue
-        if quote != "'" and command.startswith("$(", index):
+        if (
+            quote != "'"
+            and command.startswith("$(", index)
+            and not command.startswith("$((", index)
+        ):
             start = index + 2
             cursor = start
             depth = 1
@@ -602,7 +606,7 @@ def _shell_parenthesized_execution_groups(command: str) -> list[str]:
         plain_group = (
             quote is None
             and char == "("
-            and (index == 0 or command[index - 1] not in "$<>")
+            and (index == 0 or command[index - 1] not in "$<>=")
             and not (index >= 2 and command[index - 2 : index] == "$(")
         )
         if not process_prefix and not plain_group:
@@ -706,11 +710,17 @@ def _persistent_script_name(value: str) -> bool:
     ]
     if not parts:
         return False
-    persistent_parts = set(parts) & _PERSISTENT_SCRIPT_NAMES
-    safe_primary = {"build", "check", "lint", "smoke", "test", "typecheck"}
-    if parts[0] in safe_primary and persistent_parts <= {"server"}:
+    part_set = set(parts)
+    strong_persistent = {
+        "dev", "develop", "emulator", "preview", "runserver", "serve",
+        "simulator", "start", "watch",
+    }
+    if part_set & strong_persistent:
+        return True
+    safe_semantics = {"build", "check", "lint", "smoke", "test", "typecheck"}
+    if part_set & safe_semantics:
         return False
-    return bool(persistent_parts)
+    return bool(part_set & {"server", "storybook"})
 
 
 def _bounded_timeout_command(tokens: list[str]) -> bool:
@@ -871,8 +881,12 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         return True
     if executable == "find":
         for index, token in enumerate(tokens[1:], start=1):
-            if token in {"-exec", "-execdir"} and index + 1 < len(tokens):
-                return _persistent_foreground_segment(tokens[index + 1 :])
+            if (
+                token in {"-exec", "-execdir"}
+                and index + 1 < len(tokens)
+                and _persistent_foreground_segment(tokens[index + 1 :])
+            ):
+                return True
         return False
     if "--watch" in lowered or executable in _PERSISTENT_EXECUTABLES:
         return True
