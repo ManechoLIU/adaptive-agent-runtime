@@ -775,7 +775,13 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('assignment-bound safe fallback requires canonical prior terminal before provider spawn', () => { assert.equal(1, 1); });\n"
                 "test('assignment-bound external start persists exact canonical route contract', () => { assert.equal(1, 1); });\n"
                 "test('short assignment-bound execution reconciles final Git progress before terminal', () => { assert.equal(1, 1); });\n"
-                "test('fresh legacy v1 assignment ACK cannot launch external provider', () => { assert.equal(1, 1); });\n",
+                "test('fresh legacy v1 assignment ACK cannot launch external provider', () => { assert.equal(1, 1); });\n"
+                "test('Grok execution transports prompts through a private prompt file and removes it', () => { assert.equal(1, 1); });\n"
+                "test('oversized Grok reviewer prompt fails before provider spawn with sharding evidence', () => { assert.equal(1, 1); });\n"
+                "test('Grok first-output timeout terminates a silent provider attempt', () => { assert.equal(1, 1); });\n"
+                "test('Grok generation stall timeout terminates after structured output stops', () => { assert.equal(1, 1); });\n"
+                "test('Grok absolute deadline kills the entire provider process group', () => { assert.equal(1, 1); });\n"
+                "test('Grok stall timeout persists structured canonical terminal classification', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
@@ -1153,7 +1159,13 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('assignment-bound safe fallback requires canonical prior terminal before provider spawn', () => { assert.equal(1, 1); });\n"
                 "test('assignment-bound external start persists exact canonical route contract', () => { assert.equal(1, 1); });\n"
                 "test('short assignment-bound execution reconciles final Git progress before terminal', () => { assert.equal(1, 1); });\n"
-                "test('fresh legacy v1 assignment ACK cannot launch external provider', () => { assert.equal(1, 1); });\n",
+                "test('fresh legacy v1 assignment ACK cannot launch external provider', () => { assert.equal(1, 1); });\n"
+                "test('Grok execution transports prompts through a private prompt file and removes it', () => { assert.equal(1, 1); });\n"
+                "test('oversized Grok reviewer prompt fails before provider spawn with sharding evidence', () => { assert.equal(1, 1); });\n"
+                "test('Grok first-output timeout terminates a silent provider attempt', () => { assert.equal(1, 1); });\n"
+                "test('Grok generation stall timeout terminates after structured output stops', () => { assert.equal(1, 1); });\n"
+                "test('Grok absolute deadline kills the entire provider process group', () => { assert.equal(1, 1); });\n"
+                "test('Grok stall timeout persists structured canonical terminal classification', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")

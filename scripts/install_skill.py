@@ -522,6 +522,12 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "assignment-bound external start persists exact canonical route contract",
     "short assignment-bound execution reconciles final Git progress before terminal",
     "fresh legacy v1 assignment ACK cannot launch external provider",
+    "Grok execution transports prompts through a private prompt file and removes it",
+    "oversized Grok reviewer prompt fails before provider spawn with sharding evidence",
+    "Grok first-output timeout terminates a silent provider attempt",
+    "Grok generation stall timeout terminates after structured output stops",
+    "Grok absolute deadline kills the entire provider process group",
+    "Grok stall timeout persists structured canonical terminal classification",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_runtime_supervisor.py",
