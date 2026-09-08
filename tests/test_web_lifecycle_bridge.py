@@ -586,6 +586,76 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                     True,
                 )
 
+    def test_registered_web_verifier_classifies_exact_target_unavailable_as_transient(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "print(json.dumps({'ok':False,'error_code':'RUNTIME_HOST_VERIFIER_FAILED',"
+                "'error':'exact ChatGPT conversation target is unavailable'}))\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+                "protocol":"runtime_host_verifier_cli_v1","executable":str(executable),
+                "sha256":digest,"bundle_sha256":{str(executable):digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(
+                web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True
+            ):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                with self.assertRaises(web_bridge.PeerHostTransientUnavailable):
+                    verifier(
+                        phase="pre_delivery",
+                        controller_id="controller-1",
+                        host="web",
+                        expected_target_session_id="web-current",
+                        expected_target_generation=4,
+                        expected_ownership_generation=8,
+                    )
+
+    def test_registered_web_verifier_keeps_unrecognized_runtime_failure_permanent(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "print(json.dumps({'ok':False,'error_code':'RUNTIME_HOST_VERIFIER_FAILED',"
+                "'error':'verified target signature mismatch'}))\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+                "protocol":"runtime_host_verifier_cli_v1","executable":str(executable),
+                "sha256":digest,"bundle_sha256":{str(executable):digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(
+                web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True
+            ):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                with self.assertRaisesRegex(PermissionError, "rejected machine request"):
+                    verifier(
+                        phase="pre_delivery",
+                        controller_id="controller-1",
+                        host="web",
+                        expected_target_session_id="web-current",
+                        expected_target_generation=4,
+                        expected_ownership_generation=8,
+                    )
+
     def test_registered_web_verifier_exposes_pinned_host_submit_adapter(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
@@ -4978,7 +5048,13 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             return {"result": "CONFIRMED", "operation": "untrusted-current-host-adapter"}
 
         with tempfile.TemporaryDirectory() as tmp:
+            missing_verifier = Path(tmp) / "missing-host-verifiers.json"
             with patch.object(
+                web_bridge,
+                "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG",
+                missing_verifier,
+                create=True,
+            ), patch.object(
                 web_bridge,
                 "execute_native_resume",
                 wraps=web_bridge.execute_native_resume,
@@ -7383,6 +7459,215 @@ class WebLocalReentryIntegrationTests(unittest.TestCase):
             self.assertEqual(saved["state"], "WEB_REENTRY_SUBMITTED")
             self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
             self.assertEqual(saved["continuation_count"], 1)
+
+    def test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state_path = self.make_repo(Path(tmp))
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            payload["__controller_targets__"] = {"controller-1": {"web": {
+                "status": "active",
+                "session_id": "web-current",
+                "generation": 4,
+                "provenance": "host_attested_same_controller_recovery",
+                "binding_mode": "resume_only",
+                "identity_proof": "host_attested_origin",
+            }}}
+            payload["__controller_execution_ownership__"] = {"controller-1": {
+                "active_host": "web",
+                "execution_target_session_id": "web-current",
+                "generation": 8,
+                "provenance": "web_entry",
+            }}
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            state_path.write_text(json.dumps({
+                "receipt_id": "web-host-r1",
+                "session_id": "controller-1",
+                "repo": str(repo.resolve()),
+                "state": "RESUME_PENDING",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True,
+                "requires_user": False,
+                "controller_host": "web",
+                "wake_generation": 8,
+                "triggers": ["RUNTIME_CONTINUATION_DEBT"],
+            }
+            calls = []
+            def verifier(**kwargs):
+                calls.append(("verify", kwargs))
+                return {
+                    "origin_host": "chatgpt_web",
+                    "origin_conversation_id": "web-current",
+                    "origin_attested": True,
+                    "call_receipt": "hr-1",
+                }
+            def submit_reentry(**kwargs):
+                calls.append(("submit", kwargs))
+                return {
+                    "operation": "web_reentry",
+                    "result": "CONFIRMED",
+                    "state": "WEB_REENTRY_SUBMITTED",
+                    "returncode": 0,
+                    "execution_target_session_id": "web-current",
+                    "target_generation": 4,
+                    "ownership_generation": 8,
+                    "target_mode": "explicit_current",
+                    "delivery_authorization": "host_attested",
+                    "host_attested": True,
+                    "strong_web_identity_established": True,
+                    "host_execution_receipt": {
+                        "call_receipt": "hr-1",
+                        "reentry_receipt": {"receipt_id": "wr-1"},
+                    },
+                }
+            verifier.submit_reentry = submit_reentry
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+            ), patch.object(
+                web_bridge, "execute_web_reentry",
+                side_effect=AssertionError("strong Host auto-stop must not use legacy browser reentry")
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1",
+                    repo=repo,
+                    receipt_id="web-host-r1",
+                    registry=registry,
+                    codex="codex",
+                    delay_seconds=0,
+                    state_path=state_path,
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual([kind for kind, _ in calls], ["verify", "submit"])
+            schedule.assert_called_once()
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["state"], "WEB_REENTRY_SUBMITTED")
+            self.assertTrue(saved["host_attested"])
+            self.assertTrue(saved["strong_web_identity_established"])
+
+    def test_detached_supervisor_retries_transient_registered_host_attestation_failure(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state_path = self.make_repo(Path(tmp))
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            payload["__controller_targets__"] = {"controller-1": {"web": {
+                "status": "active",
+                "session_id": "web-current",
+                "generation": 4,
+                "provenance": "host_attested_same_controller_recovery",
+                "binding_mode": "resume_only",
+                "identity_proof": "host_attested_origin",
+            }}}
+            payload["__controller_execution_ownership__"] = {"controller-1": {
+                "active_host": "web",
+                "execution_target_session_id": "web-current",
+                "generation": 8,
+                "provenance": "web_entry",
+            }}
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            state_path.write_text(json.dumps({
+                "receipt_id": "web-host-transient",
+                "session_id": "controller-1",
+                "repo": str(repo.resolve()),
+                "state": "RESUME_PENDING",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True,
+                "requires_user": False,
+                "controller_host": "web",
+                "wake_generation": 8,
+            }
+            def verifier(**_kwargs):
+                raise web_bridge.PeerHostTransientUnavailable(
+                    "registered Host verifier temporarily unavailable: exact ChatGPT conversation target is unavailable"
+                )
+            verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("submit must not run without attestation")
+            )
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+            ), patch.object(
+                web_bridge, "execute_web_reentry",
+                side_effect=AssertionError("strong Host auto-stop must not use legacy browser reentry")
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1",
+                    repo=repo,
+                    receipt_id="web-host-transient",
+                    registry=registry,
+                    codex="codex",
+                    delay_seconds=0,
+                    state_path=state_path,
+                )
+            self.assertEqual(code, 0)
+            schedule.assert_called_once()
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["state"], "WEB_REENTRY_PENDING")
+            self.assertEqual(saved["failure_class"], "web_reentry_unavailable")
+            self.assertEqual(saved["error_code"], "WEB_HOST_TEMPORARILY_UNAVAILABLE")
+            self.assertEqual(saved["retry_count"], 1)
+
+    def test_detached_supervisor_does_not_retry_registered_host_identity_mismatch(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state_path = self.make_repo(Path(tmp))
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            payload["__controller_targets__"] = {"controller-1": {"web": {
+                "status": "active",
+                "session_id": "web-current",
+                "generation": 4,
+                "provenance": "host_attested_same_controller_recovery",
+                "binding_mode": "resume_only",
+                "identity_proof": "host_attested_origin",
+            }}}
+            payload["__controller_execution_ownership__"] = {"controller-1": {
+                "active_host": "web",
+                "execution_target_session_id": "web-current",
+                "generation": 8,
+                "provenance": "web_entry",
+            }}
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            state_path.write_text(json.dumps({
+                "receipt_id": "web-host-invalid",
+                "session_id": "controller-1",
+                "repo": str(repo.resolve()),
+                "state": "RESUME_PENDING",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True,
+                "requires_user": False,
+                "controller_host": "web",
+                "wake_generation": 8,
+            }
+            def verifier(**_kwargs):
+                raise PermissionError("registered Host verifier bundle member hash mismatch")
+            verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("submit must not run with invalid verifier")
+            )
+            with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+            ), patch.object(
+                web_bridge, "execute_web_reentry",
+                side_effect=AssertionError("strong Host auto-stop must not use legacy browser reentry")
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1",
+                    repo=repo,
+                    receipt_id="web-host-invalid",
+                    registry=registry,
+                    codex="codex",
+                    delay_seconds=0,
+                    state_path=state_path,
+                )
+            self.assertEqual(code, 78)
+            schedule.assert_not_called()
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["state"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
+            self.assertEqual(saved["failure_class"], "web_reentry_identity_unavailable")
+            self.assertEqual(saved["error_code"], "WEB_HOST_ATTESTATION_INVALID")
 
     def test_web_result_cannot_commit_or_rearm_after_desktop_handoff(self) -> None:
         from unittest.mock import patch

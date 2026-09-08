@@ -41,6 +41,29 @@ DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG = Path.home() / ".codex" / "adaptive-de
 _PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., Any]] = {}
 PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS = 8
 PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT = 64 * 1024
+
+
+class PeerHostTransientUnavailable(RuntimeError):
+    """Machine Host boundary exists but is temporarily unable to attest/deliver."""
+
+
+_PEER_HOST_TRANSIENT_ERROR_MARKERS = (
+    "exact chatgpt conversation target is unavailable",
+    "connect enoent",
+    "econnrefused",
+    "browser machine command timed out",
+    "another debugger is already attached",
+    "native host connection closed",
+    "native host is unavailable",
+    "socket hang up",
+)
+
+
+def _peer_host_error_is_transient(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return bool(text) and any(marker in text for marker in _PEER_HOST_TRANSIENT_ERROR_MARKERS)
+
+
 DEFAULT_MANUAL_WEB_LEASE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_AUDIT_LOG = (
     Path.home()
@@ -2613,7 +2636,17 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
                 timeout=PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS,
                 env=safe_env,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except subprocess.TimeoutExpired as exc:
+            raise PeerHostTransientUnavailable(
+                f"registered Host verifier execution temporarily unavailable: {exc}"
+            ) from exc
+        except OSError as exc:
+            if _peer_host_error_is_transient(exc):
+                raise PeerHostTransientUnavailable(
+                    f"registered Host verifier execution temporarily unavailable: {exc}"
+                ) from exc
+            raise PermissionError(f"registered Host verifier execution failed: {exc}") from exc
+        except subprocess.SubprocessError as exc:
             raise PermissionError(f"registered Host verifier execution failed: {exc}") from exc
         if len(completed.stdout.encode("utf-8", errors="replace")) > PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT:
             raise PermissionError("registered Host verifier output exceeds limit")
@@ -2622,7 +2655,20 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
         except json.JSONDecodeError as exc:
             raise PermissionError("registered Host verifier returned invalid JSON") from exc
         if completed.returncode != 0 or not isinstance(payload, dict) or payload.get("ok") is not True:
-            raise PermissionError("registered Host verifier rejected machine request")
+            error_detail = payload.get("error") if isinstance(payload, dict) else None
+            if (
+                isinstance(payload, dict)
+                and payload.get("error_code") == "RUNTIME_HOST_VERIFIER_FAILED"
+                and _peer_host_error_is_transient(error_detail)
+            ):
+                raise PeerHostTransientUnavailable(
+                    "registered Host verifier temporarily unavailable: "
+                    + str(error_detail or "machine request unavailable")
+                )
+            raise PermissionError(
+                "registered Host verifier rejected machine request"
+                + (f": {error_detail}" if error_detail else "")
+            )
         return payload
 
     def verify(**kwargs: Any) -> Any:
@@ -2801,6 +2847,110 @@ def _validated_web_origin_attestation(
         "origin_attested": True,
         "call_receipt": call_receipt.strip(),
     }
+
+
+def _execute_registered_web_host_reentry(
+    *,
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    lifecycle_state: dict[str, Any],
+    runtime_path: str | None,
+    ownership_fence: dict[str, Any] | None,
+    verifier: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    verifier = verifier or _registered_peer_attestation_verifier("web")
+    adapter = getattr(verifier, "submit_reentry", None) if callable(verifier) else None
+    if not callable(verifier) or not callable(adapter):
+        raise PermissionError("registered Host verifier/submit adapter is unavailable")
+    if not isinstance(ownership_fence, dict):
+        raise PermissionError("canonical Web execution ownership is missing")
+
+    with target_guard.locked_execution_target(
+        repo=repo,
+        host="web",
+        registry_path=registry,
+    ) as current_target:
+        if current_target.get("controller_id") != session_id:
+            raise PermissionError("Web target does not belong to the registered Controller")
+        current_registry = load_json(registry)
+        current_web_record = target_guard.target_record(
+            current_registry,
+            controller_id=session_id,
+            host="web",
+        )
+        if not isinstance(current_web_record, dict):
+            raise PermissionError("canonical Web target record is missing")
+        if (
+            current_web_record.get("provenance")
+            != "host_attested_same_controller_recovery"
+            or current_web_record.get("identity_proof") != "host_attested_origin"
+        ):
+            raise PermissionError(
+                "registered Host submit requires current Host-attested Web target"
+            )
+
+        expected_target = str(current_target["execution_target_session_id"])
+        expected_generation = current_target.get("generation")
+        expected_mode = current_target.get("target_mode")
+        expected_ownership_generation = ownership_fence.get("generation")
+        if (
+            ownership_fence.get("active_host") != "web"
+            or ownership_fence.get("execution_target_session_id") != expected_target
+            or not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation < 1
+            or not isinstance(expected_ownership_generation, int)
+            or isinstance(expected_ownership_generation, bool)
+            or expected_ownership_generation < 1
+        ):
+            raise PermissionError(
+                "canonical Web execution ownership is missing or mismatched"
+            )
+
+        origin_attestation = _validated_web_origin_attestation(
+            verifier(
+                phase="pre_delivery",
+                controller_id=session_id,
+                host="web",
+                expected_target_session_id=expected_target,
+                expected_target_generation=expected_generation,
+                expected_target_mode=expected_mode,
+                expected_ownership_generation=expected_ownership_generation,
+            ),
+            expected_target_session_id=expected_target,
+        )
+        attempt = adapter(
+            controller_id=session_id,
+            session_id=expected_target,
+            execution_target_session_id=expected_target,
+            target_generation=expected_generation,
+            target_mode=expected_mode,
+            ownership_generation=expected_ownership_generation,
+            repo=repo,
+            registry=registry,
+            lifecycle_state=lifecycle_state,
+            runtime_path=runtime_path,
+            host_origin_attestation=origin_attestation,
+        )
+        if not isinstance(attempt, dict):
+            raise PermissionError(
+                "registered Host submit adapter returned a non-object execution receipt"
+            )
+        host_execution_receipt = attempt.get("host_execution_receipt")
+        if (
+            attempt.get("execution_target_session_id") != expected_target
+            or attempt.get("target_generation") != expected_generation
+            or attempt.get("ownership_generation") != expected_ownership_generation
+            or attempt.get("target_mode") != expected_mode
+            or not isinstance(host_execution_receipt, dict)
+            or host_execution_receipt.get("call_receipt")
+            != origin_attestation["call_receipt"]
+        ):
+            raise PermissionError(
+                "registered Host submit receipt does not match canonical target, ownership, and Host call receipt"
+            )
+        return attempt
 
 
 def _wake_receipt(
@@ -4618,12 +4768,57 @@ def _run_auto_native_stop_impl(
             approval_id = str(current.get("approval_id") or "").strip() or None
 
         fingerprint = _wake_event_fingerprint(lifecycle_state)
-        attempt = execute_web_reentry(
-            controller_id=session_id, repo=repo, registry_path=registry,
-            lease_path=DEFAULT_MANUAL_WEB_LEASES, lifecycle_state=lifecycle_state,
-            approval_id=approval_id,
-            origin_verifier=_registered_peer_attestation_verifier("web"),
+        verifier = _registered_peer_attestation_verifier("web")
+        registry_data_for_web = load_json(registry)
+        current_web_record = target_guard.target_record(
+            registry_data_for_web, controller_id=session_id, host="web"
         )
+        use_registered_host = (
+            isinstance(current_web_record, dict)
+            and current_web_record.get("provenance")
+            == "host_attested_same_controller_recovery"
+            and current_web_record.get("identity_proof") == "host_attested_origin"
+            and callable(verifier)
+            and callable(getattr(verifier, "submit_reentry", None))
+        )
+        if use_registered_host:
+            try:
+                attempt = _execute_registered_web_host_reentry(
+                    session_id=session_id,
+                    repo=repo,
+                    registry=registry,
+                    lifecycle_state=lifecycle_state,
+                    runtime_path=runtime_path,
+                    ownership_fence=ownership_fence,
+                    verifier=verifier,
+                )
+            except PeerHostTransientUnavailable as exc:
+                attempt = {
+                    "operation": "web_reentry",
+                    "result": "DEFERRED",
+                    "state": "WEB_REENTRY_PENDING",
+                    "returncode": 78,
+                    "failure_class": "web_reentry_unavailable",
+                    "error_code": "WEB_HOST_TEMPORARILY_UNAVAILABLE",
+                    "stderr_tail": str(exc),
+                }
+            except Exception as exc:
+                attempt = {
+                    "operation": "web_reentry",
+                    "result": "FAILED",
+                    "state": "WEB_REENTRY_IDENTITY_UNAVAILABLE",
+                    "returncode": 78,
+                    "failure_class": "web_reentry_identity_unavailable",
+                    "error_code": "WEB_HOST_ATTESTATION_INVALID",
+                    "stderr_tail": str(exc),
+                }
+        else:
+            attempt = execute_web_reentry(
+                controller_id=session_id, repo=repo, registry_path=registry,
+                lease_path=DEFAULT_MANUAL_WEB_LEASES, lifecycle_state=lifecycle_state,
+                approval_id=approval_id,
+                origin_verifier=verifier,
+            )
         if attempt.get("result") == "CONFIRMED":
             try:
                 receipt = _validate_confirmed_web_reentry_receipt(
