@@ -398,7 +398,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
             "web_agent_health_supervisor.py", "controller_runtime_supervisor.py",
             "web_agent_events.py", "route_contract.py", "reviewer_supervisor.py",
-            "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "assignment_lease_guard.py",
+            "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "assignment_lease_guard.py", "assignment_runtime.py",
             "controller_scoring_guard.py", "project_context_guard.py", "rule_handshake.py", "evaluation_transaction.py",
         ):
             script = source / "scripts" / name
@@ -747,6 +747,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_governance.ControllerActionSourcePromptTests.test_live_e2e_accept_prompt_carries_actual_execution_source",
             "tests.test_governance.ControllerActionSourcePromptTests.test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source",
             "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests.test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix",
+            "tests.test_assignment_runtime.ExternalFailureEvidencePersistenceTests.test_terminal_persists_external_failure_class_retry_safety_and_details",
         }
         self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
         self.assertIn("scripts/controller_runtime_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
@@ -755,6 +756,8 @@ class InstallMigrationContractTests(unittest.TestCase):
         self.assertIn("tests/test_web_agent_health_supervisor.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("tests/test_terminal_continuation.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("scripts/terminal_continuation.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("scripts/assignment_runtime.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("tests/test_assignment_runtime.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn(
             "tests.test_terminal_continuation.PendingTerminalReconcileTests.test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks",
             RUNTIME_RELEASE_REGRESSION_TESTS,
@@ -806,10 +809,17 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok reviewer shard cannot finalize and synthesis binds exact candidate head', () => { assert.equal(1, 1); });\n"
                 "test('Grok reviewer requires explicit phase and immutable candidate commit', () => { assert.equal(1, 1); });\n"
                 "test('Grok synthesis validates canonical same-candidate shard receipts', () => { assert.equal(1, 1); });\n"
-                "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n",
+                "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n"
+                "test('cleanup uncertainty is fail closed and result unknown', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+            (tests_dir / "test_assignment_runtime.py").write_text(
+                "import unittest\n"
+                "class ExternalFailureEvidencePersistenceTests(unittest.TestCase):\n"
+                "    def test_terminal_persists_external_failure_class_retry_safety_and_details(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_reviewer_supervisor.py").write_text(
                 "import unittest\n"
                 "class ReviewerSupervisorRoutingTests(unittest.TestCase):\n"
@@ -1217,10 +1227,17 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok reviewer shard cannot finalize and synthesis binds exact candidate head', () => { assert.equal(1, 1); });\n"
                 "test('Grok reviewer requires explicit phase and immutable candidate commit', () => { assert.equal(1, 1); });\n"
                 "test('Grok synthesis validates canonical same-candidate shard receipts', () => { assert.equal(1, 1); });\n"
-                "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n",
+                "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n"
+                "test('cleanup uncertainty is fail closed and result unknown', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+            (tests_dir / "test_assignment_runtime.py").write_text(
+                "import unittest\n"
+                "class ExternalFailureEvidencePersistenceTests(unittest.TestCase):\n"
+                "    def test_terminal_persists_external_failure_class_retry_safety_and_details(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_reviewer_supervisor.py").write_text(
                 "import unittest\n"
                 "class ReviewerSupervisorRoutingTests(unittest.TestCase):\n"

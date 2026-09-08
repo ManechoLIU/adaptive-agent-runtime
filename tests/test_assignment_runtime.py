@@ -1044,3 +1044,20 @@ class ReviewerRuntimeContractTests(unittest.TestCase):
         )
         state = apply_receipt({}, payload, now=T0)
         self.assertEqual(state["leases"]["a1"]["review_phase"], "full")
+
+class ExternalFailureEvidencePersistenceTests(unittest.TestCase):
+    def test_terminal_persists_external_failure_class_retry_safety_and_details(self):
+        state = apply_receipt({}, receipt("assignment_started"), now=T0)
+        terminal = receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), event_seq=2,
+            terminal_state="failed", transport_outcome="failed", delivery_outcome="unresolved",
+            summary="Grok generation stalled", evidence=[], artifacts=[], next_action="inspect",
+            retry_class="generation_stalled", failure_class="generation_stalled",
+            retry_safe=True, failure_details={"cleanup_confirmed": True, "deadline_ms": 180000},
+            result_unknown=False,
+        )
+        state = apply_receipt(state, terminal, now=T0 + timedelta(minutes=1))
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["failure_class"], "generation_stalled")
+        self.assertTrue(lease["retry_safe"])
+        self.assertEqual(lease["failure_details"], {"cleanup_confirmed": True, "deadline_ms": 180000})

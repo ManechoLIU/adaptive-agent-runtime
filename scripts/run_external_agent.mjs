@@ -118,6 +118,47 @@ function grokModelProgressKind(event) {
   return null;
 }
 
+function removeDirectoryConfirmed(directory) {
+  rmSync(directory, { recursive: true, force: true });
+  if (existsSync(directory)) {
+    throw new Error(`resource still exists after cleanup: ${directory}`);
+  }
+}
+
+export function runCleanupStack(cleanups, priorError = null) {
+  const failures = [];
+  for (const entry of [...cleanups].reverse()) {
+    const label = typeof entry === "function" ? "external_resource" : String(entry?.label || "external_resource");
+    const cleanup = typeof entry === "function" ? entry : entry?.cleanup;
+    if (typeof cleanup !== "function") {
+      failures.push({ label, error: "cleanup callback unavailable" });
+      continue;
+    }
+    try {
+      cleanup();
+    } catch (error) {
+      failures.push({ label, error: String(error?.message || error) });
+    }
+  }
+  if (!failures.length) return;
+  throw new ExternalAgentExecutionError(
+    `cleanup_failed: ${failures.map((item) => `${item.label}: ${item.error}`).join("; ")}`,
+    {
+      failureClass: "cleanup_failed",
+      retrySafe: false,
+      resultUnknown: true,
+      details: {
+        failed_resources: failures.map((item) => item.label),
+        cleanup_failures: failures,
+        ...(priorError ? {
+          prior_failure_class: String(priorError?.failureClass || "transport_error"),
+          prior_error: String(priorError?.message || priorError),
+        } : {}),
+      },
+    },
+  );
+}
+
 function prepareGrokPrompt(prompt, { assignmentRole = null } = {}) {
   const observedBytes = Buffer.byteLength(prompt, "utf8");
   const maxBytes = grokMaxPromptBytes();
@@ -141,7 +182,7 @@ function prepareGrokPrompt(prompt, { assignmentRole = null } = {}) {
   return {
     path: promptPath,
     bytes: observedBytes,
-    cleanup: () => rmSync(directory, { recursive: true, force: true }),
+    cleanup: () => removeDirectoryConfirmed(directory),
   };
 }
 
@@ -1209,6 +1250,7 @@ async function executeExternalAgent({
   let args;
   let env;
   const cleanups = [];
+  let executionError = null;
   try {
     if (engine === "kimi-code" && authMode === "api") {
       const apiKey = readApiKey(engine);
@@ -1251,9 +1293,9 @@ async function executeExternalAgent({
         );
       }
       const grokPrompt = prepareGrokPrompt(prompt, { assignmentRole });
-      cleanups.push(grokPrompt.cleanup);
+      cleanups.push({ label: "prompt_file", cleanup: grokPrompt.cleanup });
       const isolatedHome = mkdtempSync(path.join(tmpdir(), "adaptive-delivery-grok-api-"));
-      cleanups.push(() => rmSync(isolatedHome, { recursive: true, force: true }));
+      cleanups.push({ label: "grok_home", cleanup: () => removeDirectoryConfirmed(isolatedHome) });
       args = commonGrokArgs(model, grokPrompt.path, reasoningEffort);
       env = { ...process.env, GROK_HOME: isolatedHome, XAI_API_KEY: apiKey };
     } else {
@@ -1261,7 +1303,7 @@ async function executeExternalAgent({
         throw new Error("Grok OAuth session not found; run the Adaptive Agent Runtime login command first");
       }
       const grokPrompt = prepareGrokPrompt(prompt, { assignmentRole });
-      cleanups.push(grokPrompt.cleanup);
+      cleanups.push({ label: "prompt_file", cleanup: grokPrompt.cleanup });
       args = commonGrokArgs(model, grokPrompt.path, reasoningEffort);
       env = sanitizedEnvironment([], ["XAI_API_KEY"]);
     }
@@ -1275,8 +1317,11 @@ async function executeExternalAgent({
       });
     }
     return await runAttached(executable, args, { cwd, env });
+  } catch (error) {
+    executionError = error;
+    throw error;
   } finally {
-    for (const cleanup of cleanups.reverse()) cleanup();
+    runCleanupStack(cleanups, executionError);
   }
 }
 

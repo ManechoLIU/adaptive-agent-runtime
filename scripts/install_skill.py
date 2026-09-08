@@ -48,6 +48,8 @@ WEB_BLOCK_END = "# <<< adaptive-delivery web lifecycle bridge <<<"
 MANIFEST_NAME = ".adaptive-delivery-install.json"
 IMPACTS = {"none", "live_assignments"}
 RUNTIME_RELEASE_REGRESSION_TESTS = (
+    "tests.test_assignment_runtime.ExternalFailureEvidencePersistenceTests."
+    "test_terminal_persists_external_failure_class_retry_safety_and_details",
     "tests.test_reviewer_supervisor.ReviewerSupervisorRoutingTests."
     "test_web_controller_review_does_not_launch_codex_directly",
     "tests.test_reviewer_supervisor.ReviewerSupervisorWebHandoffTests."
@@ -565,6 +567,7 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok reviewer requires explicit phase and immutable candidate commit",
     "Grok synthesis validates canonical same-candidate shard receipts",
     "Grok cleanup uncertainty is result unknown and not retry safe",
+    "cleanup uncertainty is fail closed and result unknown",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_runtime_supervisor.py",
@@ -587,6 +590,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/route_contract.py",
     "scripts/reviewer_supervisor.py",
     "scripts/assignment_lease_guard.py",
+    "scripts/assignment_runtime.py",
     "scripts/run_external_agent.mjs",
     "scripts/terminal_continuation.py",
     "tests/test_web_agent_execution.py",
@@ -605,6 +609,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_terminal_continuation.py",
     "tests/test_web_agent_events.py",
     "tests/test_evaluation_transaction.py",
+    "tests/test_assignment_runtime.py",
     "tests/external-agent-routing.test.mjs",
 )
 

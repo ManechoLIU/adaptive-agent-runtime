@@ -505,6 +505,27 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             lease["transport_outcome"] = transport_outcome
             lease["delivery_outcome"] = delivery_outcome
         lease["evidence"] = receipt["evidence"]; lease["artifacts"] = receipt["artifacts"]; lease["next_action"] = receipt["next_action"]; lease["retry_class"] = receipt["retry_class"]
+        failure_class = receipt.get("failure_class")
+        if failure_class is not None:
+            if not isinstance(failure_class, str) or not failure_class.strip():
+                raise ValueError("failure_class must be a non-empty string when provided")
+            lease["failure_class"] = failure_class.strip()
+        else:
+            lease.pop("failure_class", None)
+        retry_safe = receipt.get("retry_safe")
+        if retry_safe is not None:
+            if not isinstance(retry_safe, bool):
+                raise ValueError("retry_safe must be a boolean when provided")
+            lease["retry_safe"] = retry_safe
+        else:
+            lease.pop("retry_safe", None)
+        failure_details = receipt.get("failure_details")
+        if failure_details is not None:
+            if not isinstance(failure_details, dict):
+                raise ValueError("failure_details must be an object when provided")
+            lease["failure_details"] = dict(failure_details)
+        else:
+            lease.pop("failure_details", None)
         if receipt.get("review_verdict") is not None:
             verdict = receipt.get("review_verdict")
             if lease.get("execution_role") != "reviewer" or not isinstance(verdict, dict):

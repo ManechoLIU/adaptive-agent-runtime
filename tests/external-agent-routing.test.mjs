@@ -1903,3 +1903,22 @@ test("Grok misleading type or event fields do not count as ACP model progress", 
     }
   }
 });
+
+test("cleanup uncertainty is fail closed and result unknown", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?cleanup-fail=${Date.now()}`);
+  assert.equal(typeof runtimeModule.runCleanupStack, "function");
+  assert.throws(
+    () => runtimeModule.runCleanupStack([
+      { label: "prompt_file", cleanup: () => { throw new Error("permission denied"); } },
+      { label: "grok_home", cleanup: () => {} },
+    ]),
+    (error) => {
+      assert.equal(error?.failureClass, "cleanup_failed");
+      assert.equal(error?.retrySafe, false);
+      assert.equal(error?.resultUnknown, true);
+      assert.match(error?.message || "", /cleanup_failed/i);
+      assert.deepEqual(error?.details?.failed_resources, ["prompt_file"]);
+      return true;
+    },
+  );
+});
