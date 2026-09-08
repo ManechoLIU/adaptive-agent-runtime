@@ -250,7 +250,7 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertIn("ADAPTIVE_DELIVERY_WEB_SESSION_ID", block)
         self.assertIn("-o comm=", block)
         self.assertNotIn('== *\\"', block)
-        self.assertIn("resolve-manual-web-session --cwd \"$PWD\"", block)
+        self.assertNotIn("resolve-manual-web-session", block)
         self.assertIn('--web-session-id "$_ad_web_session_id"', block)
         function = block.split("  _ad_web_lifecycle_exit() {", 1)[1].split("  }\n  trap", 1)[0]
         function = "_ad_web_lifecycle_exit() {" + function + "}"
@@ -656,8 +656,15 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_browser_tab_receipt_cannot_recover_an_unverified_web_session",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_manual_web_mutations_cannot_downgrade_host_attested_current_target",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target",
-            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target",
-            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_does_not_rotate_manual_resume_lease",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_session_start_verified_target_does_not_rotate_manual_resume_lease",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_historical_alias_cannot_recover_even_with_trusted_verifier",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_unbound_chat_cannot_recover_even_with_trusted_verifier",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_zshenv_exit_bridge_executes_and_preserves_exit_precedence",
+            "tests.test_web_lifecycle_bridge.WebLifecycleComputerLeaseTests.test_audit_once_never_uses_manual_resume_lease_as_caller_identity",
+            "tests.test_install_skill.InstallCapabilityTests.test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence",
+            "tests.test_install_skill.WebAgentHealthServiceInstallationTests.test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load",
+            "tests.test_install_skill.WebAgentHealthServiceInstallationTests.test_runtime_service_load_failure_preserves_legacy_web_audit",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_resolve_reentry_session_strong_host_target_does_not_require_manual_lease",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_resolve_reentry_session_strong_host_target_requires_matching_web_ownership",
             "tests.test_web_reentry_adapter.WebReentryAdapterTests.test_reentry_without_canonical_web_ownership_never_calls_browser",
@@ -866,6 +873,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
             (tests_dir / "test_web_lifecycle_bridge.py").write_text(
                 "import unittest\n"
+                "class WebLifecycleComputerLeaseTests(unittest.TestCase):\n"
+                "    def test_audit_once_never_uses_manual_resume_lease_as_caller_identity(self): self.assertTrue(True)\n"
                 "class WebLifecycleAuditTests(unittest.TestCase):\n"
                 "    def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership(self): self.assertTrue(True)\n"
@@ -890,8 +899,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target(self): self.assertTrue(True)\n"
                 "    def test_replace_web_session_rejects_unapproved_session_and_stale_generation(self): self.assertTrue(True)\n"
                 "    def test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history(self): self.assertTrue(True)\n"
-                "    def test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target(self): self.assertTrue(True)\n"
-                "    def test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim(self): self.assertTrue(True)\n"
+                "    def test_same_controller_web_recovery_does_not_rotate_manual_resume_lease(self): self.assertTrue(True)\n"
+                "    def test_session_start_verified_target_does_not_rotate_manual_resume_lease(self): self.assertTrue(True)\n"
+                "    def test_historical_alias_cannot_recover_even_with_trusted_verifier(self): self.assertTrue(True)\n"
+                "    def test_unbound_chat_cannot_recover_even_with_trusted_verifier(self): self.assertTrue(True)\n"
+                "    def test_zshenv_exit_bridge_executes_and_preserves_exit_precedence(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_web_reentry(self): self.assertTrue(True)\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume(self): self.assertTrue(True)\n"
@@ -1174,6 +1186,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
             (tests_dir / "test_web_lifecycle_bridge.py").write_text(
                 "import unittest\n"
+                "class WebLifecycleComputerLeaseTests(unittest.TestCase):\n"
+                "    def test_audit_once_never_uses_manual_resume_lease_as_caller_identity(self): self.assertTrue(True)\n"
                 "class WebLifecycleAuditTests(unittest.TestCase):\n"
                 "    def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership(self): self.assertTrue(True)\n"
@@ -2006,3 +2020,71 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
         self.assertEqual(loaded, [plist.resolve()])
         self.assertEqual(report["state"], "loaded")
         self.assertTrue(report["configured"])
+
+def _runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load(self):
+    import plistlib
+    from scripts.install_skill import configure_runtime_services
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        target = root / "adaptive-delivery"
+        (target / "scripts").mkdir(parents=True)
+        script = target / "scripts" / "controller_runtime_supervisor.py"
+        script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        script.chmod(0o755)
+        launchagents = root / "LaunchAgents"; launchagents.mkdir()
+        health = launchagents / "com.openai.adaptive-agent-runtime.web-agent-health.plist"
+        legacy_a = launchagents / "ai.openai.adaptive-delivery.web-lifecycle.controller-a.plist"
+        legacy_b = launchagents / "com.openai.adaptive-delivery.web-lifecycle.controller-b.plist"
+        unrelated = launchagents / "com.example.keep.plist"
+        for p in (legacy_a, legacy_b, unrelated):
+            p.write_bytes(plistlib.dumps({"Label": p.stem, "ProgramArguments": ["/bin/true"]}))
+        loaded=[]; retired=[]
+        def loader(path):
+            loaded.append(path)
+            return {"state":"loaded"}
+        def retire(path):
+            retired.append(path)
+            path.unlink(missing_ok=True)
+        report = configure_runtime_services(
+            target, health_service_plist=health,
+            registry_path=root / "controllers.json",
+            service_loader=loader,
+            legacy_service_unloader=retire,
+        )
+        exists = {p.name:p.exists() for p in (health, legacy_a, legacy_b, unrelated)}
+    self.assertEqual(loaded, [health.resolve()])
+    self.assertEqual(set(retired), {legacy_a.resolve(), legacy_b.resolve()})
+    self.assertEqual(set(report["retired_legacy_services"]), {str(legacy_a.resolve()), str(legacy_b.resolve())})
+    self.assertTrue(exists[health.name])
+    self.assertFalse(exists[legacy_a.name])
+    self.assertFalse(exists[legacy_b.name])
+    self.assertTrue(exists[unrelated.name])
+
+
+def _runtime_service_load_failure_preserves_legacy_web_audit(self):
+    from scripts.install_skill import configure_runtime_services
+    with tempfile.TemporaryDirectory() as d:
+        root=Path(d)
+        target=root/"adaptive-delivery"; (target/"scripts").mkdir(parents=True)
+        script=target/"scripts"/"controller_runtime_supervisor.py"
+        script.write_text("#!/usr/bin/env python3\n", encoding="utf-8"); script.chmod(0o755)
+        launchagents=root/"LaunchAgents"; launchagents.mkdir()
+        health=launchagents/"com.openai.adaptive-agent-runtime.web-agent-health.plist"
+        legacy=launchagents/"ai.openai.adaptive-delivery.web-lifecycle.controller-a.plist"
+        legacy.write_text("legacy", encoding="utf-8")
+        retired=[]
+        with self.assertRaisesRegex(OSError, "new service failed"):
+            configure_runtime_services(
+                target, health_service_plist=health,
+                registry_path=root/"controllers.json",
+                service_loader=lambda _path: (_ for _ in ()).throw(OSError("new service failed")),
+                legacy_service_unloader=lambda path: retired.append(path),
+            )
+        legacy_exists=legacy.exists()
+    self.assertEqual(retired, [])
+    self.assertTrue(legacy_exists)
+
+
+WebAgentHealthServiceInstallationTests.test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load = _runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load
+WebAgentHealthServiceInstallationTests.test_runtime_service_load_failure_preserves_legacy_web_audit = _runtime_service_load_failure_preserves_legacy_web_audit
+

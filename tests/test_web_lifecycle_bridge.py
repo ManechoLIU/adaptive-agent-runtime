@@ -288,7 +288,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 78)
             self.assertIn("verified Web Controller Session identity", result.stderr)
 
-    def test_session_start_verified_target_rotates_existing_resume_lease_without_new_ownership_claim(self) -> None:
+    def test_session_start_verified_target_does_not_rotate_manual_resume_lease(self) -> None:
         from contextlib import redirect_stdout
         from io import StringIO
         from unittest.mock import patch
@@ -346,9 +346,9 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             payload = json.loads(output.getvalue())
             self.assertEqual(payload["session_recovery_result"]["result"], "ALREADY_VERIFIED")
-            self.assertTrue(payload["session_recovery_result"]["resume_lease_rotated"])
+            self.assertFalse(payload["session_recovery_result"]["resume_lease_rotated"])
             record = json.loads(lease.read_text(encoding="utf-8"))["leases"]["controller-1"]
-            self.assertEqual(record["web_session_id"], "web-current")
+            self.assertEqual(record["web_session_id"], "web-old")
             saved = json.loads(registry.read_text(encoding="utf-8"))
             self.assertEqual(saved["__controller_execution_ownership__"]["controller-1"]["generation"], 7)
             self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["generation"], 4)
@@ -1988,7 +1988,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
         self.assertIn('ADAPTIVE_DELIVERY_WEB_SESSION_ID', block)
         self.assertIn('-o comm=', block)
         self.assertNotIn('== *\"', block)
-        self.assertIn('resolve-manual-web-session --cwd "$PWD"', block)
+        self.assertNotIn('resolve-manual-web-session', block)
         self.assertIn('--web-session-id "$_ad_web_session_id"', block)
         self.assertNotIn("unset _ad_web_parent _ad_web_session_id", block)
 
@@ -2465,7 +2465,7 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
             check=False,
         )
 
-    def test_audit_once_resolves_authorized_manual_web_session_when_launchagent_omits_argument(self) -> None:
+    def test_audit_once_never_uses_manual_resume_lease_as_caller_identity(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2475,6 +2475,15 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
             registry.write_text(json.dumps({
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-session-1", "generation": 1,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-session-1",
+                    "generation": 1, "provenance": "web_entry",
+                }},
             }), encoding="utf-8")
             lease_file = root / "manual-leases.json"
             lease_file.write_text(json.dumps({
@@ -2491,7 +2500,8 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
                     "audit-once", "--session-id", "controller-1", "--repo", str(repo),
                     "--registry", str(registry), "--audit-log", str(audit), "--cursor", str(cursor),
                 ])
-            self.assertEqual(code, 0)
+            self.assertEqual(code, 78)
+            self.assertFalse(cursor.exists())
 
     def test_audit_once_refuses_registered_repo_without_verified_web_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -8139,8 +8149,8 @@ def _hardened_recovery_aligns_existing_lease_to_current_target(self):
                 host_identity_receipt={"attested": True},
             )
         rec = json.loads(lease.read_text())["leases"]["controller-1"]
-    self.assertTrue(recovered["resume_lease_rotated"])
-    self.assertEqual(rec["web_session_id"], "web-current")
+    self.assertFalse(recovered["resume_lease_rotated"])
+    self.assertEqual(rec["web_session_id"], "web-old")
     self.assertEqual(rec["authorized_at_unix"], 100)
     self.assertEqual(rec["expires_at_unix"], 4102444800)
 
@@ -8243,7 +8253,7 @@ WebLifecycleBridgeTests.test_same_controller_web_recovery_without_host_verifier_
 WebLifecycleBridgeTests.test_same_controller_web_recovery_verifier_exception_degrades_without_revoking_controller = _hardened_recovery_verifier_exception_preserves_state
 WebLifecycleBridgeTests.test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership = _hardened_recovery_idempotent_current_target
 WebLifecycleBridgeTests.test_web_recovery_preserves_desktop_target_and_only_advances_web_generation = _hardened_recovery_preserves_desktop_target
-WebLifecycleBridgeTests.test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target = _hardened_recovery_aligns_existing_lease_to_current_target
+WebLifecycleBridgeTests.test_same_controller_web_recovery_does_not_rotate_manual_resume_lease = _hardened_recovery_aligns_existing_lease_to_current_target
 WebLifecycleBridgeTests.test_same_controller_web_recovery_does_not_create_resume_lease_without_prior_authorization = _hardened_recovery_no_prior_lease
 WebLifecycleBridgeTests.test_historical_alias_cannot_recover_even_with_trusted_verifier = _historical_alias_cannot_recover_even_with_trusted_verifier
 WebLifecycleBridgeTests.test_unbound_chat_cannot_recover_even_with_trusted_verifier = _unbound_chat_cannot_recover_even_with_trusted_verifier

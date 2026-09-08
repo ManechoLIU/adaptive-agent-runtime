@@ -856,18 +856,13 @@ def recover_same_controller_web_session(
             registry_path=registry_path,
             provenance="web_entry",
         )
-        resume_lease_rotated = rotate_existing_manual_web_resume_lease(
-            repo=repo,
-            controller_id=controller_id,
-            web_session_id=web_session_id,
-        )
         return {
             "result": "ALREADY_VERIFIED",
             "state": "VERIFIED",
             "controller_id": controller_id,
             "active_host": ownership["active_host"],
             "ownership_generation": ownership["generation"],
-            "resume_lease_rotated": resume_lease_rotated,
+            "resume_lease_rotated": False,
             "identity": target_guard.controller_identity_projection(
                 repo=repo, host="web", source_session_id=web_session_id,
                 registry_path=registry_path,
@@ -1039,17 +1034,12 @@ def recover_same_controller_web_session(
     )
     if recovered["session_binding_state"].get("verification") != "VERIFIED":
         raise RuntimeError("same-controller recovery did not produce a verified current session")
-    resume_lease_rotated = rotate_existing_manual_web_resume_lease(
-        repo=repo,
-        controller_id=controller_id,
-        web_session_id=web_session_id,
-    )
     return {
         "result": "RECOVERED",
         "state": "VERIFIED",
         "controller_id": controller_id,
         "execution_target_session_id": web_session_id,
-        "resume_lease_rotated": resume_lease_rotated,
+        "resume_lease_rotated": False,
         "active_host": ownership_claim["active_host"],
         "ownership_generation": ownership_claim["generation"],
         "target_generation": recovered["session_binding_state"].get(
@@ -5093,9 +5083,6 @@ _ad_web_parent=$(/bin/ps -p "$PPID" -o comm= 2>/dev/null)
 _ad_web_session_id="${{ADAPTIVE_DELIVERY_WEB_SESSION_ID:-}}"
 _ad_web_bridge_script="{script}"
 _ad_web_bridge_python="{python}"
-if [[ "$_ad_web_parent" == "{AI_BRIDGE_EXECUTABLE}" && -z "$_ad_web_session_id" ]]; then
-  _ad_web_session_id=$("$_ad_web_bridge_python" "$_ad_web_bridge_script" resolve-manual-web-session --cwd "$PWD" 2>/dev/null)
-fi
 if [[ "$_ad_web_parent" == "{AI_BRIDGE_EXECUTABLE}" && -n "$_ad_web_session_id" ]]; then
   _ad_web_cwd="$PWD"
   _ad_web_command="$ZSH_EXECUTION_STRING"
@@ -5378,11 +5365,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 recovery = {
                     "result": "ALREADY_VERIFIED",
                     "controller_id": controller_id,
-                    "resume_lease_rotated": rotate_existing_manual_web_resume_lease(
-                        repo=repo,
-                        controller_id=controller_id,
-                        web_session_id=web_session_id,
-                    ),
+                    "resume_lease_rotated": False,
                 }
             except PermissionError:
                 recovery = recover_same_controller_web_session(
@@ -5490,9 +5473,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise PermissionError("audit-once controller does not match registered Controller")
             supplied_web_session_id = str(args.web_session_id or "").strip()
             if not supplied_web_session_id:
-                supplied_web_session_id = resolve_manual_web_session(
-                    cwd=repo, registry_path=registry_path, lease_path=DEFAULT_MANUAL_WEB_LEASES
-                ) or ""
+                raise PermissionError(
+                    "audit-once requires explicit Web session identity; manual resume lease cannot prove caller origin"
+                )
             web_session_id = require_web_controller_session(
                 controller_id=registered, web_session_id=supplied_web_session_id, registry_path=registry_path
             )
