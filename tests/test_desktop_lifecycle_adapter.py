@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -1405,6 +1406,137 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
 
 
 class DesktopLifecycleCanaryTests(unittest.TestCase):
+    def test_arm_canary_cli_accepts_exact_execution_target_fences(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            hooks = root / "hooks.json"
+            hooks.write_text('{"hooks": {"SessionStart": []}}\n', encoding="utf-8")
+            canary = root / "desktop-canary.json"
+            env = dict(os.environ)
+            env.update({
+                "AD_CODEX_HOOKS_PATH": str(hooks),
+                "AD_DESKTOP_CANARY_PATH": str(canary),
+            })
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SKILL_ROOT / "scripts" / "lifecycle_hook.py"),
+                    "--arm-desktop-canary",
+                    "controller-1",
+                    "--execution-target-session-id",
+                    "desktop-current",
+                    "--target-generation",
+                    "4",
+                    "--ownership-generation",
+                    "7",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            receipt = json.loads(completed.stdout)
+            self.assertEqual(receipt["execution_target_session_id"], "desktop-current")
+            self.assertEqual(receipt["target_generation"], 4)
+            self.assertEqual(receipt["ownership_generation"], 7)
+
+    def test_arm_canary_records_controller_target_and_generation_fences(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            skill_root = root / "adaptive-delivery"
+            (skill_root / "scripts").mkdir(parents=True)
+            (skill_root / "scripts" / "lifecycle_hook.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            (skill_root / "scripts" / "controller_target_guard.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            hooks = root / "hooks.json"
+            hooks.write_text('{"hooks": {"SessionStart": []}}\n', encoding="utf-8")
+
+            armed = lifecycle_hook.arm_desktop_canary(
+                "controller-1",
+                execution_target_session_id="desktop-current",
+                target_generation=4,
+                ownership_generation=7,
+                canary_path=root / "desktop-canary.json",
+                hooks_path=hooks,
+                skill_root=skill_root,
+            )
+
+            self.assertEqual(armed["schema_version"], 4)
+            self.assertEqual(armed["controller_id"], "controller-1")
+            self.assertEqual(armed["controller_session_id"], "controller-1")
+            self.assertEqual(armed["execution_target_session_id"], "desktop-current")
+            self.assertEqual(armed["target_generation"], 4)
+            self.assertEqual(armed["ownership_generation"], 7)
+
+    def test_canary_binds_logical_controller_to_distinct_execution_target(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            skill_root = root / "adaptive-delivery"
+            (skill_root / "scripts").mkdir(parents=True)
+            (skill_root / "scripts" / "lifecycle_hook.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            (skill_root / "scripts" / "controller_target_guard.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            hooks = root / "hooks.json"
+            hooks.write_text('{"hooks": {"SessionStart": []}}\n', encoding="utf-8")
+            canary = root / "desktop-canary.json"
+
+            armed = lifecycle_hook.arm_desktop_canary(
+                "controller-1",
+                canary_path=canary,
+                hooks_path=hooks,
+                skill_root=skill_root,
+            )
+            armed.update({
+                "controller_id": "controller-1",
+                "execution_target_session_id": "desktop-current",
+                "target_generation": 4,
+                "ownership_generation": 4,
+            })
+            canary.write_text(json.dumps(armed), encoding="utf-8")
+            ignored = lifecycle_hook.record_desktop_canary_observation(
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "controller-1",
+                    "turn_id": "t-logical",
+                    "controller_target_generation": 4,
+                },
+                {},
+                {"active_turn_id": "t-logical"},
+                canary_path=canary,
+                hooks_path=hooks,
+                skill_root=skill_root,
+            )
+            observed = lifecycle_hook.record_desktop_canary_observation(
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "desktop-current",
+                    "turn_id": "t-target",
+                    "controller_target_generation": 4,
+                },
+                {},
+                {"active_turn_id": "t-target"},
+                canary_path=canary,
+                hooks_path=hooks,
+                skill_root=skill_root,
+            )
+
+            self.assertEqual(armed["controller_id"], "controller-1")
+            self.assertEqual(armed["execution_target_session_id"], "desktop-current")
+            self.assertEqual(armed["target_generation"], 4)
+            self.assertEqual(armed["ownership_generation"], 4)
+            self.assertEqual(ignored["sequence_index"], 0)
+            self.assertEqual(observed["sequence_index"], 1)
+            self.assertEqual(observed["observations"], ["session_started"])
+
     def test_live_observations_are_required_before_canary_passes(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

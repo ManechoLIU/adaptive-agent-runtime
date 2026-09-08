@@ -1319,7 +1319,7 @@ def _desktop_canary_identity(
     lifecycle = root / "scripts" / "lifecycle_hook.py"
     target_guard_path = root / "scripts" / "controller_target_guard.py"
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "skill_root": str(root),
         "hooks_sha256": sha256_bytes(hooks_path.read_bytes()),
         "lifecycle_sha256": sha256_bytes(lifecycle.read_bytes()),
@@ -1330,13 +1330,33 @@ def _desktop_canary_identity(
 def arm_desktop_canary(
     controller_session_id: str,
     *,
+    execution_target_session_id: str | None = None,
+    target_generation: int | None = None,
+    ownership_generation: int | None = None,
     canary_path: Path = DESKTOP_CANARY_PATH,
     hooks_path: Path = CODEX_HOOKS_PATH,
     skill_root: Path | None = None,
 ) -> dict[str, Any]:
-    session_id = controller_session_id.strip()
-    if not session_id:
+    controller_id = controller_session_id.strip()
+    if not controller_id:
         raise ValueError("controller session is required to arm desktop canary")
+    target_session_id = str(execution_target_session_id or controller_id).strip()
+    if not target_session_id:
+        raise ValueError("execution target session is required to arm desktop canary")
+    for generation, label in (
+        (target_generation, "target generation"),
+        (ownership_generation, "ownership generation"),
+    ):
+        if generation is not None and (
+            isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
+        ):
+            raise ValueError(f"{label} must be a positive integer")
+    if target_session_id != controller_id and (
+        target_generation is None or ownership_generation is None
+    ):
+        raise ValueError(
+            "distinct execution target canary requires target and ownership generations"
+        )
     identity = _desktop_canary_identity(
         hooks_path=hooks_path, skill_root=skill_root
     )
@@ -1344,7 +1364,11 @@ def arm_desktop_canary(
     receipt = {
         **identity,
         "status": "armed",
-        "controller_session_id": session_id,
+        "controller_id": controller_id,
+        "controller_session_id": controller_id,
+        "execution_target_session_id": target_session_id,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
         "run_id": secrets.token_hex(16),
         "sequence_index": 0,
         "observations": [],
@@ -1385,7 +1409,17 @@ def record_desktop_canary_observation(
             if current.get("status") not in {"armed", "pending"}:
                 return current
             session_id = str(event.get("session_id", "")).strip()
-            if session_id != str(current.get("controller_session_id", "")):
+            execution_target_session_id = str(
+                current.get("execution_target_session_id")
+                or current.get("controller_session_id", "")
+            ).strip()
+            if session_id != execution_target_session_id:
+                return current
+            expected_target_generation = current.get("target_generation")
+            if (
+                expected_target_generation is not None
+                and event.get("controller_target_generation") != expected_target_generation
+            ):
                 return current
             observations = [
                 str(item) for item in current.get("observations", []) if str(item).strip()
@@ -3117,9 +3151,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="CONTROLLER_SESSION_ID",
         help="arm one ordered live desktop hook canary for the registered controller",
     )
+    parser.add_argument(
+        "--execution-target-session-id",
+        help="exact current desktop execution target bound to the canary",
+    )
+    parser.add_argument(
+        "--target-generation",
+        type=int,
+        help="exact current desktop target generation bound to the canary",
+    )
+    parser.add_argument(
+        "--ownership-generation",
+        type=int,
+        help="exact current controller execution-ownership generation bound to the canary",
+    )
     args = parser.parse_args(argv)
     if args.arm_desktop_canary:
-        receipt = arm_desktop_canary(args.arm_desktop_canary)
+        try:
+            receipt = arm_desktop_canary(
+                args.arm_desktop_canary,
+                execution_target_session_id=args.execution_target_session_id,
+                target_generation=args.target_generation,
+                ownership_generation=args.ownership_generation,
+            )
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 2
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
         return 0
     if args.print_machine_trace:

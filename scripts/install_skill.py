@@ -722,11 +722,24 @@ def _valid_desktop_canary(
     if age_seconds < 0 or age_seconds > DESKTOP_CANARY_MAX_AGE_SECONDS:
         return False
     observations = receipt.get("observations")
+    target_generation = receipt.get("target_generation")
+    ownership_generation = receipt.get("ownership_generation")
     return (
-        receipt.get("schema_version") == 3
+        receipt.get("schema_version") == 4
         and receipt.get("status") == "passed"
+        and isinstance(receipt.get("controller_id"), str)
+        and bool(receipt.get("controller_id"))
         and isinstance(receipt.get("controller_session_id"), str)
         and bool(receipt.get("controller_session_id"))
+        and receipt.get("controller_session_id") == receipt.get("controller_id")
+        and isinstance(receipt.get("execution_target_session_id"), str)
+        and bool(receipt.get("execution_target_session_id"))
+        and isinstance(target_generation, int)
+        and not isinstance(target_generation, bool)
+        and target_generation > 0
+        and isinstance(ownership_generation, int)
+        and not isinstance(ownership_generation, bool)
+        and ownership_generation > 0
         and isinstance(receipt.get("run_id"), str)
         and len(receipt.get("run_id")) >= 16
         and receipt.get("sequence_index") == len(DESKTOP_CANARY_SEQUENCE)

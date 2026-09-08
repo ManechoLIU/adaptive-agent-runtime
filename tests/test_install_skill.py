@@ -34,9 +34,13 @@ class InstallCapabilityTests(unittest.TestCase):
             install_codex_hooks(hooks, skill_root, python_executable="/usr/bin/python3")
             canary = root / "desktop-canary.json"
             receipt = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "status": "passed",
+                "controller_id": "controller-1",
                 "controller_session_id": "controller-1",
+                "execution_target_session_id": "desktop-current",
+                "target_generation": 4,
+                "ownership_generation": 7,
                 "run_id": "0123456789abcdef0123456789abcdef",
                 "sequence_index": 8,
                 "skill_root": str(skill_root.resolve()),
@@ -137,9 +141,13 @@ class InstallCapabilityTests(unittest.TestCase):
             canary.write_text(
                 json.dumps(
                     {
-                        "schema_version": 3,
+                        "schema_version": 4,
                         "status": "passed",
+                        "controller_id": "controller-1",
                         "controller_session_id": "controller-1",
+                        "execution_target_session_id": "desktop-current",
+                        "target_generation": 4,
+                        "ownership_generation": 7,
                         "run_id": "0123456789abcdef0123456789abcdef",
                         "sequence_index": 8,
                         "skill_root": str(skill_root.resolve()),
