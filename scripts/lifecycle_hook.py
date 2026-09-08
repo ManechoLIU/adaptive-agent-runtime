@@ -602,7 +602,46 @@ def _shell_parenthesized_execution_groups(command: str) -> list[str]:
             quote = None if quote == '"' else ('"' if quote is None else quote)
             index += 1
             continue
-        process_prefix = quote is None and command[index : index + 2] in {"<(", ">("}
+        if quote is None and command.startswith("$((", index):
+            cursor = index + 3
+            depth = 2
+            inner_quote: str | None = None
+            while cursor < len(command):
+                inner = command[cursor]
+                if inner == "\\" and inner_quote != "'":
+                    cursor += 2
+                    continue
+                if inner == "'":
+                    inner_quote = (
+                        None if inner_quote == "'" else ("'" if inner_quote is None else inner_quote)
+                    )
+                elif inner == '"':
+                    inner_quote = (
+                        None if inner_quote == '"' else ('"' if inner_quote is None else inner_quote)
+                    )
+                elif inner_quote is None and inner == "(":
+                    depth += 1
+                elif inner_quote is None and inner == ")":
+                    depth -= 1
+                    if depth == 0:
+                        index = cursor + 1
+                        break
+                cursor += 1
+            else:
+                index += 3
+            continue
+        prefix = command[index : index + 2]
+        process_prefix = quote is None and (
+            prefix in {"<(", ">("}
+            or (
+                prefix == "=("
+                and (
+                    index == 0
+                    or command[index - 1].isspace()
+                    or command[index - 1] in {";", "|", "&", "("}
+                )
+            )
+        )
         plain_group = (
             quote is None
             and char == "("
