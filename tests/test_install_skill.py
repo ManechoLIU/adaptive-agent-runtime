@@ -781,7 +781,12 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok first-output timeout terminates a silent provider attempt', () => { assert.equal(1, 1); });\n"
                 "test('Grok generation stall timeout terminates after structured output stops', () => { assert.equal(1, 1); });\n"
                 "test('Grok absolute deadline kills the entire provider process group', () => { assert.equal(1, 1); });\n"
-                "test('Grok stall timeout persists structured canonical terminal classification', () => { assert.equal(1, 1); });\n",
+                "test('Grok stall timeout persists structured canonical terminal classification', () => { assert.equal(1, 1); });\n"
+                "test('Grok failed attempt uses 0600 prompt file and removes it', () => { assert.equal(1, 1); });\n"
+                "test('oversized non-reviewer Grok prompt fails before spawn without sharding', () => { assert.equal(1, 1); });\n"
+                "test('Grok stderr and assignment heartbeat do not satisfy first stdout progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok reviewer shard cannot finalize and synthesis binds exact candidate head', () => { assert.equal(1, 1); });\n"
+                "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")
@@ -1165,7 +1170,12 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok first-output timeout terminates a silent provider attempt', () => { assert.equal(1, 1); });\n"
                 "test('Grok generation stall timeout terminates after structured output stops', () => { assert.equal(1, 1); });\n"
                 "test('Grok absolute deadline kills the entire provider process group', () => { assert.equal(1, 1); });\n"
-                "test('Grok stall timeout persists structured canonical terminal classification', () => { assert.equal(1, 1); });\n",
+                "test('Grok stall timeout persists structured canonical terminal classification', () => { assert.equal(1, 1); });\n"
+                "test('Grok failed attempt uses 0600 prompt file and removes it', () => { assert.equal(1, 1); });\n"
+                "test('oversized non-reviewer Grok prompt fails before spawn without sharding', () => { assert.equal(1, 1); });\n"
+                "test('Grok stderr and assignment heartbeat do not satisfy first stdout progress', () => { assert.equal(1, 1); });\n"
+                "test('Grok reviewer shard cannot finalize and synthesis binds exact candidate head', () => { assert.equal(1, 1); });\n"
+                "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
             (tests_dir / "__init__.py").write_text("", encoding="utf-8")

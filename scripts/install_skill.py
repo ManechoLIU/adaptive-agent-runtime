@@ -528,6 +528,11 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok generation stall timeout terminates after structured output stops",
     "Grok absolute deadline kills the entire provider process group",
     "Grok stall timeout persists structured canonical terminal classification",
+    "Grok failed attempt uses 0600 prompt file and removes it",
+    "oversized non-reviewer Grok prompt fails before spawn without sharding",
+    "Grok stderr and assignment heartbeat do not satisfy first stdout progress",
+    "Grok reviewer shard cannot finalize and synthesis binds exact candidate head",
+    "Grok cleanup uncertainty is result unknown and not retry safe",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_runtime_supervisor.py",

@@ -88,8 +88,12 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
 } else {
   const beforeOutput = Number(process.env.FAKE_RUNNER_DELAY_BEFORE_OUTPUT_MS || 0);
   if (beforeOutput > 0) await new Promise((resolve) => setTimeout(resolve, beforeOutput));
+  const promptFileIndex = process.argv.indexOf("--prompt-file");
+  const promptFilePath = promptFileIndex >= 0 ? process.argv[promptFileIndex + 1] : null;
+  const promptFileMode = promptFilePath ? (fs.statSync(promptFilePath).mode & 0o777) : null;
   process.stdout.write(JSON.stringify({
     args: process.argv.slice(2),
+    promptFileMode,
     cwd: process.cwd(),
     hasKimiApiKey: Boolean(process.env.KIMI_MODEL_API_KEY),
     kimiModelName: process.env.KIMI_MODEL_NAME || null,
@@ -1315,7 +1319,8 @@ test("oversized Grok reviewer prompt fails before provider spawn with sharding e
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
-  const ack = await assignmentAckFile(bin, { role: "reviewer", agent_id: "reviewer" }, repo);
+  const candidateHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const ack = await assignmentAckFile(bin, { role: "reviewer", agent_id: "reviewer", candidate_revision: candidateHead, reviewer_for_revision: candidateHead }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
     "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo,
@@ -1427,15 +1432,17 @@ test("Grok stall timeout persists structured canonical terminal classification",
   const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   const runtimeReceipts = path.join(bin, "runtime-receipts.jsonl");
+  const terminalReceipt = path.join(bin, "external-terminal.json");
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
-  const ack = await assignmentAckFile(bin, { role: "reviewer", agent_id: "reviewer", side_effect: false }, repo);
+  const candidateHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const ack = await assignmentAckFile(bin, { role: "reviewer", agent_id: "reviewer", side_effect: false, candidate_revision: candidateHead, reviewer_for_revision: candidateHead }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
     "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo,
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "reviewer", "--session-id", "review-stall-s1",
-    "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts,
+    "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts, "--terminal-receipt", terminalReceipt,
   ], {
     encoding: "utf8", input: "bounded reviewer contract",
     env: {
@@ -1455,4 +1462,164 @@ test("Grok stall timeout persists structured canonical terminal classification",
   assert.equal(terminal.result_unknown, false);
   assert.equal(terminal.failure_details.cleanup_confirmed, true);
   assert.match(terminal.next_action, /inspect bounded external agent failure/i);
+  const durable = JSON.parse(await readFile(terminalReceipt, "utf8"));
+  assert.equal(durable.failure_class, "generation_stalled");
+  assert.equal(durable.retry_class, "generation_stalled");
+  assert.equal(durable.retry_safe, true);
+  assert.equal(durable.result_unknown, false);
+});
+
+
+test("Grok failed attempt uses 0600 prompt file and removes it", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-prompt-permission-"));
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+  ], {
+    encoding: "utf8", input: "private bounded prompt",
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, FAKE_RUNNER_EXIT_CODE: "7" },
+  });
+  assert.equal(result.status, 7, result.stderr);
+  const call = JSON.parse(result.stdout.trim());
+  const promptFlag = call.args.indexOf("--prompt-file");
+  assert.notEqual(promptFlag, -1);
+  assert.equal(call.promptFileMode, 0o600);
+  await assert.rejects(readFile(call.args[promptFlag + 1], "utf8"));
+});
+
+test("oversized non-reviewer Grok prompt fails before spawn without sharding", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-writer-oversize-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, { assignment_id: "writer-big", role: "writer", agent_id: "writer" }, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo,
+    "--assignment-id", "writer-big", "--task-id", "T1", "--agent-id", "writer", "--session-id", "writer-big-s1",
+    "--assignment-ack", ack,
+  ], {
+    encoding: "utf8", input: "X".repeat(256),
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker, AD_GROK_MAX_PROMPT_BYTES: "128" },
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /prompt_too_large/i);
+  assert.doesNotMatch(result.stderr, /review_sharding_required/i);
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
+test("Grok stderr and assignment heartbeat do not satisfy first stdout progress", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-stderr-heartbeat-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const runtimeReceipts = path.join(bin, "receipts.jsonl");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  const runner = path.join(bin, "grok");
+  await writeFile(runner, `#!/usr/bin/env node
+if (process.argv[2] === "version") process.stdout.write("grok test\\n");
+else { process.stderr.write("provider diagnostic only\\n"); await new Promise((resolve) => setTimeout(resolve, 1000)); }
+`);
+  await chmod(runner, 0o755);
+  const ack = await assignmentAckFile(bin, { assignment_id: "stderr-heartbeat" }, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "stderr-heartbeat", "--task-id", "T1", "--agent-id", "writer", "--session-id", "stderr-heartbeat-s1",
+    "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts,
+  ], {
+    encoding: "utf8", input: "bounded",
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
+      AD_RUNTIME_HEARTBEAT_MS: "20", AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "120", AD_GROK_STALL_TIMEOUT_MS: "1000",
+      AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "1500", AD_EXTERNAL_KILL_GRACE_MS: "25" },
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /first_output_timeout/i);
+  const receipts = (await readFile(runtimeReceipts, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(receipts.some((item) => item.event_type === "assignment_heartbeat"));
+  assert.equal(receipts.at(-1).failure_class, "first_output_timeout");
+});
+
+test("Grok reviewer shard cannot finalize and synthesis binds exact candidate head", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-review-phase-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const wrongHead = "0".repeat(40);
+  const run = async ({ assignmentId, reviewPhase, verdictHead, evidence }) => {
+    const deliveryPath = path.join(bin, `${assignmentId}-delivery.json`);
+    const verdict = { reviewed_head: verdictHead, verdict: "PASS", critical: [], important: [], minor: [] };
+    await writeFile(deliveryPath, JSON.stringify({
+      delivery_outcome: "pass", summary: "review phase result", evidence,
+      artifacts: [`git:${head}`], next_action: "continue review", retry_class: "none", review_verdict: verdict,
+    }));
+    const ack = await assignmentAckFile(bin, {
+      assignment_id: assignmentId, task_id: assignmentId, agent_id: "reviewer", role: "reviewer",
+      candidate_revision: head, reviewer_for_revision: head, review_phase: reviewPhase,
+    }, repo);
+    return spawnSync(process.execPath, [adapter,
+      "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+      "--assignment-id", assignmentId, "--task-id", assignmentId, "--agent-id", "reviewer", "--session-id", `${assignmentId}-s1`,
+      "--assignment-ack", ack, "--delivery-receipt", deliveryPath,
+    ], { encoding: "utf8", input: "bounded review", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
+  };
+  const shard = await run({ assignmentId: "review-shard", reviewPhase: "shard", verdictHead: head, evidence: [`git:${head}`] });
+  assert.equal(shard.status, 1);
+  assert.match(shard.stderr, /shard|synthesis|final review/i);
+
+  const mismatched = await run({ assignmentId: "review-full-wrong", reviewPhase: "full", verdictHead: wrongHead, evidence: [`git:${head}`] });
+  assert.equal(mismatched.status, 1);
+  assert.match(mismatched.stderr, /reviewed_head|candidate_revision|candidate/i);
+
+  const synthesis = await run({ assignmentId: "review-synthesis", reviewPhase: "synthesis", verdictHead: head, evidence: ["receipt:review-shard", `git:${head}`] });
+  assert.equal(synthesis.status, 0, synthesis.stderr);
+});
+
+test("Grok cleanup uncertainty is result unknown and not retry safe", async () => {
+  const runtimeModule = await import("../scripts/run_external_agent.mjs");
+  assert.equal(typeof runtimeModule.runMonitoredGrok, "function");
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-cleanup-uncertain-"));
+  const runner = path.join(bin, "silent-grok");
+  await writeFile(runner, `#!/usr/bin/env node
+await new Promise((resolve) => setTimeout(resolve, 5000));
+`);
+  await chmod(runner, 0o755);
+  const previous = {
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "20";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "500";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1000";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "20";
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(runner, [], {
+        cwd: bin, env: process.env,
+        terminateGroup: async (child) => {
+          try { process.kill(-child.pid, "SIGKILL"); } catch {}
+          return { confirmed: false, diagnostic: "simulated process-group probe failure" };
+        },
+      }),
+      (error) => error?.failureClass === "process_group_cleanup_failed" && error?.retrySafe === false && error?.resultUnknown === true,
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      const envName = key === "first" ? "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS" : key === "stall" ? "AD_GROK_STALL_TIMEOUT_MS" : key === "absolute" ? "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS" : "AD_EXTERNAL_KILL_GRACE_MS";
+      if (value === undefined) delete process.env[envName]; else process.env[envName] = value;
+    }
+  }
 });

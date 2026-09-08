@@ -12,6 +12,7 @@ const KIMI_KEYCHAIN_SERVICE = "adaptive-delivery-kimi-k3";
 const XAI_KEYCHAIN_SERVICE = "adaptive-delivery-xai-grok";
 const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 const CARD_CATEGORIES = new Set(["frontend", "backend", "general"]);
+const REVIEW_PHASES = new Set(["full", "shard", "synthesis"]);
 const CARD_STATUSES = {
   running: { icon: "🟢", label: "运行中" },
   returned: { icon: "🟡", label: "已返回" },
@@ -554,6 +555,23 @@ function validateAssignmentLaunch(options) {
   }
   assignment.assignment_contract_version = contractVersion;
   assignment.progress_deadline_minutes = assignmentProgressDeadlineMinutes(assignment);
+  const assignmentRole = String(assignment.role || "").trim().toLowerCase();
+  const candidateRevision = String(assignment.candidate_revision || "").trim();
+  if (assignmentRole === "reviewer") {
+    if (!candidateRevision) {
+      throw new Error("reviewer assignment-ack requires immutable candidate_revision");
+    }
+    const reviewPhase = String(assignment.review_phase || "full").trim().toLowerCase();
+    if (!REVIEW_PHASES.has(reviewPhase)) {
+      throw new Error("reviewer assignment-ack review_phase must be full|shard|synthesis");
+    }
+    assignment.review_phase = reviewPhase;
+  } else {
+    if (assignment.review_phase !== undefined && assignment.review_phase !== null) {
+      throw new Error("assignment-ack review_phase is valid only for reviewer assignments");
+    }
+    assignment.review_phase = null;
+  }
   const repositoryRoot = gitFact(options.cwd, ["rev-parse", "--show-toplevel"], "launch repository");
   const branch = gitFact(options.cwd, ["branch", "--show-current"], "launch branch");
   const head = gitFact(options.cwd, ["rev-parse", "HEAD"], "launch revision");
@@ -643,7 +661,7 @@ function isTraceableLocator(value, schemes) {
   return schemes.has(token.slice(0, separator)) && token.slice(separator + 1).trim().length > 0;
 }
 
-function readDeliveryReceipt(pathname) {
+function readDeliveryReceipt(pathname, { assignmentRole = null, candidateRevision = null, reviewPhase = null } = {}) {
   if (!pathname) return null;
   let receipt;
   try {
@@ -691,7 +709,31 @@ function readDeliveryReceipt(pathname) {
     }
     const expectedOutcome = verdict.verdict === "PASS" ? "pass" : "fail";
     if (deliveryOutcome !== expectedOutcome) throw new Error("delivery-receipt review_verdict conflicts with delivery_outcome");
+    const normalizedRole = String(assignmentRole || "").trim().toLowerCase();
+    const normalizedPhase = String(reviewPhase || "full").trim().toLowerCase();
+    const expectedHead = String(candidateRevision || "").trim();
+    if (normalizedRole !== "reviewer") {
+      throw new Error("delivery-receipt review_verdict is valid only for reviewer assignments");
+    }
+    if (!expectedHead) {
+      throw new Error("delivery-receipt review_verdict requires immutable candidate_revision");
+    }
+    if (verdict.reviewed_head !== expectedHead) {
+      throw new Error("delivery-receipt review_verdict reviewed_head must equal assignment candidate_revision");
+    }
+    if (normalizedPhase === "shard") {
+      throw new Error("reviewer shard cannot publish a final review_verdict; one final synthesis review is required");
+    }
+    if (normalizedPhase === "synthesis" && !receipt.evidence.some((item) => typeof item === "string" && item.startsWith("receipt:"))) {
+      throw new Error("reviewer synthesis review requires shard receipt evidence");
+    }
     reviewVerdict = verdict;
+  }
+  const normalizedRole = String(assignmentRole || "").trim().toLowerCase();
+  const normalizedPhase = String(reviewPhase || "full").trim().toLowerCase();
+  if (normalizedRole === "reviewer" && normalizedPhase !== "shard"
+      && new Set(["pass", "fail"]).has(deliveryOutcome) && !reviewVerdict) {
+    throw new Error("full or synthesis reviewer delivery requires structured review_verdict");
   }
   return {
     delivery_outcome: deliveryOutcome, summary, evidence: receipt.evidence, artifacts: receipt.artifacts,
@@ -730,6 +772,7 @@ function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
       execution_transport: "external_process",
       execution_role: options.assignmentRole || null,
       candidate_revision: options.candidateRevision || null,
+      review_phase: options.reviewPhase || null,
       model: options.model,
       agent_type: options.agentType || `external-${options.engine}`,
       auth_mode: options.authMode,
@@ -763,7 +806,7 @@ function atomicWriteJson(pathname, payload) {
 }
 
 function persistExternalTerminalReceipt(options, {
-  exitCode, summary, deliveryOutcome = "unresolved", failureClass = null,
+  exitCode, summary, deliveryOutcome = "unresolved", failureClass = null, retryClass = null,
   retrySafe = null, resultUnknown = null, failureDetails = null,
 }) {
   if (!options.terminalReceipt) return null;
@@ -785,6 +828,10 @@ function persistExternalTerminalReceipt(options, {
     attempt: options.assignmentId ? options.attempt : null,
     lease_id: options.assignmentId ? options.leaseId : null,
     ...(failureClass ? { failure_class: failureClass } : {}),
+    ...(retryClass ? { retry_class: retryClass } : {}),
+    ...(options.assignmentRole ? { execution_role: options.assignmentRole } : {}),
+    ...(options.candidateRevision ? { candidate_revision: options.candidateRevision } : {}),
+    ...(options.reviewPhase ? { review_phase: options.reviewPhase } : {}),
     ...(typeof retrySafe === "boolean" ? { retry_safe: retrySafe } : {}),
     ...(typeof resultUnknown === "boolean" ? { result_unknown: resultUnknown } : {}),
     ...(failureDetails && typeof failureDetails === "object" && !Array.isArray(failureDetails) ? { failure_details: failureDetails } : {}),
@@ -927,8 +974,9 @@ function runAttached(executable, args, { cwd, env }) {
   });
 }
 
-function runMonitoredGrok(executable, args, {
+export function runMonitoredGrok(executable, args, {
   cwd, env, progressDeadlineMinutes = null, onStructuredProgress = null,
+  terminateGroup = terminateProcessGroup,
 }) {
   const absoluteTimeoutMs = externalAttemptTimeoutMs(progressDeadlineMinutes);
   const firstOutputTimeoutMs = grokFirstOutputTimeoutMs();
@@ -992,7 +1040,7 @@ function runMonitoredGrok(executable, args, {
       if (terminating || settled) return;
       terminating = true;
       clearInterval(watchdog);
-      const cleanup = await terminateProcessGroup(child, killGraceMs);
+      const cleanup = await terminateGroup(child, killGraceMs);
       const finalClass = cleanup.confirmed ? failureClass : "process_group_cleanup_failed";
       const diagnostic = `${message}; cleanup=${cleanup.diagnostic}`;
       finish(reject, new ExternalAgentExecutionError(`${finalClass}: ${diagnostic}`, {
@@ -1212,6 +1260,9 @@ async function main() {
       options.candidateRevision = typeof assignment.candidate_revision === "string" && assignment.candidate_revision.trim()
         ? assignment.candidate_revision.trim()
         : null;
+      options.reviewPhase = typeof assignment.review_phase === "string" && assignment.review_phase.trim()
+        ? assignment.review_phase.trim().toLowerCase()
+        : null;
       options.executionLineage = deriveExecutionLineage(options, assignment);
     }
     validateRuleHandshake(options);
@@ -1269,7 +1320,7 @@ async function main() {
       });
       persistExternalTerminalReceipt(options, {
         exitCode: 1, summary: error.message, deliveryOutcome: "unresolved",
-        failureClass, retrySafe, resultUnknown, failureDetails,
+        failureClass, retryClass: failureClass, retrySafe, resultUnknown, failureDetails,
       });
       throw error;
     }
@@ -1294,11 +1345,16 @@ async function main() {
     let deliveryError = null;
     if (code === 0) {
       try {
-        delivery = readDeliveryReceipt(options.deliveryReceipt);
+        delivery = readDeliveryReceipt(options.deliveryReceipt, {
+          assignmentRole: options.assignmentRole,
+          candidateRevision: options.candidateRevision,
+          reviewPhase: options.reviewPhase,
+        });
       } catch (error) {
         deliveryError = error;
       }
     }
+    const finalRetryClass = delivery?.retry_class || (deliveryError ? "none" : code === 0 ? "none" : "provider_exit");
     recordRuntimeReceipt(options, "assignment_terminal", eventSeq, {
       terminal_state: code === 0 ? "completed" : "failed",
       transport_outcome: code === 0 ? "completed" : "failed",
@@ -1306,7 +1362,7 @@ async function main() {
       summary: delivery?.summary || deliveryError?.message || (code === 0 ? "external agent process completed" : `external agent exited ${code}`),
       evidence: delivery?.evidence || [], artifacts: delivery?.artifacts || [],
       next_action: delivery?.next_action || (deliveryError ? "repair delivery receipt" : code === 0 ? "inspect delivery" : "inspect external agent output"),
-      retry_class: delivery?.retry_class || (deliveryError ? "none" : code === 0 ? "none" : "provider_exit"),
+      retry_class: finalRetryClass,
       reconciliation_evidence: delivery?.reconciliation_evidence || [],
       ...(delivery?.review_verdict ? { review_verdict: delivery.review_verdict } : {}),
       result_unknown: Boolean(options.sideEffect) && (code !== 0 || deliveryError !== null || delivery?.delivery_outcome === "unresolved" || delivery === null),
@@ -1315,6 +1371,7 @@ async function main() {
       exitCode: code,
       summary: delivery?.summary || deliveryError?.message || (code === 0 ? "external agent process completed" : `external agent exited ${code}`),
       deliveryOutcome: delivery?.delivery_outcome || "unresolved",
+      retryClass: finalRetryClass,
     });
     if (deliveryError) throw deliveryError;
     process.exitCode = code;
