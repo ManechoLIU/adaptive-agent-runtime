@@ -1027,8 +1027,8 @@ export function runMonitoredGrok(executable, args, {
       return;
     }
     const startedAt = Date.now();
-    let firstOutputAt = null;
-    let lastOutputAt = startedAt;
+    let firstStructuredOutputAt = null;
+    let lastStructuredOutputAt = startedAt;
     let stdoutBuffer = "";
     let terminating = false;
     let settled = false;
@@ -1050,17 +1050,17 @@ export function runMonitoredGrok(executable, args, {
         if (!line) continue;
         try {
           const event = JSON.parse(line);
-          if (event && typeof event === "object" && !Array.isArray(event) && typeof onStructuredProgress === "function") {
-            onStructuredProgress(event);
+          if (event && typeof event === "object" && !Array.isArray(event)) {
+            const now = Date.now();
+            if (firstStructuredOutputAt === null) firstStructuredOutputAt = now;
+            lastStructuredOutputAt = now;
+            if (typeof onStructuredProgress === "function") onStructuredProgress(event);
           }
         } catch {}
       }
     };
 
     child.stdout?.on("data", (chunk) => {
-      const now = Date.now();
-      if (firstOutputAt === null) firstOutputAt = now;
-      lastOutputAt = now;
       process.stdout.write(chunk);
       observeStructuredLines(chunk.toString("utf8"));
     });
@@ -1092,12 +1092,12 @@ export function runMonitoredGrok(executable, args, {
         void terminateFor("attempt_deadline_exceeded", `absolute deadline ${absoluteTimeoutMs}ms exceeded`);
         return;
       }
-      if (firstOutputAt === null && now - startedAt >= firstOutputTimeoutMs) {
-        void terminateFor("first_output_timeout", `no Grok stdout within ${firstOutputTimeoutMs}ms`);
+      if (firstStructuredOutputAt === null && now - startedAt >= firstOutputTimeoutMs) {
+        void terminateFor("first_output_timeout", `no structured Grok stdout within ${firstOutputTimeoutMs}ms`);
         return;
       }
-      if (firstOutputAt !== null && now - lastOutputAt >= stallTimeoutMs) {
-        void terminateFor("generation_stalled", `no Grok stdout progress within ${stallTimeoutMs}ms`);
+      if (firstStructuredOutputAt !== null && now - lastStructuredOutputAt >= stallTimeoutMs) {
+        void terminateFor("generation_stalled", `no structured Grok stdout progress within ${stallTimeoutMs}ms`);
       }
     }, watchdogIntervalMs);
     watchdog.unref();

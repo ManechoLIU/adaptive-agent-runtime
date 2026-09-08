@@ -1547,6 +1547,60 @@ else { process.stderr.write("provider diagnostic only\\n"); await new Promise((r
   assert.equal(receipts.at(-1).failure_class, "first_output_timeout");
 });
 
+test("Grok unstructured stdout does not satisfy structured first-output progress", async () => {
+  const runtimeModule = await import("../scripts/run_external_agent.mjs");
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-unstructured-first-"));
+  const code = 'const timer=setInterval(()=>process.stdout.write("not-json\\n"),25); setTimeout(()=>{clearInterval(timer);process.exit(0)},1000);';
+  const previous = {
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "120";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "1000";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1500";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      (error) => error?.failureClass === "first_output_timeout",
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      const envName = key === "first" ? "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS" : key === "stall" ? "AD_GROK_STALL_TIMEOUT_MS" : key === "absolute" ? "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS" : "AD_EXTERNAL_KILL_GRACE_MS";
+      if (value === undefined) delete process.env[envName]; else process.env[envName] = value;
+    }
+  }
+});
+
+test("Grok malformed stdout after one structured event does not prevent generation stall", async () => {
+  const runtimeModule = await import("../scripts/run_external_agent.mjs");
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-unstructured-stall-"));
+  const code = 'process.stdout.write(JSON.stringify({event:"started"})+"\\n"); const timer=setInterval(()=>process.stdout.write("still-not-json\\n"),25); setTimeout(()=>{clearInterval(timer);process.exit(0)},1000);';
+  const previous = {
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "500";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "120";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1500";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      (error) => error?.failureClass === "generation_stalled",
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      const envName = key === "first" ? "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS" : key === "stall" ? "AD_GROK_STALL_TIMEOUT_MS" : key === "absolute" ? "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS" : "AD_EXTERNAL_KILL_GRACE_MS";
+      if (value === undefined) delete process.env[envName]; else process.env[envName] = value;
+    }
+  }
+});
+
 test("Grok reviewer shard cannot finalize and synthesis binds exact candidate head", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-review-phase-"));
   const repo = await makeAssignmentRepo(bin);

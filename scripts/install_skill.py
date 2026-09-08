@@ -555,6 +555,8 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok failed attempt uses 0600 prompt file and removes it",
     "oversized non-reviewer Grok prompt fails before spawn without sharding",
     "Grok stderr and assignment heartbeat do not satisfy first stdout progress",
+    "Grok unstructured stdout does not satisfy structured first-output progress",
+    "Grok malformed stdout after one structured event does not prevent generation stall",
     "Grok reviewer shard cannot finalize and synthesis binds exact candidate head",
     "Grok reviewer requires explicit phase and immutable candidate commit",
     "Grok synthesis validates canonical same-candidate shard receipts",
