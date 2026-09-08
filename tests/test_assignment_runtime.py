@@ -1002,3 +1002,37 @@ class VerifiableProgressObservabilityTests(unittest.TestCase):
             apply_receipt({}, receipt("assignment_started", progress_deadline_minutes=True), now=T0)
         with self.assertRaisesRegex(ValueError, "progress_deadline_minutes"):
             apply_receipt({}, receipt("assignment_started", progress_deadline_minutes=0), now=T0)
+
+class ReviewerRuntimeContractTests(unittest.TestCase):
+    def test_reviewer_start_persists_explicit_phase_and_shard_receipts(self):
+        shard = receipt(
+            "assignment_started",
+            agent_id="reviewer",
+            execution_role="reviewer",
+            candidate_revision="a" * 40,
+            review_phase="shard",
+        )
+        state = apply_receipt({}, shard, now=T0)
+        self.assertEqual(state["leases"]["a1"]["review_phase"], "shard")
+        self.assertEqual(state["leases"]["a1"]["candidate_revision"], "a" * 40)
+
+        synthesis = receipt(
+            "assignment_started",
+            assignment_id="a2", task_id="T2", agent_id="reviewer", session_id="s2",
+            execution_role="reviewer", candidate_revision="a" * 40,
+            review_phase="synthesis", review_shard_receipts=["receipt:a1:1:2"],
+        )
+        state = apply_receipt(state, synthesis, now=T0)
+        self.assertEqual(state["leases"]["a2"]["review_phase"], "synthesis")
+        self.assertEqual(state["leases"]["a2"]["review_shard_receipts"], ["receipt:a1:1:2"])
+
+    def test_reviewer_start_rejects_missing_or_invalid_phase(self):
+        for phase in (None, "bogus"):
+            payload = receipt(
+                "assignment_started", agent_id="reviewer", execution_role="reviewer",
+                candidate_revision="a" * 40,
+            )
+            if phase is not None:
+                payload["review_phase"] = phase
+            with self.assertRaisesRegex(ValueError, "review_phase"):
+                apply_receipt({}, payload, now=T0)

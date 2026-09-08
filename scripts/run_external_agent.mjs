@@ -561,16 +561,46 @@ function validateAssignmentLaunch(options) {
     if (!candidateRevision) {
       throw new Error("reviewer assignment-ack requires immutable candidate_revision");
     }
-    const reviewPhase = String(assignment.review_phase || "full").trim().toLowerCase();
+    let resolvedCandidate;
+    try {
+      resolvedCandidate = gitFact(options.cwd, ["rev-parse", "--verify", `${candidateRevision}^{commit}`], "reviewer candidate revision");
+    } catch (error) {
+      throw new Error(`reviewer candidate_revision must resolve to an immutable commit: ${error.message}`);
+    }
+    if (resolvedCandidate !== candidateRevision) {
+      throw new Error("reviewer candidate_revision must be the exact immutable commit, not a branch, tag, or abbreviation");
+    }
+    const reviewPhase = String(assignment.review_phase || "").trim().toLowerCase();
     if (!REVIEW_PHASES.has(reviewPhase)) {
-      throw new Error("reviewer assignment-ack review_phase must be full|shard|synthesis");
+      throw new Error("reviewer assignment-ack review_phase must be explicit full|shard|synthesis");
+    }
+    const rawShardReceipts = assignment.review_shard_receipts;
+    let reviewShardReceipts = [];
+    if (reviewPhase === "synthesis") {
+      if (!Array.isArray(rawShardReceipts) || rawShardReceipts.length === 0) {
+        throw new Error("reviewer synthesis requires non-empty review_shard_receipts");
+      }
+      reviewShardReceipts = rawShardReceipts.map((item) => String(item || "").trim());
+      if (reviewShardReceipts.some((item) => !item.startsWith("receipt:") || item.slice(8).trim().length === 0)) {
+        throw new Error("review_shard_receipts must contain receipt: locators only");
+      }
+      if (new Set(reviewShardReceipts).size !== reviewShardReceipts.length) {
+        throw new Error("review_shard_receipts must be unique");
+      }
+    } else if (rawShardReceipts !== undefined && rawShardReceipts !== null && !(Array.isArray(rawShardReceipts) && rawShardReceipts.length === 0)) {
+      throw new Error("review_shard_receipts are valid only for synthesis reviewer assignments");
     }
     assignment.review_phase = reviewPhase;
+    assignment.review_shard_receipts = reviewShardReceipts;
   } else {
     if (assignment.review_phase !== undefined && assignment.review_phase !== null) {
       throw new Error("assignment-ack review_phase is valid only for reviewer assignments");
     }
+    if (assignment.review_shard_receipts !== undefined && assignment.review_shard_receipts !== null) {
+      throw new Error("assignment-ack review_shard_receipts are valid only for reviewer assignments");
+    }
     assignment.review_phase = null;
+    assignment.review_shard_receipts = [];
   }
   const repositoryRoot = gitFact(options.cwd, ["rev-parse", "--show-toplevel"], "launch repository");
   const branch = gitFact(options.cwd, ["branch", "--show-current"], "launch branch");
@@ -773,6 +803,7 @@ function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
       execution_role: options.assignmentRole || null,
       candidate_revision: options.candidateRevision || null,
       review_phase: options.reviewPhase || null,
+      review_shard_receipts: options.reviewShardReceipts || [],
       model: options.model,
       agent_type: options.agentType || `external-${options.engine}`,
       auth_mode: options.authMode,
@@ -832,6 +863,7 @@ function persistExternalTerminalReceipt(options, {
     ...(options.assignmentRole ? { execution_role: options.assignmentRole } : {}),
     ...(options.candidateRevision ? { candidate_revision: options.candidateRevision } : {}),
     ...(options.reviewPhase ? { review_phase: options.reviewPhase } : {}),
+    ...(options.reviewShardReceipts?.length ? { review_shard_receipts: options.reviewShardReceipts } : {}),
     ...(typeof retrySafe === "boolean" ? { retry_safe: retrySafe } : {}),
     ...(typeof resultUnknown === "boolean" ? { result_unknown: resultUnknown } : {}),
     ...(failureDetails && typeof failureDetails === "object" && !Array.isArray(failureDetails) ? { failure_details: failureDetails } : {}),
@@ -1263,6 +1295,9 @@ async function main() {
       options.reviewPhase = typeof assignment.review_phase === "string" && assignment.review_phase.trim()
         ? assignment.review_phase.trim().toLowerCase()
         : null;
+      options.reviewShardReceipts = Array.isArray(assignment.review_shard_receipts)
+        ? assignment.review_shard_receipts.slice()
+        : [];
       options.executionLineage = deriveExecutionLineage(options, assignment);
     }
     validateRuleHandshake(options);

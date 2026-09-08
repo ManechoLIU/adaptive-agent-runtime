@@ -929,7 +929,7 @@ test("reviewer delivery receipt persists structured review verdict", async () =>
     next_action: "integrate candidate", retry_class: "none", review_verdict: verdict,
   }));
   const ack = await assignmentAckFile(bin, { assignment_id: "review-a1", agent_id: "reviewer",
-    primary_goal: "review immutable candidate", task_id: "review-a1", owned_scope: ["TASK_LEDGER.md"], role: "reviewer", candidate_revision: head, reviewer_for_revision: head,
+    primary_goal: "review immutable candidate", task_id: "review-a1", owned_scope: ["TASK_LEDGER.md"], role: "reviewer", candidate_revision: head, reviewer_for_revision: head, review_phase: "full",
   }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
@@ -1320,7 +1320,7 @@ test("oversized Grok reviewer prompt fails before provider spawn with sharding e
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
   const candidateHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const ack = await assignmentAckFile(bin, { role: "reviewer", agent_id: "reviewer", candidate_revision: candidateHead, reviewer_for_revision: candidateHead }, repo);
+  const ack = await assignmentAckFile(bin, { role: "reviewer", agent_id: "reviewer", candidate_revision: candidateHead, reviewer_for_revision: candidateHead, review_phase: "full" }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
     "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo,
@@ -1437,7 +1437,7 @@ test("Grok stall timeout persists structured canonical terminal classification",
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
   const candidateHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const ack = await assignmentAckFile(bin, { role: "reviewer", agent_id: "reviewer", side_effect: false, candidate_revision: candidateHead, reviewer_for_revision: candidateHead }, repo);
+  const ack = await assignmentAckFile(bin, { role: "reviewer", agent_id: "reviewer", side_effect: false, candidate_revision: candidateHead, reviewer_for_revision: candidateHead, review_phase: "full" }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
     "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo,
@@ -1556,7 +1556,8 @@ test("Grok reviewer shard cannot finalize and synthesis binds exact candidate he
   await fakeRunner(bin, "grok", "version");
   const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   const wrongHead = "0".repeat(40);
-  const run = async ({ assignmentId, reviewPhase, verdictHead, evidence }) => {
+
+  const runFinalReview = async ({ assignmentId, reviewPhase, verdictHead, evidence, reviewShardReceipts = [] }) => {
     const deliveryPath = path.join(bin, `${assignmentId}-delivery.json`);
     const verdict = { reviewed_head: verdictHead, verdict: "PASS", critical: [], important: [], minor: [] };
     await writeFile(deliveryPath, JSON.stringify({
@@ -1566,6 +1567,7 @@ test("Grok reviewer shard cannot finalize and synthesis binds exact candidate he
     const ack = await assignmentAckFile(bin, {
       assignment_id: assignmentId, task_id: assignmentId, agent_id: "reviewer", role: "reviewer",
       candidate_revision: head, reviewer_for_revision: head, review_phase: reviewPhase,
+      ...(reviewShardReceipts.length ? { review_shard_receipts: reviewShardReceipts } : {}),
     }, repo);
     return spawnSync(process.execPath, [adapter,
       "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
@@ -1574,15 +1576,41 @@ test("Grok reviewer shard cannot finalize and synthesis binds exact candidate he
       "--assignment-ack", ack, "--delivery-receipt", deliveryPath,
     ], { encoding: "utf8", input: "bounded review", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
   };
-  const shard = await run({ assignmentId: "review-shard", reviewPhase: "shard", verdictHead: head, evidence: [`git:${head}`] });
-  assert.equal(shard.status, 1);
-  assert.match(shard.stderr, /shard|synthesis|final review/i);
 
-  const mismatched = await run({ assignmentId: "review-full-wrong", reviewPhase: "full", verdictHead: wrongHead, evidence: [`git:${head}`] });
+  const shardVerdict = await runFinalReview({ assignmentId: "review-shard-verdict", reviewPhase: "shard", verdictHead: head, evidence: [`git:${head}`] });
+  assert.equal(shardVerdict.status, 1);
+  assert.match(shardVerdict.stderr, /shard|synthesis|final review/i);
+
+  const mismatched = await runFinalReview({ assignmentId: "review-full-wrong", reviewPhase: "full", verdictHead: wrongHead, evidence: [`git:${head}`] });
   assert.equal(mismatched.status, 1);
   assert.match(mismatched.stderr, /reviewed_head|candidate_revision|candidate/i);
 
-  const synthesis = await run({ assignmentId: "review-synthesis", reviewPhase: "synthesis", verdictHead: head, evidence: ["receipt:review-shard", `git:${head}`] });
+  // A shard can complete with bounded delivery evidence, but it must not publish the canonical verdict.
+  const shardReceiptsPath = path.join(bin, "review-shard-runtime.jsonl");
+  const shardDeliveryPath = path.join(bin, "review-shard-delivery.json");
+  await writeFile(shardDeliveryPath, JSON.stringify({
+    delivery_outcome: "pass", summary: "bounded shard reviewed", evidence: [`git:${head}`],
+    artifacts: [`git:${head}`], next_action: "synthesize", retry_class: "none",
+  }));
+  const shardAck = await assignmentAckFile(bin, {
+    assignment_id: "review-shard", task_id: "review-shard", agent_id: "reviewer", role: "reviewer",
+    candidate_revision: head, reviewer_for_revision: head, review_phase: "shard",
+  }, repo);
+  const shard = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "review-shard", "--task-id", "review-shard", "--agent-id", "reviewer", "--session-id", "review-shard-s1",
+    "--assignment-ack", shardAck, "--runtime-receipts", shardReceiptsPath, "--delivery-receipt", shardDeliveryPath,
+  ], { encoding: "utf8", input: "bounded shard", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
+  assert.equal(shard.status, 0, shard.stderr);
+  const shardRuntimeReceipts = (await readFile(shardReceiptsPath, "utf8")).trim().split("\n").map(JSON.parse);
+  const shardTerminalReceiptId = shardRuntimeReceipts.at(-1).receipt_id;
+  const shardLocator = `receipt:${shardTerminalReceiptId}`;
+
+  const synthesis = await runFinalReview({
+    assignmentId: "review-synthesis", reviewPhase: "synthesis", verdictHead: head,
+    evidence: [shardLocator], reviewShardReceipts: [shardLocator],
+  });
   assert.equal(synthesis.status, 0, synthesis.stderr);
 });
 
@@ -1622,4 +1650,66 @@ await new Promise((resolve) => setTimeout(resolve, 5000));
       if (value === undefined) delete process.env[envName]; else process.env[envName] = value;
     }
   }
+});
+
+test("Grok reviewer requires explicit phase and immutable candidate commit", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-review-contract-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const run = (assignmentId, overrides) => {
+    const ackPromise = assignmentAckFile(bin, {
+      assignment_id: assignmentId, task_id: assignmentId, agent_id: "reviewer", role: "reviewer",
+      reviewer_for_revision: overrides.candidate_revision || head,
+      ...overrides,
+    }, repo);
+    return ackPromise.then((ack) => spawnSync(process.execPath, [adapter,
+      "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+      "--assignment-id", assignmentId, "--task-id", assignmentId, "--agent-id", "reviewer", "--session-id", `${assignmentId}-s1`,
+      "--assignment-ack", ack,
+    ], { encoding: "utf8", input: "bounded review", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } }));
+  };
+  const missingPhase = await run("review-missing-phase", { candidate_revision: head });
+  assert.equal(missingPhase.status, 1);
+  assert.match(missingPhase.stderr, /review_phase|full\|shard\|synthesis/i);
+
+  const mutableCandidate = await run("review-mutable-candidate", { candidate_revision: "main", review_phase: "full" });
+  assert.equal(mutableCandidate.status, 1);
+  assert.match(mutableCandidate.stderr, /immutable|candidate_revision|commit/i);
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
+test("Grok synthesis validates canonical same-candidate shard receipts", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-synthesis-canonical-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+  const fakeDelivery = path.join(bin, "fake-synthesis.json");
+  await writeFile(fakeDelivery, JSON.stringify({
+    delivery_outcome: "pass", summary: "fake synthesis", evidence: ["receipt:not-real", `git:${head}`], artifacts: [`git:${head}`],
+    next_action: "integrate", retry_class: "none",
+    review_verdict: { reviewed_head: head, verdict: "PASS", critical: [], important: [], minor: [] },
+  }));
+  const fakeAck = await assignmentAckFile(bin, {
+    assignment_id: "synth-fake", task_id: "synth-fake", agent_id: "reviewer", role: "reviewer",
+    candidate_revision: head, reviewer_for_revision: head, review_phase: "synthesis",
+    review_shard_receipts: ["receipt:not-real"],
+  }, repo);
+  const fakeResult = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "synth-fake", "--task-id", "synth-fake", "--agent-id", "reviewer", "--session-id", "synth-fake-s1",
+    "--assignment-ack", fakeAck, "--delivery-receipt", fakeDelivery,
+  ], { encoding: "utf8", input: "bounded synthesis", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
+  assert.equal(fakeResult.status, 1);
+  assert.match(fakeResult.stderr, /shard|receipt|canonical|runtime/i);
 });
