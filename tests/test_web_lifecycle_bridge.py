@@ -926,6 +926,56 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "controller-1",
             )
 
+    def test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            original = {
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"web": ["web-strong", "web-old"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {"web": {
+                        "status": "active",
+                        "session_id": "web-strong",
+                        "generation": 4,
+                        "provenance": "host_attested_same_controller_recovery",
+                        "binding_mode": "resume_only",
+                        "identity_proof": "host_attested_origin",
+                    }}
+                },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "web",
+                        "execution_target_session_id": "web-strong",
+                        "generation": 4,
+                        "provenance": "web_entry",
+                    }
+                },
+            }
+            registry.write_text(json.dumps(original), encoding="utf-8")
+            verifier_calls = []
+            def verifier(**kwargs: object) -> bool:
+                verifier_calls.append(kwargs)
+                return True
+            with patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+            ):
+                result = web_bridge.recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id="web-old",
+                    registry_path=registry,
+                    host_identity_receipt=None,
+                )
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(result["reason"], "HOST_ATTESTED_CURRENT_TARGET_ALREADY_ACTIVE")
+            self.assertEqual(verifier_calls, [])
+            self.assertEqual(json.loads(registry.read_text()), original)
+
     def test_same_controller_web_recovery_rejects_attestation_if_target_generation_changes_before_lock(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:

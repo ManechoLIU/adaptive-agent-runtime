@@ -801,6 +801,31 @@ def recover_same_controller_web_session(
             "verified Web Controller Session identity required; "
             "same-controller recovery refuses conflicting session ownership"
         )
+
+    current_registry = load_json(registry_path)
+    current_target_record = target_guard.target_record(
+        current_registry, controller_id=controller_id, host="web"
+    )
+    if isinstance(current_target_record, dict):
+        current_status, current_target_session_id, current_target_generation = (
+            target_guard.validate_target_record(current_target_record, host="web")
+        )
+        if (
+            current_status == "active"
+            and _is_strong_web_target_record(current_target_record)
+            and current_target_session_id != web_session_id
+        ):
+            return {
+                "result": "DEFERRED",
+                "state": "SAME_CONTROLLER_SESSION_RECOVERY",
+                "reason": "HOST_ATTESTED_CURRENT_TARGET_ALREADY_ACTIVE",
+                "controller_id": controller_id,
+                "current_execution_target_session_id": current_target_session_id,
+                "current_target_generation": current_target_generation,
+                "safe_control_actions_allowed": True,
+                "identity": identity,
+            }
+
     ownership_generation = _controller_ownership_generation(
         registry_path, controller_id
     )
