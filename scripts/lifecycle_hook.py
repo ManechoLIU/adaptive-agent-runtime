@@ -581,6 +581,64 @@ def _shell_command_substitutions(command: str) -> list[str]:
     return substitutions
 
 
+def _shell_parenthesized_execution_groups(command: str) -> list[str]:
+    groups: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and quote != "'":
+            index += 2
+            continue
+        if char == "'":
+            quote = None if quote == "'" else ("'" if quote is None else quote)
+            index += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else ('"' if quote is None else quote)
+            index += 1
+            continue
+        process_prefix = quote is None and command[index : index + 2] in {"<(", ">("}
+        plain_group = (
+            quote is None
+            and char == "("
+            and (index == 0 or command[index - 1] not in "$<>")
+            and not (index >= 2 and command[index - 2 : index] == "$(")
+        )
+        if not process_prefix and not plain_group:
+            index += 1
+            continue
+        start = index + (2 if process_prefix else 1)
+        cursor = start
+        depth = 1
+        inner_quote: str | None = None
+        while cursor < len(command):
+            inner = command[cursor]
+            if inner == "\\" and inner_quote != "'":
+                cursor += 2
+                continue
+            if inner == "'":
+                inner_quote = (
+                    None if inner_quote == "'" else ("'" if inner_quote is None else inner_quote)
+                )
+            elif inner == '"':
+                inner_quote = (
+                    None if inner_quote == '"' else ('"' if inner_quote is None else inner_quote)
+                )
+            elif inner_quote is None and inner == "(":
+                depth += 1
+            elif inner_quote is None and inner == ")":
+                depth -= 1
+                if depth == 0:
+                    groups.append(command[start:cursor])
+                    index = cursor + 1
+                    break
+            cursor += 1
+        else:
+            index += 1
+    return groups
+
+
 def _strip_command_prefix(tokens: list[str]) -> list[str]:
     remaining = list(tokens)
     if remaining and Path(remaining[0]).name.lower() == "env":
@@ -643,10 +701,16 @@ def _persistent_runner_payload(tokens: list[str]) -> bool:
 
 
 def _persistent_script_name(value: str) -> bool:
-    parts = {
+    parts = [
         part for part in re.split(r"[:/._-]+", value.strip().lower()) if part
-    }
-    return bool(parts & _PERSISTENT_SCRIPT_NAMES)
+    ]
+    if not parts:
+        return False
+    persistent_parts = set(parts) & _PERSISTENT_SCRIPT_NAMES
+    safe_primary = {"build", "check", "lint", "smoke", "test", "typecheck"}
+    if parts[0] in safe_primary and persistent_parts <= {"server"}:
+        return False
+    return bool(persistent_parts)
 
 
 def _bounded_timeout_command(tokens: list[str]) -> bool:
@@ -805,6 +869,11 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         if not token.startswith("-")
     ):
         return True
+    if executable == "find":
+        for index, token in enumerate(tokens[1:], start=1):
+            if token in {"-exec", "-execdir"} and index + 1 < len(tokens):
+                return _persistent_foreground_segment(tokens[index + 1 :])
+        return False
     if "--watch" in lowered or executable in _PERSISTENT_EXECUTABLES:
         return True
     if executable in {"pnpm", "npm", "yarn", "bun"}:
@@ -837,7 +906,10 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
 def _persistent_foreground_command(command: str) -> bool:
     if any(
         _persistent_foreground_command(substitution)
-        for substitution in _shell_command_substitutions(command)
+        for substitution in (
+            _shell_command_substitutions(command)
+            + _shell_parenthesized_execution_groups(command)
+        )
     ):
         return True
     return any(
