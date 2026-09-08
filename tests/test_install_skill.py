@@ -1044,6 +1044,15 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
+            (tests_dir / "test_install_skill.py").write_text(
+                "import unittest\n"
+                "class InstallCapabilityTests(unittest.TestCase):\n"
+                "    def test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence(self): self.assertTrue(True)\n"
+                "class WebAgentHealthServiceInstallationTests(unittest.TestCase):\n"
+                "    def test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load(self): self.assertTrue(True)\n"
+                "    def test_runtime_service_load_failure_preserves_legacy_web_audit(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)
             subprocess.run(["git", "-C", str(source), "commit", "-m", "release regressions"], check=True, capture_output=True)
             revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
@@ -1304,6 +1313,15 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class StructuredCollaborationTerminalTests(unittest.TestCase):\n"
                 "    def test_public_structured_terminal_ingest_rejects_caller_supplied_observation(self): self.assertTrue(True)\n"
                 "    def test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_install_skill.py").write_text(
+                "import unittest\n"
+                "class InstallCapabilityTests(unittest.TestCase):\n"
+                "    def test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence(self): self.assertTrue(True)\n"
+                "class WebAgentHealthServiceInstallationTests(unittest.TestCase):\n"
+                "    def test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load(self): self.assertTrue(True)\n"
+                "    def test_runtime_service_load_failure_preserves_legacy_web_audit(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)

@@ -154,6 +154,15 @@ class ProjectContextGuardTests(unittest.TestCase):
         registry.write_text(json.dumps({
             "controller-1": str(self.repo.resolve()),
             "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+            "__controller_targets__": {"controller-1": {"web": {
+                "status": "active", "session_id": "web-current", "generation": 1,
+                "provenance": "host_attested_same_controller_recovery",
+                "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+            }}},
+            "__controller_execution_ownership__": {"controller-1": {
+                "active_host": "web", "execution_target_session_id": "web-current",
+                "generation": 1, "provenance": "web_entry",
+            }},
         }), encoding="utf-8")
         (self.repo / "AGENTS.md").write_text(
             "# Project Rules\n\nadaptive_agent_runtime_required_capabilities: missing_identity_v99\n",
@@ -198,6 +207,15 @@ class ProjectContextGuardTests(unittest.TestCase):
         registry.write_text(json.dumps({
             "controller-1": str(self.repo.resolve()),
             "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+            "__controller_targets__": {"controller-1": {"web": {
+                "status": "active", "session_id": "web-current", "generation": 1,
+                "provenance": "host_attested_same_controller_recovery",
+                "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+            }}},
+            "__controller_execution_ownership__": {"controller-1": {
+                "active_host": "web", "execution_target_session_id": "web-current",
+                "generation": 1, "provenance": "web_entry",
+            }},
         }), encoding="utf-8")
         (self.repo / "AGENTS.md").write_text(
             "# Project Rules\n\nadaptive_agent_runtime_required_capabilities: controller_identity_projection,web_session_binding,target_generation_fence\n",
@@ -295,6 +313,15 @@ class ProjectContextGuardTests(unittest.TestCase):
                 "__controller_sessions__": {
                     "controller-1": {"web": ["web-current"]}
                 },
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-current", "generation": 1,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-current",
+                    "generation": 1, "provenance": "web_entry",
+                }},
             }),
             encoding="utf-8",
         )

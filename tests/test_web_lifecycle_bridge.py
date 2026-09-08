@@ -27,6 +27,66 @@ web_bridge = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(web_bridge)
 
 
+
+
+def _provision_verified_current_web_target(
+    registry: Path, *, controller_id: str = "controller-1",
+    web_session_id: str = "web-session-1", target_generation: int = 1,
+    ownership_generation: int | None = None,
+) -> None:
+    """Test fixture: make an explicitly current, Host-attested Web execution target."""
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    sessions = payload.setdefault("__controller_sessions__", {})
+    controller_sessions = sessions.setdefault(controller_id, {})
+    web_sessions = controller_sessions.get("web") or []
+    if isinstance(web_sessions, str):
+        web_sessions = [web_sessions]
+    if web_session_id not in web_sessions:
+        web_sessions.append(web_session_id)
+    controller_sessions["web"] = web_sessions
+    targets = payload.setdefault("__controller_targets__", {})
+    targets.setdefault(controller_id, {})["web"] = {
+        "status": "active",
+        "session_id": web_session_id,
+        "generation": target_generation,
+        "provenance": "host_attested_same_controller_recovery",
+        "binding_mode": "resume_only",
+        "identity_proof": "host_attested_origin",
+    }
+    payload.setdefault("__controller_execution_ownership__", {})[controller_id] = {
+        "active_host": "web",
+        "execution_target_session_id": web_session_id,
+        "generation": ownership_generation if ownership_generation is not None else target_generation,
+        "provenance": "web_entry",
+    }
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+
+
+
+def _provision_manual_current_web_target(
+    registry: Path, *, controller_id: str = "controller-1",
+    web_session_id: str = "web-session-1", generation: int = 1,
+) -> None:
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    sessions = payload.setdefault("__controller_sessions__", {})
+    controller_sessions = sessions.setdefault(controller_id, {})
+    aliases = controller_sessions.get("web") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    if web_session_id not in aliases:
+        aliases.append(web_session_id)
+    controller_sessions["web"] = aliases
+    payload.setdefault("__controller_targets__", {}).setdefault(controller_id, {})["web"] = {
+        "status": "active", "session_id": web_session_id, "generation": generation,
+        "provenance": "manual_user_authorized", "binding_mode": "temporary",
+        "host_attested": False,
+    }
+    payload.setdefault("__controller_execution_ownership__", {})[controller_id] = {
+        "active_host": "web", "execution_target_session_id": web_session_id,
+        "generation": generation, "provenance": "manual_user_authorized",
+    }
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+
 class WebLifecycleBridgeTests(unittest.TestCase):
     def test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection(self) -> None:
         from unittest.mock import patch
@@ -133,6 +193,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             result = self.run_bridge(
                 "translate-receipt", "--session-id", "controller-1", "--repo", str(repo),
                 "--registry", str(registry), "--web-session-id", "web-session-1",
@@ -164,6 +225,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             result = self.run_bridge(
                 "translate-receipt", "--session-id", "controller-1", "--repo", str(repo),
                 "--registry", str(registry), "--web-session-id", "web-session-1",
@@ -208,6 +270,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             registry.write_text(
                 json.dumps({"controller-1": str(repo), "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}}}) + "\n", encoding="utf-8"
             )
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             capture = tmp_path / "capture.json"
 
             result = self.run_bridge(
@@ -457,6 +520,9 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             registry.write_text(
                 json.dumps({"controller-1": str(repo.resolve())}),
                 encoding="utf-8",
+            )
+            _provision_manual_current_web_target(
+                registry, web_session_id="web-new", generation=1
             )
             pending_state = {
                 "pending_control_event": True,
@@ -1772,6 +1838,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "controller-1": str(repo),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             lease = root / "manual-web-leases.json"
 
             result = self.run_bridge(
@@ -1827,6 +1894,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "controller-1": str(repo),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             lease = root / "manual-web-leases.json"
             lease.write_text(json.dumps({
                 "schema_version": 1,
@@ -1971,6 +2039,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "__controller_surfaces__": {"controller-1": str(surface.resolve())},
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             capture = root / "capture.json"
             result = self.run_bridge(
                 "post-shell", "--cwd", str(surface), "--command", "git status --short",
@@ -2042,6 +2111,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = tmp_path / "audit.jsonl"
             receipt = {
                 "receiptId": "guard-1",
@@ -2092,6 +2162,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"; cursor = root / "cursor.json"
             receipt = {
                 "receiptId":"guard-lock-1", "childTool":"shell_command", "state":"succeeded",
@@ -2132,6 +2203,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"; cursor = root / "cursor.json"
             receipt = {
                 "receiptId":"guard-fail-1", "childTool":"shell_command", "state":"succeeded",
@@ -2162,6 +2234,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"; cursor = root / "cursor.json"
             receipt = {
                 "receiptId":"guard-rule-1", "childTool":"shell_command", "state":"succeeded",
@@ -2373,6 +2446,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = tmp_path / "audit.jsonl"
             receipt = {
                 "receiptId": "guard-auto-stop-1",
@@ -2422,6 +2496,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = tmp_path / "audit.jsonl"
             receipt = {
                 "receiptId": "shell-1",
@@ -2524,7 +2599,7 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 78)
-            self.assertIn("verified Web Controller Session identity", result.stderr)
+            self.assertIn("explicit Web session identity", result.stderr)
 
     def test_audit_once_ignores_computer_lease_bound_to_different_web_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2578,6 +2653,7 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = tmp_path / "audit.jsonl"
             audit.write_text(json.dumps({
                 "receiptId":"computer-1", "childTool":"computer", "state":"succeeded",
@@ -2676,6 +2752,7 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = tmp_path / "audit.jsonl"
             audit.write_text(json.dumps({
                 "receiptId":"computer-2", "childTool":"computer", "state":"succeeded",
@@ -2737,6 +2814,7 @@ class WebLifecycleComputerLeaseTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             lease = tmp_path / "lease.json"
 
             result = self.run_bridge(
@@ -4988,14 +5066,22 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             return {"result": "CONFIRMED", "operation": "untrusted-current-host-adapter"}
 
         with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, receipt_path, marker = self.make_controller(root)
+            _provision_verified_current_web_target(
+                registry, web_session_id="web-session-1", target_generation=1, ownership_generation=1
+            )
             with patch.object(
                 web_bridge,
                 "execute_native_resume",
                 wraps=web_bridge.execute_native_resume,
-            ) as native_resume:
-                receipt, _, marker = self.wake(
-                    Path(tmp),
+            ) as native_resume, patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=None
+            ):
+                receipt = web_bridge.wake_existing_controller(
                     lifecycle_state={"pending_control_event": True, "triggers": ["READY:F1"]},
+                    session_id="controller-1", repo=repo, registry=registry, codex=str(codex),
+                    receipt_path=receipt_path,
                     host_facts={"controller_host": "web", "resume_actionable": True},
                     resume_adapters={"web": supplied_current_host_adapter},
                 )
@@ -5578,6 +5664,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-capture-retry-1", "childTool": "shell_command", "state": "succeeded",
@@ -5620,6 +5707,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-only-capture-1", "childTool": "shell_command", "state": "succeeded",
@@ -5675,6 +5763,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-generation-1", "childTool": "shell_command", "state": "succeeded",
@@ -5725,6 +5814,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "claim-click-deferred-1", "childTool": "computer", "state": "succeeded",
@@ -5771,6 +5861,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "computer-wake-retry-1", "childTool": "computer", "state": "succeeded",
@@ -5812,6 +5903,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-retry-1", "childTool": "shell_command", "state": "succeeded",
@@ -5850,6 +5942,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-none-1", "childTool": "shell_command", "state": "succeeded",
@@ -5877,6 +5970,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"
             receipt = {
                 "receiptId": "wake-fail-1", "childTool": "shell_command", "state": "succeeded",
@@ -5908,6 +6002,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             calls: list[str] = []
 
             def capture_dispatch(**kwargs: object) -> dict:
@@ -6319,6 +6414,7 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             result = subprocess.run(
                 ["/usr/bin/python3", str(BRIDGE), "session-start", "--repo", str(repo), "--registry", str(registry),
                  "--web-session-id", "web-session-1"],
@@ -6348,6 +6444,7 @@ class ControllerHostTrackingTests(WebLifecycleBridgeTests):
                 "controller-1": str(repo.resolve()),
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             result = self.run_bridge(
                 "translate-receipt", "--session-id", "controller-1", "--repo", str(repo),
                 "--registry", str(registry), "--web-session-id", "web-session-1",
@@ -8258,6 +8355,12 @@ WebLifecycleBridgeTests.test_same_controller_web_recovery_does_not_create_resume
 WebLifecycleBridgeTests.test_historical_alias_cannot_recover_even_with_trusted_verifier = _historical_alias_cannot_recover_even_with_trusted_verifier
 WebLifecycleBridgeTests.test_unbound_chat_cannot_recover_even_with_trusted_verifier = _unbound_chat_cannot_recover_even_with_trusted_verifier
 WebLifecycleBridgeTests.test_expired_manual_lease_retargets_without_renewal = _expired_manual_lease_retargets_without_renewal
+# Retain legacy release-gate method names but bind them to the hardened contract.
+WebLifecycleBridgeTests.test_browser_tab_receipt_cannot_recover_an_unverified_web_session = _unbound_chat_cannot_recover_even_with_trusted_verifier
+WebLifecycleBridgeTests.test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target = _historical_alias_cannot_recover_even_with_trusted_verifier
+# The old test name asserted a now-forbidden recovery-driven lease rotation.
+if hasattr(WebLifecycleBridgeTests, "test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target"):
+    delattr(WebLifecycleBridgeTests, "test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target")
 
 
 def _session_start_requires_explicit_verified_current_target(self):
