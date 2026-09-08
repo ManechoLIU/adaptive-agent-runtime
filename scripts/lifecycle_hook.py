@@ -736,7 +736,9 @@ def _unwrap_execution_target(tokens: list[str]) -> list[str]:
         executable = Path(remaining[0]).name.lower()
         if executable == "command" and len(remaining) > 1 and remaining[1] in {"-v", "-V"}:
             return []
-        if executable not in {"arch", "command", "exec", "nohup", "time", "nice"}:
+        if executable not in {
+            "arch", "builtin", "caffeinate", "command", "exec", "nohup", "time", "nice",
+        }:
             return remaining
         index = 1
         while index < len(remaining) and remaining[index].startswith("-"):
@@ -747,6 +749,12 @@ def _unwrap_execution_target(tokens: list[str]) -> list[str]:
             if executable == "exec" and token == "-a" and index + 1 < len(remaining):
                 index += 2
                 continue
+            if executable == "arch" and token in {"-arch", "-d", "-e"} and index + 1 < len(remaining):
+                index += 2
+                continue
+            if executable == "caffeinate" and token in {"-t", "-w"} and index + 1 < len(remaining):
+                index += 2
+                continue
             if executable in {"time", "nice"} and token in {
                 "-f", "--format", "-o", "--output", "-n", "--adjustment",
             } and index + 1 < len(remaining):
@@ -755,6 +763,18 @@ def _unwrap_execution_target(tokens: list[str]) -> list[str]:
             index += 1
         remaining = _strip_command_prefix(remaining[index:])
     return []
+
+
+def _code_stdin_sink(tokens: list[str]) -> bool:
+    target = _unwrap_execution_target(tokens)
+    if not target:
+        return False
+    executable = target[0] if target[0] == "." else Path(target[0]).name.lower()
+    if executable in {"bash", "sh", "zsh"}:
+        return _shell_reads_pipeline_stdin(target)
+    return executable in {".", "source"} and any(
+        token in {"-", "/dev/fd/0", "/dev/stdin"} for token in target[1:]
+    )
 
 
 def _shell_reads_pipeline_stdin(tokens: list[str]) -> bool:
@@ -823,7 +843,7 @@ def _pipeline_executes_shell_input(command: str) -> bool:
             ):
                 break
             consumer.append(candidate)
-        if _shell_reads_pipeline_stdin(consumer):
+        if _code_stdin_sink(consumer):
             return True
     return False
 
@@ -867,17 +887,49 @@ def _redirection_executes_shell_input(command: str) -> bool:
             " ".join(inner)
         ):
             return True
-    segment: list[str] = []
-    for token in tokens:
-        if token in _SHELL_SEPARATORS or (
-            token and set(token) <= {";", "&", "|"}
-        ):
-            segment = []
-            continue
-        input_target = segment[:-1] if segment and segment[-1].isdigit() else segment
-        if token.startswith("<") and _shell_reads_pipeline_stdin(input_target):
+    segment_start = 0
+    while segment_start < len(tokens):
+        segment_end = segment_start
+        while segment_end < len(tokens):
+            candidate = tokens[segment_end]
+            if candidate in _SHELL_SEPARATORS or (
+                candidate and set(candidate) <= {";", "&", "|"}
+            ):
+                break
+            segment_end += 1
+        current = tokens[segment_start:segment_end]
+        stripped: list[str] = []
+        index = 0
+        had_input_redirection = False
+        while index < len(current):
+            token = current[index]
+            if (
+                token.isdigit()
+                and index + 1 < len(current)
+                and current[index + 1].startswith("<")
+            ):
+                index += 1
+                continue
+            if token.startswith("<") and token != "<(":
+                had_input_redirection = True
+                index += 1
+                if index < len(current) and current[index] in {"<(", ">(", "=("}:
+                    depth = 1
+                    index += 1
+                    while index < len(current) and depth:
+                        if current[index] in {"(", "<(", ">(", "=("}:
+                            depth += 1
+                        elif current[index] == ")":
+                            depth -= 1
+                        index += 1
+                elif index < len(current):
+                    index += 1
+                continue
+            stripped.append(token)
+            index += 1
+        if had_input_redirection and _code_stdin_sink(stripped):
             return True
-        segment.append(token)
+        segment_start = segment_end + 1
     return False
 
 
@@ -1010,7 +1062,7 @@ def _persistent_signature_anywhere(tokens: list[str]) -> bool:
 def _xargs_execution_payload(tokens: list[str]) -> list[str]:
     remaining = list(tokens[1:])
     value_options = {
-        "-E", "--eof", "-I", "--replace", "-L", "--max-lines", "-n",
+        "-E", "--eof", "-I", "--replace", "-J", "-L", "--max-lines", "-n",
         "--max-args", "-P", "--max-procs", "-s", "--max-chars",
     }
     while remaining:
