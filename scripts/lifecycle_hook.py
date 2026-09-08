@@ -588,6 +588,7 @@ def _shell_command_substitutions(command: str) -> list[str]:
 def _shell_parenthesized_execution_groups(command: str) -> list[str]:
     groups: list[str] = []
     quote: str | None = None
+    double_bracket = False
     index = 0
     while index < len(command):
         char = command[index]
@@ -601,6 +602,14 @@ def _shell_parenthesized_execution_groups(command: str) -> list[str]:
         if char == '"':
             quote = None if quote == '"' else ('"' if quote is None else quote)
             index += 1
+            continue
+        if quote is None and command.startswith("[[", index):
+            double_bracket = True
+            index += 2
+            continue
+        if quote is None and double_bracket and command.startswith("]]", index):
+            double_bracket = False
+            index += 2
             continue
         if quote is None and command.startswith("$((", index):
             cursor = index + 3
@@ -644,6 +653,7 @@ def _shell_parenthesized_execution_groups(command: str) -> list[str]:
         )
         plain_group = (
             quote is None
+            and not double_bracket
             and char == "("
             and (index == 0 or command[index - 1] not in "$<>=")
             and not (index >= 2 and command[index - 2 : index] == "$(")
@@ -716,6 +726,81 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
     if remaining and remaining[0] == "--":
         remaining.pop(0)
     return remaining
+
+
+def _shell_reads_pipeline_stdin(tokens: list[str]) -> bool:
+    remaining = _strip_command_prefix(tokens)
+    while remaining and remaining[0] in {"(", "{"}:
+        remaining.pop(0)
+        remaining = _strip_command_prefix(remaining)
+    if not remaining:
+        return False
+    executable = Path(remaining[0]).name.lower()
+    if executable in {"timeout", "gtimeout"} and _bounded_timeout_command(remaining):
+        return False
+    if executable in {"command", "exec", "nohup", "time", "nice"}:
+        index = 1
+        while index < len(remaining) and remaining[index].startswith("-"):
+            token = remaining[index]
+            if token == "--":
+                index += 1
+                break
+            if executable == "exec" and token == "-a" and index + 1 < len(remaining):
+                index += 2
+                continue
+            if executable in {"time", "nice"} and token in {
+                "-f", "--format", "-o", "--output", "-n", "--adjustment",
+            } and index + 1 < len(remaining):
+                index += 2
+                continue
+            index += 1
+        return _shell_reads_pipeline_stdin(remaining[index:])
+    if executable not in {"bash", "sh", "zsh"}:
+        return False
+    index = 1
+    while index < len(remaining):
+        token = remaining[index]
+        if token in {")", "}"}:
+            index += 1
+            continue
+        if token == "--":
+            index += 1
+            break
+        if token in {"-c", "--command"} or (
+            token.startswith("-") and not token.startswith("--") and "c" in token[1:]
+        ):
+            return False
+        if token in {"-O", "-o"} and index + 1 < len(remaining):
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return False
+    return index >= len(remaining) or all(token in {")", "}"} for token in remaining[index:])
+
+
+def _pipeline_executes_shell_input(command: str) -> bool:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    for index, token in enumerate(tokens):
+        if token not in {"|", "|&"}:
+            continue
+        consumer: list[str] = []
+        for candidate in tokens[index + 1 :]:
+            if candidate in _SHELL_SEPARATORS or (
+                candidate and set(candidate) <= {";", "&", "|"}
+            ):
+                break
+            consumer.append(candidate)
+        if _shell_reads_pipeline_stdin(consumer):
+            return True
+    return False
 
 
 def _persistent_runner_payload(tokens: list[str]) -> bool:
@@ -841,6 +926,15 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
     if not tokens:
         return False
     executable = Path(tokens[0]).name.lower()
+    if executable in {"[", "[["}:
+        return False
+    if executable == "eval":
+        payload = tokens[1:]
+        if not payload:
+            return False
+        if any("$" in token for token in payload):
+            return True
+        return _persistent_foreground_command(" ".join(payload))
     if executable in {"timeout", "gtimeout"}:
         if _bounded_timeout_command(tokens):
             return False
@@ -957,6 +1051,8 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
 
 
 def _persistent_foreground_command(command: str) -> bool:
+    if _pipeline_executes_shell_input(command):
+        return True
     if any(
         _persistent_foreground_command(substitution)
         for substitution in (
