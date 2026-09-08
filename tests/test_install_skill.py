@@ -1732,6 +1732,8 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
                     installed_script, "--poll-seconds", "15",
                 ],
                 [*canonical["ProgramArguments"], "--once"],
+                [*canonical["ProgramArguments"][:-1], "inf"],
+                [*canonical["ProgramArguments"][:-1], "1e309"],
             )
             for arguments in invalid_arguments:
                 with self.subTest(arguments=arguments):

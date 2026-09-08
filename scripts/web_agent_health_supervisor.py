@@ -9,6 +9,7 @@ gated on a trusted Web machine-event source.
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import time
@@ -202,8 +203,10 @@ def run_health_supervisor(
     heartbeat_path: str | Path = DEFAULT_HEARTBEAT,
     event_source_path: str | Path = DEFAULT_MACHINE_EVENT_SOURCE_RECEIPT,
 ) -> None:
-    if poll_seconds < 1.0:
-        raise ValueError("Web Agent health supervisor poll interval must be at least one second")
+    if not math.isfinite(poll_seconds) or poll_seconds < 1.0:
+        raise ValueError(
+            "Controller Runtime supervisor poll interval must be finite and at least one second"
+        )
     while True:
         now = datetime.now(UTC)
         write_health_heartbeat(path=heartbeat_path, now=now)

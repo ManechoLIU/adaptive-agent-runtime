@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import plistlib
 import re
@@ -749,6 +750,7 @@ def _health_service_plist_matches(
         and args[1] == "--registry"
         and Path(args[2]).expanduser().is_absolute()
         and args[3] == "--poll-seconds"
+        and math.isfinite(poll_seconds)
         and poll_seconds >= 1.0
     )
 

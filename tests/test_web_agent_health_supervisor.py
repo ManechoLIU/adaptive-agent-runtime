@@ -92,6 +92,25 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
         heartbeat.write_text(json.dumps(payload), encoding="utf-8")
         self.assertFalse(health_supervisor_ready(path=heartbeat, now=T0))
 
+    def test_supervisor_rejects_nonfinite_poll_before_writing_heartbeat(self):
+        from scripts.web_agent_health_supervisor import run_health_supervisor
+
+        root = Path(self.tmp.name)
+        empty_registry = root / "empty-controllers.json"
+        empty_registry.write_text("{}", encoding="utf-8")
+        for poll_seconds in (float("inf"), float("1e309")):
+            heartbeat = root / f"heartbeat-{poll_seconds}.json"
+            event_source = root / f"event-source-{poll_seconds}.json"
+            with self.subTest(poll_seconds=poll_seconds):
+                with self.assertRaises(ValueError):
+                    run_health_supervisor(
+                        registry_path=empty_registry,
+                        poll_seconds=poll_seconds,
+                        heartbeat_path=heartbeat,
+                        event_source_path=event_source,
+                    )
+                self.assertFalse(heartbeat.exists())
+
     def assignment(self, **extra):
         value = {
             "assignment_id": "A-WEB",
