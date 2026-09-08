@@ -475,7 +475,10 @@ _COMMAND_EXECUTION_TOOLS = {
     "shell",
     "shell_command",
 }
-_PERSISTENT_SCRIPT_NAMES = {"dev", "emulator", "serve", "simulator", "start", "watch"}
+_PERSISTENT_SCRIPT_NAMES = {
+    "dev", "develop", "emulator", "preview", "runserver", "serve", "server",
+    "simulator", "start", "storybook", "watch",
+}
 _PERSISTENT_EXECUTABLES = {
     "gunicorn",
     "nodemon",
@@ -511,6 +514,71 @@ def _command_segments(command: str) -> list[list[str]]:
     if current:
         segments.append(current)
     return segments
+
+
+def _shell_command_substitutions(command: str) -> list[str]:
+    substitutions: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and quote != "'":
+            index += 2
+            continue
+        if char == "'":
+            quote = None if quote == "'" else ("'" if quote is None else quote)
+            index += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else ('"' if quote is None else quote)
+            index += 1
+            continue
+        if quote != "'" and command.startswith("$(", index):
+            start = index + 2
+            cursor = start
+            depth = 1
+            inner_quote: str | None = None
+            while cursor < len(command):
+                inner = command[cursor]
+                if inner == "\\" and inner_quote != "'":
+                    cursor += 2
+                    continue
+                if inner == "'":
+                    inner_quote = (
+                        None if inner_quote == "'" else ("'" if inner_quote is None else inner_quote)
+                    )
+                elif inner == '"':
+                    inner_quote = (
+                        None if inner_quote == '"' else ('"' if inner_quote is None else inner_quote)
+                    )
+                elif inner_quote is None and inner == "(":
+                    depth += 1
+                elif inner_quote is None and inner == ")":
+                    depth -= 1
+                    if depth == 0:
+                        substitutions.append(command[start:cursor])
+                        index = cursor + 1
+                        break
+                cursor += 1
+            else:
+                index += 2
+            continue
+        if quote != "'" and char == "`":
+            cursor = index + 1
+            while cursor < len(command):
+                if command[cursor] == "\\":
+                    cursor += 2
+                    continue
+                if command[cursor] == "`":
+                    substitutions.append(command[index + 1 : cursor])
+                    index = cursor + 1
+                    break
+                cursor += 1
+            else:
+                index += 1
+            continue
+        index += 1
+    return substitutions
 
 
 def _strip_command_prefix(tokens: list[str]) -> list[str]:
@@ -650,6 +718,8 @@ def _persistent_signature_anywhere(tokens: list[str]) -> bool:
             if not candidate.startswith("-")
         ):
             return True
+        if index > 0 and _persistent_script_name(name):
+            return True
     return False
 
 
@@ -765,6 +835,11 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
 
 
 def _persistent_foreground_command(command: str) -> bool:
+    if any(
+        _persistent_foreground_command(substitution)
+        for substitution in _shell_command_substitutions(command)
+    ):
+        return True
     return any(
         _persistent_foreground_segment(segment)
         for segment in _command_segments(command)
