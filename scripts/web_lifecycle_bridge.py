@@ -76,6 +76,10 @@ DEFAULT_AUDIT_LOG = (
 )
 AI_BRIDGE_EXECUTABLE = "/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge"
 DEFAULT_RUNTIME_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
+DEFAULT_DESKTOP_CANARY = (
+    Path.home() / ".codex" / "state" / "adaptive-delivery-desktop-canary.json"
+)
 STDERR_TAIL_LIMIT = 8192
 LAUNCHER_LOG_LIMIT = 262144
 RESTORE_STATIC_DOCUMENT_NAMES = ("AGENTS.md", "MEMORY.md", "WIKI_INDEX.md")
@@ -2246,11 +2250,62 @@ def execute_native_resume(
     return attempt
 
 
+def desktop_host_reload_required(
+    *,
+    session_id: str,
+    repo: Path,
+    canary_path: Path = DEFAULT_DESKTOP_CANARY,
+    hooks_path: Path = DEFAULT_CODEX_HOOKS,
+) -> bool:
+    """Require a fresh Desktop process when an exact armed canary has not started."""
+    canary = load_json(canary_path)
+    dot_git = repo.resolve() / ".git"
+    common_dir = dot_git
+    if dot_git.is_file():
+        try:
+            marker = dot_git.read_text(encoding="utf-8").strip()
+        except OSError:
+            marker = ""
+        if marker.startswith("gitdir:"):
+            git_dir = Path(marker.removeprefix("gitdir:").strip()).expanduser()
+            if not git_dir.is_absolute():
+                git_dir = (repo / git_dir).resolve()
+            try:
+                relative_common = (git_dir / "commondir").read_text(
+                    encoding="utf-8"
+                ).strip()
+            except OSError:
+                relative_common = ""
+            common_dir = (
+                (git_dir / relative_common).resolve()
+                if relative_common
+                else git_dir.resolve()
+            )
+    handshake = load_json(
+        common_dir / "adaptive-delivery" / "rule-handshake.json"
+    )
+    hooks_sha256 = _file_sha256(hooks_path)
+    installed_revision = str(handshake.get("installed_revision") or "").strip()
+    return (
+        handshake.get("live_e2e_required") is True
+        and bool(installed_revision)
+        and installed_revision
+        == str(handshake.get("loaded_revision") or "").strip()
+        and str(canary.get("controller_session_id") or "").strip() == session_id
+        and canary.get("status") == "armed"
+        and canary.get("sequence_index") == 0
+        and canary.get("observations") == []
+        and bool(hooks_sha256)
+        and canary.get("hooks_sha256") == hooks_sha256
+    )
+
+
 def confirm_host_observed_desktop_foreground(
     *,
     attempt: dict[str, Any],
     lifecycle_state: dict[str, Any],
     ownership_fence: dict[str, Any] | None,
+    host_reload_required: bool = False,
 ) -> dict[str, Any]:
     """Confirm an exact Desktop wake when the Host reports its writer is already active."""
     if (
@@ -2283,6 +2338,19 @@ def confirm_host_observed_desktop_foreground(
         or ownership_generation <= 0
     ):
         return attempt
+
+    if host_reload_required:
+        deferred = dict(attempt)
+        deferred.update({
+            "state": "WAITING_EXTERNAL_HOST_RELOAD",
+            "host_reload_required": True,
+            "activation_gate": "host_reload_required",
+            "failure_class": "host_reload_required",
+            "error_code": "DESKTOP_HOST_RELOAD_REQUIRED",
+            "host_returncode": attempt.get("returncode"),
+            "returncode": 0,
+        })
+        return deferred
 
     confirmed = dict(attempt)
     confirmed.update({
@@ -4218,6 +4286,7 @@ def maybe_schedule_rule_wake(
         "WEB_REENTRY_RESULT_UNKNOWN",
         "WEB_REENTRY_RETRY_EXHAUSTED",
         "RESUME_STALLED_NO_PROGRESS",
+        "WAITING_EXTERNAL_HOST_RELOAD",
     }:
         return "already_scheduled"
     scheduled = schedule_auto_native_stop(
@@ -4575,6 +4644,7 @@ def _schedule_auto_native_stop_locked(
         "WEB_REENTRY_SUBMITTED",
         "WEB_REENTRY_RESULT_UNKNOWN",
         "RESUME_STALLED_NO_PROGRESS",
+        "WAITING_EXTERNAL_HOST_RELOAD",
     }
     if same_receipt and (
         (terminal_receipt == receipt_id and terminal_outcome in {"submit_confirmed", "result_unknown", "retry_exhausted"})
@@ -5247,6 +5317,10 @@ def _run_auto_native_stop_impl(
         attempt=attempt,
         lifecycle_state=lifecycle_state,
         ownership_fence=ownership_fence,
+        host_reload_required=desktop_host_reload_required(
+            session_id=session_id,
+            repo=repo,
+        ),
     )
 
     # Revalidate both supervisor token and canonical host ownership before
@@ -5272,6 +5346,9 @@ def _run_auto_native_stop_impl(
             "execution_target_session_id",
             "target_generation",
             "target_mode",
+            "host_reload_required",
+            "activation_gate",
+            "host_returncode",
         ):
             if evidence_key in attempt:
                 latest[evidence_key] = attempt[evidence_key]

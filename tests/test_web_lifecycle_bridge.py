@@ -2562,6 +2562,111 @@ class WebLifecycleAuditTests(unittest.TestCase):
             self.assertEqual(wake["target_generation"], 4)
             self.assertEqual(wake["ownership_generation"], 7)
 
+    def test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                }},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }), encoding="utf-8")
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "rule-update:rev-2", "session_id": "controller-1",
+                "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True, "requires_user": False,
+                "controller_host": "desktop_codex", "wake_generation": 12,
+                "triggers": ["rule_update_pending:rev-2"],
+            }
+            already_foreground = {
+                "operation": "native_resume", "result": "DEFERRED",
+                "state": "RESUME_DEFERRED_ACTIVE_WRITER", "returncode": 1,
+                "failure_class": "active_writer_present",
+                "error_code": "WEB_LIFECYCLE_ACTIVE_WRITER",
+                "stderr_tail": "thread desktop-current already has an active writer",
+                "execution_target_session_id": "desktop-current", "target_generation": 4,
+                "target_mode": "explicit_current",
+                "host_observation": web_bridge._HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND,
+            }
+            with patch.object(
+                web_bridge, "_load_lifecycle_state", return_value=lifecycle
+            ), patch.object(
+                web_bridge, "execute_native_resume", return_value=already_foreground
+            ), patch.object(
+                web_bridge, "desktop_host_reload_required", return_value=True
+            ), patch.object(web_bridge, "_rearm_auto_native_stop") as rearm:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo,
+                    receipt_id="rule-update:rev-2", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state,
+                )
+
+            self.assertEqual(code, 0)
+            rearm.assert_not_called()
+            self.assertFalse(web_bridge.default_wake_receipt_path(repo).exists())
+            persisted = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["state"], "WAITING_EXTERNAL_HOST_RELOAD")
+            self.assertTrue(persisted["host_reload_required"])
+            self.assertEqual(persisted["activation_gate"], "host_reload_required")
+            self.assertFalse(web_bridge.schedule_auto_native_stop(
+                session_id="controller-1", repo=repo,
+                receipt_id="rule-update:rev-2", registry=registry,
+                codex="codex", delay_seconds=0, state_path=state,
+            ))
+
+    def test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary(self) -> None:
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            runtime_state = repo / ".git" / "adaptive-delivery"
+            runtime_state.mkdir()
+            (runtime_state / "rule-handshake.json").write_text(json.dumps({
+                "live_e2e_required": True,
+                "installed_revision": "rev-1",
+                "loaded_revision": "rev-1",
+            }), encoding="utf-8")
+            hooks = root / "hooks.json"
+            hooks.write_text('{"hooks":{}}\n', encoding="utf-8")
+            canary = root / "desktop-canary.json"
+            value = {
+                "controller_session_id": "controller-1",
+                "status": "armed",
+                "sequence_index": 0,
+                "observations": [],
+                "hooks_sha256": hashlib.sha256(hooks.read_bytes()).hexdigest(),
+            }
+            canary.write_text(json.dumps(value), encoding="utf-8")
+
+            self.assertTrue(web_bridge.desktop_host_reload_required(
+                session_id="controller-1", repo=repo,
+                canary_path=canary, hooks_path=hooks,
+            ))
+            value["sequence_index"] = 1
+            value["observations"] = ["session_started"]
+            canary.write_text(json.dumps(value), encoding="utf-8")
+            self.assertFalse(web_bridge.desktop_host_reload_required(
+                session_id="controller-1", repo=repo,
+                canary_path=canary, hooks_path=hooks,
+            ))
+
     def test_mocked_active_writer_without_host_observation_still_rearms(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:

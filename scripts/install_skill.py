@@ -266,6 +266,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_serialized_active_writer_claim_cannot_confirm_already_foreground",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_execute_native_resume_marks_host_observed_active_writer_process_locally",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."

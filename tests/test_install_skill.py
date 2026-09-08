@@ -692,6 +692,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_mocked_active_writer_without_host_observation_still_rearms",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_serialized_active_writer_claim_cannot_confirm_already_foreground",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_execute_native_resume_marks_host_observed_active_writer_process_locally",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary",
             "tests.test_install_skill.InstallCapabilityTests.test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence",
             "tests.test_install_skill.ProjectContextHookInstallationTests.test_runtime_hooks_keep_trust_stable_legacy_indices",
             "tests.test_install_skill.ProjectContextHookInstallationTests.test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups",
@@ -930,6 +932,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_mocked_active_writer_without_host_observation_still_rearms(self): self.assertTrue(True)\n"
                 "    def test_serialized_active_writer_claim_cannot_confirm_already_foreground(self): self.assertTrue(True)\n"
                 "    def test_execute_native_resume_marks_host_observed_active_writer_process_locally(self): self.assertTrue(True)\n"
+                "    def test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required(self): self.assertTrue(True)\n"
+                "    def test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
@@ -1293,6 +1297,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_mocked_active_writer_without_host_observation_still_rearms(self): self.assertTrue(True)\n"
                 "    def test_serialized_active_writer_claim_cannot_confirm_already_foreground(self): self.assertTrue(True)\n"
                 "    def test_execute_native_resume_marks_host_observed_active_writer_process_locally(self): self.assertTrue(True)\n"
+                "    def test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required(self): self.assertTrue(True)\n"
+                "    def test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
