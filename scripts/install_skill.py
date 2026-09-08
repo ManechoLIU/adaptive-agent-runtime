@@ -168,6 +168,12 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_identity_blocked_event_retries_after_registry_changes",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_nonretryable_web_failure_same_event_and_fence_stays_quiet",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_registered_host_nonretryable_failure_persists_quiet_fence",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_registered_host_result_unknown_persists_quiet_fence",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
     "test_registered_current_web_adapter_is_fenced_and_host_attested",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."

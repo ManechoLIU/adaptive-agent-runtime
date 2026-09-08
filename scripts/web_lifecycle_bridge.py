@@ -4334,6 +4334,39 @@ def continuation_supervisor_needs_bootstrap(
         return False
     if (
         str(supervisor_state.get("state") or "")
+        in {"WEB_REENTRY_FAILED_BEFORE_DISPATCH", "WEB_REENTRY_RESULT_UNKNOWN"}
+        and str(supervisor_state.get("last_lifecycle_fingerprint") or "")
+        == lifecycle_fingerprint
+    ):
+        blocked_fence = supervisor_state.get("blocked_controller_fence")
+        if isinstance(blocked_fence, dict):
+            if current_controller_wait_fence == blocked_fence:
+                return False
+            if current_controller_wait_fence is None:
+                # Once a non-retryable Host outcome is recorded, missing current
+                # target facts are never a reason to try the same event again.
+                return False
+        else:
+            # Upgrade compatibility for failure states persisted by the previous
+            # Runtime revision before blocked_controller_fence existed.
+            expected_target = str(
+                supervisor_state.get("execution_target_session_id") or ""
+            ).strip()
+            expected_target_generation = supervisor_state.get("target_generation")
+            expected_ownership_generation = supervisor_state.get("ownership_generation")
+            if isinstance(current_controller_wait_fence, dict) and (
+                current_controller_wait_fence.get("execution_target_session_id")
+                == expected_target
+                and current_controller_wait_fence.get("target_generation")
+                == expected_target_generation
+                and current_controller_wait_fence.get("ownership_generation")
+                == expected_ownership_generation
+            ):
+                return False
+            if current_controller_wait_fence is None:
+                return False
+    if (
+        str(supervisor_state.get("state") or "")
         in {
             "WEB_REENTRY_IDENTITY_UNAVAILABLE",
             "WEB_REENTRY_TARGET_RECEIPT_MISMATCH",
@@ -4763,6 +4796,8 @@ def _run_auto_native_stop_impl(
                 current.pop("failure_class", None)
                 current.pop("error_code", None)
                 current.pop("blocked_registry_sha256", None)
+                current.pop("blocked_controller_fence", None)
+                current.pop("blocked_since_unix_ms", None)
                 write_auto_stop_state(state_path, current)
                 return 0
             if lifecycle_state.get("requires_user") is True:
@@ -4996,6 +5031,25 @@ def _run_auto_native_stop_impl(
                     "last_lifecycle_fingerprint": fingerprint,
                     "blocked_registry_sha256": _file_sha256(registry),
                 })
+            if failure_class in {
+                "web_reentry_failed_before_dispatch",
+                "web_reentry_result_unknown",
+            }:
+                current["last_lifecycle_fingerprint"] = fingerprint
+                try:
+                    blocked_controller_fence = _controller_web_wait_fence(
+                        registry=registry, controller_id=session_id
+                    )
+                except (OSError, ValueError, PermissionError):
+                    blocked_controller_fence = None
+                if isinstance(blocked_controller_fence, dict):
+                    current["blocked_controller_fence"] = blocked_controller_fence
+                else:
+                    current.pop("blocked_controller_fence", None)
+                current["blocked_since_unix_ms"] = int(time.time() * 1000)
+            else:
+                current.pop("blocked_controller_fence", None)
+                current.pop("blocked_since_unix_ms", None)
             write_auto_stop_state(state_path, current)
             if failure_class == "web_reentry_unavailable":
                 retry_delay = min(60.0, float(2 ** min(max(retry_count - 1, 0), 5)))

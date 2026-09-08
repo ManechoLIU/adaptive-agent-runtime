@@ -8751,3 +8751,181 @@ def _session_start_foreign_or_alias_never_becomes_current(self):
 
 WebControllerSessionIdentityTests.test_session_start_accepts_only_bound_web_controller_session = _session_start_requires_explicit_verified_current_target
 WebControllerSessionIdentityTests.test_session_start_refuses_web_session_bound_to_another_controller = _session_start_foreign_or_alias_never_becomes_current
+
+
+def _nonretryable_web_failure_same_event_and_fence_stays_quiet(self):
+    lifecycle = {
+        "pending_control_event": True,
+        "requires_user": False,
+        "wake_generation": 12,
+        "triggers": ["rule_update_pending:rev-x"],
+        "snapshot": {"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+    }
+    fingerprint = web_bridge._wake_event_fingerprint(lifecycle)
+    fence = {
+        "execution_target_session_id": "web-current",
+        "target_generation": 4,
+        "ownership_generation": 8,
+        "target_provenance": "host_attested_same_controller_recovery",
+        "target_binding_mode": "resume_only",
+        "target_host_attested": None,
+        "ownership_provenance": "web_entry",
+    }
+    for state_name, failure_class in (
+        ("WEB_REENTRY_FAILED_BEFORE_DISPATCH", "web_reentry_failed_before_dispatch"),
+        ("WEB_REENTRY_RESULT_UNKNOWN", "web_reentry_result_unknown"),
+    ):
+        supervisor = {
+            "state": state_name,
+            "failure_class": failure_class,
+            "pending_control_event": True,
+            "last_lifecycle_fingerprint": fingerprint,
+            "blocked_controller_fence": dict(fence),
+        }
+        self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle, supervisor, current_controller_wait_fence=dict(fence)
+        ))
+        changed_lifecycle = json.loads(json.dumps(lifecycle))
+        changed_lifecycle["triggers"].append("NEW_EVENT")
+        self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+            changed_lifecycle, supervisor, current_controller_wait_fence=dict(fence)
+        ))
+        changed_fence = dict(fence)
+        changed_fence["target_generation"] = 5
+        changed_fence["ownership_generation"] = 9
+        self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle, supervisor, current_controller_wait_fence=changed_fence
+        ))
+        self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle, supervisor, current_controller_wait_fence=None
+        ))
+
+
+def _registered_host_nonretryable_failure_persists_quiet_fence(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "host_attested_same_controller_recovery",
+            "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 8, "provenance": "web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id":"host-fail","session_id":"controller-1","repo":str(repo.resolve()),
+            "state":"RESUME_PENDING","pending_control_event":True,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 12, "triggers": ["rule_update_pending:rev-x"],
+            "snapshot": {"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+        }
+        attempt = {
+            "operation":"web_reentry", "result":"FAILED",
+            "state":"WEB_REENTRY_FAILED_BEFORE_DISPATCH", "returncode":1,
+            "failure_class":"web_reentry_failed_before_dispatch",
+            "error_code":"WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+            "execution_target_session_id":"web-current", "target_generation":4,
+            "ownership_generation":8, "target_mode":"explicit_current",
+            "delivery_authorization":"host_attested", "host_attested":True,
+            "strong_web_identity_established":True,
+        }
+        def verifier(**_kwargs):
+            return {"call_receipt":"host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry", return_value=attempt
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="host-fail", registry=registry,
+                codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        current_fence = web_bridge._controller_web_wait_fence(
+            registry=registry, controller_id="controller-1"
+        )
+    self.assertEqual(code, 1)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WEB_REENTRY_FAILED_BEFORE_DISPATCH")
+    self.assertEqual(saved["failure_class"], "web_reentry_failed_before_dispatch")
+    self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
+    self.assertEqual(saved["blocked_controller_fence"], current_fence)
+    self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+        lifecycle, saved, current_controller_wait_fence=current_fence
+    ))
+
+
+WebContinuationSupervisorBootstrapTests.test_nonretryable_web_failure_same_event_and_fence_stays_quiet = _nonretryable_web_failure_same_event_and_fence_stays_quiet
+WebLocalReentryIntegrationTests.test_registered_host_nonretryable_failure_persists_quiet_fence = _registered_host_nonretryable_failure_persists_quiet_fence
+
+
+def _registered_host_result_unknown_persists_quiet_fence(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "host_attested_same_controller_recovery",
+            "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 8, "provenance": "web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id":"host-unknown","session_id":"controller-1","repo":str(repo.resolve()),
+            "state":"RESUME_PENDING","pending_control_event":True,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 13, "triggers": ["terminal_receipt_pending"],
+            "snapshot": {"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+        }
+        attempt = {
+            "operation":"web_reentry", "result":"BLOCKED",
+            "state":"WEB_REENTRY_RESULT_UNKNOWN", "returncode":78,
+            "failure_class":"web_reentry_result_unknown",
+            "error_code":"WEB_REENTRY_RESULT_UNKNOWN",
+            "stderr_tail":"Host dispatch occurred but submit confirmation is unknown; automatic retry is forbidden",
+            "execution_target_session_id":"web-current", "target_generation":4,
+            "ownership_generation":8, "target_mode":"explicit_current",
+            "delivery_authorization":"host_attested", "host_attested":True,
+            "strong_web_identity_established":True,
+        }
+        def verifier(**_kwargs):
+            return {"call_receipt":"host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry", return_value=attempt
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="host-unknown", registry=registry,
+                codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        current_fence = web_bridge._controller_web_wait_fence(
+            registry=registry, controller_id="controller-1"
+        )
+    self.assertEqual(code, 78)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+    self.assertEqual(saved["failure_class"], "web_reentry_result_unknown")
+    self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
+    self.assertEqual(saved["blocked_controller_fence"], current_fence)
+    self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+        lifecycle, saved, current_controller_wait_fence=current_fence
+    ))
+
+
+WebLocalReentryIntegrationTests.test_registered_host_result_unknown_persists_quiet_fence = _registered_host_result_unknown_persists_quiet_fence
