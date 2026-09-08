@@ -2510,6 +2510,29 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
         actual_digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
         if not isinstance(digest, str) or len(digest) != 64 or not secrets.compare_digest(actual_digest, digest.lower()):
             raise PermissionError("registered Host verifier executable hash mismatch")
+        bundle = record.get("bundle_sha256")
+        if not isinstance(bundle, dict) or str(executable) not in bundle:
+            raise PermissionError("registered Host verifier bundle hash manifest is incomplete")
+        if len(bundle) > 64:
+            raise PermissionError("registered Host verifier bundle hash manifest is too large")
+        for bundle_path_raw, bundle_digest in bundle.items():
+            if not isinstance(bundle_path_raw, str) or not bundle_path_raw.strip():
+                raise PermissionError("registered Host verifier bundle path is invalid")
+            bundle_path = Path(bundle_path_raw).expanduser()
+            if not bundle_path.is_absolute():
+                raise PermissionError("registered Host verifier bundle path must be absolute")
+            bundle_stat = bundle_path.lstat()
+            if bundle_path.is_symlink() or not bundle_path.is_file():
+                raise PermissionError("registered Host verifier bundle member must be a regular non-symlink file")
+            if hasattr(os, "getuid") and bundle_stat.st_uid != os.getuid():
+                raise PermissionError("registered Host verifier bundle member owner mismatch")
+            actual_bundle_digest = __import__("hashlib").sha256(bundle_path.read_bytes()).hexdigest()
+            if (
+                not isinstance(bundle_digest, str)
+                or len(bundle_digest) != 64
+                or not secrets.compare_digest(actual_bundle_digest, bundle_digest.lower())
+            ):
+                raise PermissionError("registered Host verifier bundle member hash mismatch")
     except Exception as exc:
         return _rejecting_peer_attestation_verifier(
             f"registered Host verifier configuration rejected: {exc}"

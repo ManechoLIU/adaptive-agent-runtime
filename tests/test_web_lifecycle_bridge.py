@@ -548,6 +548,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                         "protocol": "runtime_host_verifier_cli_v1",
                         "executable": str(executable),
                         "sha256": digest,
+                        "bundle_sha256": {str(executable): digest},
                     }
                 },
             }), encoding="utf-8")
@@ -585,6 +586,42 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                     True,
                 )
 
+    def test_registered_web_verifier_rejects_mutated_bundle_member(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text("#!/bin/sh\nprintf '{\"ok\":false}\n'\n", encoding="utf-8")
+            executable.chmod(0o700)
+            dependency = root / "integration.mjs"
+            dependency.write_text("export const value = 1;\n", encoding="utf-8")
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            dependency_digest = __import__("hashlib").sha256(dependency.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({
+                "schema_version": 1,
+                "verifiers": {"web": {
+                    "protocol": "runtime_host_verifier_cli_v1",
+                    "executable": str(executable),
+                    "sha256": digest,
+                    "bundle_sha256": {
+                        str(executable): digest,
+                        str(dependency): dependency_digest,
+                    },
+                }},
+            }), encoding="utf-8")
+            config.chmod(0o600)
+            dependency.write_text("export const value = 2;\n", encoding="utf-8")
+            with patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                self.assertTrue(callable(verifier))
+                with self.assertRaisesRegex(PermissionError, "bundle.*hash"):
+                    verifier(
+                        phase="pre_delivery", controller_id="controller-1", host="web",
+                        expected_target_session_id="web-new", expected_target_generation=4,
+                        expected_ownership_generation=9,
+                    )
+
     def test_malformed_registered_web_verifier_config_fails_closed_without_manual_fallback(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
@@ -600,6 +637,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                         "protocol": "runtime_host_verifier_cli_v1",
                         "executable": str(executable),
                         "sha256": "0" * 64,
+                        "bundle_sha256": {str(executable): "0" * 64},
                     }
                 },
             }), encoding="utf-8")
