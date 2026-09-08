@@ -4045,11 +4045,53 @@ def _release_supervisor_token(
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+
+def _controller_web_wait_fence(
+    *, registry: Path, controller_id: str
+) -> dict[str, Any] | None:
+    """Project only this Controller's Web target/ownership facts for wake de-duplication.
+
+    Whole-registry hashes are intentionally excluded: unrelated Controller or metadata
+    updates must never make an already-confirmed Web continuation eligible for re-submit.
+    """
+    registry_data = load_json(registry)
+    target = target_guard.target_record(
+        registry_data, controller_id=controller_id, host="web"
+    )
+    ownership = target_guard.execution_ownership_record(
+        registry_data, controller_id=controller_id
+    )
+    if not isinstance(target, dict) or ownership is None:
+        return None
+    status, target_session, target_generation = target_guard.validate_target_record(
+        target, host="web"
+    )
+    ownership_host, ownership_target, ownership_generation = (
+        target_guard.validate_execution_ownership_record(ownership)
+    )
+    if (
+        status != "active"
+        or ownership_host != "web"
+        or target_session != ownership_target
+    ):
+        return None
+    return {
+        "execution_target_session_id": target_session,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+        "target_provenance": target.get("provenance"),
+        "target_binding_mode": target.get("binding_mode"),
+        "target_host_attested": target.get("host_attested"),
+        "ownership_provenance": ownership.get("provenance"),
+    }
+
+
 def continuation_supervisor_needs_bootstrap(
     lifecycle_state: dict[str, Any],
     supervisor_state: dict[str, Any],
     *,
     current_registry_sha256: str | None = None,
+    current_controller_wait_fence: dict[str, Any] | None = None,
 ) -> bool:
     if lifecycle_state.get("pending_control_event") is not True:
         return False
@@ -4060,11 +4102,27 @@ def continuation_supervisor_needs_bootstrap(
         str(supervisor_state.get("state") or "") == "WAITING_FOR_CONTROLLER_PROGRESS"
         and str(supervisor_state.get("last_lifecycle_fingerprint") or "") == lifecycle_fingerprint
     ):
-        waiting_registry_sha256 = str(supervisor_state.get("waiting_registry_sha256") or "")
-        if current_registry_sha256 is None or (
-            waiting_registry_sha256 and waiting_registry_sha256 == current_registry_sha256
-        ):
-            return False
+        waiting_fence = supervisor_state.get("waiting_controller_fence")
+        if isinstance(waiting_fence, dict):
+            if current_controller_wait_fence == waiting_fence:
+                return False
+            if current_controller_wait_fence is None:
+                # Missing/invalid current target facts are not a reason to re-submit a
+                # continuation that was already confirmed; fail closed until lifecycle changes.
+                return False
+        else:
+            # Backward-compatible suppression for the immediately previous runtime revision.
+            expected_target = str(supervisor_state.get("execution_target_session_id") or "").strip()
+            expected_target_generation = supervisor_state.get("target_generation")
+            expected_ownership_generation = supervisor_state.get("ownership_generation")
+            if isinstance(current_controller_wait_fence, dict) and (
+                current_controller_wait_fence.get("execution_target_session_id") == expected_target
+                and current_controller_wait_fence.get("target_generation") == expected_target_generation
+                and current_controller_wait_fence.get("ownership_generation") == expected_ownership_generation
+            ):
+                return False
+            if current_controller_wait_fence is None:
+                return False
     if (
         str(supervisor_state.get("state") or "") == "RESUME_STALLED_NO_PROGRESS"
         and str(supervisor_state.get("last_lifecycle_fingerprint") or "")
@@ -4120,10 +4178,17 @@ def ensure_continuation_supervisor(
 ) -> bool:
     state_path = default_auto_stop_state_path(session_id)
     supervisor_state = load_json(state_path)
+    try:
+        current_controller_wait_fence = _controller_web_wait_fence(
+            registry=registry, controller_id=session_id
+        )
+    except (OSError, ValueError, PermissionError):
+        current_controller_wait_fence = None
     if not continuation_supervisor_needs_bootstrap(
         lifecycle_state,
         supervisor_state,
         current_registry_sha256=_file_sha256(registry),
+        current_controller_wait_fence=current_controller_wait_fence,
     ):
         return False
     generation = int(lifecycle_state.get("wake_generation", 0) or 0)
@@ -4634,7 +4699,17 @@ def _run_auto_native_stop_impl(
                 current.pop("error_code", None)
                 current.pop("blocked_registry_sha256", None)
                 if manual_fenced:
-                    current["waiting_registry_sha256"] = _file_sha256(registry)
+                    try:
+                        waiting_controller_fence = _controller_web_wait_fence(
+                            registry=registry, controller_id=session_id
+                        )
+                    except (OSError, ValueError, PermissionError):
+                        waiting_controller_fence = None
+                    if isinstance(waiting_controller_fence, dict):
+                        current["waiting_controller_fence"] = waiting_controller_fence
+                    else:
+                        current.pop("waiting_controller_fence", None)
+                    current.pop("waiting_registry_sha256", None)
                     current["waiting_since_unix_ms"] = int(time.time() * 1000)
                     write_auto_stop_state(state_path, current)
                     return 0
