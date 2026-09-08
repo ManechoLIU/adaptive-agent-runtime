@@ -43,6 +43,12 @@ const DEFAULT_GROK_FIRST_OUTPUT_TIMEOUT_MS = 90_000;
 const DEFAULT_GROK_STALL_TIMEOUT_MS = 180_000;
 const DEFAULT_EXTERNAL_ATTEMPT_TIMEOUT_MS = 600_000;
 const DEFAULT_EXTERNAL_KILL_GRACE_MS = 5_000;
+const GROK_MODEL_PROGRESS_SESSION_UPDATES = new Set([
+  "agent_message_chunk",
+  "agent_thought_chunk",
+  "tool_call",
+  "tool_call_update",
+]);
 
 class ExternalAgentExecutionError extends Error {
   constructor(message, { failureClass = "transport_error", retrySafe = true, resultUnknown = false, details = {} } = {}) {
@@ -94,6 +100,22 @@ function externalAttemptTimeoutMs(progressDeadlineMinutes) {
 
 function externalKillGraceMs() {
   return boundedEnvInteger("AD_EXTERNAL_KILL_GRACE_MS", DEFAULT_EXTERNAL_KILL_GRACE_MS, { min: 10, max: 60_000 });
+}
+
+function grokModelProgressKind(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return null;
+  const candidates = [event, event.update, event.payload, event.data].filter(
+    (value) => value && typeof value === "object" && !Array.isArray(value),
+  );
+  for (const candidate of candidates) {
+    for (const key of ["sessionUpdate", "session_update", "type", "event"]) {
+      const value = candidate[key];
+      if (typeof value === "string" && GROK_MODEL_PROGRESS_SESSION_UPDATES.has(value.trim())) {
+        return value.trim();
+      }
+    }
+  }
+  return null;
 }
 
 function prepareGrokPrompt(prompt, { assignmentRole = null } = {}) {
@@ -1051,10 +1073,15 @@ export function runMonitoredGrok(executable, args, {
         try {
           const event = JSON.parse(line);
           if (event && typeof event === "object" && !Array.isArray(event)) {
-            const now = Date.now();
-            if (firstStructuredOutputAt === null) firstStructuredOutputAt = now;
-            lastStructuredOutputAt = now;
-            if (typeof onStructuredProgress === "function") onStructuredProgress(event);
+            const progressKind = grokModelProgressKind(event);
+            if (progressKind) {
+              const now = Date.now();
+              if (firstStructuredOutputAt === null) firstStructuredOutputAt = now;
+              lastStructuredOutputAt = now;
+              if (typeof onStructuredProgress === "function") {
+                onStructuredProgress(event, progressKind);
+              }
+            }
           }
         } catch {}
       }
@@ -1389,24 +1416,50 @@ async function main() {
         deliveryError = error;
       }
     }
-    const finalRetryClass = delivery?.retry_class || (deliveryError ? "none" : code === 0 ? "none" : "provider_exit");
+    const finalFailureClass = deliveryError
+      ? "delivery_receipt_invalid"
+      : code === 0
+        ? null
+        : "provider_exit";
+    const finalRetryClass = delivery?.retry_class || finalFailureClass || "none";
+    const finalRetrySafe = finalFailureClass === "delivery_receipt_invalid"
+      ? false
+      : finalFailureClass === "provider_exit"
+        ? !Boolean(options.sideEffect)
+        : null;
+    const finalResultUnknown = Boolean(options.sideEffect)
+      && (code !== 0 || deliveryError !== null || delivery?.delivery_outcome === "unresolved" || delivery === null);
+    const finalFailureDetails = deliveryError
+      ? { validation_error: deliveryError.message }
+      : code !== 0
+        ? { provider_exit_code: code }
+        : null;
+    const finalSummary = delivery?.summary || deliveryError?.message
+      || (code === 0 ? "external agent process completed" : `external agent exited ${code}`);
     recordRuntimeReceipt(options, "assignment_terminal", eventSeq, {
       terminal_state: code === 0 ? "completed" : "failed",
       transport_outcome: code === 0 ? "completed" : "failed",
       delivery_outcome: delivery?.delivery_outcome || "unresolved",
-      summary: delivery?.summary || deliveryError?.message || (code === 0 ? "external agent process completed" : `external agent exited ${code}`),
+      summary: finalSummary,
       evidence: delivery?.evidence || [], artifacts: delivery?.artifacts || [],
       next_action: delivery?.next_action || (deliveryError ? "repair delivery receipt" : code === 0 ? "inspect delivery" : "inspect external agent output"),
       retry_class: finalRetryClass,
+      ...(finalFailureClass ? { failure_class: finalFailureClass } : {}),
+      ...(typeof finalRetrySafe === "boolean" ? { retry_safe: finalRetrySafe } : {}),
+      ...(finalFailureDetails ? { failure_details: finalFailureDetails } : {}),
       reconciliation_evidence: delivery?.reconciliation_evidence || [],
       ...(delivery?.review_verdict ? { review_verdict: delivery.review_verdict } : {}),
-      result_unknown: Boolean(options.sideEffect) && (code !== 0 || deliveryError !== null || delivery?.delivery_outcome === "unresolved" || delivery === null),
+      result_unknown: finalResultUnknown,
     });
     persistExternalTerminalReceipt(options, {
       exitCode: code,
-      summary: delivery?.summary || deliveryError?.message || (code === 0 ? "external agent process completed" : `external agent exited ${code}`),
+      summary: finalSummary,
       deliveryOutcome: delivery?.delivery_outcome || "unresolved",
+      failureClass: finalFailureClass,
       retryClass: finalRetryClass,
+      retrySafe: finalRetrySafe,
+      resultUnknown: finalResultUnknown,
+      failureDetails: finalFailureDetails,
     });
     if (deliveryError) throw deliveryError;
     process.exitCode = code;

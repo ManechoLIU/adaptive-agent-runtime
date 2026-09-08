@@ -91,6 +91,9 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
   const promptFileIndex = process.argv.indexOf("--prompt-file");
   const promptFilePath = promptFileIndex >= 0 ? process.argv[promptFileIndex + 1] : null;
   const promptFileMode = promptFilePath ? (fs.statSync(promptFilePath).mode & 0o777) : null;
+  if (process.env.FAKE_RUNNER_MODEL_PROGRESS === "1") {
+    process.stdout.write(JSON.stringify({ sessionId: "fake", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "progress" } } }) + "\\n");
+  }
   process.stdout.write(JSON.stringify({
     args: process.argv.slice(2),
     promptFileMode,
@@ -1385,7 +1388,7 @@ test("Grok generation stall timeout terminates after structured output stops", a
     encoding: "utf8", input: "bounded",
     env: {
       ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
-      FAKE_RUNNER_DELAY_MS: "1000",
+      FAKE_RUNNER_MODEL_PROGRESS: "1", FAKE_RUNNER_DELAY_MS: "1000",
       AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "1000", AD_GROK_STALL_TIMEOUT_MS: "50",
       AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "2000", AD_EXTERNAL_KILL_GRACE_MS: "25",
     },
@@ -1451,7 +1454,7 @@ test("Grok stall timeout persists structured canonical terminal classification",
     encoding: "utf8", input: "bounded reviewer contract",
     env: {
       ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
-      FAKE_RUNNER_DELAY_MS: "1000",
+      FAKE_RUNNER_MODEL_PROGRESS: "1", FAKE_RUNNER_DELAY_MS: "1000",
       AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "1000", AD_GROK_STALL_TIMEOUT_MS: "50",
       AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "1000", AD_EXTERNAL_KILL_GRACE_MS: "25",
     },
@@ -1582,7 +1585,7 @@ test("Grok unstructured stdout does not satisfy structured first-output progress
 test("Grok malformed stdout after one structured event does not prevent generation stall", async () => {
   const runtimeModule = await import("../scripts/run_external_agent.mjs");
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-unstructured-stall-"));
-  const code = 'process.stdout.write(JSON.stringify({event:"started"})+"\\n"); const timer=setInterval(()=>process.stdout.write("still-not-json\\n"),25); setTimeout(()=>{clearInterval(timer);process.exit(0)},1000);';
+  const code = 'process.stdout.write(JSON.stringify({sessionId:"s",update:{sessionUpdate:"agent_message_chunk",content:{type:"text",text:"x"}}})+"\\n"); const timer=setInterval(()=>process.stdout.write("still-not-json\\n"),25); setTimeout(()=>{clearInterval(timer);process.exit(0)},1000);';
   const previous = {
     first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
     stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
@@ -1771,4 +1774,105 @@ test("Grok synthesis validates canonical same-candidate shard receipts", async (
   ], { encoding: "utf8", input: "bounded synthesis", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
   assert.equal(fakeResult.status, 1);
   assert.match(fakeResult.stderr, /shard|receipt|canonical|runtime/i);
+});
+
+test("Grok structured metadata stdout does not satisfy model first-output progress", async () => {
+  const runtimeModule = await import("../scripts/run_external_agent.mjs");
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-metadata-first-"));
+  const code = 'const timer=setInterval(()=>process.stdout.write(JSON.stringify({sessionId:"s",update:{sessionUpdate:"usage_update",usage:{inputTokens:1}}})+"\\n"),25); setTimeout(()=>{clearInterval(timer);process.exit(0)},1000);';
+  const previous = {
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "120";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "1000";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1500";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      (error) => error?.failureClass === "first_output_timeout",
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      const envName = key === "first" ? "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS" : key === "stall" ? "AD_GROK_STALL_TIMEOUT_MS" : key === "absolute" ? "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS" : "AD_EXTERNAL_KILL_GRACE_MS";
+      if (value === undefined) delete process.env[envName]; else process.env[envName] = value;
+    }
+  }
+});
+
+test("Grok metadata after agent activity does not prevent generation stall", async () => {
+  const runtimeModule = await import("../scripts/run_external_agent.mjs");
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-metadata-stall-"));
+  const code = 'process.stdout.write(JSON.stringify({sessionId:"s",update:{sessionUpdate:"agent_message_chunk",content:{type:"text",text:"x"}}})+"\\n"); const timer=setInterval(()=>process.stdout.write(JSON.stringify({sessionId:"s",update:{sessionUpdate:"session_info_update",title:"still alive"}})+"\\n"),25); setTimeout(()=>{clearInterval(timer);process.exit(0)},1000);';
+  const previous = {
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "500";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "120";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1500";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      (error) => error?.failureClass === "generation_stalled",
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      const envName = key === "first" ? "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS" : key === "stall" ? "AD_GROK_STALL_TIMEOUT_MS" : key === "absolute" ? "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS" : "AD_EXTERNAL_KILL_GRACE_MS";
+      if (value === undefined) delete process.env[envName]; else process.env[envName] = value;
+    }
+  }
+});
+
+test("ordinary Grok provider exit and invalid delivery persist durable failure classification", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-durable-classification-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const helper = path.join(bin, "continuation-helper.py");
+  await writeFile(helper, "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n");
+  await chmod(helper, 0o755);
+  const baseEnv = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, AD_TERMINAL_CONTINUATION_HELPER: helper };
+
+  const failedReceipt = path.join(bin, "provider-exit-terminal.json");
+  const failedAck = await assignmentAckFile(bin, { assignment_id: "provider-exit" }, repo);
+  const failed = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "provider-exit", "--task-id", "T1", "--agent-id", "writer", "--session-id", "provider-exit-s1",
+    "--assignment-ack", failedAck, "--terminal-receipt", failedReceipt,
+  ], { encoding: "utf8", input: "bounded", env: { ...baseEnv, FAKE_RUNNER_EXIT_CODE: "7" } });
+  assert.equal(failed.status, 7, failed.stderr);
+  const failedDurable = JSON.parse(await readFile(failedReceipt, "utf8"));
+  assert.equal(failedDurable.failure_class, "provider_exit");
+  assert.equal(failedDurable.retry_class, "provider_exit");
+  assert.equal(failedDurable.retry_safe, true);
+  assert.equal(failedDurable.result_unknown, false);
+  assert.equal(failedDurable.failure_details.provider_exit_code, 7);
+
+  const invalidReceipt = path.join(bin, "invalid-delivery-terminal.json");
+  const invalidDeliveryPath = path.join(bin, "invalid-delivery.json");
+  await writeFile(invalidDeliveryPath, JSON.stringify({ delivery_outcome: "pass", summary: "missing artifact", evidence: ["green-test:42"], artifacts: [], next_action: "review", retry_class: "none" }));
+  const invalidAck = await assignmentAckFile(bin, { assignment_id: "invalid-durable" }, repo);
+  const invalid = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "invalid-durable", "--task-id", "T1", "--agent-id", "writer", "--session-id", "invalid-durable-s1",
+    "--assignment-ack", invalidAck, "--delivery-receipt", invalidDeliveryPath, "--terminal-receipt", invalidReceipt,
+  ], { encoding: "utf8", input: "bounded", env: baseEnv });
+  assert.equal(invalid.status, 1, invalid.stderr);
+  const invalidDurable = JSON.parse(await readFile(invalidReceipt, "utf8"));
+  assert.equal(invalidDurable.failure_class, "delivery_receipt_invalid");
+  assert.equal(invalidDurable.retry_class, "delivery_receipt_invalid");
+  assert.equal(invalidDurable.retry_safe, false);
+  assert.equal(invalidDurable.result_unknown, false);
+  assert.match(invalidDurable.failure_details.validation_error, /delivery PASS requires evidence and artifact/i);
 });
