@@ -470,17 +470,21 @@ def _pre_tool_denial(reason: str) -> dict[str, Any]:
 
 _COMMAND_EXECUTION_TOOLS = {
     "bash",
+    "commandexecution",
     "exec_command",
     "shell",
     "shell_command",
 }
-_PERSISTENT_SCRIPT_NAMES = {"dev", "serve", "start", "watch"}
+_PERSISTENT_SCRIPT_NAMES = {"dev", "emulator", "serve", "simulator", "start", "watch"}
 _PERSISTENT_EXECUTABLES = {
+    "gunicorn",
     "nodemon",
+    "simulator",
+    "uvicorn",
     "vite",
+    "watch",
     "webpack-dev-server",
 }
-_BOUNDED_COMMAND_FLAGS = {"--once", "--run", "--help", "--version"}
 _SHELL_SEPARATORS = {";", "&&", "||", "|", "&"}
 
 
@@ -523,20 +527,34 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         return False
     executable = Path(tokens[0]).name.lower()
     if executable in {"timeout", "gtimeout"}:
-        return False
-    if any(token.lower() in _BOUNDED_COMMAND_FLAGS for token in tokens[1:]) or (
-        len(tokens) == 2 and tokens[1] in {"-h", "-v", "-V"}
-    ):
-        return False
+        if len(tokens) >= 3 and re.fullmatch(r"\d+(?:\.\d+)?(?:ms|s|m|h|d)?", tokens[1]):
+            return False
+        return _persistent_foreground_segment(tokens[1:]) if len(tokens) > 1 else False
     if executable in {"bash", "sh", "zsh"}:
         for index, token in enumerate(tokens[1:], start=1):
             if token in {"-c", "-lc"} and index + 1 < len(tokens):
                 return _persistent_foreground_command(tokens[index + 1])
         return False
     lowered = [token.lower() for token in tokens]
-    if "--watch" in lowered or executable in _PERSISTENT_EXECUTABLES:
-        return True
+    if executable in {"npx", "bunx"} and len(tokens) > 1:
+        return _persistent_foreground_segment(tokens[1:])
+    if executable == "yarn" and len(tokens) > 2 and lowered[1] == "dlx":
+        return _persistent_foreground_segment(tokens[2:])
+    if len(tokens) == 2 and tokens[1] in {
+        "--help", "-h", "--version", "-v", "-V"
+    }:
+        return False
     if executable == "tsx" and "watch" in lowered[1:]:
+        return True
+    if (
+        executable.startswith("python")
+        and len(lowered) >= 3
+        and lowered[1:3] == ["-m", "http.server"]
+    ):
+        return True
+    if executable == "next" and len(lowered) > 1 and lowered[1] == "dev":
+        return True
+    if "--watch" in lowered or executable in _PERSISTENT_EXECUTABLES:
         return True
     if executable in {"pnpm", "npm", "yarn", "bun"}:
         index = 1
@@ -554,7 +572,7 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
             command = lowered[index + 1]
         if command in _PERSISTENT_SCRIPT_NAMES:
             return True
-        if command == "exec" and index + 1 < len(tokens):
+        if command in {"exec", "dlx", "x"} and index + 1 < len(tokens):
             return _persistent_foreground_segment(tokens[index + 1 :])
     return False
 
@@ -574,7 +592,9 @@ def registered_controller_foreground_denial(
     The caller performs the exact current-target fence before using this result.
     The reason is deliberately constant so command contents never enter receipts.
     """
-    normalized_tool = Path(str(tool_name or "")).name.lower()
+    normalized_tool = (
+        str(tool_name or "").strip().rsplit(".", 1)[-1].rsplit("__", 1)[-1].lower()
+    )
     if normalized_tool not in _COMMAND_EXECUTION_TOOLS or not isinstance(tool_input, dict):
         return None
     initial_yield = tool_input.get("yield_time_ms")
@@ -1487,9 +1507,9 @@ def evaluate_event(
                     host=str(event.get("controller_host", "")).strip(),
                     target_generation=event.get("controller_target_generation"),
                     turn_id=receipt_turn_id,
-                    host_capabilities={"update_goal", "create_goal", "set_thread_title"}
-                    if event.get("controller_host") == DESKTOP_SESSION_HOST
-                    else set(),
+                    host_capabilities=(
+                        None if event.get("controller_host") == DESKTOP_SESSION_HOST else set()
+                    ),
                 )
             except ValueError as exc:
                 activated_display_sync = {
@@ -1529,7 +1549,9 @@ def evaluate_event(
                         "Ledger Goal rollover 已验证，但宿主显示同步仍是 Continuation Debt。"
                         "按顺序完成旧系统 Goal update_goal(status=complete)、"
                         "用台账当前 Goal 精确文本 create_goal、再为当前总控任务 set_thread_title；"
-                        "每步必须由同一 exact Controller target/generation 的 PostToolUse 回执闭合。"
+                        "随后用 get_goal 与 list_threads 回读精确 Goal/标题。"
+                        "每步必须由同一 exact Controller target/generation 的 PostToolUse 回执闭合；"
+                        "回读失败不得重放已经成功的写操作。"
                     ),
                 }
             }, state

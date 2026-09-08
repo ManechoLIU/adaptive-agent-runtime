@@ -635,10 +635,21 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
         commands = (
             ("Bash", "pnpm --filter @selfalone/server dev"),
             ("exec_command", "DATABASE_URL=postgres://localhost/selfalone pnpm --filter @selfalone/server exec tsx watch src/index.ts"),
+            ("functions.exec_command", "pnpm dev"),
+            ("functions.shell_command", "pnpm dev"),
+            ("commandExecution", "pnpm dev"),
             ("exec_command", "cd apps/server && pnpm dev"),
             ("exec_command", "bash -lc 'pnpm --filter @selfalone/server dev'"),
+            ("exec_command", "bash -lc 'pnpm --filter @selfalone/server dev' --help"),
             ("exec_command", "npm run dev"),
             ("exec_command", "pnpm test -- --watch"),
+            ("exec_command", "tsx watch src/index.ts --once"),
+            ("exec_command", "pnpm dev -- --once"),
+            ("exec_command", "pnpm simulator"),
+            ("exec_command", "npx vite"),
+            ("exec_command", "yarn dlx vite"),
+            ("exec_command", "bunx vite"),
+            ("exec_command", "python3 -m http.server"),
             ("exec_command", "pnpm dev -v"),
             ("exec_command", "vite"),
         )
@@ -719,11 +730,12 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
         allowed_inputs = (
             {"command": "pnpm --filter @selfalone/server dev", "yield_time_ms": 1000},
             {"cmd": "timeout 5s pnpm --filter @selfalone/server dev"},
-            {"command": "pnpm --filter @selfalone/server dev -- --once"},
             {"command": "pnpm --filter @selfalone/server test"},
             {"command": "pnpm build"},
             {"command": "pnpm typecheck"},
             {"command": "vite --help"},
+            {"command": "pnpm --help"},
+            {"command": "tsx --version"},
             {"command": "tsx scripts/smoke.ts"},
         )
         with tempfile.TemporaryDirectory() as tmp:

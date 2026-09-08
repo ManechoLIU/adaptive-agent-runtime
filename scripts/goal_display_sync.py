@@ -13,16 +13,22 @@ import json
 from typing import Any
 
 
-REQUIRED_HOST_CAPABILITIES = {"update_goal", "create_goal", "set_thread_title"}
+REQUIRED_HOST_CAPABILITIES = {
+    "update_goal", "create_goal", "set_thread_title", "get_goal", "list_threads"
+}
 STEP_BY_STATUS = {
     "pending_update_goal": "update_goal_complete",
     "pending_create_goal": "create_goal",
     "pending_thread_title": "set_thread_title",
+    "pending_goal_readback": "get_goal_readback",
+    "pending_title_readback": "thread_title_readback",
 }
 NEXT_STATUS = {
     "update_goal_complete": "pending_create_goal",
     "create_goal": "pending_thread_title",
-    "set_thread_title": "completed",
+    "set_thread_title": "pending_goal_readback",
+    "get_goal_readback": "pending_title_readback",
+    "thread_title_readback": "completed",
 }
 
 
@@ -68,7 +74,7 @@ def start_goal_display_sync(
     host: str,
     target_generation: int | None,
     turn_id: str,
-    host_capabilities: set[str],
+    host_capabilities: set[str] | None,
 ) -> dict[str, Any] | None:
     """Create one idempotent receipt only for a validated rolled Goal."""
     if str(rollover.get("status", "")).strip().lower() != "rolled":
@@ -85,15 +91,17 @@ def start_goal_display_sync(
         raise ValueError("Goal display sync rollover contract is incomplete")
     if closed_goal_id == current_goal_id or current_goal_id not in objective:
         raise ValueError("Goal display sync current Goal does not match the ledger display")
+    # The idempotency key identifies the durable Goal transition, not the
+    # execution target that happened to perform it.  A completed transition
+    # must not recreate the host Goal after a legitimate target rotation.
+    # Pending receipts remain exact-target fenced by the binding fields below.
     fingerprint = _json_sha256({
         "controller_id": controller_id,
-        "execution_target_session_id": source_session_id,
-        "host": host,
-        "target_generation": generation,
         "ledger_sha256": ledger_sha256,
         "closed_goal_id": closed_goal_id,
         "current_goal_id": current_goal_id,
         "objective": objective,
+        "project_name": project_name,
     })
     if isinstance(existing, dict) and existing.get("fingerprint") == fingerprint:
         return existing
@@ -119,11 +127,15 @@ def start_goal_display_sync(
             "status": "degraded",
             "reason": "CURRENT_TARGET_GENERATION_UNAVAILABLE",
         })
-    elif not REQUIRED_HOST_CAPABILITIES.issubset(host_capabilities):
+    elif host_capabilities is not None and not REQUIRED_HOST_CAPABILITIES.issubset(host_capabilities):
         receipt.update({
             "status": "degraded",
             "reason": "HOST_GOAL_DISPLAY_CAPABILITY_UNAVAILABLE",
         })
+    elif host_capabilities is None:
+        receipt["host_capability_state"] = "configured_unverified"
+    else:
+        receipt["host_capability_state"] = "declared_available_pending_live_receipt"
     return receipt
 
 
@@ -144,7 +156,7 @@ def _expected_tool_error(receipt: dict[str, Any], event: dict[str, Any]) -> str 
     elif expected_step == "create_goal":
         valid = kind == "create_goal" and str(tool_input.get("objective", "")).strip() == receipt.get("objective")
         expected_name = "create_goal with the exact ledger current Goal"
-    else:
+    elif expected_step == "set_thread_title":
         target = str(tool_input.get("threadId", tool_input.get("thread_id", ""))).strip()
         valid_target = not target or target == receipt.get("execution_target_session_id")
         valid = (
@@ -153,6 +165,12 @@ def _expected_tool_error(receipt: dict[str, Any], event: dict[str, Any]) -> str 
             and valid_target
         )
         expected_name = "set_thread_title with the exact Controller task title"
+    elif expected_step == "get_goal_readback":
+        valid = kind == "get_goal"
+        expected_name = "get_goal host readback"
+    else:
+        valid = kind == "list_threads"
+        expected_name = "list_threads Controller title readback"
     if not valid:
         return f"Goal display sync requires {expected_name} next."
     return None
@@ -202,12 +220,48 @@ def observe_goal_display_sync_result(
         and response.get("isError") is not True
         and response.get("exit_code") in (None, 0)
     )
+    response_text = json.dumps(response, ensure_ascii=False, sort_keys=True, default=str)
+    response_text_lower = response_text.lower()
+    step_name = str(inflight.get("step", ""))
+    if success and step_name == "get_goal_readback":
+        success = str(next_receipt.get("objective", "")) in response_text
+    elif success and step_name == "thread_title_readback":
+        success = (
+            str(next_receipt.get("execution_target_session_id", "")) in response_text
+            and str(next_receipt.get("thread_title", "")) in response_text
+        )
     if not success:
+        capability_unavailable = (
+            ("tool" in response_text_lower and "unavailable" in response_text_lower)
+            or any(
+                marker in response_text_lower
+                for marker in (
+                    "unknown tool",
+                    "tool not found",
+                    "tool_not_found",
+                    "not supported",
+                )
+            )
+        )
+        failure_reason = (
+            "HOST_GOAL_DISPLAY_CAPABILITY_UNAVAILABLE"
+            if capability_unavailable
+            else (
+                "HOST_READBACK_MISMATCH"
+                if step_name in {"get_goal_readback", "thread_title_readback"}
+                else "HOST_TOOL_FAILED"
+            )
+        )
         next_receipt["last_failure"] = {
             "step": inflight.get("step"),
             "tool_use_id": tool_use_id,
             "response_sha256": _json_sha256(response),
+            "reason": failure_reason,
         }
+        if capability_unavailable:
+            next_receipt["status"] = "degraded"
+            next_receipt["reason"] = failure_reason
+            next_receipt["host_capability_state"] = "unavailable"
         return next_receipt
     step = dict(inflight)
     step["response_sha256"] = _json_sha256(response)

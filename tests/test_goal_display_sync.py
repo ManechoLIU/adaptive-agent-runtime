@@ -41,7 +41,9 @@ class GoalDisplaySyncTests(unittest.TestCase):
             host="desktop_codex",
             target_generation=4,
             turn_id="turn-rollover",
-            host_capabilities={"update_goal", "create_goal", "set_thread_title"},
+            host_capabilities={
+                "update_goal", "create_goal", "set_thread_title", "get_goal", "list_threads"
+            },
         )
         self.assertIsNotNone(receipt)
         return receipt  # type: ignore[return-value]
@@ -50,11 +52,11 @@ class GoalDisplaySyncTests(unittest.TestCase):
         self,
         receipt: dict[str, object],
         event: dict[str, object],
-        *, success: bool = True,
+        *, success: bool = True, response: dict[str, object] | None = None,
     ) -> dict[str, object]:
         authorized, denial = goal_display_sync.authorize_goal_display_sync_tool(receipt, event)
         self.assertIsNone(denial)
-        response = {"isError": not success, "result": "ok" if success else "failed"}
+        response = response or {"isError": not success, "result": "ok" if success else "failed"}
         return goal_display_sync.observe_goal_display_sync_result(
             authorized,
             {**event, "tool_response": response},
@@ -79,6 +81,22 @@ class GoalDisplaySyncTests(unittest.TestCase):
         )
         receipt = self.complete_step(receipt, title)
 
+        self.assertEqual(receipt["status"], "pending_goal_readback")
+        receipt = self.complete_step(
+            receipt,
+            self.event("get_goal", "goal-read-1", {}),
+            response={"objective": "M1-F5-B 大纲闭环", "status": "active"},
+        )
+        self.assertEqual(receipt["status"], "pending_title_readback")
+        receipt = self.complete_step(
+            receipt,
+            self.event("mcp__codex_app__list_threads", "title-read-1", {"limit": 10}),
+            response={"threads": [{
+                "threadId": "desktop-current",
+                "title": "SelfAlone 总控｜M1-F5-B 大纲闭环",
+            }]},
+        )
+
         self.assertEqual(receipt["status"], "completed")
         self.assertEqual(receipt["controller_id"], "controller-1")
         self.assertEqual(receipt["execution_target_session_id"], "desktop-current")
@@ -87,7 +105,8 @@ class GoalDisplaySyncTests(unittest.TestCase):
         self.assertEqual(receipt["closed_goal_id"], "M1-F4")
         self.assertEqual(receipt["current_goal_id"], "M1-F5-B")
         self.assertEqual([item["step"] for item in receipt["steps"]], [
-            "update_goal_complete", "create_goal", "set_thread_title"
+            "update_goal_complete", "create_goal", "set_thread_title",
+            "get_goal_readback", "thread_title_readback",
         ])
 
     def test_create_goal_is_rejected_until_old_goal_completion_succeeds(self) -> None:
@@ -126,6 +145,20 @@ class GoalDisplaySyncTests(unittest.TestCase):
                 "set_thread_title", "title-retry", {"title": "SelfAlone 总控｜M1-F5-B 大纲闭环"}
             ),
         )
+        self.assertEqual(receipt["status"], "pending_goal_readback")
+        receipt = self.complete_step(
+            receipt,
+            self.event("get_goal", "goal-read", {}),
+            response={"objective": "M1-F5-B 大纲闭环"},
+        )
+        receipt = self.complete_step(
+            receipt,
+            self.event("list_threads", "title-read", {}),
+            response={"threads": [{
+                "threadId": "desktop-current",
+                "title": "SelfAlone 总控｜M1-F5-B 大纲闭环",
+            }]},
+        )
         self.assertEqual(receipt["status"], "completed")
         self.assertEqual(sum(step["step"] == "create_goal" for step in receipt["steps"]), 1)
 
@@ -137,18 +170,63 @@ class GoalDisplaySyncTests(unittest.TestCase):
             self.event("set_thread_title", "title-1", {"title": "SelfAlone 总控｜M1-F5-B 大纲闭环"}),
         ):
             receipt = self.complete_step(receipt, event)
+        receipt = self.complete_step(
+            receipt,
+            self.event("get_goal", "goal-read", {}),
+            response={"objective": "M1-F5-B 大纲闭环"},
+        )
+        receipt = self.complete_step(
+            receipt,
+            self.event("list_threads", "title-read", {}),
+            response={"threads": [{
+                "threadId": "desktop-current",
+                "title": "SelfAlone 总控｜M1-F5-B 大纲闭环",
+            }]},
+        )
         duplicate = goal_display_sync.start_goal_display_sync(
             receipt,
             self.contract(),
             controller_id="controller-1",
-            source_session_id="desktop-current",
+            source_session_id="desktop-next",
             host="desktop_codex",
-            target_generation=4,
+            target_generation=5,
             turn_id="turn-retry",
-            host_capabilities={"update_goal", "create_goal", "set_thread_title"},
+            host_capabilities={"update_goal", "create_goal", "set_thread_title", "get_goal", "list_threads"},
         )
         self.assertIs(duplicate, receipt)
-        self.assertEqual(len(duplicate["steps"]), 3)
+        self.assertEqual(len(duplicate["steps"]), 5)
+
+    def test_unavailable_host_tool_marks_receipt_degraded(self) -> None:
+        receipt = self.start()
+        update = self.event("update_goal", "update-missing", {"status": "complete"})
+        receipt = self.complete_step(
+            receipt,
+            update,
+            response={"isError": True, "error": "Tool update_goal is unavailable"},
+        )
+        self.assertEqual(receipt["status"], "degraded")
+        self.assertEqual(receipt["reason"], "HOST_GOAL_DISPLAY_CAPABILITY_UNAVAILABLE")
+
+    def test_host_readback_mismatch_retries_only_the_failed_read(self) -> None:
+        receipt = self.start()
+        for event in (
+            self.event("update_goal", "update-1", {"status": "complete"}),
+            self.event("create_goal", "create-1", {"objective": "M1-F5-B 大纲闭环"}),
+            self.event("set_thread_title", "title-1", {"title": "SelfAlone 总控｜M1-F5-B 大纲闭环"}),
+        ):
+            receipt = self.complete_step(receipt, event)
+        receipt = self.complete_step(
+            receipt,
+            self.event("get_goal", "goal-read-wrong", {}),
+            response={"objective": "M1-F4 old goal"},
+        )
+        self.assertEqual(receipt["status"], "pending_goal_readback")
+        self.assertEqual(len(receipt["steps"]), 3)
+        _receipt, denial = goal_display_sync.authorize_goal_display_sync_tool(
+            receipt,
+            self.event("create_goal", "create-again", {"objective": "M1-F5-B 大纲闭环"}),
+        )
+        self.assertIn("get_goal", denial or "")
 
     def test_project_terminal_states_do_not_create_a_display_sync(self) -> None:
         for status in ("project_complete", "project_blocked"):
@@ -161,7 +239,7 @@ class GoalDisplaySyncTests(unittest.TestCase):
                     host="desktop_codex",
                     target_generation=4,
                     turn_id="turn-terminal",
-                    host_capabilities={"update_goal", "create_goal", "set_thread_title"},
+                    host_capabilities={"update_goal", "create_goal", "set_thread_title", "get_goal", "list_threads"},
                 ))
 
     def test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced(self) -> None:

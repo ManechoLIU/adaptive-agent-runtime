@@ -333,6 +333,12 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_goal_display_sync.GoalDisplaySyncTests."
     "test_title_failure_recovers_without_recreating_goal",
     "tests.test_goal_display_sync.GoalDisplaySyncTests."
+    "test_host_readback_mismatch_retries_only_the_failed_read",
+    "tests.test_goal_display_sync.GoalDisplaySyncTests."
+    "test_duplicate_rollover_reuses_completed_receipt",
+    "tests.test_goal_display_sync.GoalDisplaySyncTests."
+    "test_unavailable_host_tool_marks_receipt_degraded",
+    "tests.test_goal_display_sync.GoalDisplaySyncTests."
     "test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced",
     "tests.test_web_agent_execution.WebAgentExecutionTests."
     "test_direct_start_web_assignment_is_rejected_even_with_forged_readiness_probe",
@@ -1045,7 +1051,9 @@ def detect_host_capabilities(
         and (skill_root_path / "scripts" / "goal_display_sync.py").is_file()
     )
     desktop["goal_display_sync"] = (
-        "ready" if goal_display_sync_ready else "degraded_runtime_hook_unavailable"
+        "configured_unverified"
+        if goal_display_sync_ready
+        else "degraded_runtime_hook_unavailable"
     )
 
     bridge_available = bridge_path.is_file() and os.access(bridge_path, os.X_OK)

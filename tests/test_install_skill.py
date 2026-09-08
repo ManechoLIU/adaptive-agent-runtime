@@ -71,7 +71,9 @@ class InstallCapabilityTests(unittest.TestCase):
             )
 
             self.assertEqual(report["desktop_adapter"]["status"], "enabled")
-            self.assertEqual(report["desktop_adapter"]["goal_display_sync"], "ready")
+            self.assertEqual(
+                report["desktop_adapter"]["goal_display_sync"], "configured_unverified"
+            )
             self.assertEqual(
                 report["web_local_adapter"]["goal_display_sync"],
                 "degraded_host_capability_unavailable",
@@ -650,6 +652,9 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_goal_display_sync.GoalDisplaySyncTests.test_rolled_happy_path_records_exact_host_sequence_and_binding",
             "tests.test_goal_display_sync.GoalDisplaySyncTests.test_successful_rolled_control_receipt_activates_display_sync_debt",
             "tests.test_goal_display_sync.GoalDisplaySyncTests.test_title_failure_recovers_without_recreating_goal",
+            "tests.test_goal_display_sync.GoalDisplaySyncTests.test_host_readback_mismatch_retries_only_the_failed_read",
+            "tests.test_goal_display_sync.GoalDisplaySyncTests.test_duplicate_rollover_reuses_completed_receipt",
+            "tests.test_goal_display_sync.GoalDisplaySyncTests.test_unavailable_host_tool_marks_receipt_degraded",
             "tests.test_goal_display_sync.GoalDisplaySyncTests.test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced",
             "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_managed_controller_rejects_unbounded_dev_commands_before_state_write",
             "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions",
@@ -1012,6 +1017,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_rolled_happy_path_records_exact_host_sequence_and_binding(self): self.assertTrue(True)\n"
                 "    def test_successful_rolled_control_receipt_activates_display_sync_debt(self): self.assertTrue(True)\n"
                 "    def test_title_failure_recovers_without_recreating_goal(self): self.assertTrue(True)\n"
+                "    def test_host_readback_mismatch_retries_only_the_failed_read(self): self.assertTrue(True)\n"
+                "    def test_duplicate_rollover_reuses_completed_receipt(self): self.assertTrue(True)\n"
+                "    def test_unavailable_host_tool_marks_receipt_degraded(self): self.assertTrue(True)\n"
                 "    def test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
@@ -1275,6 +1283,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_rolled_happy_path_records_exact_host_sequence_and_binding(self): self.assertTrue(True)\n"
                 "    def test_successful_rolled_control_receipt_activates_display_sync_debt(self): self.assertTrue(True)\n"
                 "    def test_title_failure_recovers_without_recreating_goal(self): self.assertTrue(True)\n"
+                "    def test_host_readback_mismatch_retries_only_the_failed_read(self): self.assertTrue(True)\n"
+                "    def test_duplicate_rollover_reuses_completed_receipt(self): self.assertTrue(True)\n"
+                "    def test_unavailable_host_tool_marks_receipt_degraded(self): self.assertTrue(True)\n"
                 "    def test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
