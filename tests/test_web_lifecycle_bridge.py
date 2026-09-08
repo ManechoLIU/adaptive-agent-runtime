@@ -6307,7 +6307,17 @@ class WebHostNativeWakeIsolationTests(unittest.TestCase):
             registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
             receipt_path = root / "wake.json"
             state = {"pending_control_event": True, "controller_host": "web", "wake_generation": 1}
-            with patch.object(web_bridge, "execute_native_resume", side_effect=AssertionError("web wake must not invoke desktop codex")):
+            missing_verifier = root / "missing-host-verifiers.json"
+            with patch.object(
+                web_bridge,
+                "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG",
+                missing_verifier,
+                create=True,
+            ), patch.object(
+                web_bridge,
+                "execute_native_resume",
+                side_effect=AssertionError("web wake must not invoke desktop codex"),
+            ):
                 receipt = web_bridge.wake_existing_controller(
                     lifecycle_state=state,
                     session_id="controller-1",
@@ -6335,13 +6345,21 @@ class WebHostNativeWakeIsolationTests(unittest.TestCase):
             def web_resume(**kwargs):
                 calls.append(kwargs)
                 return {"operation":"web_resume","result":"CONFIRMED","state":"RESUME_CONFIRMED","returncode":0}
-            receipt = web_bridge.wake_existing_controller(
-                lifecycle_state={"pending_control_event": True, "controller_host": "web", "wake_generation": 1},
-                session_id="controller-1", repo=repo, registry=registry, codex="codex",
-                receipt_path=receipt_path,
-                host_facts={"controller_host": "web", "resume_actionable": True},
-                resume_adapters={"web": web_resume},
-            )
+            missing_verifier = root / "missing-host-verifiers.json"
+            from unittest.mock import patch
+            with patch.object(
+                web_bridge,
+                "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG",
+                missing_verifier,
+                create=True,
+            ):
+                receipt = web_bridge.wake_existing_controller(
+                    lifecycle_state={"pending_control_event": True, "controller_host": "web", "wake_generation": 1},
+                    session_id="controller-1", repo=repo, registry=registry, codex="codex",
+                    receipt_path=receipt_path,
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                    resume_adapters={"web": web_resume},
+                )
             self.assertEqual(calls, [])
             self.assertEqual(receipt["result"], "DEFERRED")
             self.assertEqual(
