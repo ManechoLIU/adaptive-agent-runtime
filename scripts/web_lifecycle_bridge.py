@@ -83,6 +83,7 @@ AUTHORITATIVE_DOCUMENT_NAMES = ("SKILL.md", "SPEC.md", "DESIGN.md", "TECHNICAL.m
 RESTORE_DOCUMENT_LIMIT = 32768
 AUTO_CONTINUATION_STALL_LIMIT = 3
 WEB_REENTRY_TRANSIENT_RETRY_LIMIT = 6
+_HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND = object()
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -2235,8 +2236,72 @@ def execute_native_resume(
     attempt.update(classify_native_resume_failure(
         returncode, stdout, stderr
     ))
+    if attempt.get("state") == "RESUME_DEFERRED_ACTIVE_WRITER":
+        # This observation is produced only by the native Host command after
+        # the exact Desktop target was resolved under the target guard. It is
+        # not Controller identity attestation and must still pass canonical
+        # target and ownership-generation fences before becoming confirmation.
+        attempt["host_observation"] = _HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND
     attempt["result"] = "DEFERRED" if attempt["state"] == "RESUME_DEFERRED_ACTIVE_WRITER" else "FAILED"
     return attempt
+
+
+def confirm_host_observed_desktop_foreground(
+    *,
+    attempt: dict[str, Any],
+    lifecycle_state: dict[str, Any],
+    ownership_fence: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Confirm an exact Desktop wake when the Host reports its writer is already active."""
+    if (
+        lifecycle_state.get("pending_control_event") is not True
+        or lifecycle_state.get("requires_user") is True
+        or attempt.get("result") != "DEFERRED"
+        or attempt.get("state") != "RESUME_DEFERRED_ACTIVE_WRITER"
+        or attempt.get("failure_class") != "active_writer_present"
+        or attempt.get("host_observation") is not _HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND
+        or not isinstance(ownership_fence, dict)
+        or ownership_fence.get("active_host") != target_guard.DESKTOP_SESSION_HOST
+        or attempt.get("target_mode") != "explicit_current"
+    ):
+        return attempt
+
+    execution_target = str(attempt.get("execution_target_session_id") or "").strip()
+    target_generation = attempt.get("target_generation")
+    ownership_target = str(
+        ownership_fence.get("execution_target_session_id") or ""
+    ).strip()
+    ownership_generation = ownership_fence.get("generation")
+    if (
+        not execution_target
+        or execution_target != ownership_target
+        or not isinstance(target_generation, int)
+        or isinstance(target_generation, bool)
+        or target_generation <= 0
+        or not isinstance(ownership_generation, int)
+        or isinstance(ownership_generation, bool)
+        or ownership_generation <= 0
+    ):
+        return attempt
+
+    confirmed = dict(attempt)
+    confirmed.update({
+        "operation": "native_resume_already_foreground",
+        "result": "CONFIRMED",
+        "state": "RESUME_CONFIRMED_ALREADY_FOREGROUND",
+        "pending_control_event": True,
+        "host_returncode": attempt.get("returncode"),
+        "returncode": 0,
+        "ownership_generation": ownership_generation,
+    })
+    for key in (
+        "error_code",
+        "failure_class",
+        "fallback_eligible",
+        "replacement_eligible",
+    ):
+        confirmed.pop(key, None)
+    return confirmed
 
 
 
@@ -5177,6 +5242,12 @@ def _run_auto_native_stop_impl(
             "execution_target_session_id"
         )
         attempt["ownership_generation"] = ownership_fence.get("generation")
+
+    attempt = confirm_host_observed_desktop_foreground(
+        attempt=attempt,
+        lifecycle_state=lifecycle_state,
+        ownership_fence=ownership_fence,
+    )
 
     # Revalidate both supervisor token and canonical host ownership before
     # committing any external result or rearming.

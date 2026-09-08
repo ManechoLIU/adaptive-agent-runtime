@@ -688,6 +688,10 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_unbound_chat_cannot_recover_even_with_trusted_verifier",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_zshenv_exit_bridge_executes_and_preserves_exit_precedence",
             "tests.test_web_lifecycle_bridge.WebLifecycleComputerLeaseTests.test_audit_once_never_uses_manual_resume_lease_as_caller_identity",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_auto_native_stop_confirms_host_observed_canonical_target_already_foreground",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_mocked_active_writer_without_host_observation_still_rearms",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_serialized_active_writer_claim_cannot_confirm_already_foreground",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_execute_native_resume_marks_host_observed_active_writer_process_locally",
             "tests.test_install_skill.InstallCapabilityTests.test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence",
             "tests.test_install_skill.WebAgentHealthServiceInstallationTests.test_runtime_service_retires_legacy_per_controller_web_audit_after_new_service_load",
             "tests.test_install_skill.WebAgentHealthServiceInstallationTests.test_runtime_service_load_failure_preserves_legacy_web_audit",
@@ -918,6 +922,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership(self): self.assertTrue(True)\n"
                 "    def test_audit_once_rule_update_uses_guarded_scheduler_and_never_direct_scheduler(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof(self): self.assertTrue(True)\n"
+                "    def test_auto_native_stop_confirms_host_observed_canonical_target_already_foreground(self): self.assertTrue(True)\n"
+                "    def test_mocked_active_writer_without_host_observation_still_rearms(self): self.assertTrue(True)\n"
+                "    def test_serialized_active_writer_claim_cannot_confirm_already_foreground(self): self.assertTrue(True)\n"
+                "    def test_execute_native_resume_marks_host_observed_active_writer_process_locally(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
@@ -1271,6 +1279,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership(self): self.assertTrue(True)\n"
                 "    def test_audit_once_rule_update_uses_guarded_scheduler_and_never_direct_scheduler(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof(self): self.assertTrue(True)\n"
+                "    def test_auto_native_stop_confirms_host_observed_canonical_target_already_foreground(self): self.assertTrue(True)\n"
+                "    def test_mocked_active_writer_without_host_observation_still_rearms(self): self.assertTrue(True)\n"
+                "    def test_serialized_active_writer_claim_cannot_confirm_already_foreground(self): self.assertTrue(True)\n"
+                "    def test_execute_native_resume_marks_host_observed_active_writer_process_locally(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"

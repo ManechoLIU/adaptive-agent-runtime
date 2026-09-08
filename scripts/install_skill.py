@@ -250,6 +250,14 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_auto_native_stop_confirms_host_observed_canonical_target_already_foreground",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_mocked_active_writer_without_host_observation_still_rearms",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_serialized_active_writer_claim_cannot_confirm_already_foreground",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_execute_native_resume_marks_host_observed_active_writer_process_locally",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
