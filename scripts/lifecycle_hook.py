@@ -548,6 +548,26 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
     return remaining
 
 
+def _strip_runner_options(tokens: list[str]) -> list[str]:
+    remaining = list(tokens)
+    value_options = {
+        "-p", "--package", "--cache", "--cwd", "--dir", "--prefix", "--workspace"
+    }
+    while remaining:
+        token = remaining[0].lower()
+        if token == "--":
+            remaining.pop(0)
+            break
+        if token in value_options:
+            remaining = remaining[2:] if len(remaining) > 1 else []
+            continue
+        if token.startswith("-"):
+            remaining.pop(0)
+            continue
+        break
+    return remaining
+
+
 def _persistent_foreground_segment(tokens: list[str]) -> bool:
     tokens = _strip_command_prefix(tokens)
     if not tokens:
@@ -574,9 +594,7 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         return False
     if executable in {"command", "exec", "nohup"}:
         index = 1
-        if executable == "command" and any(
-            token in {"-v", "-V"} for token in tokens[index:]
-        ):
+        if executable == "command" and len(tokens) > 1 and tokens[1] in {"-v", "-V"}:
             return False
         while index < len(tokens) and tokens[index].startswith("-"):
             if tokens[index] == "--":
@@ -618,7 +636,7 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
             break
         return _persistent_foreground_segment(tokens[index:])
     if executable == "yarn" and len(tokens) > 2 and lowered[1] == "dlx":
-        return _persistent_foreground_segment(tokens[2:])
+        return _persistent_foreground_segment(_strip_runner_options(tokens[2:]))
     if executable == "tsx" and "watch" in lowered[1:]:
         return True
     if (
@@ -653,7 +671,9 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         if command in _PERSISTENT_SCRIPT_NAMES:
             return True
         if command in {"exec", "dlx", "x"} and index + 1 < len(tokens):
-            return _persistent_foreground_segment(tokens[index + 1 :])
+            return _persistent_foreground_segment(
+                _strip_runner_options(tokens[index + 1 :])
+            )
     return False
 
 
