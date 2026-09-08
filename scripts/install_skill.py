@@ -559,6 +559,7 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok malformed stdout after one structured event does not prevent generation stall",
     "Grok structured metadata stdout does not satisfy model first-output progress",
     "Grok metadata after agent activity does not prevent generation stall",
+    "Grok misleading type or event fields do not count as ACP model progress",
     "ordinary Grok provider exit and invalid delivery persist durable failure classification",
     "Grok reviewer shard cannot finalize and synthesis binds exact candidate head",
     "Grok reviewer requires explicit phase and immutable candidate commit",

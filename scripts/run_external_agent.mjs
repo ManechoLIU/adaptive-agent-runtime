@@ -108,7 +108,7 @@ function grokModelProgressKind(event) {
     (value) => value && typeof value === "object" && !Array.isArray(value),
   );
   for (const candidate of candidates) {
-    for (const key of ["sessionUpdate", "session_update", "type", "event"]) {
+    for (const key of ["sessionUpdate", "session_update"]) {
       const value = candidate[key];
       if (typeof value === "string" && GROK_MODEL_PROGRESS_SESSION_UPDATES.has(value.trim())) {
         return value.trim();
