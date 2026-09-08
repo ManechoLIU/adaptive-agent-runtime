@@ -7466,7 +7466,9 @@ def _manual_fenced_confirmed_waits_for_progress_without_resubmit(self):
                 codex="codex", delay_seconds=0, state_path=state_path,
             )
         saved = json.loads(state_path.read_text(encoding="utf-8"))
-        registry_sha256 = web_bridge._file_sha256(registry)
+        waiting_controller_fence = web_bridge._controller_web_wait_fence(
+            registry=registry, controller_id="controller-1"
+        )
     self.assertEqual(code, 0)
     reentry.assert_called_once()
     schedule.assert_not_called()
@@ -7476,7 +7478,8 @@ def _manual_fenced_confirmed_waits_for_progress_without_resubmit(self):
     self.assertFalse(saved["strong_web_identity_established"])
     self.assertEqual(saved["continuation_count"], 1)
     self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
-    self.assertEqual(saved["waiting_registry_sha256"], registry_sha256)
+    self.assertEqual(saved["waiting_controller_fence"], waiting_controller_fence)
+    self.assertNotIn("waiting_registry_sha256", saved)
 
 
 def _waiting_for_controller_progress_does_not_bootstrap_until_machine_facts_change(self):
@@ -7486,23 +7489,48 @@ def _waiting_for_controller_progress_does_not_bootstrap_until_machine_facts_chan
         "snapshot": {"head":"h1","ledger_sha256":"l1","worktree_status_sha256":"w1","ready_ids":["F1"],"runnable_ids":["F1"],"candidate_revisions":[]},
     }
     fingerprint = web_bridge._wake_event_fingerprint(lifecycle)
+    fence = {
+        "execution_target_session_id": "web-current",
+        "target_generation": 4,
+        "ownership_generation": 4,
+        "target_provenance": "manual_user_authorized",
+        "target_binding_mode": "temporary",
+        "target_host_attested": False,
+        "ownership_provenance": "manual_user_authorized",
+    }
     waiting = {
         "state": "WAITING_FOR_CONTROLLER_PROGRESS",
         "pending_control_event": True,
         "last_lifecycle_fingerprint": fingerprint,
-        "waiting_registry_sha256": "registry-a",
+        "waiting_controller_fence": dict(fence),
         "delivery_authorization": "manual_fenced",
     }
+    # Whole-registry changes are irrelevant when this Controller's target/ownership facts did not change.
     self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
-        lifecycle, waiting, current_registry_sha256="registry-a"
+        lifecycle, waiting,
+        current_registry_sha256="completely-different-registry-hash",
+        current_controller_wait_fence=dict(fence),
     ))
     changed_lifecycle = json.loads(json.dumps(lifecycle))
     changed_lifecycle["triggers"].append("LEDGER_CHANGED")
     self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
-        changed_lifecycle, waiting, current_registry_sha256="registry-a"
+        changed_lifecycle, waiting,
+        current_registry_sha256="another-registry-hash",
+        current_controller_wait_fence=dict(fence),
     ))
+    changed_fence = dict(fence)
+    changed_fence["target_generation"] = 5
+    changed_fence["ownership_generation"] = 5
     self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
-        lifecycle, waiting, current_registry_sha256="registry-b"
+        lifecycle, waiting,
+        current_registry_sha256="yet-another-registry-hash",
+        current_controller_wait_fence=changed_fence,
+    ))
+    # Invalid/missing current target facts fail closed instead of re-sending an already-confirmed wake.
+    self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+        lifecycle, waiting,
+        current_registry_sha256="registry-hash",
+        current_controller_wait_fence=None,
     ))
 
 
