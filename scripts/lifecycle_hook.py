@@ -548,7 +548,7 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
     return remaining
 
 
-def _strip_runner_options(tokens: list[str]) -> list[str]:
+def _persistent_runner_payload(tokens: list[str]) -> bool:
     remaining = list(tokens)
     value_options = {
         "-p", "--package", "--cache", "--cwd", "--dir", "--prefix", "--workspace"
@@ -558,6 +558,10 @@ def _strip_runner_options(tokens: list[str]) -> list[str]:
         if token == "--":
             remaining.pop(0)
             break
+        if token in {"-c", "--call"} and len(remaining) > 1:
+            return _persistent_foreground_command(remaining[1])
+        if token.startswith(("--call=", "-c=")):
+            return _persistent_foreground_command(remaining[0].split("=", 1)[1])
         if token in value_options:
             remaining = remaining[2:] if len(remaining) > 1 else []
             continue
@@ -565,7 +569,7 @@ def _strip_runner_options(tokens: list[str]) -> list[str]:
             remaining.pop(0)
             continue
         break
-    return remaining
+    return _persistent_foreground_segment(remaining)
 
 
 def _persistent_foreground_segment(tokens: list[str]) -> bool:
@@ -592,7 +596,7 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         "--help", "-h", "--version", "-v", "-V"
     }:
         return False
-    if executable in {"command", "exec", "nohup"}:
+    if executable in {"command", "exec", "nohup", "time"}:
         index = 1
         if executable == "command" and len(tokens) > 1 and tokens[1] in {"-v", "-V"}:
             return False
@@ -600,6 +604,14 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
             if tokens[index] == "--":
                 index += 1
                 break
+            if executable == "exec" and tokens[index] == "-a" and index + 1 < len(tokens):
+                index += 2
+                continue
+            if executable == "time" and tokens[index] in {
+                "-f", "--format", "-o", "--output"
+            } and index + 1 < len(tokens):
+                index += 2
+                continue
             index += 1
         return _persistent_foreground_segment(tokens[index:])
     if executable == "nice":
@@ -619,24 +631,9 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
             return _persistent_foreground_segment(tokens[index:])
         return False
     if executable in {"npx", "bunx"} and len(tokens) > 1:
-        index = 1
-        while index < len(tokens):
-            token = lowered[index]
-            if token == "--":
-                index += 1
-                break
-            if token in {"--call", "-c"} and index + 1 < len(tokens):
-                return _persistent_foreground_command(tokens[index + 1])
-            if token in {"--package", "-p", "--cache"} and index + 1 < len(tokens):
-                index += 2
-                continue
-            if token.startswith(("--package=", "--cache=")) or token.startswith("-"):
-                index += 1
-                continue
-            break
-        return _persistent_foreground_segment(tokens[index:])
+        return _persistent_runner_payload(tokens[1:])
     if executable == "yarn" and len(tokens) > 2 and lowered[1] == "dlx":
-        return _persistent_foreground_segment(_strip_runner_options(tokens[2:]))
+        return _persistent_runner_payload(tokens[2:])
     if executable == "tsx" and "watch" in lowered[1:]:
         return True
     if (
@@ -671,9 +668,7 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         if command in _PERSISTENT_SCRIPT_NAMES:
             return True
         if command in {"exec", "dlx", "x"} and index + 1 < len(tokens):
-            return _persistent_foreground_segment(
-                _strip_runner_options(tokens[index + 1 :])
-            )
+            return _persistent_runner_payload(tokens[index + 1 :])
     return False
 
 
