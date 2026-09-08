@@ -82,6 +82,7 @@ RESTORE_STATIC_DOCUMENT_NAMES = ("AGENTS.md", "MEMORY.md", "WIKI_INDEX.md")
 AUTHORITATIVE_DOCUMENT_NAMES = ("SKILL.md", "SPEC.md", "DESIGN.md", "TECHNICAL.md", "EVOLUTION.md")
 RESTORE_DOCUMENT_LIMIT = 32768
 AUTO_CONTINUATION_STALL_LIMIT = 3
+WEB_REENTRY_TRANSIENT_RETRY_LIMIT = 6
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -4068,9 +4069,12 @@ def _rule_revision_from_state(lifecycle_state: dict[str, Any]) -> str | None:
 
 
 def _lifecycle_delivery_key(lifecycle_state: dict[str, Any]) -> str:
-    revision = _rule_revision_from_state(lifecycle_state)
-    if revision:
-        return f"rule-update:{revision}"
+    for trigger in lifecycle_state.get("triggers", []):
+        text = str(trigger)
+        if text.startswith("rule_update_pending:"):
+            revision = text.split(":", 1)[1].strip()
+            if revision:
+                return f"rule-update:{revision}"
     generation = int(lifecycle_state.get("wake_generation", 0) or 0)
     return f"wake-generation:{generation}"
 
@@ -4145,6 +4149,7 @@ def maybe_schedule_rule_wake(
         "WAITING_FOR_CONTROLLER_PROGRESS",
         "WEB_REENTRY_SUBMITTED",
         "WEB_REENTRY_RESULT_UNKNOWN",
+        "WEB_REENTRY_RETRY_EXHAUSTED",
         "RESUME_STALLED_NO_PROGRESS",
     }:
         return "already_scheduled"
@@ -4323,7 +4328,7 @@ def continuation_supervisor_needs_bootstrap(
     if (
         terminal_key == delivery_key
         and terminal_receipt
-        and terminal_outcome in {"submit_confirmed", "result_unknown"}
+        and terminal_outcome in {"submit_confirmed", "result_unknown", "retry_exhausted"}
     ):
         return False
     legacy_receipt = str(supervisor_state.get("receipt_id") or "").strip()
@@ -4334,6 +4339,7 @@ def continuation_supervisor_needs_bootstrap(
             "WAITING_FOR_CONTROLLER_PROGRESS",
             "WEB_REENTRY_SUBMITTED",
             "WEB_REENTRY_RESULT_UNKNOWN",
+            "WEB_REENTRY_RETRY_EXHAUSTED",
             "RESUME_STALLED_NO_PROGRESS",
         }
     ):
@@ -4504,7 +4510,7 @@ def _schedule_auto_native_stop_locked(
         "RESUME_STALLED_NO_PROGRESS",
     }
     if same_receipt and (
-        (terminal_receipt == receipt_id and terminal_outcome in {"submit_confirmed", "result_unknown"})
+        (terminal_receipt == receipt_id and terminal_outcome in {"submit_confirmed", "result_unknown", "retry_exhausted"})
         or legacy_terminal
     ):
         prior["last_coalesced_at_unix_ms"] = int(time.time() * 1000)
@@ -5065,6 +5071,22 @@ def _run_auto_native_stop_impl(
                 "stderr_tail": bounded_tail(str(attempt.get("stderr_tail", ""))),
                 "retry_count": retry_count,
             })
+            if (
+                failure_class == "web_reentry_unavailable"
+                and retry_count >= WEB_REENTRY_TRANSIENT_RETRY_LIMIT
+            ):
+                terminal_now_ms = int(time.time() * 1000)
+                current.update({
+                    "state": "WEB_REENTRY_RETRY_EXHAUSTED",
+                    "failure_class": "web_reentry_retry_exhausted",
+                    "error_code": "WEB_REENTRY_RETRY_EXHAUSTED",
+                    "returncode": 78,
+                    "delivery_terminal_receipt_id": receipt_id,
+                    "delivery_terminal_key": _lifecycle_delivery_key(lifecycle_state),
+                    "delivery_terminal_outcome": "retry_exhausted",
+                    "delivery_terminal_at_unix_ms": terminal_now_ms,
+                    "completed_at_unix_ms": terminal_now_ms,
+                })
             if failure_class == "web_reentry_identity_unavailable":
                 current.update({
                     "last_lifecycle_fingerprint": fingerprint,
@@ -5099,6 +5121,8 @@ def _run_auto_native_stop_impl(
                 current.pop("blocked_since_unix_ms", None)
             write_auto_stop_state(state_path, current)
             if failure_class == "web_reentry_unavailable":
+                if retry_count >= WEB_REENTRY_TRANSIENT_RETRY_LIMIT:
+                    return 78
                 retry_delay = min(60.0, float(2 ** min(max(retry_count - 1, 0), 5)))
                 _rearm_auto_native_stop(
                     session_id=session_id, repo=repo, receipt_id=receipt_id, registry=registry,

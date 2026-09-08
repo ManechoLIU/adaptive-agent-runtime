@@ -9093,3 +9093,89 @@ def _same_terminal_receipt_cannot_be_rescheduled(self):
 WebLocalReentryIntegrationTests.test_strong_host_confirmed_submit_waits_without_rearm = _strong_host_confirmed_submit_waits_without_rearm
 WebContinuationSupervisorBootstrapTests.test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes = _terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes
 WebAutoStopSupervisorCoalescingTests.test_same_terminal_receipt_cannot_be_rescheduled = _same_terminal_receipt_cannot_be_rescheduled
+
+
+def _non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot(self):
+    lifecycle = {
+        "pending_control_event": True,
+        "requires_user": False,
+        "wake_generation": 22,
+        "triggers": ["READY:F2", "main_worktree_changed"],
+        "snapshot": {
+            "head": "h2", "ledger_sha256": "l2", "worktree_status_sha256": "w2",
+            "ready_ids": ["F2"], "runnable_ids": ["F2"], "candidate_revisions": [],
+            "rule_handshake": {
+                "installed_revision": "rev-current", "loaded_revision": "rev-current",
+                "state": "current", "blocking": False,
+            },
+        },
+    }
+    self.assertEqual(web_bridge._lifecycle_delivery_key(lifecycle), "wake-generation:22")
+    prior = {
+        "state": "WAITING_FOR_CONTROLLER_PROGRESS",
+        "receipt_id": "rule-update:rev-current",
+        "delivery_terminal_receipt_id": "rule-update:rev-current",
+        "delivery_terminal_key": "rule-update:rev-current",
+        "delivery_terminal_outcome": "submit_confirmed",
+    }
+    self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(lifecycle, prior))
+
+
+def _transient_web_reentry_retry_budget_exhausts_without_rearm(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "host_attested_same_controller_recovery", "binding_mode": "resume_only",
+            "identity_proof": "host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 8, "provenance": "web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id": "web-transient-budget", "session_id": "controller-1",
+            "repo": str(repo.resolve()), "state": "WEB_REENTRY_PENDING",
+            "pending_control_event": True,
+            "retry_count": web_bridge.WEB_REENTRY_TRANSIENT_RETRY_LIMIT - 1,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 23, "triggers": ["READY:F3"],
+            "snapshot": {"head":"h3","ledger_sha256":"l3","worktree_status_sha256":"w3","ready_ids":["F3"],"runnable_ids":["F3"],"candidate_revisions":[]},
+        }
+        attempt = {
+            "operation": "web_reentry", "result": "DEFERRED", "state": "WEB_REENTRY_PENDING",
+            "returncode": 78, "failure_class": "web_reentry_unavailable",
+            "error_code": "WEB_REENTRY_UNAVAILABLE", "stderr_tail": "temporary route gap",
+            "execution_target_session_id": "web-current", "target_generation": 4,
+            "ownership_generation": 8, "target_mode": "explicit_current",
+            "delivery_authorization": "host_attested", "host_attested": True,
+            "strong_web_identity_established": True,
+        }
+        def verifier(**_kwargs): return {"call_receipt": "host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(web_bridge, "_execute_registered_web_host_reentry", return_value=attempt), patch.object(
+            web_bridge, "schedule_auto_native_stop"
+        ) as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="web-transient-budget",
+                registry=registry, codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 78)
+    schedule.assert_not_called()
+    self.assertEqual(saved["retry_count"], web_bridge.WEB_REENTRY_TRANSIENT_RETRY_LIMIT)
+    self.assertEqual(saved["state"], "WEB_REENTRY_RETRY_EXHAUSTED")
+    self.assertEqual(saved["failure_class"], "web_reentry_retry_exhausted")
+    self.assertEqual(saved["delivery_terminal_outcome"], "retry_exhausted")
+    self.assertEqual(saved["delivery_terminal_key"], "wake-generation:23")
+
+
+WebContinuationSupervisorBootstrapTests.test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot = _non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot
+WebLocalReentryIntegrationTests.test_transient_web_reentry_retry_budget_exhausts_without_rearm = _transient_web_reentry_retry_budget_exhausts_without_rearm
