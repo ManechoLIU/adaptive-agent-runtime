@@ -174,6 +174,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_registered_host_nonretryable_failure_persists_quiet_fence",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_registered_host_result_unknown_persists_quiet_fence",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_confirmed_web_reentry_clears_stale_nonretryable_block_evidence",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
     "test_registered_current_web_adapter_is_fenced_and_host_attested",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."

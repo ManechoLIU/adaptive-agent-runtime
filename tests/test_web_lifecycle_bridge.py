@@ -8929,3 +8929,63 @@ def _registered_host_result_unknown_persists_quiet_fence(self):
 
 
 WebLocalReentryIntegrationTests.test_registered_host_result_unknown_persists_quiet_fence = _registered_host_result_unknown_persists_quiet_fence
+
+
+def _confirmed_web_reentry_clears_stale_nonretryable_block_evidence(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "manual_user_authorized", "binding_mode": "temporary",
+            "host_attested": False,
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 4, "provenance": "manual_user_authorized",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        stale_fence = web_bridge._controller_web_wait_fence(
+            registry=registry, controller_id="controller-1"
+        )
+        state_path.write_text(json.dumps({
+            "receipt_id": "recover-confirmed", "session_id": "controller-1",
+            "repo": str(repo.resolve()), "state": "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+            "pending_control_event": True,
+            "failure_class": "web_reentry_failed_before_dispatch",
+            "error_code": "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+            "blocked_controller_fence": stale_fence,
+            "blocked_since_unix_ms": 123,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 14, "triggers": ["NEW_EVENT"],
+            "snapshot": {"head":"h2","ledger_sha256":"l2","worktree_status_sha256":"w2","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+        }
+        confirmed = {
+            "operation":"web_reentry", "result":"CONFIRMED",
+            "state":"WEB_REENTRY_MANUAL_FENCED_SUBMITTED", "returncode":0,
+            "execution_target_session_id":"web-current", "target_generation":4,
+            "ownership_generation":4, "target_mode":"explicit_current",
+            "delivery_authorization":"manual_fenced", "host_attested":False,
+            "strong_web_identity_established":False,
+        }
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "execute_web_reentry", return_value=confirmed
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="recover-confirmed",
+                registry=registry, codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 0)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WAITING_FOR_CONTROLLER_PROGRESS")
+    self.assertNotIn("failure_class", saved)
+    self.assertNotIn("error_code", saved)
+    self.assertNotIn("blocked_controller_fence", saved)
+    self.assertNotIn("blocked_since_unix_ms", saved)
+
+
+WebLocalReentryIntegrationTests.test_confirmed_web_reentry_clears_stale_nonretryable_block_evidence = _confirmed_web_reentry_clears_stale_nonretryable_block_evidence

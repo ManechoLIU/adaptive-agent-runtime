@@ -4981,6 +4981,8 @@ def _run_auto_native_stop_impl(
                 current.pop("failure_class", None)
                 current.pop("error_code", None)
                 current.pop("blocked_registry_sha256", None)
+                current.pop("blocked_controller_fence", None)
+                current.pop("blocked_since_unix_ms", None)
                 if manual_fenced:
                     try:
                         waiting_controller_fence = _controller_web_wait_fence(

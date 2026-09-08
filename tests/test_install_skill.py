@@ -693,6 +693,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_nonretryable_web_failure_same_event_and_fence_stays_quiet",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_registered_host_nonretryable_failure_persists_quiet_fence",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_registered_host_result_unknown_persists_quiet_fence",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_confirmed_web_reentry_clears_stale_nonretryable_block_evidence",
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_registered_current_web_adapter_is_fenced_and_host_attested",
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_current_web_adapter_is_not_called_when_pre_delivery_attestation_rejects",
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_current_web_adapter_receipt_must_correlate_origin_call_receipt",
@@ -956,6 +957,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_waiting_for_controller_progress_does_not_bootstrap_until_machine_facts_change(self): self.assertTrue(True)\n"
                 "    def test_registered_host_nonretryable_failure_persists_quiet_fence(self): self.assertTrue(True)\n"
                 "    def test_registered_host_result_unknown_persists_quiet_fence(self): self.assertTrue(True)\n"
+                "    def test_confirmed_web_reentry_clears_stale_nonretryable_block_evidence(self): self.assertTrue(True)\n"
                 "class WebReentryDebounceTests(unittest.TestCase):\n"
                 "    def test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim(self): self.assertTrue(True)\n",
                 encoding="utf-8",
@@ -1241,7 +1243,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_nonretryable_web_failure_same_event_and_fence_stays_quiet(self): self.assertTrue(True)\n"
                 "class WebLocalReentryIntegrationTests(unittest.TestCase):\n"
                 "    def test_registered_host_nonretryable_failure_persists_quiet_fence(self): self.assertTrue(True)\n"
-                "    def test_registered_host_result_unknown_persists_quiet_fence(self): self.assertTrue(True)\n",
+                "    def test_registered_host_result_unknown_persists_quiet_fence(self): self.assertTrue(True)\n"
+                "    def test_confirmed_web_reentry_clears_stale_nonretryable_block_evidence(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(
