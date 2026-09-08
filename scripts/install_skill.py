@@ -556,6 +556,8 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "oversized non-reviewer Grok prompt fails before spawn without sharding",
     "Grok stderr and assignment heartbeat do not satisfy first stdout progress",
     "Grok reviewer shard cannot finalize and synthesis binds exact candidate head",
+    "Grok reviewer requires explicit phase and immutable candidate commit",
+    "Grok synthesis validates canonical same-candidate shard receipts",
     "Grok cleanup uncertainty is result unknown and not retry safe",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (

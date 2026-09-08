@@ -798,6 +798,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('oversized non-reviewer Grok prompt fails before spawn without sharding', () => { assert.equal(1, 1); });\n"
                 "test('Grok stderr and assignment heartbeat do not satisfy first stdout progress', () => { assert.equal(1, 1); });\n"
                 "test('Grok reviewer shard cannot finalize and synthesis binds exact candidate head', () => { assert.equal(1, 1); });\n"
+                "test('Grok reviewer requires explicit phase and immutable candidate commit', () => { assert.equal(1, 1); });\n"
+                "test('Grok synthesis validates canonical same-candidate shard receipts', () => { assert.equal(1, 1); });\n"
                 "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
@@ -1201,6 +1203,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('oversized non-reviewer Grok prompt fails before spawn without sharding', () => { assert.equal(1, 1); });\n"
                 "test('Grok stderr and assignment heartbeat do not satisfy first stdout progress', () => { assert.equal(1, 1); });\n"
                 "test('Grok reviewer shard cannot finalize and synthesis binds exact candidate head', () => { assert.equal(1, 1); });\n"
+                "test('Grok reviewer requires explicit phase and immutable candidate commit', () => { assert.equal(1, 1); });\n"
+                "test('Grok synthesis validates canonical same-candidate shard receipts', () => { assert.equal(1, 1); });\n"
                 "test('Grok cleanup uncertainty is result unknown and not retry safe', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )

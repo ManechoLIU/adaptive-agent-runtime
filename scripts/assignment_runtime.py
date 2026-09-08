@@ -263,14 +263,19 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
         if health_mode not in HEALTH_MODES:
             raise ValueError("unsupported runtime health_mode")
         execution_role = str(receipt.get("execution_role") or "").strip() or None
+        execution_transport = str(receipt.get("execution_transport") or "").strip() or None
         candidate_revision = str(receipt.get("candidate_revision") or "").strip() or None
         review_phase = str(receipt.get("review_phase") or "").strip().lower() or None
         raw_review_shards = receipt.get("review_shard_receipts")
         if execution_role == "reviewer":
             if not candidate_revision:
                 raise ValueError("reviewer runtime start requires candidate_revision")
+            if review_phase is None:
+                if execution_transport == "external_process":
+                    raise ValueError("external reviewer runtime start requires explicit review_phase=full|shard|synthesis")
+                review_phase = "full"
             if review_phase not in REVIEW_PHASES:
-                raise ValueError("reviewer runtime start requires explicit review_phase=full|shard|synthesis")
+                raise ValueError("reviewer runtime start requires review_phase=full|shard|synthesis")
             if review_phase == "synthesis":
                 if (
                     not isinstance(raw_review_shards, list)
@@ -351,7 +356,7 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
             "progress_deadline_at": _iso(issued + timedelta(minutes=deadline_minutes)),
             "last_progress_phase": "STARTED",
             "runtime_receipt_id": receipt.get("receipt_id"),
-            "execution_transport": str(receipt.get("execution_transport") or "").strip() or None,
+            "execution_transport": execution_transport,
             "execution_role": execution_role,
             "review_phase": review_phase,
             "review_shard_receipts": list(review_shard_receipts),

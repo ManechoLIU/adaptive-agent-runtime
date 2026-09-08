@@ -1026,13 +1026,21 @@ class ReviewerRuntimeContractTests(unittest.TestCase):
         self.assertEqual(state["leases"]["a2"]["review_phase"], "synthesis")
         self.assertEqual(state["leases"]["a2"]["review_shard_receipts"], ["receipt:a1:1:2"])
 
-    def test_reviewer_start_rejects_missing_or_invalid_phase(self):
+    def test_external_reviewer_start_rejects_missing_or_invalid_phase(self):
         for phase in (None, "bogus"):
             payload = receipt(
                 "assignment_started", agent_id="reviewer", execution_role="reviewer",
-                candidate_revision="a" * 40,
+                execution_transport="external_process", candidate_revision="a" * 40,
             )
             if phase is not None:
                 payload["review_phase"] = phase
             with self.assertRaisesRegex(ValueError, "review_phase"):
                 apply_receipt({}, payload, now=T0)
+
+    def test_non_external_reviewer_without_phase_defaults_to_full(self):
+        payload = receipt(
+            "assignment_started", agent_id="web-reviewer", execution_role="reviewer",
+            execution_transport="web", candidate_revision="a" * 40,
+        )
+        state = apply_receipt({}, payload, now=T0)
+        self.assertEqual(state["leases"]["a1"]["review_phase"], "full")
