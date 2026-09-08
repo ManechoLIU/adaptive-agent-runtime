@@ -2290,23 +2290,29 @@ def desktop_host_reload_required(
     )
     hooks_sha256 = _file_sha256(hooks_path)
     installed_revision = str(handshake.get("installed_revision") or "").strip()
-    registry = load_json(registry_path)
-    target = target_guard.target_record(
-        registry, controller_id=session_id, host=target_guard.DESKTOP_SESSION_HOST
-    )
-    ownership = target_guard.execution_ownership_record(
-        registry, controller_id=session_id
-    )
     try:
-        target_status, target_session_id, target_generation = (
-            target_guard.validate_target_record(
-                target or {}, host=target_guard.DESKTOP_SESSION_HOST
+        with target_guard.locked_registry(registry_path) as registry:
+            if target_guard.unique_controller_id_for_repo_in_registry(
+                repo, registry
+            ) != session_id:
+                return False
+            target = target_guard.target_record(
+                registry,
+                controller_id=session_id,
+                host=target_guard.DESKTOP_SESSION_HOST,
             )
-        )
-        ownership_host, ownership_target, ownership_generation = (
-            target_guard.validate_execution_ownership_record(ownership or {})
-        )
-    except (PermissionError, ValueError):
+            ownership = target_guard.execution_ownership_record(
+                registry, controller_id=session_id
+            )
+            target_status, target_session_id, target_generation = (
+                target_guard.validate_target_record(
+                    target or {}, host=target_guard.DESKTOP_SESSION_HOST
+                )
+            )
+            ownership_host, ownership_target, ownership_generation = (
+                target_guard.validate_execution_ownership_record(ownership or {})
+            )
+    except (OSError, PermissionError, ValueError):
         return False
     return (
         handshake.get("live_e2e_required") is True
@@ -5353,6 +5359,7 @@ def _run_auto_native_stop_impl(
         host_reload_required=desktop_host_reload_required(
             session_id=session_id,
             repo=repo,
+            registry_path=registry,
         ),
     )
 

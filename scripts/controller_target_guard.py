@@ -176,12 +176,19 @@ def registered_controller_for_repo(
     repo = repo.expanduser().resolve()
     registry_path = registry_path.expanduser()
     registry = load_json(registry_path)
+    return unique_controller_id_for_repo_in_registry(repo, registry), registry
+
+
+def unique_controller_id_for_repo_in_registry(
+    repo: Path, registry: dict[str, Any]
+) -> str:
+    """Resolve exactly one logical Controller from an already locked registry."""
     matches = _matching_controller_ids_for_repo(repo, registry)
     if len(matches) != 1:
         raise PermissionError(
             f"expected exactly one registered Controller for {repo}, found {len(matches)}"
         )
-    return matches[0], registry
+    return matches[0]
 
 
 def _project_controller_state_from_registry(

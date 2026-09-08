@@ -1354,6 +1354,12 @@ def arm_desktop_canary(
                 controller_id=controller_id,
                 canonical_root=canonical_root,
             )
+            if target_guard.unique_controller_id_for_repo_in_registry(
+                canonical_root, registry
+            ) != controller_id:
+                raise PermissionError(
+                    "desktop canary requires the unique project Controller"
+                )
             target_record = target_guard.target_record(
                 registry, controller_id=controller_id, host=DESKTOP_SESSION_HOST
             )
@@ -1487,6 +1493,10 @@ def record_desktop_canary_observation(
                 return current
             if event.get("controller_ownership_generation") != current.get(
                 "ownership_generation"
+            ):
+                return current
+            if event.get("controller_registry_path") != current.get(
+                "controller_registry_path"
             ):
                 return current
             observations = [
@@ -3126,8 +3136,17 @@ def run_hook() -> int:
             post_outbound_request = None
     path = state_path(controller_id)
     canary_ownership_current = False
+    normalized_event["controller_registry_path"] = str(
+        REGISTRY_PATH.expanduser().resolve()
+    )
     with target_guard.locked_registry(REGISTRY_PATH) as registry:
-        if target_guard.active_source_controller_id(
+        try:
+            unique_controller_id = target_guard.unique_controller_id_for_repo_in_registry(
+                expected_root, registry
+            )
+        except (OSError, ValueError, PermissionError):
+            return 0
+        if unique_controller_id != controller_id or target_guard.active_source_controller_id(
             registry,
             source_session_id=source_session_id,
             host=DESKTOP_SESSION_HOST,
@@ -3249,7 +3268,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.arm_desktop_canary,
                 repo=Path(args.repo).expanduser().resolve(),
             )
-        except (OSError, ValueError, PermissionError) as error:
+        except PermissionError as error:
+            print(str(error), file=sys.stderr)
+            return 78
+        except (OSError, ValueError) as error:
             print(str(error), file=sys.stderr)
             return 2
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))

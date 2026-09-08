@@ -2574,6 +2574,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
             self.assertEqual(wake["ownership_generation"], 7)
 
     def test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required(self) -> None:
+        import hashlib
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2593,6 +2594,30 @@ class WebLifecycleAuditTests(unittest.TestCase):
                     "execution_target_session_id": "desktop-current",
                     "generation": 7,
                 }},
+            }), encoding="utf-8")
+            runtime_state = repo / ".git" / "adaptive-delivery"
+            runtime_state.mkdir()
+            (runtime_state / "rule-handshake.json").write_text(json.dumps({
+                "live_e2e_required": True,
+                "installed_revision": "rev-2",
+                "loaded_revision": "rev-2",
+            }), encoding="utf-8")
+            hooks = root / "hooks.json"
+            hooks.write_text('{"hooks":{}}\n', encoding="utf-8")
+            canary = root / "desktop-canary.json"
+            canary.write_text(json.dumps({
+                "schema_version": 4,
+                "controller_id": "controller-1",
+                "controller_session_id": "controller-1",
+                "execution_target_session_id": "desktop-current",
+                "target_generation": 4,
+                "ownership_generation": 7,
+                "canonical_repo": str(repo.resolve()),
+                "controller_registry_path": str(registry.resolve()),
+                "status": "armed",
+                "sequence_index": 0,
+                "observations": [],
+                "hooks_sha256": hashlib.sha256(hooks.read_bytes()).hexdigest(),
             }), encoding="utf-8")
             state = root / "auto-stop.json"
             state.write_text(json.dumps({
@@ -2615,13 +2640,20 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 "target_mode": "explicit_current",
                 "host_observation": web_bridge._HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND,
             }
+            actual_reload_gate = web_bridge.desktop_host_reload_required
+
+            def reload_required(**kwargs):
+                return actual_reload_gate(
+                    **kwargs, canary_path=canary, hooks_path=hooks
+                )
+
             with patch.object(
                 web_bridge, "_load_lifecycle_state", return_value=lifecycle
             ), patch.object(
                 web_bridge, "execute_native_resume", return_value=already_foreground
             ), patch.object(
-                web_bridge, "desktop_host_reload_required", return_value=True
-            ), patch.object(web_bridge, "_rearm_auto_native_stop") as rearm:
+                web_bridge, "desktop_host_reload_required", side_effect=reload_required
+            ) as reload_gate, patch.object(web_bridge, "_rearm_auto_native_stop") as rearm:
                 code = web_bridge.run_auto_native_stop(
                     session_id="controller-1", repo=repo,
                     receipt_id="rule-update:rev-2", registry=registry,
@@ -2629,6 +2661,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 )
 
             self.assertEqual(code, 0)
+            self.assertEqual(reload_gate.call_args.kwargs["registry_path"], registry)
             rearm.assert_not_called()
             self.assertFalse(web_bridge.default_wake_receipt_path(repo).exists())
             persisted = json.loads(state.read_text(encoding="utf-8"))
@@ -2696,6 +2729,15 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 session_id="controller-1", repo=repo,
                 canary_path=canary, hooks_path=hooks, registry_path=registry,
             ))
+            conflicted_registry = json.loads(registry.read_text(encoding="utf-8"))
+            conflicted_registry["controller-2"] = str(repo.resolve())
+            registry.write_text(json.dumps(conflicted_registry), encoding="utf-8")
+            self.assertFalse(web_bridge.desktop_host_reload_required(
+                session_id="controller-1", repo=repo,
+                canary_path=canary, hooks_path=hooks, registry_path=registry,
+            ))
+            conflicted_registry.pop("controller-2")
+            registry.write_text(json.dumps(conflicted_registry), encoding="utf-8")
             value["sequence_index"] = 1
             value["observations"] = ["session_started"]
             canary.write_text(json.dumps(value), encoding="utf-8")
@@ -4233,6 +4275,10 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                 web_bridge, "execute_native_resume", side_effect=resume_then_supersede
             ), patch.object(
                 web_bridge, "preflight_native_resume", return_value=(True, "", {})
+            ), patch.object(
+                web_bridge.target_guard,
+                "unique_controller_id_for_repo_in_registry",
+                return_value="controller-1",
             ), patch.object(web_bridge.subprocess, "run", bootstrap):
                 code = web_bridge.run_auto_native_stop(
                     session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
@@ -4458,6 +4504,10 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                     "controller_host": "desktop_codex", "wake_generation": 1,
                 }), patch.object(web_bridge, "execute_native_resume", side_effect=native_resume), patch.object(
                     web_bridge.subprocess, "Popen", return_value=Mock(pid=2222)
+                ), patch.object(
+                    web_bridge.target_guard,
+                    "unique_controller_id_for_repo_in_registry",
+                    return_value="controller-1",
                 ), patch.object(web_bridge, "_pid_is_alive", return_value=True):
                     old_thread.start(); self.assertTrue(resume_entered.wait(1))
                     replacement_thread.start()
@@ -4495,7 +4545,7 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                 finally: done.set()
             t=threading.Thread(target=old)
             try:
-                with patch.object(web_bridge,"_load_lifecycle_state",side_effect=lifecycle), patch.object(web_bridge,"execute_native_resume",return_value=confirmed), patch.object(web_bridge.subprocess,"Popen",return_value=Mock(pid=2222)), patch.object(web_bridge,"_pid_is_alive",return_value=True):
+                with patch.object(web_bridge,"_load_lifecycle_state",side_effect=lifecycle), patch.object(web_bridge,"execute_native_resume",return_value=confirmed), patch.object(web_bridge.subprocess,"Popen",return_value=Mock(pid=2222)), patch.object(web_bridge.target_guard,"unique_controller_id_for_repo_in_registry",return_value="controller-1"), patch.object(web_bridge,"_pid_is_alive",return_value=True):
                     t.start(); self.assertTrue(second_read.wait(1)); self.assertTrue(web_bridge.schedule_auto_native_stop(session_id="controller-1",repo=repo,receipt_id="r1",registry=registry,codex="codex",delay_seconds=1,state_path=state,force_rearm=True,replace_supervisor_token=old_token)); new_token=json.loads(state.read_text())["supervisor_token"]; release.set(); self.assertTrue(done.wait(2))
             finally: release.set(); t.join(2)
             final=json.loads(state.read_text()); self.assertEqual(final["supervisor_token"],new_token); self.assertEqual(final["supervisor_pid"],2222); self.assertEqual(final["state"],"RESUME_PENDING")

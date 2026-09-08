@@ -9,6 +9,7 @@ class InstallCapabilityTests(unittest.TestCase):
     def test_desktop_adapter_is_enabled_only_by_an_exact_live_canary_receipt(self):
         import hashlib
         import json
+        import subprocess
         from datetime import datetime, timezone
 
         from scripts.install_skill import install_codex_hooks
@@ -34,6 +35,7 @@ class InstallCapabilityTests(unittest.TestCase):
             install_codex_hooks(hooks, skill_root, python_executable="/usr/bin/python3")
             repo = root / "repo"
             repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
             registry = root / "controllers.json"
             registry_value = {
                 "controller-1": str(repo.resolve()),
@@ -91,6 +93,7 @@ class InstallCapabilityTests(unittest.TestCase):
                 zshenv_file=root / ".zshenv",
                 skill_root=skill_root,
                 desktop_canary_file=canary,
+                controller_registry=registry,
             )
 
             self.assertEqual(report["desktop_adapter"]["status"], "enabled")
@@ -101,6 +104,56 @@ class InstallCapabilityTests(unittest.TestCase):
                 report["web_local_adapter"]["goal_display_sync"],
                 "degraded_host_capability_unavailable",
             )
+
+            other_registry = root / "other-controllers.json"
+            other_registry.write_text(json.dumps(registry_value), encoding="utf-8")
+            wrong_registry = detect_host_capabilities(
+                codex_executable=codex,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=hooks,
+                zshenv_file=root / ".zshenv",
+                skill_root=skill_root,
+                desktop_canary_file=canary,
+                controller_registry=other_registry,
+            )
+            self.assertEqual(wrong_registry["desktop_adapter"]["status"], "degraded")
+
+            boolean_generation_registry = json.loads(json.dumps(registry_value))
+            boolean_generation_registry["__controller_targets__"]["controller-1"][
+                "desktop_codex"
+            ]["generation"] = True
+            registry.write_text(
+                json.dumps(boolean_generation_registry), encoding="utf-8"
+            )
+            receipt["target_generation"] = 1
+            canary.write_text(json.dumps(receipt), encoding="utf-8")
+            boolean_generation = detect_host_capabilities(
+                codex_executable=codex,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=hooks,
+                zshenv_file=root / ".zshenv",
+                skill_root=skill_root,
+                desktop_canary_file=canary,
+                controller_registry=registry,
+            )
+            self.assertEqual(boolean_generation["desktop_adapter"]["status"], "degraded")
+
+            duplicate_registry = json.loads(json.dumps(registry_value))
+            duplicate_registry["controller-2"] = str(repo.resolve())
+            registry.write_text(json.dumps(duplicate_registry), encoding="utf-8")
+            receipt["target_generation"] = 4
+            canary.write_text(json.dumps(receipt), encoding="utf-8")
+            controller_conflict = detect_host_capabilities(
+                codex_executable=codex,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=hooks,
+                zshenv_file=root / ".zshenv",
+                skill_root=skill_root,
+                desktop_canary_file=canary,
+                controller_registry=registry,
+            )
+            self.assertEqual(controller_conflict["desktop_adapter"]["status"], "degraded")
+            registry.write_text(json.dumps(registry_value), encoding="utf-8")
 
             moved_registry = json.loads(json.dumps(registry_value))
             moved_registry["__controller_execution_ownership__"]["controller-1"] = {
@@ -116,6 +169,7 @@ class InstallCapabilityTests(unittest.TestCase):
                 zshenv_file=root / ".zshenv",
                 skill_root=skill_root,
                 desktop_canary_file=canary,
+                controller_registry=registry,
             )
             self.assertEqual(ownership_moved["desktop_adapter"]["status"], "degraded")
             registry.write_text(json.dumps(registry_value), encoding="utf-8")
@@ -130,6 +184,7 @@ class InstallCapabilityTests(unittest.TestCase):
                 zshenv_file=root / ".zshenv",
                 skill_root=skill_root,
                 desktop_canary_file=canary,
+                controller_registry=registry,
             )
             self.assertEqual(stale_guard["desktop_adapter"]["status"], "degraded")
 
@@ -146,6 +201,7 @@ class InstallCapabilityTests(unittest.TestCase):
                 zshenv_file=root / ".zshenv",
                 skill_root=skill_root,
                 desktop_canary_file=canary,
+                controller_registry=registry,
             )
             self.assertEqual(stale["desktop_adapter"]["status"], "degraded")
             self.assertIn("canary", stale["desktop_adapter"]["reason"].lower())

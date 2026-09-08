@@ -866,6 +866,10 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
                     "active_source_controller_id",
                     return_value="controller-1",
                 ), patch.object(
+                    lifecycle_hook.target_guard,
+                    "unique_controller_id_for_repo_in_registry",
+                    return_value="controller-1",
+                ), patch.object(
                     lifecycle_hook, "registry_controller_root_matches", return_value=True
                 ), patch.object(
                     lifecycle_hook, "persist_event_state", return_value=({}, {})
@@ -1467,9 +1471,8 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             canary = root / "desktop-canary.json"
             lifecycle_hook.arm_desktop_canary(
                 "controller-1",
-                execution_target_session_id="desktop-current",
-                target_generation=4,
-                ownership_generation=4,
+                repo=repo,
+                registry_path=registry,
                 canary_path=canary,
                 hooks_path=hooks,
                 skill_root=skill_root,
@@ -1514,6 +1517,34 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             self.assertEqual(receipt["observations"], ["session_started"])
 
             registry_value = json.loads(registry.read_text(encoding="utf-8"))
+            registry_value["controller-2"] = str(repo.resolve())
+            registry.write_text(json.dumps(registry_value), encoding="utf-8")
+            conflict_event = {
+                "hook_event_name": "PreToolUse",
+                "session_id": "desktop-current",
+                "turn_id": "turn-1",
+                "cwd": str(repo),
+                "tool_name": "exec_command",
+                "tool_input": {"cmd": "pwd"},
+            }
+            with patch.object(lifecycle_hook, "REGISTRY_PATH", registry), patch.object(
+                lifecycle_hook, "project_snapshot", return_value={"root": str(repo.resolve())}
+            ), patch.object(
+                lifecycle_hook, "controller_event_is_managed", return_value=True
+            ), patch.object(
+                lifecycle_hook,
+                "persist_event_state",
+                return_value=({}, {"active_turn_id": "turn-1", "must_yield": False}),
+            ), patch.object(
+                lifecycle_hook, "record_desktop_canary_observation", side_effect=record
+            ), patch.object(
+                sys, "stdin", StringIO(json.dumps(conflict_event))
+            ):
+                lifecycle_hook.run_hook()
+            during_conflict = json.loads(canary.read_text(encoding="utf-8"))
+            self.assertEqual(during_conflict["sequence_index"], 1)
+
+            registry_value.pop("controller-2")
             registry_value["__controller_execution_ownership__"]["controller-1"] = {
                 "active_host": "web",
                 "execution_target_session_id": "web-current",
@@ -1545,6 +1576,86 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
 
             after_handoff = json.loads(canary.read_text(encoding="utf-8"))
             self.assertEqual(after_handoff["sequence_index"], 1)
+
+    def test_run_hook_does_not_advance_canary_armed_from_another_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry_value = {
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                }},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }
+            armed_registry = root / "registry-a.json"
+            active_registry = root / "registry-b.json"
+            armed_registry.write_text(json.dumps(registry_value), encoding="utf-8")
+            active_registry.write_text(json.dumps(registry_value), encoding="utf-8")
+            skill_root = root / "adaptive-delivery"
+            (skill_root / "scripts").mkdir(parents=True)
+            (skill_root / "scripts" / "lifecycle_hook.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            (skill_root / "scripts" / "controller_target_guard.py").write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            hooks = root / "hooks.json"
+            hooks.write_text('{"hooks": {"SessionStart": []}}\n', encoding="utf-8")
+            canary = root / "desktop-canary.json"
+            lifecycle_hook.arm_desktop_canary(
+                "controller-1",
+                repo=repo,
+                registry_path=armed_registry,
+                canary_path=canary,
+                hooks_path=hooks,
+                skill_root=skill_root,
+            )
+
+            event = {
+                "hook_event_name": "SessionStart",
+                "session_id": "desktop-current",
+                "turn_id": "turn-1",
+                "cwd": str(repo),
+            }
+            actual_record = lifecycle_hook.record_desktop_canary_observation
+
+            def record(event, output, state):
+                return actual_record(
+                    event,
+                    output,
+                    state,
+                    canary_path=canary,
+                    hooks_path=hooks,
+                    skill_root=skill_root,
+                )
+
+            with patch.object(lifecycle_hook, "REGISTRY_PATH", active_registry), patch.object(
+                lifecycle_hook, "project_snapshot", return_value={"root": str(repo.resolve())}
+            ), patch.object(
+                lifecycle_hook, "controller_event_is_managed", return_value=True
+            ), patch.object(
+                lifecycle_hook,
+                "persist_event_state",
+                return_value=({}, {"active_turn_id": "turn-1", "must_yield": False}),
+            ), patch.object(
+                lifecycle_hook, "record_desktop_canary_observation", side_effect=record
+            ), patch.object(sys, "stdin", StringIO(json.dumps(event))):
+                code = lifecycle_hook.run_hook()
+
+            receipt = json.loads(canary.read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertEqual(receipt["sequence_index"], 0)
+            self.assertEqual(receipt["observations"], [])
 
     def test_arm_canary_cli_accepts_exact_execution_target_fences(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -1594,6 +1705,85 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             self.assertEqual(receipt["execution_target_session_id"], "desktop-current")
             self.assertEqual(receipt["target_generation"], 4)
             self.assertEqual(receipt["ownership_generation"], 7)
+
+    def test_arm_canary_cli_returns_identity_denial_for_non_desktop_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web",
+                    "execution_target_session_id": "web-current",
+                    "generation": 8,
+                }},
+            }), encoding="utf-8")
+            env = dict(os.environ)
+            env["AD_CONTROLLER_REGISTRY"] = str(registry)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SKILL_ROOT / "scripts" / "lifecycle_hook.py"),
+                    "--arm-desktop-canary",
+                    "controller-1",
+                    "--repo",
+                    str(repo),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 78)
+            self.assertIn("execution ownership", completed.stderr)
+
+    def test_arm_canary_cli_rejects_multiple_controllers_for_one_project(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "controller-2": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }), encoding="utf-8")
+            env = dict(os.environ)
+            env["AD_CONTROLLER_REGISTRY"] = str(registry)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SKILL_ROOT / "scripts" / "lifecycle_hook.py"),
+                    "--arm-desktop-canary",
+                    "controller-1",
+                    "--repo",
+                    str(repo),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 78)
+            self.assertIn("exactly one registered Controller", completed.stderr)
 
     def test_arm_canary_records_controller_target_and_generation_fences(self) -> None:
         with tempfile.TemporaryDirectory() as d:

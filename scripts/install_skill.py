@@ -19,6 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+try:
+    import controller_target_guard as target_guard
+except ModuleNotFoundError:
+    from scripts import controller_target_guard as target_guard
+
 UTC = timezone.utc
 PRODUCT_NAME = "Adaptive Agent Runtime"
 SKILL_ID = "adaptive-agent-runtime"
@@ -696,55 +701,61 @@ DESKTOP_CANARY_SEQUENCE = (
 DESKTOP_CANARY_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
-def _desktop_canary_registry_fence_current(receipt: dict[str, Any]) -> bool:
+def _desktop_canary_registry_fence_current(
+    receipt: dict[str, Any], *, registry_path: Path
+) -> bool:
     controller_id = str(receipt.get("controller_id") or "").strip()
     target_session_id = str(receipt.get("execution_target_session_id") or "").strip()
     repo_value = str(receipt.get("canonical_repo") or "").strip()
     registry_value = str(receipt.get("controller_registry_path") or "").strip()
     if not controller_id or not target_session_id or not repo_value or not registry_value:
         return False
+    expected_registry_path = registry_path.expanduser().resolve()
     try:
         repo = Path(repo_value).expanduser().resolve()
-        registry = json.loads(
-            Path(registry_value).expanduser().read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(registry, dict):
-        return False
-    registered_repo = registry.get(controller_id)
-    if not isinstance(registered_repo, str):
-        return False
-    try:
-        if Path(registered_repo).expanduser().resolve() != repo:
+        if Path(registry_value).expanduser().resolve() != expected_registry_path:
             return False
     except OSError:
         return False
-    targets = registry.get("__controller_targets__")
-    ownership = registry.get("__controller_execution_ownership__")
-    if not isinstance(targets, dict) or not isinstance(ownership, dict):
+    try:
+        with target_guard.locked_registry(expected_registry_path) as registry:
+            registered_controller = target_guard.unique_controller_id_for_repo_in_registry(
+                repo, registry
+            )
+            if registered_controller != controller_id:
+                return False
+            target = target_guard.target_record(
+                registry, controller_id=controller_id, host="desktop_codex"
+            )
+            owner = target_guard.execution_ownership_record(
+                registry, controller_id=controller_id
+            )
+            if target is None or owner is None:
+                return False
+            target_status, registered_target, target_generation = (
+                target_guard.validate_target_record(target, host="desktop_codex")
+            )
+            ownership_host, ownership_target, ownership_generation = (
+                target_guard.validate_execution_ownership_record(owner)
+            )
+    except (OSError, ValueError, PermissionError):
         return False
-    controller_targets = targets.get(controller_id)
-    target = (
-        controller_targets.get("desktop_codex")
-        if isinstance(controller_targets, dict)
-        else None
-    )
-    owner = ownership.get(controller_id)
     return (
-        isinstance(target, dict)
-        and target.get("status") == "active"
-        and target.get("session_id") == target_session_id
-        and target.get("generation") == receipt.get("target_generation")
-        and isinstance(owner, dict)
-        and owner.get("active_host") == "desktop_codex"
-        and owner.get("execution_target_session_id") == target_session_id
-        and owner.get("generation") == receipt.get("ownership_generation")
+        target_status == "active"
+        and registered_target == target_session_id
+        and target_generation == receipt.get("target_generation")
+        and ownership_host == "desktop_codex"
+        and ownership_target == target_session_id
+        and ownership_generation == receipt.get("ownership_generation")
     )
 
 
 def _valid_desktop_canary(
-    path: Path, *, hooks_path: Path, skill_root: Path | None
+    path: Path,
+    *,
+    hooks_path: Path,
+    skill_root: Path | None,
+    controller_registry_path: Path,
 ) -> bool:
     if skill_root is None:
         return False
@@ -795,7 +806,9 @@ def _valid_desktop_canary(
         and receipt.get("lifecycle_sha256") == lifecycle_sha256
         and receipt.get("controller_target_guard_sha256") == target_guard_sha256
         and observations == list(DESKTOP_CANARY_SEQUENCE)
-        and _desktop_canary_registry_fence_current(receipt)
+        and _desktop_canary_registry_fence_current(
+            receipt, registry_path=controller_registry_path
+        )
     )
 
 
@@ -1131,6 +1144,7 @@ def detect_host_capabilities(
     health_service_plist: str | Path = DEFAULT_WEB_AGENT_HEALTH_PLIST,
     web_event_source_receipt: str | Path = DEFAULT_WEB_AGENT_EVENT_SOURCE,
     runtime_supervisor_heartbeat: str | Path = DEFAULT_CONTROLLER_RUNTIME_HEARTBEAT,
+    controller_registry: str | Path = DEFAULT_CONTROLLER_REGISTRY,
 ) -> dict[str, dict[str, Any]]:
     codex_path = Path(codex_executable).expanduser() if codex_executable else None
     if codex_path is None:
@@ -1140,6 +1154,7 @@ def detect_host_capabilities(
     hooks_path = Path(hooks_file).expanduser()
     zshenv_path = Path(zshenv_file).expanduser()
     desktop_canary_path = Path(desktop_canary_file).expanduser()
+    controller_registry_path = Path(controller_registry).expanduser().resolve()
     skill_root_path = Path(skill_root).expanduser().resolve() if skill_root is not None else None
     health_service_path = Path(health_service_plist).expanduser().resolve(strict=False)
     health_service_configured = _health_service_plist_matches(
@@ -1187,7 +1202,10 @@ def detect_host_capabilities(
         )
     )
     canary_valid = _valid_desktop_canary(
-        desktop_canary_path, hooks_path=hooks_path, skill_root=skill_root_path
+        desktop_canary_path,
+        hooks_path=hooks_path,
+        skill_root=skill_root_path,
+        controller_registry_path=controller_registry_path,
     )
     if not codex_available:
         desktop = {
@@ -1542,6 +1560,7 @@ def configure_host_adapters(
     zshenv_file: str | Path = DEFAULT_ZSHENV,
     python_executable: str | None = None,
     configure_ai_bridge: bool = True,
+    controller_registry: str | Path = DEFAULT_CONTROLLER_REGISTRY,
 ) -> dict[str, dict[str, Any]]:
     target_path = Path(target).expanduser().resolve()
     codex_path = Path(codex_executable).expanduser() if codex_executable else None
@@ -1559,6 +1578,7 @@ def configure_host_adapters(
         hooks_file=hooks_file,
         zshenv_file=zshenv_file,
         skill_root=target_path,
+        controller_registry=controller_registry,
     )
 
 
@@ -1798,6 +1818,7 @@ def install_skill(
     stop_condition: str,
     previous_revision: str | None = None,
     now: datetime | None = None,
+    controller_registry: str | Path = DEFAULT_CONTROLLER_REGISTRY,
 ) -> dict[str, Any]:
     source_path = Path(source).expanduser().resolve()
     target_path = Path(target).expanduser().resolve()
@@ -1845,7 +1866,9 @@ def install_skill(
         tracked = _materialize_revision(source_path, revision, stage)
         hashes = {relative: _sha256(stage / relative) for relative in tracked}
         installed_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        staged_capabilities = detect_host_capabilities(skill_root=target_path)
+        staged_capabilities = detect_host_capabilities(
+            skill_root=target_path, controller_registry=controller_registry
+        )
         staged_capabilities["controller_identity"] = _installed_controller_identity_capability(stage)
         manifest: dict[str, Any] = {
             "schema_version": 1,
@@ -2029,6 +2052,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest = install_skill(
                     args.source, target_path, summary=args.summary, impact=args.impact,
                     stop_condition=args.stop_condition, previous_revision=args.previous_revision,
+                    controller_registry=args.controller_registry,
                 )
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
                 print(f"adaptive-agent-runtime-install: blocked: {error}")
@@ -2068,6 +2092,7 @@ def _run_install_transaction(
             manifest = install_skill(
                 args.source, target_path, summary=args.summary, impact=args.impact,
                 stop_condition=args.stop_condition, previous_revision=args.previous_revision,
+                controller_registry=args.controller_registry,
             )
             if not args.no_configure_runtime_services:
                 service = configure_runtime_services(
@@ -2084,6 +2109,7 @@ def _run_install_transaction(
                     hooks_file=hooks_path,
                     zshenv_file=zshenv_path,
                     configure_ai_bridge=not args.no_configure_ai_bridge,
+                    controller_registry=args.controller_registry,
                 )
             manifest["capabilities"] = detect_host_capabilities(
                 codex_executable=args.codex,
@@ -2092,6 +2118,7 @@ def _run_install_transaction(
                 zshenv_file=zshenv_path,
                 skill_root=target_path,
                 health_service_plist=health_service_path,
+                controller_registry=args.controller_registry,
             )
             _write_json_atomic(target_path / MANIFEST_NAME, manifest)
         except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
