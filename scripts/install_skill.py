@@ -74,6 +74,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_production_bridge_has_no_trusted_web_attestation_verifier",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_registered_web_verifier_loads_pinned_external_runtime_host_cli",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_malformed_registered_web_verifier_config_fails_closed_without_manual_fallback",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_browser_tab_receipt_cannot_recover_an_unverified_web_session",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_replace_web_session_bootstrap_rotates_target_and_manual_lease_without_host_attestation",

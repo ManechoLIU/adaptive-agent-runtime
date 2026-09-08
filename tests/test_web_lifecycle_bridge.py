@@ -519,6 +519,107 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "controller-1",
             )
 
+    def test_registered_web_verifier_loads_pinned_external_runtime_host_cli(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "request=json.loads(sys.stdin.read())\n"
+                "print(json.dumps({'ok': True, 'operation': 'attest_and_verify', "
+                "'challenge_id': 'hc_runtime', 'host_receipt_id': 'hr_runtime', "
+                "'verified_target': {'provenance': 'runtime_host_verifier_v1', "
+                "'conversation_id': request['conversation_id'], "
+                "'browser_target_id': 'target-runtime', 'top_frame_id': 'top-runtime', "
+                "'loader_id': 'loader-runtime', 'secure_origin': 'https://chatgpt.com', "
+                "'target_generation': request['target_generation'], "
+                "'ownership_generation': request['ownership_generation']}}))\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({
+                "schema_version": 1,
+                "verifiers": {
+                    "web": {
+                        "protocol": "runtime_host_verifier_cli_v1",
+                        "executable": str(executable),
+                        "sha256": digest,
+                    }
+                },
+            }), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(
+                web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config,
+                create=True,
+            ):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                self.assertTrue(callable(verifier))
+                origin = verifier(
+                    phase="pre_delivery",
+                    controller_id="controller-1",
+                    host="web",
+                    expected_target_session_id="web-new",
+                    expected_target_generation=4,
+                    expected_target_mode="same_controller_session_recovery",
+                    expected_ownership_generation=9,
+                )
+                self.assertEqual(origin, {
+                    "origin_host": "chatgpt_web",
+                    "origin_conversation_id": "web-new",
+                    "origin_attested": True,
+                    "call_receipt": "hr_runtime",
+                })
+                self.assertIs(
+                    verifier(
+                        controller_id="controller-1",
+                        host="web",
+                        expected_target_session_id="web-new",
+                        expected_target_generation=4,
+                        expected_target_mode="same_controller_session_recovery",
+                        expected_ownership_generation=9,
+                    ),
+                    True,
+                )
+
+    def test_malformed_registered_web_verifier_config_fails_closed_without_manual_fallback(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({
+                "schema_version": 1,
+                "verifiers": {
+                    "web": {
+                        "protocol": "runtime_host_verifier_cli_v1",
+                        "executable": str(executable),
+                        "sha256": "0" * 64,
+                    }
+                },
+            }), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(
+                web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config,
+                create=True,
+            ):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                self.assertTrue(callable(verifier))
+                with self.assertRaisesRegex(PermissionError, "hash|registered.*verifier"):
+                    verifier(
+                        phase="pre_delivery",
+                        controller_id="controller-1",
+                        host="web",
+                        expected_target_session_id="web-new",
+                        expected_target_generation=4,
+                        expected_ownership_generation=9,
+                    )
+
     def test_production_bridge_has_no_trusted_web_attestation_verifier(self) -> None:
         self.assertIsNone(web_bridge._registered_peer_attestation_verifier("web"))
         self.assertIsNone(web_bridge._registered_peer_attestation_verifier("desktop_codex"))

@@ -37,7 +37,10 @@ except ModuleNotFoundError:
 
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 DEFAULT_MANUAL_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
+DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG = Path.home() / ".codex" / "adaptive-delivery-host-attestation-verifiers.json"
 _PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., Any]] = {}
+PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS = 8
+PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT = 64 * 1024
 DEFAULT_MANUAL_WEB_LEASE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_AUDIT_LOG = (
     Path.home()
@@ -830,6 +833,7 @@ def recover_same_controller_web_session(
             expected_target_session_id=web_session_id,
             expected_target_generation=prior_generation,
             expected_target_mode="same_controller_session_recovery",
+            expected_ownership_generation=ownership_generation,
             host_execution_receipt=host_identity_receipt,
             adapter_attempt={
                 "operation": "controller_session_identity_recovery",
@@ -2458,9 +2462,133 @@ def _bounded_adapter_diagnostics(value: Any) -> str | None:
     return bounded_tail(value)
 
 
+def _rejecting_peer_attestation_verifier(message: str) -> Callable[..., Any]:
+    def reject(**_kwargs: Any) -> Any:
+        raise PermissionError(message)
+    return reject
+
+
+def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
+    config_path = Path(DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG).expanduser()
+    if not config_path.exists():
+        return None
+    try:
+        config_stat = config_path.lstat()
+        if config_path.is_symlink() or not config_path.is_file():
+            raise PermissionError("registered Host verifier config must be a regular non-symlink file")
+        if hasattr(os, "getuid") and config_stat.st_uid != os.getuid():
+            raise PermissionError("registered Host verifier config owner mismatch")
+        if config_stat.st_mode & 0o077:
+            raise PermissionError("registered Host verifier config permissions must be 0600 or stricter")
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict) or config.get("schema_version") != 1:
+            raise PermissionError("registered Host verifier config schema is invalid")
+        verifiers = config.get("verifiers")
+        if not isinstance(verifiers, dict):
+            raise PermissionError("registered Host verifier map is invalid")
+        record = verifiers.get(host)
+        if record is None:
+            return None
+        if not isinstance(record, dict):
+            raise PermissionError("registered Host verifier record is invalid")
+        if record.get("protocol") != "runtime_host_verifier_cli_v1":
+            raise PermissionError("registered Host verifier protocol is unsupported")
+        executable_raw = record.get("executable")
+        digest = record.get("sha256")
+        if not isinstance(executable_raw, str) or not executable_raw.strip():
+            raise PermissionError("registered Host verifier executable is missing")
+        executable = Path(executable_raw).expanduser()
+        if not executable.is_absolute():
+            raise PermissionError("registered Host verifier executable must be absolute")
+        executable_stat = executable.lstat()
+        if executable.is_symlink() or not executable.is_file():
+            raise PermissionError("registered Host verifier executable must be a regular non-symlink file")
+        if hasattr(os, "getuid") and executable_stat.st_uid != os.getuid():
+            raise PermissionError("registered Host verifier executable owner mismatch")
+        if executable_stat.st_mode & 0o111 == 0:
+            raise PermissionError("registered Host verifier executable is not executable")
+        actual_digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+        if not isinstance(digest, str) or len(digest) != 64 or not secrets.compare_digest(actual_digest, digest.lower()):
+            raise PermissionError("registered Host verifier executable hash mismatch")
+    except Exception as exc:
+        return _rejecting_peer_attestation_verifier(
+            f"registered Host verifier configuration rejected: {exc}"
+        )
+
+    def verify(**kwargs: Any) -> Any:
+        expected_host = str(kwargs.get("host") or "").strip()
+        if expected_host != host:
+            raise PermissionError("registered Host verifier host mismatch")
+        conversation_id = str(kwargs.get("expected_target_session_id") or "").strip()
+        target_generation = kwargs.get("expected_target_generation")
+        ownership_generation = kwargs.get("expected_ownership_generation")
+        if not conversation_id:
+            raise PermissionError("registered Host verifier requires exact target session")
+        for value, name in ((target_generation, "target generation"), (ownership_generation, "ownership generation")):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise PermissionError(f"registered Host verifier requires positive {name}")
+        request = {
+            "operation": "attest_and_verify",
+            "conversation_id": conversation_id,
+            "target_generation": target_generation,
+            "ownership_generation": ownership_generation,
+        }
+        safe_env = {
+            "HOME": str(Path.home()),
+            "PATH": DEFAULT_RUNTIME_PATH,
+            "LANG": "C.UTF-8",
+        }
+        try:
+            completed = subprocess.run(
+                [str(executable)],
+                input=json.dumps(request, ensure_ascii=False, sort_keys=True) + "\n",
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS,
+                env=safe_env,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise PermissionError(f"registered Host verifier execution failed: {exc}") from exc
+        if len(completed.stdout.encode("utf-8", errors="replace")) > PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT:
+            raise PermissionError("registered Host verifier output exceeds limit")
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise PermissionError("registered Host verifier returned invalid JSON") from exc
+        if completed.returncode != 0 or not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise PermissionError("registered Host verifier rejected machine attestation")
+        verified = payload.get("verified_target")
+        receipt = payload.get("host_receipt_id")
+        if (
+            not isinstance(verified, dict)
+            or verified.get("provenance") != "runtime_host_verifier_v1"
+            or verified.get("conversation_id") != conversation_id
+            or verified.get("target_generation") != target_generation
+            or verified.get("ownership_generation") != ownership_generation
+            or not isinstance(receipt, str)
+            or not receipt.strip()
+            or len(receipt.encode("utf-8")) > 512
+        ):
+            raise PermissionError("registered Host verifier returned mismatched verified target")
+        if kwargs.get("phase") == "pre_delivery":
+            return {
+                "origin_host": "chatgpt_web" if host == "web" else host,
+                "origin_conversation_id": conversation_id,
+                "origin_attested": True,
+                "call_receipt": receipt.strip(),
+            }
+        return True
+
+    return verify
+
+
 def _registered_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
     """Return only a verifier registered by this bridge's trusted host boundary."""
-    return _PEER_HOST_ATTESTATION_VERIFIERS.get(host)
+    builtin = _PEER_HOST_ATTESTATION_VERIFIERS.get(host)
+    if callable(builtin):
+        return builtin
+    return _external_peer_attestation_verifier(host)
 
 
 def _validated_web_origin_attestation(
