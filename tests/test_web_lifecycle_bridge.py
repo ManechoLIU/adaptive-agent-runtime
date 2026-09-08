@@ -4978,7 +4978,13 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             return {"result": "CONFIRMED", "operation": "untrusted-current-host-adapter"}
 
         with tempfile.TemporaryDirectory() as tmp:
+            missing_verifier = Path(tmp) / "missing-host-verifiers.json"
             with patch.object(
+                web_bridge,
+                "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG",
+                missing_verifier,
+                create=True,
+            ), patch.object(
                 web_bridge,
                 "execute_native_resume",
                 wraps=web_bridge.execute_native_resume,
