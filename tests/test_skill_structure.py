@@ -361,6 +361,9 @@ class SkillStructureTests(unittest.TestCase):
         for phrase in (
             "scripts/install_skill.py",
             "scripts/rule_handshake.py ack",
+            "source_session_id",
+            "logical Controller ID",
+            "explicit canonical current target",
             "rule_update_pending:<revision>",
             "git rev-parse --git-common-dir",
             "runtime-assignments.json",

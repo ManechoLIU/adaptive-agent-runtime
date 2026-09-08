@@ -527,19 +527,10 @@ def require_web_controller_session(
         registry, controller_id=controller_id, host="web"
     )
     if record is None:
-        aliases = target_guard.host_sessions(
-            registry, controller_id=controller_id, host="web"
-        )
-        verified = (
-            len(aliases) == 1
-            and aliases[0] == value
-            and registered_controller_session(
-                controller_id=controller_id,
-                session_id=value,
-                host="web",
-                registry_path=registry_path,
-            )
-        )
+        # Web lineage is historical ownership only. Without an explicit current
+        # target there is no authorized Web execution entry, even if exactly one
+        # alias exists or it matches a legacy logical Controller identifier.
+        verified = False
     else:
         verified = (
             record.get("host_attested") is not False
@@ -631,9 +622,10 @@ def _rotated_manual_web_resume_lease_payload(
         return payload, False
     if record.get("provenance") != "manual_user_authorized" or record.get("mode") != "resume_only":
         return payload, False
+    # Target rotation must not leave a same-Controller manual lease pointing at a
+    # historical alias. Retarget the lease metadata even when it is already
+    # expired/suspended; preserve authorization/expiry exactly and never renew it.
     expires_at = record.get("expires_at_unix")
-    if not isinstance(expires_at, int) or isinstance(expires_at, bool) or expires_at <= now_unix:
-        return payload, False
     lease_repo_value = record.get("repo")
     if not isinstance(lease_repo_value, str) or not lease_repo_value.strip():
         return payload, False
@@ -668,11 +660,11 @@ def rotate_existing_manual_web_resume_lease(
     lease_path: Path | None = None,
     now_unix: int | None = None,
 ) -> bool:
-    """Carry an existing user-authorized resume-only lease across Web target rotation.
+    """Keep an existing manual resume lease aligned with Web target rotation.
 
-    This never creates authorization. It only retargets an unexpired lease that already
-    belongs to the same logical Controller and repository, preserving its original
-    authorization time and expiry.
+    This never creates or renews authorization. It retargets an existing lease record
+    that belongs to the same logical Controller/repository, including an already
+    expired or suspended record, while preserving its authorization time and expiry.
     """
     repo = canonical_root(repo)
     lease_path = Path(lease_path or DEFAULT_MANUAL_WEB_LEASES).expanduser()
@@ -796,6 +788,31 @@ def recover_same_controller_web_session(
     controller_id = str(project.get("controller_id") or "").strip()
     if not controller_id:
         raise PermissionError("same-controller recovery has no existing controller_id")
+
+    # Host attestation proves that a browser conversation exists and matches the
+    # requested generation fence; it does not prove that an arbitrary historical
+    # alias or unrelated project chat is the user's intended successor Controller.
+    # Recovery therefore may only upgrade the already-canonical current Web target
+    # in place. Any target session change requires the explicit replace-web-session
+    # path first, which records a new manual/temporary current target.
+    registry_snapshot = load_json(registry_path)
+    current_target_record = target_guard.target_record(
+        registry_snapshot, controller_id=controller_id, host="web"
+    )
+    if not isinstance(current_target_record, dict):
+        raise PermissionError(
+            "same-controller Web recovery requires an explicit canonical current target; "
+            "use replace-web-session after explicit target authorization"
+        )
+    current_status, current_target_session, _current_target_generation = (
+        target_guard.validate_target_record(current_target_record, host="web")
+    )
+    if current_status != "active" or current_target_session != web_session_id:
+        raise PermissionError(
+            "same-controller Web recovery cannot replace the canonical current target; "
+            "historical/unbound sessions require explicit replace-web-session authorization"
+        )
+
     if binding.get("verification") == "CONFLICT":
         raise PermissionError(
             "verified Web Controller Session identity required; "

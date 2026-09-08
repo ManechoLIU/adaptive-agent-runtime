@@ -688,6 +688,12 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_registered_current_web_adapter_without_ownership_is_never_called",
             "tests.test_web_lifecycle_bridge.WebReentryDebounceTests.test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim",
             "tests.test_rule_handshake.RuleHandshakeTests.test_live_e2e_rejects_stale_ownership_generation_before_acceptance",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_fake_project_chat_cannot_ack_by_claiming_logical_controller_id",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_current_web_target_ack_records_exact_source_and_generations",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_fake_project_chat_cannot_accept_or_defer_live_e2e",
+            "tests.test_governance.ControllerActionSourcePromptTests.test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source",
+            "tests.test_governance.ControllerActionSourcePromptTests.test_live_e2e_accept_prompt_carries_actual_execution_source",
+            "tests.test_governance.ControllerActionSourcePromptTests.test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source",
             "tests.test_web_reentry_adapter.AiBridgeMcpDiscoveryTests.test_discovery_selects_only_live_loopback_endpoint_and_accepts_url_prefix",
         }
         self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
@@ -824,7 +830,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_missing_required_identity_capability_reports_contract_drift_without_revoking_controller(self): self.assertTrue(True)\n"
                 "    def test_contract_drift_does_not_upgrade_foreign_unverified_session_to_degraded(self): self.assertTrue(True)\n"
                 "    def test_project_context_separates_unique_controller_from_unverified_web_session(self): self.assertTrue(True)\n"
-                "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n",
+                "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n"
+                "class ControllerActionSourcePromptTests(unittest.TestCase):\n"
+                "    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_accept_prompt_carries_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_rule_handshake.py").write_text(
@@ -836,7 +846,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_failed_live_e2e_does_not_freeze_invalid_wake_snapshot(self): self.assertTrue(True)\n"
                 "    def test_live_e2e_debt_survives_later_nonimpacting_install_until_accepted(self): self.assertTrue(True)\n"
                 "    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self): self.assertTrue(True)\n"
-                "    def test_live_e2e_rejects_stale_ownership_generation_before_acceptance(self): self.assertTrue(True)\n",
+                "    def test_live_e2e_rejects_stale_ownership_generation_before_acceptance(self): self.assertTrue(True)\n"
+                "    def test_fake_project_chat_cannot_ack_by_claiming_logical_controller_id(self): self.assertTrue(True)\n"
+                "    def test_current_web_target_ack_records_exact_source_and_generations(self): self.assertTrue(True)\n"
+                "    def test_fake_project_chat_cannot_accept_or_defer_live_e2e(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_controller_target_guard.py").write_text(
@@ -973,7 +986,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_hard_blocked_or_deferred_actions_clear_continuation_debt_and_allow_yield(self): self.assertTrue(True)\n"
                 "    def test_continuation_debt_fingerprint_escalates_through_existing_recurrence_rules(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self): self.assertTrue(True)\n"
-                "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n",
+                "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n"
+                "class ControllerActionSourcePromptTests(unittest.TestCase):\n"
+                "    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_accept_prompt_carries_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_desktop_lifecycle_adapter.py").write_text(
@@ -1125,7 +1142,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_runtime_state_creation_after_prompt_invalidates_fact_receipt_before_stop(self): self.assertTrue(True)\n"
                 "    def test_nested_correction_refresh_preserves_full_applicable_agents_scope_chain(self): self.assertTrue(True)\n"
                 "    def test_project_context_separates_unique_controller_from_unverified_web_session(self): self.assertTrue(True)\n"
-                "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n",
+                "    def test_project_context_reports_verified_bound_web_session_without_changing_ownership(self): self.assertTrue(True)\n"
+                "class ControllerActionSourcePromptTests(unittest.TestCase):\n"
+                "    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_accept_prompt_carries_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_rule_handshake.py").write_text(
@@ -1136,7 +1157,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_real_confirmed_wake_followed_by_closed_cycle_can_finalize_live_e2e(self): self.assertTrue(True)\n"
                 "    def test_failed_live_e2e_does_not_freeze_invalid_wake_snapshot(self): self.assertTrue(True)\n"
                 "    def test_live_e2e_debt_survives_later_nonimpacting_install_until_accepted(self): self.assertTrue(True)\n"
-                "    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self): self.assertTrue(True)\n",
+                "    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self): self.assertTrue(True)\n"
+                "    def test_fake_project_chat_cannot_ack_by_claiming_logical_controller_id(self): self.assertTrue(True)\n"
+                "    def test_current_web_target_ack_records_exact_source_and_generations(self): self.assertTrue(True)\n"
+                "    def test_fake_project_chat_cannot_accept_or_defer_live_e2e(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_controller_target_guard.py").write_text(
@@ -1222,7 +1246,11 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_hard_blocked_or_deferred_actions_clear_continuation_debt_and_allow_yield(self): self.assertTrue(True)\n"
                 "    def test_continuation_debt_fingerprint_escalates_through_existing_recurrence_rules(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self): self.assertTrue(True)\n"
-                "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n",
+                "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n"
+                "class ControllerActionSourcePromptTests(unittest.TestCase):\n"
+                "    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_live_e2e_accept_prompt_carries_actual_execution_source(self): self.assertTrue(True)\n"
+                "    def test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_desktop_lifecycle_adapter.py").write_text(

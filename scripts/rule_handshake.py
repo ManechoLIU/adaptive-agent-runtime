@@ -17,6 +17,11 @@ try:
 except ModuleNotFoundError:
     from scripts.project_state import adaptive_delivery_state_dir, git_common_dir, repository_root
 
+try:
+    import controller_target_guard as target_guard
+except ModuleNotFoundError:
+    from scripts import controller_target_guard as target_guard
+
 UTC = timezone.utc
 MANIFEST_NAME = ".adaptive-delivery-install.json"
 LEDGER_NAMES = ("TASK_LEDGER.md", "PROJECT_STATUS.md")
@@ -449,6 +454,8 @@ def accept_live_e2e(
     *,
     skill_root: str | Path | None = None,
     registry_path: str | Path | None = None,
+    execution_host: str | None = None,
+    source_session_id: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     manifest_path = install_manifest_path(skill_root)
@@ -479,6 +486,13 @@ def accept_live_e2e(
         same_repo = False
     if not same_repo:
         raise ValueError("live E2E requires the unique registered Controller for this repository")
+    action_source = validate_controller_action_source(
+        repo,
+        controller_session_id,
+        execution_host=execution_host,
+        source_session_id=source_session_id,
+        registry_path=registry_file,
+    )
 
     state_root = adaptive_delivery_state_dir(repo)
     wake_source = state_root / "controller-wake-receipt.json"
@@ -532,6 +546,11 @@ def accept_live_e2e(
             "status": "accepted",
             "installed_revision": installed,
             "controller_session_id": controller_session_id,
+            "execution_host": action_source["execution_host"],
+            "source_session_id": action_source["source_session_id"],
+            "target_generation": action_source["target_generation"],
+            "ownership_generation": action_source["ownership_generation"],
+            "controller_action_source": action_source,
             "accepted_at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
             "manifest_sha256": _sha256(manifest_path),
             "wake_evidence_path": str(temporary_path.resolve()),
@@ -596,6 +615,8 @@ def defer_live_e2e(
     reason: str,
     skill_root: str | Path | None = None,
     registry_path: str | Path | None = None,
+    execution_host: str | None = None,
+    source_session_id: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     reason = str(reason or "").strip()
@@ -625,12 +646,23 @@ def defer_live_e2e(
             raise ValueError("live E2E deferral Controller is not registered for this repository")
     except (OSError, ValueError):
         raise ValueError("live E2E deferral Controller is not registered for this repository") from None
+    action_source = validate_controller_action_source(
+        repo,
+        controller_session_id,
+        execution_host=execution_host,
+        source_session_id=source_session_id,
+        registry_path=registry_file,
+    )
 
     deferred_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
     updated = {
         **state,
         "live_e2e_deferred_revision": installed,
         "live_e2e_deferred_by_controller": controller_session_id,
+        "live_e2e_deferred_execution_host": action_source["execution_host"],
+        "live_e2e_deferred_source_session_id": action_source["source_session_id"],
+        "live_e2e_deferred_target_generation": action_source["target_generation"],
+        "live_e2e_deferred_ownership_generation": action_source["ownership_generation"],
         "live_e2e_deferred_reason": reason,
         "live_e2e_deferred_at": deferred_at,
     }
@@ -640,8 +672,105 @@ def defer_live_e2e(
         "status": "deferred",
         "installed_revision": installed,
         "controller_session_id": controller_session_id,
+        "execution_host": action_source["execution_host"],
+        "source_session_id": action_source["source_session_id"],
+        "target_generation": action_source["target_generation"],
+        "ownership_generation": action_source["ownership_generation"],
+        "controller_action_source": action_source,
         "reason": reason,
         "deferred_at": deferred_at,
+    }
+
+
+
+def validate_controller_action_source(
+    repo: str | Path,
+    controller_session_id: str,
+    *,
+    execution_host: str | None,
+    source_session_id: str | None,
+    registry_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Require the caller's execution entry to be this Controller's exact current target.
+
+    This is an operational current-target gate. It intentionally rejects logical
+    Controller-ID fallback and historical aliases. Strong Web invocation-origin
+    attestation remains a Host capability; this gate prevents ordinary project
+    chats from acquiring Controller authority merely by knowing controller_id.
+    """
+    host = str(execution_host or "").strip()
+    source = str(source_session_id or "").strip()
+    if host not in target_guard.SUPPORTED_HOSTS:
+        raise ValueError("Controller action requires an explicit supported execution host")
+    if not source:
+        raise ValueError("Controller action requires an explicit source execution session")
+    registry_file = Path(registry_path).expanduser().resolve() if registry_path else DEFAULT_REGISTRY
+    registry = _read_json(registry_file)
+
+    registered = registry.get(controller_session_id)
+    if not isinstance(registered, str) or not registered.strip():
+        raise ValueError("Controller action requires a registered logical Controller")
+    try:
+        if git_common_dir(registered) != git_common_dir(repo):
+            raise ValueError("Controller action logical Controller is not registered for this repository")
+    except (OSError, ValueError):
+        raise ValueError("Controller action logical Controller is not registered for this repository") from None
+
+    owner = target_guard.active_source_controller_id(
+        registry, source_session_id=source, host=host
+    )
+    if owner != controller_session_id:
+        raise ValueError("Controller action source is not the canonical current execution target")
+
+    target = target_guard.target_record(
+        registry, controller_id=controller_session_id, host=host
+    )
+    if not isinstance(target, dict):
+        raise ValueError("Controller action requires an explicit canonical current target")
+    status, target_session, target_generation = target_guard.validate_target_record(
+        target, host=host
+    )
+    if status != "active" or target_session != source:
+        raise ValueError("Controller action source does not match the active current target")
+
+    ownership = target_guard.execution_ownership_record(
+        registry, controller_id=controller_session_id
+    )
+    if not isinstance(ownership, dict):
+        raise ValueError("Controller action requires canonical execution ownership")
+    ownership_host, ownership_target, ownership_generation = (
+        target_guard.validate_execution_ownership_record(ownership)
+    )
+    if ownership_host != host or ownership_target != source:
+        raise ValueError("Controller action source does not match canonical execution ownership")
+
+    identity = target_guard.controller_identity_projection(
+        repo=Path(repo),
+        host=host,
+        source_session_id=source,
+        registry_path=registry_file,
+    )
+    binding = identity.get("session_binding_state")
+    if not isinstance(binding, dict) or identity.get("controller_actions_allowed") is not True:
+        verification = str(binding.get("verification") or "UNVERIFIED") if isinstance(binding, dict) else "UNVERIFIED"
+        reason = str(binding.get("reason") or "CONTROLLER_ACTION_IDENTITY_UNAVAILABLE") if isinstance(binding, dict) else "CONTROLLER_ACTION_IDENTITY_UNAVAILABLE"
+        raise ValueError(
+            "Controller action source is not authorized for Controller actions "
+            f"(verification={verification}, reason={reason})"
+        )
+
+    return {
+        "execution_host": host,
+        "source_session_id": source,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+        "target_provenance": target.get("provenance"),
+        "target_binding_mode": target.get("binding_mode"),
+        "target_host_attested": target.get("host_attested"),
+        "ownership_provenance": ownership.get("provenance"),
+        "identity_state": identity.get("identity_state"),
+        "session_verification": binding.get("verification"),
+        "controller_actions_allowed": True,
     }
 
 
@@ -652,6 +781,8 @@ def acknowledge_rule_revision(
     *,
     skill_root: str | Path | None = None,
     registry_path: str | Path | None = None,
+    execution_host: str | None = None,
+    source_session_id: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     manifest_path = install_manifest_path(skill_root)
@@ -665,7 +796,8 @@ def acknowledge_rule_revision(
     if errors:
         raise ValueError("installation integrity failed: " + "; ".join(errors))
 
-    registry = _read_json(Path(registry_path).expanduser().resolve() if registry_path else DEFAULT_REGISTRY)
+    registry_file = Path(registry_path).expanduser().resolve() if registry_path else DEFAULT_REGISTRY
+    registry = _read_json(registry_file)
     registered = registry.get(controller_session_id)
     if not isinstance(registered, str) or not registered.strip():
         raise ValueError("loaded ACK requires a registered controller session")
@@ -674,6 +806,13 @@ def acknowledge_rule_revision(
             raise ValueError("loaded ACK controller is not registered for this repository")
     except (OSError, ValueError):
         raise ValueError("loaded ACK controller is not registered for this repository") from None
+    action_source = validate_controller_action_source(
+        repo,
+        controller_session_id,
+        execution_host=execution_host,
+        source_session_id=source_session_id,
+        registry_path=registry_file,
+    )
 
     prior_state = load_rule_state(repo)
     prior_loaded = str(prior_state.get("loaded_revision") or "").strip() or None
@@ -712,6 +851,11 @@ def acknowledge_rule_revision(
         "installed_revision": installed,
         "loaded_revision": installed,
         "controller_session_id": controller_session_id,
+        "execution_host": action_source["execution_host"],
+        "source_session_id": action_source["source_session_id"],
+        "target_generation": action_source["target_generation"],
+        "ownership_generation": action_source["ownership_generation"],
+        "controller_action_source": action_source,
         "acknowledged_at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
         "manifest_sha256": _sha256(manifest_path),
         "live_e2e_required": live_e2e_required,
@@ -742,18 +886,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     ack = sub.add_parser("ack")
     ack.add_argument("--repo", required=True)
     ack.add_argument("--controller-session", required=True)
+    ack.add_argument("--execution-host", required=True, choices=target_guard.SUPPORTED_HOSTS)
+    ack.add_argument("--source-session", required=True)
     ack.add_argument("--revision", required=True)
     ack.add_argument("--skill-root")
     ack.add_argument("--registry")
     live_e2e = sub.add_parser("accept-live-e2e")
     live_e2e.add_argument("--repo", required=True)
     live_e2e.add_argument("--controller-session", required=True)
+    live_e2e.add_argument("--execution-host", required=True, choices=target_guard.SUPPORTED_HOSTS)
+    live_e2e.add_argument("--source-session", required=True)
     live_e2e.add_argument("--revision", required=True)
     live_e2e.add_argument("--skill-root")
     live_e2e.add_argument("--registry")
     defer_e2e = sub.add_parser("defer-live-e2e")
     defer_e2e.add_argument("--repo", required=True)
     defer_e2e.add_argument("--controller-session", required=True)
+    defer_e2e.add_argument("--execution-host", required=True, choices=target_guard.SUPPORTED_HOSTS)
+    defer_e2e.add_argument("--source-session", required=True)
     defer_e2e.add_argument("--revision", required=True)
     defer_e2e.add_argument("--reason", required=True)
     defer_e2e.add_argument("--skill-root")
@@ -775,6 +925,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.revision,
                 skill_root=args.skill_root,
                 registry_path=args.registry,
+                execution_host=args.execution_host,
+                source_session_id=args.source_session,
             )
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
             return 0
@@ -785,6 +937,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.revision,
                 skill_root=args.skill_root,
                 registry_path=args.registry,
+                execution_host=args.execution_host,
+                source_session_id=args.source_session,
             )
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
             return 0
@@ -796,6 +950,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reason=args.reason,
                 skill_root=args.skill_root,
                 registry_path=args.registry,
+                execution_host=args.execution_host,
+                source_session_id=args.source_session,
             )
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
             return 0

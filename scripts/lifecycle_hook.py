@@ -826,6 +826,25 @@ def _non_rule_triggers(triggers: list[str] | set[str]) -> set[str]:
     }
 
 
+
+def _controller_action_context(event: dict[str, Any]) -> dict[str, str]:
+    host = str(event.get("execution_host") or event.get("controller_host") or "").strip()
+    controller_id = str(
+        event.get("controller_session_id") or event.get("controller_id") or event.get("session_id") or ""
+    ).strip()
+    if host == "web":
+        source = str(
+            event.get("web_session_id") or event.get("source_session_id") or event.get("session_id") or ""
+        ).strip()
+    else:
+        source = str(event.get("source_session_id") or event.get("session_id") or "").strip()
+    return {
+        "session_id": controller_id,
+        "source_session_id": source,
+        "execution_host": host,
+    }
+
+
 def continuation_reason(
     triggers: list[str],
     ready_ids: list[str],
@@ -835,6 +854,8 @@ def continuation_reason(
     rule_handshake: dict[str, Any] | None = None,
     root: str | None = None,
     session_id: str | None = None,
+    source_session_id: str | None = None,
+    execution_host: str | None = None,
     next_action: str | None = None,
 ) -> str:
     runnable_ids = list(runnable_ids or ready_ids)
@@ -851,22 +872,26 @@ def continuation_reason(
         stop = str(handshake.get("stop_condition", "")).strip()
         repo_arg = f" --repo {root}" if root else " --repo <repo>"
         session_arg = f" --controller-session {session_id}" if session_id else " --controller-session <controller-session>"
+        host_arg = f" --execution-host {execution_host}" if execution_host else " --execution-host <web|desktop_codex>"
+        source_arg = f" --source-session {source_session_id}" if source_session_id else " --source-session <current-execution-session>"
         handshake_script = Path(__file__).resolve().parent / "rule_handshake.py"
         rule_text = (
             f" 规则更新待加载：{revision}；摘要：{summary}；影响：{impact}；停止条件：{stop}。"
             "先读取已安装的新规则，再执行 "
-            f'python3 "{handshake_script}" ack{repo_arg}{session_arg} --revision {revision}，随后同步现有台账规则版本行。'
+            f'python3 "{handshake_script}" ack{repo_arg}{session_arg}{host_arg}{source_arg} --revision {revision}，随后同步现有台账规则版本行。'
         )
     elif state == "ledger_stale":
         rule_text = f" 已有 LOADED ACK {revision}，但台账规则版本仍旧；先把现有规则版本行同步到精确 revision {revision}。"
     elif state == "pending_live_e2e":
         repo_arg = f" --repo {root}" if root else " --repo <repo>"
         session_arg = f" --controller-session {session_id}" if session_id else " --controller-session <controller-session>"
+        host_arg = f" --execution-host {execution_host}" if execution_host else " --execution-host <web|desktop_codex>"
+        source_arg = f" --source-session {source_session_id}" if source_session_id else " --source-session <current-execution-session>"
         handshake_script = Path(__file__).resolve().parent / "rule_handshake.py"
         rule_text = (
             f" Runtime {revision} 已 ACK 且台账已同步，但真实续接 E2E 尚未闭合。"
             "当前同一 Controller 只允许安全控制回合，不得启动新的 Assignment；完成真实 confirmed wake 后的 CLOSED control cycle，再执行 "
-            f'python3 "{handshake_script}" accept-live-e2e{repo_arg}{session_arg} --revision {revision}。'
+            f'python3 "{handshake_script}" accept-live-e2e{repo_arg}{session_arg}{host_arg}{source_arg} --revision {revision}。'
         )
     elif state == "integrity_error":
         errors = "; ".join(str(item) for item in handshake.get("errors", []))
@@ -1201,7 +1226,8 @@ def evaluate_event(
             list(snapshot.get("ready_ids", [])),
             list(snapshot.get("candidate_revisions", [])),
             runnable_ids=list(snapshot.get("runnable_ids", snapshot.get("ready_ids", []))),
-            rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
+            rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"),
+            **_controller_action_context(event),
             next_action=pending_next_action if continuation_pending else None,
         )
         if pending_terminal_receipts:
@@ -1335,7 +1361,8 @@ def evaluate_event(
             list(snapshot.get("ready_ids", [])),
             list(snapshot.get("candidate_revisions", [])),
             runnable_ids=list(snapshot.get("runnable_ids", snapshot.get("ready_ids", []))),
-            rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
+            rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"),
+            **_controller_action_context(event),
             next_action=pending_next_action if continuation_pending else None,
         )
         return {
@@ -1353,7 +1380,8 @@ def evaluate_event(
             list(snapshot.get("ready_ids", [])),
             list(snapshot.get("candidate_revisions", [])),
             runnable_ids=list(snapshot.get("runnable_ids", snapshot.get("ready_ids", []))),
-            rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"), session_id=str(event.get("session_id", "")),
+            rule_handshake=snapshot.get("rule_handshake"), root=snapshot.get("root"),
+            **_controller_action_context(event),
             next_action=pending_next_action if continuation_pending else None,
         )
         return {"decision": "block", "reason": reason}, state

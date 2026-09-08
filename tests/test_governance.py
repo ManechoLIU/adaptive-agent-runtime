@@ -5755,3 +5755,79 @@ class WebDispatchRuntimeGateTests(unittest.TestCase):
             }
             errors = canonical_web_dispatch_errors(repo, snapshot)
         self.assertTrue(any("canonical Runtime dispatch" in error for error in errors))
+
+
+class ControllerActionSourcePromptTests(unittest.TestCase):
+    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self) -> None:
+        text = lifecycle_hook.continuation_reason(
+            ["rule_update_pending:rev-new"], [], [],
+            rule_handshake={
+                "state": "pending_ack",
+                "installed_revision": "rev-new",
+                "summary": "source gate",
+                "impact": "live_assignments",
+                "stop_condition": "ack from current target only",
+            },
+            root="/repo",
+            session_id="controller-1",
+            source_session_id="web-current",
+            execution_host="web",
+        )
+        self.assertIn("--controller-session controller-1", text)
+        self.assertIn("--execution-host web", text)
+        self.assertIn("--source-session web-current", text)
+        self.assertIn("--revision rev-new", text)
+
+    def test_live_e2e_accept_prompt_carries_actual_execution_source(self) -> None:
+        text = lifecycle_hook.continuation_reason(
+            ["rule_live_e2e_pending:rev-new"], [], [],
+            rule_handshake={
+                "state": "pending_live_e2e",
+                "installed_revision": "rev-new",
+            },
+            root="/repo",
+            session_id="controller-1",
+            source_session_id="desktop-current",
+            execution_host="desktop_codex",
+        )
+        self.assertIn("accept-live-e2e", text)
+        self.assertIn("--controller-session controller-1", text)
+        self.assertIn("--execution-host desktop_codex", text)
+        self.assertIn("--source-session desktop-current", text)
+        self.assertIn("--revision rev-new", text)
+
+
+def _web_bridge_event_uses_actual_web_conversation_as_controller_action_source(self) -> None:
+    from scripts import web_lifecycle_bridge
+    event = web_lifecycle_bridge.post_tool_event(
+        session_id="controller-1",
+        repo=Path("/tmp/controller-source-project"),
+        command="true",
+        web_session_id="web-current-conversation",
+        execution_host="web",
+    )
+    context = lifecycle_hook._controller_action_context(event)
+    self.assertEqual(context["session_id"], "controller-1")
+    self.assertEqual(context["execution_host"], "web")
+    self.assertEqual(context["source_session_id"], "web-current-conversation")
+
+
+ControllerActionSourcePromptTests.test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source = _web_bridge_event_uses_actual_web_conversation_as_controller_action_source
+
+
+def _web_bridge_event_uses_actual_web_conversation_as_controller_action_source(self) -> None:
+    from scripts import web_lifecycle_bridge
+    event = web_lifecycle_bridge.post_tool_event(
+        session_id="controller-1",
+        repo=Path("/tmp/controller-source-project"),
+        command="true",
+        web_session_id="web-current-conversation",
+        execution_host="web",
+    )
+    context = lifecycle_hook._controller_action_context(event)
+    self.assertEqual(context["session_id"], "controller-1")
+    self.assertEqual(context["execution_host"], "web")
+    self.assertEqual(context["source_session_id"], "web-current-conversation")
+
+
+ControllerActionSourcePromptTests.test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source = _web_bridge_event_uses_actual_web_conversation_as_controller_action_source

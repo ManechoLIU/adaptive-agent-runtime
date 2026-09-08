@@ -176,6 +176,18 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack",
     "tests.test_rule_handshake.RuleHandshakeTests."
     "test_live_e2e_rejects_stale_ownership_generation_before_acceptance",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_fake_project_chat_cannot_ack_by_claiming_logical_controller_id",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_current_web_target_ack_records_exact_source_and_generations",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_fake_project_chat_cannot_accept_or_defer_live_e2e",
+    "tests.test_governance.ControllerActionSourcePromptTests."
+    "test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source",
+    "tests.test_governance.ControllerActionSourcePromptTests."
+    "test_live_e2e_accept_prompt_carries_actual_execution_source",
+    "tests.test_governance.ControllerActionSourcePromptTests."
+    "test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source",
     "tests.test_web_lifecycle_bridge.WebReentryDebounceTests."
     "test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."

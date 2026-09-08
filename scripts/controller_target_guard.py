@@ -358,19 +358,10 @@ def controller_identity_projection(
                     registry, controller_id=project_controller, host=host
                 )
                 if record is None:
-                    if (
-                        host == "web"
-                        and supplied_session in aliases
-                        and len(aliases) == 1
-                    ):
-                        verification = "VERIFIED"
-                        reason = "BOUND_REGISTERED_WEB_SESSION"
-                        mode = "legacy_single_binding"
-                        generation = 0
-                    elif host == "web" and supplied_session in aliases:
-                        verification = "STALE"
+                    if host == "web" and (supplied_session in aliases or supplied_session == project_controller):
+                        verification = "STALE" if supplied_session in aliases else "UNVERIFIED"
                         reason = "EXPLICIT_CURRENT_TARGET_REQUIRED"
-                        mode = "historical_alias"
+                        mode = "historical_alias" if supplied_session in aliases else None
                         generation = 0
                     elif not aliases and supplied_session == project_controller:
                         verification = "VERIFIED"
