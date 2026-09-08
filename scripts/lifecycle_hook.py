@@ -543,6 +543,8 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
             break
     while remaining and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", remaining[0]):
         remaining.pop(0)
+    if remaining and remaining[0] == "--":
+        remaining.pop(0)
     return remaining
 
 
@@ -557,18 +559,66 @@ def _persistent_foreground_segment(tokens: list[str]) -> bool:
         return _persistent_foreground_segment(tokens[1:]) if len(tokens) > 1 else False
     if executable in {"bash", "sh", "zsh"}:
         for index, token in enumerate(tokens[1:], start=1):
-            if token in {"-c", "-lc"} and index + 1 < len(tokens):
+            if (
+                token.startswith("-")
+                and not token.startswith("--")
+                and "c" in token[1:]
+                and index + 1 < len(tokens)
+            ):
                 return _persistent_foreground_command(tokens[index + 1])
         return False
     lowered = [token.lower() for token in tokens]
-    if executable in {"npx", "bunx"} and len(tokens) > 1:
-        return _persistent_foreground_segment(tokens[1:])
-    if executable == "yarn" and len(tokens) > 2 and lowered[1] == "dlx":
-        return _persistent_foreground_segment(tokens[2:])
     if len(tokens) == 2 and tokens[1] in {
         "--help", "-h", "--version", "-v", "-V"
     }:
         return False
+    if executable in {"command", "exec", "nohup"}:
+        index = 1
+        if executable == "command" and any(
+            token in {"-v", "-V"} for token in tokens[index:]
+        ):
+            return False
+        while index < len(tokens) and tokens[index].startswith("-"):
+            if tokens[index] == "--":
+                index += 1
+                break
+            index += 1
+        return _persistent_foreground_segment(tokens[index:])
+    if executable == "nice":
+        index = 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            token = lowered[index]
+            if token in {"-n", "--adjustment"} and index + 1 < len(tokens):
+                index += 2
+                continue
+            index += 1
+        return _persistent_foreground_segment(tokens[index:])
+    if executable == "corepack" and len(tokens) > 1:
+        index = 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            index += 1
+        if index < len(tokens) and lowered[index] in {"pnpm", "npm", "yarn", "bun"}:
+            return _persistent_foreground_segment(tokens[index:])
+        return False
+    if executable in {"npx", "bunx"} and len(tokens) > 1:
+        index = 1
+        while index < len(tokens):
+            token = lowered[index]
+            if token == "--":
+                index += 1
+                break
+            if token in {"--call", "-c"} and index + 1 < len(tokens):
+                return _persistent_foreground_command(tokens[index + 1])
+            if token in {"--package", "-p", "--cache"} and index + 1 < len(tokens):
+                index += 2
+                continue
+            if token.startswith(("--package=", "--cache=")) or token.startswith("-"):
+                index += 1
+                continue
+            break
+        return _persistent_foreground_segment(tokens[index:])
+    if executable == "yarn" and len(tokens) > 2 and lowered[1] == "dlx":
+        return _persistent_foreground_segment(tokens[2:])
     if executable == "tsx" and "watch" in lowered[1:]:
         return True
     if (
