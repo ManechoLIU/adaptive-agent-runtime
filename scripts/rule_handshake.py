@@ -569,39 +569,59 @@ def accept_live_e2e(
         )
         if acceptance_errors:
             raise ValueError("live E2E acceptance failed: " + "; ".join(acceptance_errors))
-        if wake_snapshot.exists():
-            if wake_snapshot.read_text(encoding="utf-8") != encoded_wake:
-                raise ValueError("immutable live E2E wake snapshot already exists with different content")
-            temporary_path.unlink()
-        else:
-            os.replace(temporary_path, wake_snapshot)
-        receipt = {
-            **provisional,
-            "wake_evidence_path": str(wake_snapshot.resolve()),
-            "wake_evidence_sha256": _sha256(wake_snapshot),
-        }
-        final_errors = _live_e2e_acceptance_errors(
-            repo,
-            receipt,
-            manifest_path=manifest_path,
-            installed_revision=installed,
-            controller_session_id=controller_session_id,
-            registry_path=registry_file,
-            validate_current_target=True,
-        )
-        if final_errors:
-            raise ValueError("live E2E acceptance failed: " + "; ".join(final_errors))
-        _write_json_atomic(live_e2e_acceptance_path(repo), receipt)
-        updated_state = {
-            **state,
-            "live_e2e_required": False,
-            "live_e2e_required_since_revision": None,
-            "live_e2e_required_changed_files": [],
-            "live_e2e_accepted_revision": installed,
-            "live_e2e_accepted_at": receipt["accepted_at"],
-        }
-        _write_json_atomic(rule_state_path(repo), updated_state)
-        return receipt
+        with target_guard.locked_registry(registry_file, exclusive=True) as locked_registry:
+            _revalidate_controller_action_source_fence_locked(
+                locked_registry,
+                repo=repo,
+                controller_session_id=controller_session_id,
+                action_source=action_source,
+            )
+            # The registry cannot rotate while this final acceptance validation and
+            # the durable acceptance writes execute.
+            final_errors = _live_e2e_acceptance_errors(
+                repo,
+                provisional,
+                manifest_path=manifest_path,
+                installed_revision=installed,
+                controller_session_id=controller_session_id,
+                registry_path=registry_file,
+                validate_current_target=True,
+            )
+            if final_errors:
+                raise ValueError("live E2E acceptance failed: " + "; ".join(final_errors))
+            if wake_snapshot.exists():
+                if wake_snapshot.read_text(encoding="utf-8") != encoded_wake:
+                    raise ValueError("immutable live E2E wake snapshot already exists with different content")
+                temporary_path.unlink()
+            else:
+                os.replace(temporary_path, wake_snapshot)
+            receipt = {
+                **provisional,
+                "wake_evidence_path": str(wake_snapshot.resolve()),
+                "wake_evidence_sha256": _sha256(wake_snapshot),
+            }
+            final_errors = _live_e2e_acceptance_errors(
+                repo,
+                receipt,
+                manifest_path=manifest_path,
+                installed_revision=installed,
+                controller_session_id=controller_session_id,
+                registry_path=registry_file,
+                validate_current_target=True,
+            )
+            if final_errors:
+                raise ValueError("live E2E acceptance failed: " + "; ".join(final_errors))
+            _write_json_atomic(live_e2e_acceptance_path(repo), receipt)
+            updated_state = {
+                **state,
+                "live_e2e_required": False,
+                "live_e2e_required_since_revision": None,
+                "live_e2e_required_changed_files": [],
+                "live_e2e_accepted_revision": installed,
+                "live_e2e_accepted_at": receipt["accepted_at"],
+            }
+            _write_json_atomic(rule_state_path(repo), updated_state)
+            return receipt
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
@@ -666,7 +686,14 @@ def defer_live_e2e(
         "live_e2e_deferred_reason": reason,
         "live_e2e_deferred_at": deferred_at,
     }
-    _write_json_atomic(rule_state_path(repo), updated)
+    with target_guard.locked_registry(registry_file, exclusive=True) as locked_registry:
+        _revalidate_controller_action_source_fence_locked(
+            locked_registry,
+            repo=repo,
+            controller_session_id=controller_session_id,
+            action_source=action_source,
+        )
+        _write_json_atomic(rule_state_path(repo), updated)
     return {
         "schema_version": 1,
         "status": "deferred",
@@ -774,6 +801,87 @@ def validate_controller_action_source(
     }
 
 
+
+def _revalidate_controller_action_source_fence_locked(
+    registry: dict[str, Any],
+    *,
+    repo: str | Path,
+    controller_session_id: str,
+    action_source: dict[str, Any],
+) -> None:
+    """Revalidate the exact Controller source against a registry snapshot held under EX lock.
+
+    This intentionally does not call the full identity projection again; the full
+    authorization decision already happened before entering the critical section.
+    Here we fence only the machine facts that can rotate concurrently: current
+    target session/generation and canonical execution ownership generation.
+    """
+    host = str(action_source.get("execution_host") or "").strip()
+    source = str(action_source.get("source_session_id") or "").strip()
+    expected_target_generation = action_source.get("target_generation")
+    expected_ownership_generation = action_source.get("ownership_generation")
+
+    registered = registry.get(controller_session_id)
+    try:
+        same_repo = (
+            isinstance(registered, str)
+            and git_common_dir(registered) == git_common_dir(repo)
+        )
+    except (OSError, ValueError):
+        same_repo = False
+    if not same_repo:
+        raise ValueError(
+            "Controller action source changed before Controller action persistence"
+        )
+
+    target = target_guard.target_record(
+        registry, controller_id=controller_session_id, host=host
+    )
+    if not isinstance(target, dict):
+        raise ValueError(
+            "Controller action source changed before Controller action persistence"
+        )
+    try:
+        status, current_source, current_target_generation = (
+            target_guard.validate_target_record(target, host=host)
+        )
+    except ValueError:
+        raise ValueError(
+            "Controller action source changed before Controller action persistence"
+        ) from None
+    if (
+        status != "active"
+        or current_source != source
+        or current_target_generation != expected_target_generation
+    ):
+        raise ValueError(
+            "Controller action source changed before Controller action persistence"
+        )
+
+    ownership = target_guard.execution_ownership_record(
+        registry, controller_id=controller_session_id
+    )
+    if not isinstance(ownership, dict):
+        raise ValueError(
+            "Controller action source changed before Controller action persistence"
+        )
+    try:
+        ownership_host, ownership_source, ownership_generation = (
+            target_guard.validate_execution_ownership_record(ownership)
+        )
+    except ValueError:
+        raise ValueError(
+            "Controller action source changed before Controller action persistence"
+        ) from None
+    if (
+        ownership_host != host
+        or ownership_source != source
+        or ownership_generation != expected_ownership_generation
+    ):
+        raise ValueError(
+            "Controller action source changed before Controller action persistence"
+        )
+
 def acknowledge_rule_revision(
     repo: str | Path,
     controller_session_id: str,
@@ -864,7 +972,14 @@ def acknowledge_rule_revision(
         "live_e2e_accepted_revision": prior_state.get("live_e2e_accepted_revision"),
         "live_e2e_accepted_at": prior_state.get("live_e2e_accepted_at"),
     }
-    _write_json_atomic(rule_state_path(repo), receipt)
+    with target_guard.locked_registry(registry_file, exclusive=True) as locked_registry:
+        _revalidate_controller_action_source_fence_locked(
+            locked_registry,
+            repo=repo,
+            controller_session_id=controller_session_id,
+            action_source=action_source,
+        )
+        _write_json_atomic(rule_state_path(repo), receipt)
     return receipt
 
 

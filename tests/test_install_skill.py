@@ -698,6 +698,9 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_rule_handshake.RuleHandshakeTests.test_fake_project_chat_cannot_ack_by_claiming_logical_controller_id",
             "tests.test_rule_handshake.RuleHandshakeTests.test_current_web_target_ack_records_exact_source_and_generations",
             "tests.test_rule_handshake.RuleHandshakeTests.test_fake_project_chat_cannot_accept_or_defer_live_e2e",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_ack_revalidates_source_fence_immediately_before_persist",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_defer_revalidates_source_fence_immediately_before_persist",
+            "tests.test_rule_handshake.RuleHandshakeTests.test_accept_revalidates_source_fence_before_freezing_evidence",
             "tests.test_governance.ControllerActionSourcePromptTests.test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source",
             "tests.test_governance.ControllerActionSourcePromptTests.test_live_e2e_accept_prompt_carries_actual_execution_source",
             "tests.test_governance.ControllerActionSourcePromptTests.test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source",
@@ -856,7 +859,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_live_e2e_rejects_stale_ownership_generation_before_acceptance(self): self.assertTrue(True)\n"
                 "    def test_fake_project_chat_cannot_ack_by_claiming_logical_controller_id(self): self.assertTrue(True)\n"
                 "    def test_current_web_target_ack_records_exact_source_and_generations(self): self.assertTrue(True)\n"
-                "    def test_fake_project_chat_cannot_accept_or_defer_live_e2e(self): self.assertTrue(True)\n",
+                "    def test_fake_project_chat_cannot_accept_or_defer_live_e2e(self): self.assertTrue(True)\n"
+                "    def test_ack_revalidates_source_fence_immediately_before_persist(self): self.assertTrue(True)\n"
+                "    def test_defer_revalidates_source_fence_immediately_before_persist(self): self.assertTrue(True)\n"
+                "    def test_accept_revalidates_source_fence_before_freezing_evidence(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_controller_target_guard.py").write_text(
@@ -1181,7 +1187,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_live_e2e_rejects_confirmed_wake_that_predates_rule_ack(self): self.assertTrue(True)\n"
                 "    def test_fake_project_chat_cannot_ack_by_claiming_logical_controller_id(self): self.assertTrue(True)\n"
                 "    def test_current_web_target_ack_records_exact_source_and_generations(self): self.assertTrue(True)\n"
-                "    def test_fake_project_chat_cannot_accept_or_defer_live_e2e(self): self.assertTrue(True)\n",
+                "    def test_fake_project_chat_cannot_accept_or_defer_live_e2e(self): self.assertTrue(True)\n"
+                "    def test_ack_revalidates_source_fence_immediately_before_persist(self): self.assertTrue(True)\n"
+                "    def test_defer_revalidates_source_fence_immediately_before_persist(self): self.assertTrue(True)\n"
+                "    def test_accept_revalidates_source_fence_before_freezing_evidence(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_controller_target_guard.py").write_text(

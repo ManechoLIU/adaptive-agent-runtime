@@ -196,6 +196,12 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_current_web_target_ack_records_exact_source_and_generations",
     "tests.test_rule_handshake.RuleHandshakeTests."
     "test_fake_project_chat_cannot_accept_or_defer_live_e2e",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_ack_revalidates_source_fence_immediately_before_persist",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_defer_revalidates_source_fence_immediately_before_persist",
+    "tests.test_rule_handshake.RuleHandshakeTests."
+    "test_accept_revalidates_source_fence_before_freezing_evidence",
     "tests.test_governance.ControllerActionSourcePromptTests."
     "test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source",
     "tests.test_governance.ControllerActionSourcePromptTests."

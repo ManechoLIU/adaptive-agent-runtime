@@ -938,3 +938,148 @@ def _manual_unverified_current_web_target_cannot_ack_even_if_caller_claims_exact
 
 
 RuleHandshakeTests.test_manual_unverified_current_web_target_cannot_ack_even_if_caller_claims_exact_target = _manual_unverified_current_web_target_cannot_ack_even_if_caller_claims_exact_target
+
+
+def _rotate_action_source_registry(registry: Path, *, controller_id: str = "controller-1") -> None:
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    ownership = payload["__controller_execution_ownership__"][controller_id]
+    host = ownership["active_host"]
+    old_target = payload["__controller_targets__"][controller_id][host]
+    next_session = "web-next" if host == "web" else "desktop-next"
+    aliases = payload["__controller_sessions__"][controller_id].setdefault(host, [])
+    if next_session not in aliases:
+        aliases.append(next_session)
+    next_target = dict(old_target)
+    next_target["session_id"] = next_session
+    next_target["generation"] = int(old_target["generation"]) + 1
+    payload["__controller_targets__"][controller_id][host] = next_target
+    next_ownership = dict(ownership)
+    next_ownership["execution_target_session_id"] = next_session
+    next_ownership["generation"] = int(ownership["generation"]) + 1
+    payload["__controller_execution_ownership__"][controller_id] = next_ownership
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _ack_revalidates_source_fence_immediately_before_persist(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        source, revision = make_source(base)
+        target = base / "installed"
+        install_skill(source, target, summary="rules", impact="live_assignments", stop_condition="ack", now=NOW)
+        repo = make_project(base)
+        registry = base / "controllers.json"
+        write_current_controller_registry(
+            registry, repo, source_session_id="web-real-controller",
+            target_generation=3, ownership_generation=7,
+        )
+        real_validate = rule_handshake_module.validate_controller_action_source
+        def validate_then_rotate(*args, **kwargs):
+            result = real_validate(*args, **kwargs)
+            _rotate_action_source_registry(registry)
+            return result
+        with patch.object(rule_handshake_module, "validate_controller_action_source", side_effect=validate_then_rotate):
+            with self.assertRaisesRegex(ValueError, "changed before Controller action persistence"):
+                rule_handshake_module.acknowledge_rule_revision(
+                    repo, "controller-1", revision,
+                    skill_root=target, registry_path=registry,
+                    execution_host="web", source_session_id="web-real-controller", now=NOW,
+                )
+        self.assertFalse(rule_state_path(repo).exists())
+
+
+def _defer_revalidates_source_fence_immediately_before_persist(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        source, previous = make_source(base)
+        (source / "scripts" / "web_lifecycle_bridge.py").write_text("VALUE = 2\n", encoding="utf-8")
+        git(source, "add", "."); git(source, "commit", "-m", "critical")
+        revision = git(source, "rev-parse", "HEAD")
+        target = base / "installed"
+        install_skill(source, target, summary="critical", impact="live_assignments", stop_condition="e2e", previous_revision=previous, now=NOW)
+        repo = make_project(base)
+        registry = base / "controllers.json"
+        write_current_controller_registry(
+            registry, repo, source_session_id="web-real-controller",
+            target_generation=3, ownership_generation=7,
+        )
+        rule_handshake_module.acknowledge_rule_revision(
+            repo, "controller-1", revision, skill_root=target, registry_path=registry,
+            execution_host="web", source_session_id="web-real-controller", now=NOW,
+        )
+        ledger = repo / "TASK_LEDGER.md"
+        ledger.write_text(ledger.read_text().replace("adaptive-delivery@old", f"adaptive-delivery@{revision}"), encoding="utf-8")
+        real_validate = rule_handshake_module.validate_controller_action_source
+        def validate_then_rotate(*args, **kwargs):
+            result = real_validate(*args, **kwargs)
+            _rotate_action_source_registry(registry)
+            return result
+        with patch.object(rule_handshake_module, "validate_controller_action_source", side_effect=validate_then_rotate):
+            with self.assertRaisesRegex(ValueError, "changed before Controller action persistence"):
+                rule_handshake_module.defer_live_e2e(
+                    repo, "controller-1", revision, reason="race",
+                    skill_root=target, registry_path=registry,
+                    execution_host="web", source_session_id="web-real-controller", now=NOW,
+                )
+        saved = rule_handshake_module.load_rule_state(repo)
+        self.assertNotIn("live_e2e_deferred_revision", saved)
+
+
+def _accept_revalidates_source_fence_before_freezing_evidence(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        source, previous = make_source(base)
+        (source / "scripts" / "web_lifecycle_bridge.py").write_text("VALUE = 2\n", encoding="utf-8")
+        git(source, "add", "."); git(source, "commit", "-m", "critical")
+        revision = git(source, "rev-parse", "HEAD")
+        target = base / "installed"
+        install_skill(source, target, summary="critical", impact="live_assignments", stop_condition="e2e", previous_revision=previous, now=NOW)
+        repo = make_project(base)
+        registry = base / "controllers.json"
+        write_current_controller_registry(
+            registry, repo, source_session_id="web-real-controller",
+            target_generation=3, ownership_generation=7,
+        )
+        rule_handshake_module.acknowledge_rule_revision(
+            repo, "controller-1", revision, skill_root=target, registry_path=registry,
+            execution_host="web", source_session_id="web-real-controller", now=NOW,
+        )
+        ledger = repo / "TASK_LEDGER.md"
+        ledger.write_text(ledger.read_text().replace("adaptive-delivery@old", f"adaptive-delivery@{revision}"), encoding="utf-8")
+        state_dir = rule_state_path(repo).parent
+        (state_dir / "controller-wake-receipt.json").write_text(json.dumps({
+            "controller_id": "controller-1", "selected_host": "web", "result": "CONFIRMED",
+            "execution_target_session_id": "web-real-controller", "target_generation": 3,
+            "ownership_generation": 7, "completed_at_unix_ms": int(NOW.timestamp() * 1000) + 1000,
+        }), encoding="utf-8")
+        cycle_dir = state_dir / "controller-cycle-evidence"; cycle_dir.mkdir(parents=True, exist_ok=True)
+        (cycle_dir / "closed.json").write_text(json.dumps({
+            "record_kind": "controller_cycle_evidence", "controller_id": "controller-1",
+            "terminal_status": "CLOSED", "validation_errors": [],
+            "recorded_at": "2026-08-30T01:00:02+00:00",
+        }), encoding="utf-8")
+        real_errors = rule_handshake_module._live_e2e_acceptance_errors
+        calls = {"count": 0}
+        def validate_then_rotate(*args, **kwargs):
+            result = real_errors(*args, **kwargs)
+            calls["count"] += 1
+            if calls["count"] == 1:
+                _rotate_action_source_registry(registry)
+            return result
+        with patch.object(rule_handshake_module, "_live_e2e_acceptance_errors", side_effect=validate_then_rotate):
+            with self.assertRaisesRegex(ValueError, "changed before Controller action persistence"):
+                rule_handshake_module.accept_live_e2e(
+                    repo, "controller-1", revision, skill_root=target, registry_path=registry,
+                    execution_host="web", source_session_id="web-real-controller",
+                    now=datetime(2026, 8, 30, 1, 0, 3, tzinfo=UTC),
+                )
+        frozen = state_dir / "runtime-live-e2e-evidence" / f"{revision}.wake.json"
+        self.assertFalse(frozen.exists())
+        self.assertFalse(live_e2e_acceptance_path(repo).exists())
+
+
+RuleHandshakeTests.test_ack_revalidates_source_fence_immediately_before_persist = _ack_revalidates_source_fence_immediately_before_persist
+RuleHandshakeTests.test_defer_revalidates_source_fence_immediately_before_persist = _defer_revalidates_source_fence_immediately_before_persist
+RuleHandshakeTests.test_accept_revalidates_source_fence_before_freezing_evidence = _accept_revalidates_source_fence_before_freezing_evidence
