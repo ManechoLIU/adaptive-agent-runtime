@@ -585,6 +585,12 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "controller-1",
             )
 
+    def test_registered_web_verifier_timeout_covers_product_host_request_budget(self) -> None:
+        self.assertGreaterEqual(
+            web_bridge.PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS,
+            15,
+        )
+
     def test_registered_web_verifier_loads_pinned_external_runtime_host_cli(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
@@ -651,6 +657,11 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                     ),
                     True,
                 )
+
+    def test_registered_web_verifier_classifies_frame_tree_timeout_as_transient(self) -> None:
+        self.assertTrue(
+            web_bridge._peer_host_error_is_transient("Page.getFrameTree timed out")
+        )
 
     def test_registered_web_verifier_classifies_exact_target_unavailable_as_transient(self) -> None:
         from unittest.mock import patch
@@ -2497,6 +2508,284 @@ class WebLifecycleAuditTests(unittest.TestCase):
             schedule.assert_called_once()
             self.assertEqual(schedule.call_args.kwargs["receipt_id"], "pending-click-1")
             self.assertEqual(schedule.call_args.kwargs["session_id"], "controller-1")
+
+    def test_auto_native_stop_confirms_host_observed_canonical_target_already_foreground(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                }},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }), encoding="utf-8")
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "rule-update:rev-1", "session_id": "controller-1",
+                "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            initial = {
+                "pending_control_event": True, "requires_user": False,
+                "controller_host": "desktop_codex", "wake_generation": 11,
+                "triggers": ["rule_update_pending:rev-1"],
+            }
+            closed = dict(initial, pending_control_event=False)
+            already_foreground = {
+                "operation": "native_resume", "result": "DEFERRED",
+                "state": "RESUME_DEFERRED_ACTIVE_WRITER", "returncode": 1,
+                "failure_class": "active_writer_present",
+                "error_code": "WEB_LIFECYCLE_ACTIVE_WRITER",
+                "stderr_tail": "thread desktop-current already has an active writer",
+                "execution_target_session_id": "desktop-current", "target_generation": 4,
+                "target_mode": "explicit_current",
+                "host_observation": web_bridge._HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND,
+            }
+            with patch.object(
+                web_bridge, "_load_lifecycle_state", side_effect=[initial, closed]
+            ), patch.object(
+                web_bridge, "execute_native_resume", return_value=already_foreground
+            ), patch.object(web_bridge, "_rearm_auto_native_stop") as rearm:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo,
+                    receipt_id="rule-update:rev-1", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state,
+                )
+            self.assertEqual(code, 0)
+            rearm.assert_not_called()
+            wake = json.loads(
+                web_bridge.default_wake_receipt_path(repo).read_text(encoding="utf-8")
+            )
+            self.assertEqual(wake["result"], "CONFIRMED")
+            self.assertEqual(wake["operation"], "native_resume_already_foreground")
+            self.assertEqual(wake["execution_target_session_id"], "desktop-current")
+            self.assertEqual(wake["target_generation"], 4)
+            self.assertEqual(wake["ownership_generation"], 7)
+
+    def test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                }},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }), encoding="utf-8")
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "rule-update:rev-2", "session_id": "controller-1",
+                "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True, "requires_user": False,
+                "controller_host": "desktop_codex", "wake_generation": 12,
+                "triggers": ["rule_update_pending:rev-2"],
+            }
+            already_foreground = {
+                "operation": "native_resume", "result": "DEFERRED",
+                "state": "RESUME_DEFERRED_ACTIVE_WRITER", "returncode": 1,
+                "failure_class": "active_writer_present",
+                "error_code": "WEB_LIFECYCLE_ACTIVE_WRITER",
+                "stderr_tail": "thread desktop-current already has an active writer",
+                "execution_target_session_id": "desktop-current", "target_generation": 4,
+                "target_mode": "explicit_current",
+                "host_observation": web_bridge._HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND,
+            }
+            with patch.object(
+                web_bridge, "_load_lifecycle_state", return_value=lifecycle
+            ), patch.object(
+                web_bridge, "execute_native_resume", return_value=already_foreground
+            ), patch.object(
+                web_bridge, "desktop_host_reload_required", return_value=True
+            ), patch.object(web_bridge, "_rearm_auto_native_stop") as rearm:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo,
+                    receipt_id="rule-update:rev-2", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state,
+                )
+
+            self.assertEqual(code, 0)
+            rearm.assert_not_called()
+            self.assertFalse(web_bridge.default_wake_receipt_path(repo).exists())
+            persisted = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["state"], "WAITING_EXTERNAL_HOST_RELOAD")
+            self.assertTrue(persisted["host_reload_required"])
+            self.assertEqual(persisted["activation_gate"], "host_reload_required")
+            self.assertFalse(web_bridge.schedule_auto_native_stop(
+                session_id="controller-1", repo=repo,
+                receipt_id="rule-update:rev-2", registry=registry,
+                codex="codex", delay_seconds=0, state_path=state,
+            ))
+
+    def test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary(self) -> None:
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            runtime_state = repo / ".git" / "adaptive-delivery"
+            runtime_state.mkdir()
+            (runtime_state / "rule-handshake.json").write_text(json.dumps({
+                "live_e2e_required": True,
+                "installed_revision": "rev-1",
+                "loaded_revision": "rev-1",
+            }), encoding="utf-8")
+            hooks = root / "hooks.json"
+            hooks.write_text('{"hooks":{}}\n', encoding="utf-8")
+            canary = root / "desktop-canary.json"
+            value = {
+                "controller_session_id": "controller-1",
+                "status": "armed",
+                "sequence_index": 0,
+                "observations": [],
+                "hooks_sha256": hashlib.sha256(hooks.read_bytes()).hexdigest(),
+            }
+            canary.write_text(json.dumps(value), encoding="utf-8")
+
+            self.assertTrue(web_bridge.desktop_host_reload_required(
+                session_id="controller-1", repo=repo,
+                canary_path=canary, hooks_path=hooks,
+            ))
+            value["sequence_index"] = 1
+            value["observations"] = ["session_started"]
+            canary.write_text(json.dumps(value), encoding="utf-8")
+            self.assertFalse(web_bridge.desktop_host_reload_required(
+                session_id="controller-1", repo=repo,
+                canary_path=canary, hooks_path=hooks,
+            ))
+
+    def test_mocked_active_writer_without_host_observation_still_rearms(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current", "generation": 7,
+                }},
+            }), encoding="utf-8")
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "rule-update:rev-1", "session_id": "controller-1",
+                "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+                "pending_control_event": True,
+            }), encoding="utf-8")
+            deferred = {
+                "operation": "native_resume", "result": "DEFERRED",
+                "state": "RESUME_DEFERRED_ACTIVE_WRITER", "returncode": 1,
+                "failure_class": "active_writer_present",
+                "execution_target_session_id": "desktop-current", "target_generation": 4,
+            }
+            lifecycle = {
+                "pending_control_event": True, "requires_user": False,
+                "controller_host": "desktop_codex", "wake_generation": 11,
+            }
+            with patch.object(
+                web_bridge, "_load_lifecycle_state", return_value=lifecycle
+            ), patch.object(
+                web_bridge, "execute_native_resume", return_value=deferred
+            ), patch.object(web_bridge, "_rearm_auto_native_stop") as rearm:
+                code = web_bridge.run_auto_native_stop(
+                    session_id="controller-1", repo=repo,
+                    receipt_id="rule-update:rev-1", registry=registry,
+                    codex="codex", delay_seconds=0, state_path=state,
+                )
+            self.assertEqual(code, 0)
+            rearm.assert_called_once()
+            self.assertFalse(web_bridge.default_wake_receipt_path(repo).exists())
+
+    def test_serialized_active_writer_claim_cannot_confirm_already_foreground(self) -> None:
+        attempt = {
+            "operation": "native_resume",
+            "result": "DEFERRED",
+            "state": "RESUME_DEFERRED_ACTIVE_WRITER",
+            "returncode": 1,
+            "failure_class": "active_writer_present",
+            "execution_target_session_id": "desktop-current",
+            "target_generation": 4,
+            "target_mode": "explicit_current",
+            # A caller-controlled or persisted JSON value cannot reproduce the
+            # process-local observation emitted by execute_native_resume().
+            "host_observation": "canonical_target_already_foreground",
+        }
+        result = web_bridge.confirm_host_observed_desktop_foreground(
+            attempt=attempt,
+            lifecycle_state={"pending_control_event": True, "requires_user": False},
+            ownership_fence={
+                "controller_id": "controller-1",
+                "active_host": "desktop_codex",
+                "execution_target_session_id": "desktop-current",
+                "generation": 7,
+            },
+        )
+        self.assertIs(result, attempt)
+        self.assertEqual(result["result"], "DEFERRED")
+
+    def test_execute_native_resume_marks_host_observed_active_writer_process_locally(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                }},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+            }), encoding="utf-8")
+            codex = root / "codex"
+            codex.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'thread desktop-current already has an active writer' >&2\nexit 1\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+            with patch.object(
+                web_bridge, "preflight_native_resume", return_value=(True, "", {})
+            ):
+                attempt = web_bridge.execute_native_resume(
+                    session_id="controller-1", repo=repo,
+                    registry=registry, codex=str(codex),
+                )
+            self.assertEqual(attempt["state"], "RESUME_DEFERRED_ACTIVE_WRITER")
+            self.assertIs(
+                attempt["host_observation"],
+                web_bridge._HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND,
+            )
 
     def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

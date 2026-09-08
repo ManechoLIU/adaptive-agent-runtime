@@ -39,7 +39,7 @@ DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 DEFAULT_MANUAL_WEB_LEASES = Path.home() / ".codex" / "adaptive-delivery-web-controller-leases.json"
 DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG = Path.home() / ".codex" / "adaptive-delivery-host-attestation-verifiers.json"
 _PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., Any]] = {}
-PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS = 8
+PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS = 15
 PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT = 64 * 1024
 
 
@@ -53,6 +53,9 @@ _PEER_HOST_TRANSIENT_ERROR_MARKERS = (
     "connect enoent",
     "econnrefused",
     "browser machine command timed out",
+    "debugger attach timed out",
+    "target.gettargetinfo timed out",
+    "page.getframetree timed out",
     "another debugger is already attached",
     "native host connection closed",
     "native host is unavailable",
@@ -76,6 +79,10 @@ DEFAULT_AUDIT_LOG = (
 )
 AI_BRIDGE_EXECUTABLE = "/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge"
 DEFAULT_RUNTIME_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
+DEFAULT_DESKTOP_CANARY = (
+    Path.home() / ".codex" / "state" / "adaptive-delivery-desktop-canary.json"
+)
 STDERR_TAIL_LIMIT = 8192
 LAUNCHER_LOG_LIMIT = 262144
 RESTORE_STATIC_DOCUMENT_NAMES = ("AGENTS.md", "MEMORY.md", "WIKI_INDEX.md")
@@ -83,6 +90,7 @@ AUTHORITATIVE_DOCUMENT_NAMES = ("SKILL.md", "SPEC.md", "DESIGN.md", "TECHNICAL.m
 RESTORE_DOCUMENT_LIMIT = 32768
 AUTO_CONTINUATION_STALL_LIMIT = 3
 WEB_REENTRY_TRANSIENT_RETRY_LIMIT = 6
+_HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND = object()
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -2235,8 +2243,136 @@ def execute_native_resume(
     attempt.update(classify_native_resume_failure(
         returncode, stdout, stderr
     ))
+    if attempt.get("state") == "RESUME_DEFERRED_ACTIVE_WRITER":
+        # This observation is produced only by the native Host command after
+        # the exact Desktop target was resolved under the target guard. It is
+        # not Controller identity attestation and must still pass canonical
+        # target and ownership-generation fences before becoming confirmation.
+        attempt["host_observation"] = _HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND
     attempt["result"] = "DEFERRED" if attempt["state"] == "RESUME_DEFERRED_ACTIVE_WRITER" else "FAILED"
     return attempt
+
+
+def desktop_host_reload_required(
+    *,
+    session_id: str,
+    repo: Path,
+    canary_path: Path = DEFAULT_DESKTOP_CANARY,
+    hooks_path: Path = DEFAULT_CODEX_HOOKS,
+) -> bool:
+    """Require a fresh Desktop process when an exact armed canary has not started."""
+    canary = load_json(canary_path)
+    dot_git = repo.resolve() / ".git"
+    common_dir = dot_git
+    if dot_git.is_file():
+        try:
+            marker = dot_git.read_text(encoding="utf-8").strip()
+        except OSError:
+            marker = ""
+        if marker.startswith("gitdir:"):
+            git_dir = Path(marker.removeprefix("gitdir:").strip()).expanduser()
+            if not git_dir.is_absolute():
+                git_dir = (repo / git_dir).resolve()
+            try:
+                relative_common = (git_dir / "commondir").read_text(
+                    encoding="utf-8"
+                ).strip()
+            except OSError:
+                relative_common = ""
+            common_dir = (
+                (git_dir / relative_common).resolve()
+                if relative_common
+                else git_dir.resolve()
+            )
+    handshake = load_json(
+        common_dir / "adaptive-delivery" / "rule-handshake.json"
+    )
+    hooks_sha256 = _file_sha256(hooks_path)
+    installed_revision = str(handshake.get("installed_revision") or "").strip()
+    return (
+        handshake.get("live_e2e_required") is True
+        and bool(installed_revision)
+        and installed_revision
+        == str(handshake.get("loaded_revision") or "").strip()
+        and str(canary.get("controller_session_id") or "").strip() == session_id
+        and canary.get("status") == "armed"
+        and canary.get("sequence_index") == 0
+        and canary.get("observations") == []
+        and bool(hooks_sha256)
+        and canary.get("hooks_sha256") == hooks_sha256
+    )
+
+
+def confirm_host_observed_desktop_foreground(
+    *,
+    attempt: dict[str, Any],
+    lifecycle_state: dict[str, Any],
+    ownership_fence: dict[str, Any] | None,
+    host_reload_required: bool = False,
+) -> dict[str, Any]:
+    """Confirm an exact Desktop wake when the Host reports its writer is already active."""
+    if (
+        lifecycle_state.get("pending_control_event") is not True
+        or lifecycle_state.get("requires_user") is True
+        or attempt.get("result") != "DEFERRED"
+        or attempt.get("state") != "RESUME_DEFERRED_ACTIVE_WRITER"
+        or attempt.get("failure_class") != "active_writer_present"
+        or attempt.get("host_observation") is not _HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND
+        or not isinstance(ownership_fence, dict)
+        or ownership_fence.get("active_host") != target_guard.DESKTOP_SESSION_HOST
+        or attempt.get("target_mode") != "explicit_current"
+    ):
+        return attempt
+
+    execution_target = str(attempt.get("execution_target_session_id") or "").strip()
+    target_generation = attempt.get("target_generation")
+    ownership_target = str(
+        ownership_fence.get("execution_target_session_id") or ""
+    ).strip()
+    ownership_generation = ownership_fence.get("generation")
+    if (
+        not execution_target
+        or execution_target != ownership_target
+        or not isinstance(target_generation, int)
+        or isinstance(target_generation, bool)
+        or target_generation <= 0
+        or not isinstance(ownership_generation, int)
+        or isinstance(ownership_generation, bool)
+        or ownership_generation <= 0
+    ):
+        return attempt
+
+    if host_reload_required:
+        deferred = dict(attempt)
+        deferred.update({
+            "state": "WAITING_EXTERNAL_HOST_RELOAD",
+            "host_reload_required": True,
+            "activation_gate": "host_reload_required",
+            "failure_class": "host_reload_required",
+            "error_code": "DESKTOP_HOST_RELOAD_REQUIRED",
+            "host_returncode": attempt.get("returncode"),
+            "returncode": 0,
+        })
+        return deferred
+
+    confirmed = dict(attempt)
+    confirmed.update({
+        "operation": "native_resume_already_foreground",
+        "result": "CONFIRMED",
+        "state": "RESUME_CONFIRMED_ALREADY_FOREGROUND",
+        "pending_control_event": True,
+        "host_returncode": attempt.get("returncode"),
+        "returncode": 0,
+        "ownership_generation": ownership_generation,
+    })
+    for key in (
+        "error_code",
+        "failure_class",
+        "fallback_eligible",
+        "replacement_eligible",
+    ):
+        confirmed.pop(key, None)
+    return confirmed
 
 
 
@@ -4153,6 +4289,7 @@ def maybe_schedule_rule_wake(
         "WEB_REENTRY_RESULT_UNKNOWN",
         "WEB_REENTRY_RETRY_EXHAUSTED",
         "RESUME_STALLED_NO_PROGRESS",
+        "WAITING_EXTERNAL_HOST_RELOAD",
     }:
         return "already_scheduled"
     scheduled = schedule_auto_native_stop(
@@ -4510,6 +4647,7 @@ def _schedule_auto_native_stop_locked(
         "WEB_REENTRY_SUBMITTED",
         "WEB_REENTRY_RESULT_UNKNOWN",
         "RESUME_STALLED_NO_PROGRESS",
+        "WAITING_EXTERNAL_HOST_RELOAD",
     }
     if same_receipt and (
         (terminal_receipt == receipt_id and terminal_outcome in {"submit_confirmed", "result_unknown", "retry_exhausted"})
@@ -5178,6 +5316,16 @@ def _run_auto_native_stop_impl(
         )
         attempt["ownership_generation"] = ownership_fence.get("generation")
 
+    attempt = confirm_host_observed_desktop_foreground(
+        attempt=attempt,
+        lifecycle_state=lifecycle_state,
+        ownership_fence=ownership_fence,
+        host_reload_required=desktop_host_reload_required(
+            session_id=session_id,
+            repo=repo,
+        ),
+    )
+
     # Revalidate both supervisor token and canonical host ownership before
     # committing any external result or rearming.
     with _owned_supervisor_state(
@@ -5201,6 +5349,9 @@ def _run_auto_native_stop_impl(
             "execution_target_session_id",
             "target_generation",
             "target_mode",
+            "host_reload_required",
+            "activation_gate",
+            "host_returncode",
         ):
             if evidence_key in attempt:
                 latest[evidence_key] = attempt[evidence_key]
