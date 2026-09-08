@@ -27,11 +27,11 @@ except ModuleNotFoundError:
 
 try:
     from web_reentry_adapter import (
-        execute_web_reentry, resolve_reentry_session,
+        build_reentry_prompt, execute_web_reentry, resolve_reentry_session,
     )
 except ModuleNotFoundError:
     from scripts.web_reentry_adapter import (
-        execute_web_reentry, resolve_reentry_session,
+        build_reentry_prompt, execute_web_reentry, resolve_reentry_session,
     )
 
 
@@ -2538,29 +2538,26 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
             f"registered Host verifier configuration rejected: {exc}"
         )
 
-    def verify(**kwargs: Any) -> Any:
-        expected_host = str(kwargs.get("host") or "").strip()
-        if expected_host != host:
-            raise PermissionError("registered Host verifier host mismatch")
-        conversation_id = str(kwargs.get("expected_target_session_id") or "").strip()
-        target_generation = kwargs.get("expected_target_generation")
-        ownership_generation = kwargs.get("expected_ownership_generation")
-        if not conversation_id:
-            raise PermissionError("registered Host verifier requires exact target session")
-        for value, name in ((target_generation, "target generation"), (ownership_generation, "ownership generation")):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise PermissionError(f"registered Host verifier requires positive {name}")
-        request = {
-            "operation": "attest_and_verify",
-            "conversation_id": conversation_id,
-            "target_generation": target_generation,
-            "ownership_generation": ownership_generation,
-        }
-        safe_env = {
-            "HOME": str(Path.home()),
-            "PATH": DEFAULT_RUNTIME_PATH,
-            "LANG": "C.UTF-8",
-        }
+    safe_env = {
+        "HOME": str(Path.home()),
+        "PATH": DEFAULT_RUNTIME_PATH,
+        "LANG": "C.UTF-8",
+    }
+
+    def validate_pinned_bundle() -> None:
+        for bundle_path_raw, bundle_digest in bundle.items():
+            bundle_path = Path(bundle_path_raw).expanduser()
+            bundle_stat = bundle_path.lstat()
+            if bundle_path.is_symlink() or not bundle_path.is_file():
+                raise PermissionError("registered Host verifier bundle member must remain a regular non-symlink file")
+            if hasattr(os, "getuid") and bundle_stat.st_uid != os.getuid():
+                raise PermissionError("registered Host verifier bundle member owner mismatch")
+            actual_bundle_digest = __import__("hashlib").sha256(bundle_path.read_bytes()).hexdigest()
+            if not secrets.compare_digest(actual_bundle_digest, str(bundle_digest).lower()):
+                raise PermissionError("registered Host verifier bundle member hash mismatch")
+
+    def run_cli(request: dict[str, Any]) -> dict[str, Any]:
+        validate_pinned_bundle()
         try:
             completed = subprocess.run(
                 [str(executable)],
@@ -2580,7 +2577,27 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
         except json.JSONDecodeError as exc:
             raise PermissionError("registered Host verifier returned invalid JSON") from exc
         if completed.returncode != 0 or not isinstance(payload, dict) or payload.get("ok") is not True:
-            raise PermissionError("registered Host verifier rejected machine attestation")
+            raise PermissionError("registered Host verifier rejected machine request")
+        return payload
+
+    def verify(**kwargs: Any) -> Any:
+        expected_host = str(kwargs.get("host") or "").strip()
+        if expected_host != host:
+            raise PermissionError("registered Host verifier host mismatch")
+        conversation_id = str(kwargs.get("expected_target_session_id") or "").strip()
+        target_generation = kwargs.get("expected_target_generation")
+        ownership_generation = kwargs.get("expected_ownership_generation")
+        if not conversation_id:
+            raise PermissionError("registered Host verifier requires exact target session")
+        for value, name in ((target_generation, "target generation"), (ownership_generation, "ownership generation")):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise PermissionError(f"registered Host verifier requires positive {name}")
+        payload = run_cli({
+            "operation": "attest_and_verify",
+            "conversation_id": conversation_id,
+            "target_generation": target_generation,
+            "ownership_generation": ownership_generation,
+        })
         verified = payload.get("verified_target")
         receipt = payload.get("host_receipt_id")
         if (
@@ -2603,6 +2620,107 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
             }
         return True
 
+    def submit_reentry(**kwargs: Any) -> dict[str, Any]:
+        if host != "web":
+            raise PermissionError("registered Host submit adapter is Web-only")
+        conversation_id = str(kwargs.get("execution_target_session_id") or "").strip()
+        target_generation = kwargs.get("target_generation")
+        ownership_generation = kwargs.get("ownership_generation")
+        target_mode = str(kwargs.get("target_mode") or "").strip()
+        origin = kwargs.get("host_origin_attestation")
+        lifecycle_state = kwargs.get("lifecycle_state")
+        if not conversation_id or not target_mode:
+            raise PermissionError("registered Host submit adapter requires exact target and mode")
+        for value, name in ((target_generation, "target generation"), (ownership_generation, "ownership generation")):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise PermissionError(f"registered Host submit adapter requires positive {name}")
+        if (
+            not isinstance(origin, dict)
+            or origin.get("origin_host") != "chatgpt_web"
+            or origin.get("origin_conversation_id") != conversation_id
+            or origin.get("origin_attested") is not True
+            or not isinstance(origin.get("call_receipt"), str)
+            or not str(origin.get("call_receipt")).strip()
+        ):
+            raise PermissionError("registered Host submit adapter requires verified origin receipt")
+        if not isinstance(lifecycle_state, dict):
+            raise PermissionError("registered Host submit adapter requires lifecycle state")
+        controller_id = str(kwargs.get("controller_id") or "").strip()
+        if not controller_id:
+            raise PermissionError("registered Host submit adapter requires controller_id")
+        continuation_payload = build_reentry_prompt(
+            controller_id=controller_id,
+            lifecycle_state=lifecycle_state,
+            terminal_receipts=lifecycle_state.get("pending_terminal_receipts", []),
+        )
+        wake_id = f"runtime_web_{secrets.token_hex(16)}"
+        payload = run_cli({
+            "operation": "submit_reentry",
+            "conversation_id": conversation_id,
+            "host_receipt_id": str(origin["call_receipt"]).strip(),
+            "expected_target_generation": target_generation,
+            "expected_ownership_generation": ownership_generation,
+            "wake_id": wake_id,
+            "wake_nonce": secrets.token_urlsafe(24),
+            "continuation_payload": continuation_payload,
+        })
+        receipt = payload.get("reentry_receipt")
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("provenance") != "browser_host_reentry_receipt_v1"
+            or receipt.get("conversation_id") != conversation_id
+            or receipt.get("target_generation") != target_generation
+            or receipt.get("ownership_generation") != ownership_generation
+            or receipt.get("wake_id") not in (None, wake_id)
+        ):
+            raise PermissionError("registered Host submit adapter returned mismatched receipt")
+        result_class = receipt.get("result_class")
+        dispatch_attempted = receipt.get("dispatch_attempted")
+        submit_confirmed = receipt.get("submit_confirmed")
+        retryable = receipt.get("retryable")
+        auto_retry_allowed = receipt.get("auto_retry_allowed")
+        if not all(isinstance(value, bool) for value in (dispatch_attempted, submit_confirmed, retryable, auto_retry_allowed)):
+            raise PermissionError("registered Host submit adapter returned invalid result flags")
+        common = {
+            "operation": "web_reentry",
+            "execution_target_session_id": conversation_id,
+            "target_generation": target_generation,
+            "ownership_generation": ownership_generation,
+            "target_mode": target_mode,
+            "delivery_authorization": "host_attested",
+            "host_attested": True,
+            "strong_web_identity_established": True,
+            "host_execution_receipt": {
+                "call_receipt": str(origin["call_receipt"]).strip(),
+                "reentry_receipt": receipt,
+            },
+        }
+        if result_class == "SUBMIT_CONFIRMED" and dispatch_attempted and submit_confirmed and not retryable and not auto_retry_allowed:
+            return {**common, "result": "CONFIRMED", "state": "WEB_REENTRY_SUBMITTED", "returncode": 0}
+        if result_class == "RESULT_UNKNOWN" and dispatch_attempted and not submit_confirmed and not retryable and not auto_retry_allowed:
+            return {
+                **common, "result": "BLOCKED", "state": "WEB_REENTRY_RESULT_UNKNOWN",
+                "returncode": 78, "error_code": "WEB_REENTRY_RESULT_UNKNOWN",
+                "failure_class": "web_reentry_result_unknown",
+                "stderr_tail": "Host dispatch occurred but submit confirmation is unknown; automatic retry is forbidden",
+            }
+        if (
+            result_class == "CONFIRMED_FAILURE_BEFORE_DISPATCH"
+            and not dispatch_attempted
+            and not submit_confirmed
+            and auto_retry_allowed is retryable
+        ):
+            return {
+                **common,
+                "result": "DEFERRED" if retryable else "FAILED",
+                "state": "WEB_REENTRY_PENDING" if retryable else "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+                "returncode": 78 if retryable else 1,
+                "error_code": "WEB_REENTRY_UNAVAILABLE" if retryable else "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+                "failure_class": "web_reentry_unavailable" if retryable else "web_reentry_failed_before_dispatch",
+            }
+        raise PermissionError("registered Host submit adapter returned inconsistent result semantics")
+
+    setattr(verify, "submit_reentry", submit_reentry)
     return verify
 
 
@@ -2854,6 +2972,9 @@ def wake_existing_controller(
                 elif selected_host == "web":
                     adapter = (resume_adapters or {}).get("web")
                     verifier = _registered_peer_attestation_verifier("web")
+                    registered_submit = getattr(verifier, "submit_reentry", None) if callable(verifier) else None
+                    if adapter is None and callable(registered_submit):
+                        adapter = registered_submit
                     current_registry_for_web = load_json(registry)
                     manual_builtin_candidate = (
                         adapter is None

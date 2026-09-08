@@ -586,6 +586,83 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                     True,
                 )
 
+    def test_registered_web_verifier_exposes_pinned_host_submit_adapter(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "request=json.loads(sys.stdin.read())\n"
+                "if request['operation']=='attest_and_verify':\n"
+                " print(json.dumps({'ok': True, 'operation':'attest_and_verify', 'host_receipt_id':'hr_submit', 'verified_target': {'provenance':'runtime_host_verifier_v1','conversation_id':request['conversation_id'],'target_generation':request['target_generation'],'ownership_generation':request['ownership_generation']}}))\n"
+                "else:\n"
+                " print(json.dumps({'ok': True, 'operation':'submit_reentry', 'reentry_receipt': {'provenance':'browser_host_reentry_receipt_v1','conversation_id':request['conversation_id'],'target_generation':request['expected_target_generation'],'ownership_generation':request['expected_ownership_generation'],'dispatch_attempted':True,'submit_confirmed':True,'retryable':False,'auto_retry_allowed':False,'result_class':'SUBMIT_CONFIRMED','status':'submit_confirmed','receipt_id':'wr_submit'}}))\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+                "protocol":"runtime_host_verifier_cli_v1","executable":str(executable),"sha256":digest,
+                "bundle_sha256":{str(executable):digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                origin = verifier(
+                    phase="pre_delivery", controller_id="controller-1", host="web",
+                    expected_target_session_id="web-new", expected_target_generation=4,
+                    expected_ownership_generation=9,
+                )
+                adapter = getattr(verifier, "submit_reentry")
+                attempt = adapter(
+                    controller_id="controller-1", execution_target_session_id="web-new",
+                    target_generation=4, ownership_generation=9, target_mode="explicit_current",
+                    lifecycle_state={"wake_generation": 7, "next_action": "continue"},
+                    host_origin_attestation=origin,
+                )
+                self.assertEqual(attempt["result"], "CONFIRMED")
+                self.assertEqual(attempt["execution_target_session_id"], "web-new")
+                self.assertEqual(attempt["target_generation"], 4)
+                self.assertEqual(attempt["ownership_generation"], 9)
+                self.assertTrue(attempt["host_attested"])
+                self.assertTrue(attempt["strong_web_identity_established"])
+                self.assertEqual(attempt["host_execution_receipt"]["call_receipt"], "hr_submit")
+                self.assertEqual(attempt["host_execution_receipt"]["reentry_receipt"]["receipt_id"], "wr_submit")
+
+    def test_registered_web_verifier_rechecks_bundle_before_each_execution(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\nimport json,sys\nr=json.loads(sys.stdin.read())\nprint(json.dumps({'ok':True,'operation':'attest_and_verify','host_receipt_id':'hr','verified_target':{'provenance':'runtime_host_verifier_v1','conversation_id':r['conversation_id'],'target_generation':r['target_generation'],'ownership_generation':r['ownership_generation']}}))\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            dependency = root / "integration.mjs"
+            dependency.write_text("export const value = 1;\n", encoding="utf-8")
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            dep_digest = __import__("hashlib").sha256(dependency.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+                "protocol":"runtime_host_verifier_cli_v1","executable":str(executable),"sha256":digest,
+                "bundle_sha256":{str(executable):digest,str(dependency):dep_digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                self.assertTrue(callable(verifier))
+                dependency.write_text("export const value = 2;\n", encoding="utf-8")
+                with self.assertRaisesRegex(PermissionError, "bundle.*hash"):
+                    verifier(
+                        phase="pre_delivery", controller_id="controller-1", host="web",
+                        expected_target_session_id="web-new", expected_target_generation=4,
+                        expected_ownership_generation=9,
+                    )
+
     def test_registered_web_verifier_rejects_mutated_bundle_member(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
@@ -6349,6 +6426,62 @@ class WebHostNativeWakeIsolationTests(unittest.TestCase):
                 adapter_calls[0]["host_origin_attestation"]["call_receipt"],
                 "host-call-1",
             )
+
+    def test_registered_external_web_host_submit_adapter_is_used_without_caller_injection(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-current", "generation": 4,
+                    "target_mode": "explicit_current",
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-current", "generation": 8,
+                }},
+            }), encoding="utf-8")
+            calls = []
+            def verifier(**kwargs):
+                return {
+                    "origin_host": "chatgpt_web",
+                    "origin_conversation_id": kwargs["expected_target_session_id"],
+                    "origin_attested": True,
+                    "call_receipt": "host-call-external",
+                }
+            def submit_reentry(**kwargs):
+                calls.append(dict(kwargs))
+                return {
+                    "operation": "web_reentry", "result": "CONFIRMED", "state": "WEB_REENTRY_SUBMITTED",
+                    "returncode": 0, "execution_target_session_id": kwargs["execution_target_session_id"],
+                    "target_generation": kwargs["target_generation"], "ownership_generation": kwargs["ownership_generation"],
+                    "target_mode": kwargs["target_mode"], "delivery_authorization": "host_attested",
+                    "host_attested": True, "strong_web_identity_established": True,
+                    "host_execution_receipt": {
+                        "call_receipt": kwargs["host_origin_attestation"]["call_receipt"],
+                        "reentry_receipt": {"receipt_id": "wr_external"},
+                    },
+                }
+            verifier.submit_reentry = submit_reentry
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), patch.object(
+                web_bridge, "execute_web_reentry", side_effect=AssertionError("legacy browser adapter must not run")
+            ):
+                receipt = web_bridge.wake_existing_controller(
+                    lifecycle_state={"pending_control_event": True, "controller_host": "web", "wake_generation": 2},
+                    session_id="controller-1", repo=repo, registry=registry, codex="codex",
+                    receipt_path=root / "wake.json",
+                    host_facts={"controller_host": "web", "resume_actionable": True},
+                )
+            self.assertEqual(receipt["result"], "CONFIRMED")
+            self.assertTrue(receipt["host_attested"])
+            self.assertTrue(receipt["strong_web_identity_established"])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["execution_target_session_id"], "web-current")
+            self.assertEqual(calls[0]["target_generation"], 4)
+            self.assertEqual(calls[0]["ownership_generation"], 8)
 
     def test_current_web_adapter_is_not_called_when_pre_delivery_attestation_rejects(self) -> None:
         from unittest.mock import patch

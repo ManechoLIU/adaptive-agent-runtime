@@ -648,6 +648,9 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests.test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_production_bridge_has_no_trusted_web_attestation_verifier",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_loads_pinned_external_runtime_host_cli",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_exposes_pinned_host_submit_adapter",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_rechecks_bundle_before_each_execution",
+            "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_registered_external_web_host_submit_adapter_is_used_without_caller_injection",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_malformed_registered_web_verifier_config_fails_closed_without_manual_fallback",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_browser_tab_receipt_cannot_recover_an_unverified_web_session",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_rotates_existing_resume_only_lease_to_new_verified_target",
@@ -857,6 +860,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection(self): self.assertTrue(True)\n"
                 "    def test_production_bridge_has_no_trusted_web_attestation_verifier(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_loads_pinned_external_runtime_host_cli(self): self.assertTrue(True)\n"
+                "    def test_registered_web_verifier_exposes_pinned_host_submit_adapter(self): self.assertTrue(True)\n"
+                "    def test_registered_web_verifier_rechecks_bundle_before_each_execution(self): self.assertTrue(True)\n"
                 "    def test_malformed_registered_web_verifier_config_fails_closed_without_manual_fallback(self): self.assertTrue(True)\n"
                 "    def test_browser_tab_receipt_cannot_recover_an_unverified_web_session(self): self.assertTrue(True)\n"
                 "    def test_replace_web_session_bootstrap_rotates_target_and_manual_lease_without_host_attestation(self): self.assertTrue(True)\n"
@@ -879,6 +884,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class WebHostNativeWakeIsolationTests(unittest.TestCase):\n"
                 "    def test_stale_web_host_with_only_desktop_current_target_resumes_same_controller_desktop(self): self.assertTrue(True)\n"
                 "    def test_registered_current_web_adapter_is_fenced_and_host_attested(self): self.assertTrue(True)\n"
+                "    def test_registered_external_web_host_submit_adapter_is_used_without_caller_injection(self): self.assertTrue(True)\n"
                 "    def test_current_web_adapter_is_not_called_when_pre_delivery_attestation_rejects(self): self.assertTrue(True)\n"
                 "    def test_current_web_adapter_receipt_must_correlate_origin_call_receipt(self): self.assertTrue(True)\n"
                 "    def test_current_web_adapter_is_not_called_for_malformed_origin_attestation(self): self.assertTrue(True)\n"
