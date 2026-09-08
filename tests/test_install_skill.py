@@ -1690,9 +1690,72 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
         self.assertIn("--registry", payload["ProgramArguments"])
         self.assertNotIn("web_reentry_adapter.py", " ".join(payload["ProgramArguments"]))
 
+    def test_desktop_background_continuation_rejects_decoy_or_once_plist(self):
+        import json
+        import plistlib
+        from datetime import datetime, timezone
+        from scripts.install_skill import (
+            detect_host_capabilities, install_web_agent_health_service_plist,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / "adaptive-delivery"
+            (target / "scripts").mkdir(parents=True)
+            script = target / "scripts" / "controller_runtime_supervisor.py"
+            script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            plist = root / "controller-runtime.plist"
+            heartbeat = root / "controller-runtime-heartbeat.json"
+            install_web_agent_health_service_plist(
+                plist, target, python_executable="/usr/bin/python3",
+                registry_path=root / "controllers.json",
+            )
+            heartbeat.write_text(json.dumps({
+                "schema_version": 1,
+                "state": "ready",
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "pid": 43,
+                "supervisor_contract": "host_neutral_controller_runtime_v1",
+            }), encoding="utf-8")
+            canonical = plistlib.loads(plist.read_bytes())
+            installed_script = canonical["ProgramArguments"][1]
+
+            invalid_arguments = (
+                [
+                    "/bin/false", installed_script,
+                    "--registry", str(root / "controllers.json"),
+                ],
+                [
+                    "/usr/bin/python3", "--registry",
+                    str(root / "controllers.json"), installed_script,
+                ],
+                [*canonical["ProgramArguments"], "--once"],
+            )
+            for arguments in invalid_arguments:
+                with self.subTest(arguments=arguments):
+                    payload = dict(canonical)
+                    payload["ProgramArguments"] = arguments
+                    plist.write_bytes(plistlib.dumps(payload))
+                    report = detect_host_capabilities(
+                        codex_executable=root / "missing-codex",
+                        skill_root=target,
+                        ai_bridge_executable=root / "missing-ai-bridge",
+                        hooks_file=root / "hooks.json",
+                        zshenv_file=root / ".zshenv",
+                        health_service_plist=plist,
+                        runtime_supervisor_heartbeat=heartbeat,
+                    )
+                    self.assertEqual(
+                        report["desktop_adapter"]["background_continuation"],
+                        "not_configured",
+                    )
+                    self.assertFalse(
+                        report["desktop_adapter"]["background_continuation_ready"]
+                    )
+
     def test_desktop_background_continuation_is_reported_without_ai_bridge(self):
         import json
-        from datetime import datetime, timezone
+        from datetime import datetime, timedelta, timezone
         from scripts.install_skill import (
             detect_host_capabilities, install_web_agent_health_service_plist,
         )
@@ -1745,6 +1808,28 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
             )
             self.assertEqual(
                 legacy_report["desktop_adapter"]["background_continuation"],
+                "configured_unverified",
+            )
+            heartbeat.write_text(json.dumps({
+                "schema_version": 1,
+                "state": "ready",
+                "observed_at": (
+                    datetime.now(timezone.utc) - timedelta(seconds=91)
+                ).isoformat(),
+                "pid": 42,
+                "supervisor_contract": "host_neutral_controller_runtime_v1",
+            }), encoding="utf-8")
+            stale_report = detect_host_capabilities(
+                codex_executable=root / "missing-codex",
+                skill_root=target,
+                ai_bridge_executable=root / "missing-ai-bridge",
+                hooks_file=root / "hooks.json",
+                zshenv_file=root / ".zshenv",
+                health_service_plist=plist,
+                runtime_supervisor_heartbeat=heartbeat,
+            )
+            self.assertEqual(
+                stale_report["desktop_adapter"]["background_continuation"],
                 "configured_unverified",
             )
             heartbeat.write_text(json.dumps({

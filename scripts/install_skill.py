@@ -726,12 +726,31 @@ def _health_service_plist_matches(
     except (OSError, ValueError, plistlib.InvalidFileException):
         return False
     args = payload.get("ProgramArguments") if isinstance(payload, dict) else None
+    if (
+        not isinstance(args, list)
+        or len(args) != 6
+        or not all(isinstance(item, str) and item for item in args)
+    ):
+        return False
+    python = Path(args[0]).expanduser().resolve(strict=False)
+    program = payload.get("Program")
+    try:
+        poll_seconds = float(args[5])
+    except ValueError:
+        return False
     return (
         payload.get("Label") == WEB_AGENT_HEALTH_LABEL
         and payload.get("RunAtLoad") is True
         and payload.get("KeepAlive") is True
-        and isinstance(args, list)
-        and str(expected) in [str(item) for item in args]
+        and python.is_file()
+        and os.access(python, os.X_OK)
+        and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", python.name) is not None
+        and (program is None or Path(program).expanduser().resolve(strict=False) == python)
+        and Path(args[1]).expanduser().resolve(strict=False) == expected
+        and args[2] == "--registry"
+        and Path(args[3]).expanduser().is_absolute()
+        and args[4] == "--poll-seconds"
+        and poll_seconds >= 1.0
     )
 
 
