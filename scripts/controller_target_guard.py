@@ -12,6 +12,11 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Sequence
 
+try:
+    import agent_target_resolution as agent_target
+except ModuleNotFoundError:
+    from scripts import agent_target_resolution as agent_target
+
 
 DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
 CONTROLLER_SESSIONS_KEY = "__controller_sessions__"
@@ -274,7 +279,15 @@ def controller_identity_capabilities() -> dict[str, Any]:
             "same_controller_recovery",
             "web_session_binding",
             "target_generation_fence",
+            "logical_agent_target_resolution",
+            "verified_execution_target_fence",
         ],
+        "logical_agent_target_resolution_contract": agent_target.LOGICAL_AGENT_TARGET_RESOLUTION_CONTRACT,
+        "verified_execution_target_contract": agent_target.VERIFIED_EXECUTION_TARGET_CONTRACT,
+        "logical_agent_target_resolution_states": list(agent_target.LOGICAL_AGENT_TARGET_RESOLUTION_STATES),
+        "supported_logical_agent_types": list(agent_target.SUPPORTED_LOGICAL_AGENT_TYPES),
+        "ownership_resolver_scope": "controller_registry_only",
+        "automatic_problem_attribution": "post_migration_enhancement",
     }
 
 
@@ -870,6 +883,109 @@ def resolve_execution_target(
         "registry": str(registry_path.resolve()),
         "registry_sha256": _registry_sha256(registry_path),
     }
+
+
+def _resolve_controller_verified_execution_target(
+    *,
+    repo: Path,
+    host: str,
+    logical_agent_identity: object,
+    registry_path: Path,
+) -> dict[str, Any]:
+    identity = agent_target.normalize_logical_agent_identity(logical_agent_identity)
+    if identity["agent_type"] != "controller":
+        raise ValueError("controller ownership provider received a non-controller logical Agent")
+    normalized_host = str(host or "").strip()
+    if normalized_host not in SUPPORTED_HOSTS:
+        raise ValueError(f"unsupported controller host: {normalized_host}")
+    repo = repo.expanduser().resolve()
+    registry_path = Path(registry_path).expanduser()
+    with locked_registry(registry_path) as registry:
+        matches = _matching_controller_ids_for_repo(repo, registry)
+        if len(matches) != 1:
+            raise PermissionError("verified logical Agent resolution requires one unique project Controller")
+        controller_id = matches[0]
+        if identity["agent_id"] != controller_id:
+            raise PermissionError("logical Agent identity does not match the project Controller")
+        aliases = host_sessions(registry, controller_id=controller_id, host=normalized_host)
+        record = target_record(registry, controller_id=controller_id, host=normalized_host)
+        if not isinstance(record, dict):
+            raise PermissionError("verified logical Agent resolution requires an explicit current target")
+        status, target, target_generation = validate_target_record(record, host=normalized_host)
+        if status != "active" or target is None:
+            raise PermissionError("verified logical Agent resolution requires an active current target")
+        if target != controller_id and target not in aliases:
+            raise PermissionError("verified logical Agent target is not a bound Controller entry")
+        ownership = execution_ownership_record(registry, controller_id=controller_id)
+        if ownership is None:
+            raise PermissionError("verified logical Agent resolution requires execution ownership")
+        ownership_host, ownership_target, ownership_generation = validate_execution_ownership_record(ownership)
+        if ownership_host != normalized_host or ownership_target != target:
+            raise PermissionError("verified logical Agent ownership does not match the current execution target")
+        provenance = str(record.get("provenance") or "controller_registry")
+    return agent_target.verified_execution_target(
+        logical_agent=identity,
+        host=normalized_host,
+        execution_target_session_id=target,
+        target_generation=target_generation,
+        ownership_generation=ownership_generation,
+        target_mode="explicit_current",
+        provenance=provenance,
+    )
+
+
+def resolve_logical_agent_execution_target(
+    *,
+    repo: Path,
+    host: str,
+    logical_agent_identity: object,
+    registry_path: Path = DEFAULT_REGISTRY,
+) -> dict[str, Any]:
+    """Resolve a logical Agent through the canonical ownership-provider seam.
+
+    Only the Controller ownership provider is implemented in this revision.
+    Agent/Reviewer/Runtime-repair ownership resolution is intentionally deferred;
+    their identities still use this same contract and return structured UNRESOLVED.
+    """
+    identity = agent_target.normalize_logical_agent_identity(logical_agent_identity)
+    if identity["agent_type"] != "controller":
+        return agent_target.execution_target_resolution(
+            logical_agent=identity,
+            state="UNRESOLVED",
+            reason="OWNERSHIP_RESOLVER_REQUIRED",
+        )
+    target = _resolve_controller_verified_execution_target(
+        repo=repo,
+        host=host,
+        logical_agent_identity=identity,
+        registry_path=registry_path,
+    )
+    return agent_target.execution_target_resolution(
+        logical_agent=identity,
+        state="VERIFIED",
+        reason="CURRENT_EXECUTION_TARGET",
+        verified_target=target,
+    )
+
+
+def resolve_verified_logical_agent_execution_target(
+    *,
+    repo: Path,
+    host: str,
+    logical_agent_identity: object,
+    registry_path: Path = DEFAULT_REGISTRY,
+) -> dict[str, Any]:
+    """Compatibility helper that requires the generic resolution to be VERIFIED."""
+    identity = agent_target.normalize_logical_agent_identity(logical_agent_identity)
+    resolution = resolve_logical_agent_execution_target(
+        repo=repo,
+        host=host,
+        logical_agent_identity=identity,
+        registry_path=registry_path,
+    )
+    return agent_target.require_verified_execution_target_from_resolution(
+        resolution, expected_logical_agent=identity
+    )
 
 
 @contextmanager

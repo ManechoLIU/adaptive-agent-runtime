@@ -367,7 +367,11 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
                 "__controller_targets__": {
                     "controller-1": {
-                        "web": {"status": "active", "session_id": "web-current", "generation": 4}
+                        "web": {
+                            "status": "active", "session_id": "web-current", "generation": 4,
+                            "provenance": "host_attested_same_controller_recovery",
+                            "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+                        }
                     }
                 },
                 "__controller_execution_ownership__": {
@@ -394,7 +398,33 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 },
             }), encoding="utf-8")
             output = StringIO()
+            def verifier(**kwargs):
+                session = kwargs["expected_target_session_id"]
+                receipt = "hr-" + session
+                return {
+                    "identity_attested": True, "host_receipt_id": receipt,
+                    "verified_target": {
+                        "provenance": "runtime_host_verifier_v1", "conversation_id": session,
+                        "browser_target_id": "target-current", "top_frame_id": "top-current",
+                        "loader_id": "loader-current", "secure_origin": "https://chatgpt.com",
+                        "target_generation": kwargs["expected_target_generation"],
+                        "ownership_generation": kwargs["expected_ownership_generation"],
+                        "host_receipt_id": receipt,
+                    },
+                }
+            verifier.discover_current_entry = lambda **_kwargs: {
+                "provenance": "runtime_host_current_entry_v1",
+                "entry_scope": "runtime_invocation",
+                "machine_source": "host_invocation_context_v1",
+                "conversation_id": "web-current", "browser_target_id": "target-current",
+                "top_frame_id": "top-current", "loader_id": "loader-current",
+                "secure_origin": "https://chatgpt.com", "target_generation": 4,
+                "ownership_generation": 7, "host_receipt_id": "entry-current",
+                "observed_at_unix_ms": int(time.time() * 1000),
+            }
             with patch.object(web_bridge, "DEFAULT_MANUAL_WEB_LEASES", lease), patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+            ), patch.object(
                 web_bridge, "web_session_restore_payload", return_value={
                     "session_binding_state": {"verification": "VERIFIED"},
                     "controller_actions_allowed": True,
@@ -543,12 +573,28 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             }
             out, err = StringIO(), StringIO()
 
-            def verifier(**kwargs: object) -> bool:
-                return (
-                    kwargs.get("controller_id") == "controller-1"
-                    and kwargs.get("expected_target_session_id") == "web-new"
-                    and kwargs.get("host_execution_receipt") == host_receipt
-                )
+            def verifier(**kwargs: object):
+                session = str(kwargs.get("expected_target_session_id") or "")
+                receipt = "hr-" + session
+                return {
+                    "identity_attested": True, "host_receipt_id": receipt,
+                    "verified_target": {
+                        "provenance": "runtime_host_verifier_v1", "conversation_id": session,
+                        "browser_target_id": "target-new", "top_frame_id": "top-new",
+                        "loader_id": "loader-new", "secure_origin": "https://chatgpt.com",
+                        "target_generation": kwargs.get("expected_target_generation"),
+                        "ownership_generation": kwargs.get("expected_ownership_generation"),
+                        "host_receipt_id": receipt,
+                    },
+                }
+            verifier.discover_current_entry = lambda **_kwargs: {
+                "provenance": "runtime_host_current_entry_v1", "entry_scope": "runtime_invocation",
+                "machine_source": "host_invocation_context_v1", "conversation_id": "web-new",
+                "browser_target_id": "target-new", "top_frame_id": "top-new",
+                "loader_id": "loader-new", "secure_origin": "https://chatgpt.com",
+                "target_generation": 1, "ownership_generation": 1,
+                "host_receipt_id": "entry-new", "observed_at_unix_ms": int(time.time() * 1000),
+            }
 
             with patch.object(
                 web_bridge,
@@ -658,6 +704,53 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                     ),
                     True,
                 )
+
+    def test_registered_web_verifier_exposes_pinned_current_entry_discovery(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,sys,time\n"
+                "request=json.loads(sys.stdin.read())\n"
+                "assert request['operation']=='discover_current_entry'\n"
+                "assert 'conversation_id' not in request\n"
+                "assert 'controller_id' not in request\n"
+                "assert request['logical_agent_identity']=={'schema_version':1,'agent_type':'controller','agent_id':'controller-1'}\n"
+                "print(json.dumps({'ok':True,'operation':'discover_current_entry','current_entry':{"
+                "'provenance':'runtime_host_current_entry_v1','entry_scope':'runtime_invocation',"
+                "'machine_source':'host_invocation_context_v1','conversation_id':'web-machine-current',"
+                "'browser_target_id':'browser-target-7','top_frame_id':'top-frame-7','loader_id':'loader-7',"
+                "'secure_origin':'https://chatgpt.com','target_generation':request['target_generation'],"
+                "'ownership_generation':request['ownership_generation'],'host_receipt_id':'entry-receipt-7',"
+                "'observed_at_unix_ms':int(time.time()*1000)}}))\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+                "protocol":"runtime_host_verifier_cli_v1","executable":str(executable),
+                "sha256":digest,"bundle_sha256":{str(executable):digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                discover = getattr(verifier, "discover_current_entry")
+                entry = discover(
+                    logical_agent_identity={
+                        "schema_version": 1, "agent_type": "controller", "agent_id": "controller-1"
+                    },
+                    host="web", expected_target_generation=4, expected_ownership_generation=9,
+                )
+            self.assertEqual(entry["conversation_id"], "web-machine-current")
+            self.assertEqual(entry["browser_target_id"], "browser-target-7")
+            self.assertEqual(entry["top_frame_id"], "top-frame-7")
+            self.assertEqual(entry["loader_id"], "loader-7")
+            self.assertEqual(entry["secure_origin"], "https://chatgpt.com")
+            self.assertEqual(entry["target_generation"], 4)
+            self.assertEqual(entry["ownership_generation"], 9)
 
     def test_registered_web_verifier_classifies_frame_tree_timeout_as_transient(self) -> None:
         self.assertTrue(
@@ -7256,6 +7349,324 @@ class WebControllerSessionIdentityTests(unittest.TestCase):
             self.assertEqual(payload["event_source"], "web")
 
 
+
+class WebCurrentEntryDiscoveryTests(unittest.TestCase):
+    @staticmethod
+    def make_repo(root: Path) -> tuple[Path, Path]:
+        repo = root / "repo"; repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        (repo / "AGENTS.md").write_text("rules\n", encoding="utf-8")
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
+        _provision_verified_current_web_target(
+            registry, controller_id="controller-1", web_session_id="web-current",
+            target_generation=4, ownership_generation=7,
+        )
+        return repo, registry
+
+    @staticmethod
+    def verifier_with_current_entry(session_id: str, *, target_generation: int = 4, ownership_generation: int = 7):
+        calls = []
+        def verifier(**kwargs):
+            calls.append(("verify", dict(kwargs)))
+            expected = kwargs["expected_target_session_id"]
+            receipt = "hr-" + expected
+            return {
+                "identity_attested": True,
+                "host_receipt_id": receipt,
+                "verified_target": {
+                    "provenance": "runtime_host_verifier_v1",
+                    "conversation_id": expected,
+                    "browser_target_id": "browser-target-current",
+                    "top_frame_id": "top-current",
+                    "loader_id": "loader-current",
+                    "secure_origin": "https://chatgpt.com",
+                    "target_generation": kwargs["expected_target_generation"],
+                    "ownership_generation": kwargs["expected_ownership_generation"],
+                    "host_receipt_id": receipt,
+                },
+            }
+        def discover_current_entry(**kwargs):
+            calls.append(("discover", dict(kwargs)))
+            return {
+                "provenance": "runtime_host_current_entry_v1",
+                "entry_scope": "runtime_invocation",
+                "machine_source": "host_invocation_context_v1",
+                "conversation_id": session_id,
+                "browser_target_id": "browser-target-current",
+                "top_frame_id": "top-current",
+                "loader_id": "loader-current",
+                "secure_origin": "https://chatgpt.com",
+                "target_generation": target_generation,
+                "ownership_generation": ownership_generation,
+                "host_receipt_id": "current-entry-receipt",
+                "observed_at_unix_ms": int(time.time() * 1000),
+            }
+        verifier.discover_current_entry = discover_current_entry
+        return verifier, calls
+
+    def test_generic_current_entry_discovery_accepts_runtime_repair_agent_verified_target(self) -> None:
+        from unittest.mock import patch
+        identity = web_bridge.agent_target.logical_agent_identity(
+            agent_type="runtime_repair_agent", agent_id="runtime-repair-7"
+        )
+        target = web_bridge.agent_target.verified_execution_target(
+            logical_agent=identity,
+            host="web",
+            execution_target_session_id="web-runtime-repair-current",
+            target_generation=6,
+            ownership_generation=11,
+            provenance="future_ownership_resolver",
+        )
+        calls = []
+        def verifier(**_kwargs):
+            raise AssertionError("attest_and_verify is not part of current-entry discovery itself")
+        def discover(**kwargs):
+            calls.append(dict(kwargs))
+            return {
+                "provenance": "runtime_host_current_entry_v1",
+                "entry_scope": "runtime_invocation",
+                "machine_source": "host_invocation_context_v1",
+                "conversation_id": "web-runtime-repair-current",
+                "browser_target_id": "target-runtime-repair",
+                "top_frame_id": "top-runtime-repair",
+                "loader_id": "loader-runtime-repair",
+                "secure_origin": "https://chatgpt.com",
+                "target_generation": 6,
+                "ownership_generation": 11,
+                "host_receipt_id": "entry-runtime-repair",
+                "observed_at_unix_ms": int(time.time() * 1000),
+            }
+        verifier.discover_current_entry = discover
+        with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier):
+            entry = web_bridge.discover_current_web_entry_for_logical_agent(
+                verified_current_target=target
+            )
+        self.assertEqual(entry["logical_agent_identity"], identity)
+        self.assertEqual(entry["verified_execution_target_fence"], target)
+        self.assertEqual(entry["conversation_id"], "web-runtime-repair-current")
+        self.assertEqual(calls[0]["logical_agent_identity"], identity)
+        self.assertNotIn("controller_id", calls[0])
+        self.assertNotIn("conversation_id", calls[0])
+
+    def test_session_start_auto_discovers_machine_current_entry_and_allows_controller_actions(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            verifier, calls = self.verifier_with_current_entry("web-current")
+            out, err = StringIO(), StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), redirect_stdout(out), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 0, err.getvalue())
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["controller_id"], "controller-1")
+            self.assertEqual(payload["web_session_id"], "web-current")
+            self.assertEqual(payload["session_binding_state"]["verification"], "VERIFIED")
+            self.assertEqual(payload["session_binding_state"]["target_generation"], 4)
+            self.assertTrue(payload["controller_actions_allowed"])
+            self.assertEqual(payload["current_entry_identity"]["logical_agent_identity"], {
+                "schema_version": 1, "agent_type": "controller", "agent_id": "controller-1"
+            })
+            self.assertEqual(
+                payload["current_entry_identity"]["verified_execution_target_fence"]["contract"],
+                "verified_execution_target_v1",
+            )
+            self.assertEqual([kind for kind, _ in calls][:2], ["discover", "verify"])
+
+    def test_session_start_without_host_current_entry_fails_closed(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            err = StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=lambda **_kwargs: True), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 78)
+            self.assertIn("HOST_SESSION_ID_UNAVAILABLE", err.getvalue())
+
+    def test_session_start_caller_claim_of_real_canonical_conversation_is_not_current_entry_proof(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            err = StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=lambda **_kwargs: True), redirect_stderr(err):
+                code = web_bridge.main([
+                    "session-start", "--repo", str(repo), "--registry", str(registry),
+                    "--web-session-id", "web-current",
+                ])
+            self.assertEqual(code, 78)
+            self.assertIn("HOST_SESSION_ID_UNAVAILABLE", err.getvalue())
+
+    def test_session_start_historical_alias_discovered_by_host_is_not_restored_as_current(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            payload = json.loads(registry.read_text())
+            payload["__controller_sessions__"]["controller-1"]["web"].append("web-historical")
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            verifier, _calls = self.verifier_with_current_entry("web-historical")
+            err = StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 78)
+            saved = json.loads(registry.read_text())
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["session_id"], "web-current")
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["generation"], 4)
+
+    def test_session_start_same_conversation_different_browser_target_fails_closed(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            verifier, _calls = self.verifier_with_current_entry("web-current")
+            base = verifier
+            def mismatched(**kwargs):
+                value = base(**kwargs)
+                if kwargs.get("phase") == "identity_evidence":
+                    value["verified_target"]["browser_target_id"] = "browser-target-other"
+                return value
+            mismatched.discover_current_entry = verifier.discover_current_entry
+            err = StringIO()
+            with patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=mismatched
+            ), redirect_stderr(err):
+                code = web_bridge.main([
+                    "session-start", "--repo", str(repo), "--registry", str(registry)
+                ])
+            self.assertEqual(code, 78)
+            self.assertIn("browser_target_id", err.getvalue())
+            saved = json.loads(registry.read_text())
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["session_id"], "web-current")
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["generation"], 4)
+
+    def test_session_start_caller_claim_cannot_override_different_machine_current_entry(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            verifier, _calls = self.verifier_with_current_entry("web-new")
+            err = StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), redirect_stderr(err):
+                code = web_bridge.main([
+                    "session-start", "--repo", str(repo), "--registry", str(registry),
+                    "--web-session-id", "web-current",
+                ])
+            self.assertEqual(code, 78)
+            self.assertIn("caller-supplied", err.getvalue())
+            saved = json.loads(registry.read_text())
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["session_id"], "web-current")
+
+    def test_session_start_active_tab_drift_cannot_change_discovered_invocation_identity(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            active = {"session": "web-current"}
+            def verifier(**kwargs):
+                # Simulate browser focus/tab drift after machine current-entry discovery.
+                return {
+                    "identity_attested": True,
+                    "host_receipt_id": "hr-drift",
+                    "verified_target": {
+                        "provenance": "runtime_host_verifier_v1",
+                        "conversation_id": active["session"],
+                        "target_generation": kwargs["expected_target_generation"],
+                        "ownership_generation": kwargs["expected_ownership_generation"],
+                        "host_receipt_id": "hr-drift",
+                    },
+                }
+            def discover(**_kwargs):
+                active["session"] = "web-other"
+                return {
+                    "provenance": "runtime_host_current_entry_v1",
+                    "entry_scope": "runtime_invocation",
+                    "machine_source": "host_invocation_context_v1",
+                    "conversation_id": "web-current",
+                    "browser_target_id": "target-current",
+                    "top_frame_id": "top-current",
+                    "loader_id": "loader-current",
+                    "secure_origin": "https://chatgpt.com",
+                    "target_generation": 4,
+                    "ownership_generation": 7,
+                    "host_receipt_id": "entry-current",
+                    "observed_at_unix_ms": int(time.time() * 1000),
+                }
+            verifier.discover_current_entry = discover
+            err = StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 78)
+            saved = json.loads(registry.read_text())
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["session_id"], "web-current")
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["generation"], 4)
+
+    def test_session_start_machine_current_successor_rotates_same_controller_only(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            verifier, calls = self.verifier_with_current_entry("web-new")
+            out, err = StringIO(), StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), redirect_stdout(out), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 0, err.getvalue())
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["controller_id"], "controller-1")
+            self.assertEqual(payload["web_session_id"], "web-new")
+            self.assertTrue(payload["controller_actions_allowed"])
+            self.assertEqual(payload["session_binding_state"]["verification"], "VERIFIED")
+            saved = json.loads(registry.read_text())
+            logical = [key for key, value in saved.items() if not key.startswith("__") and isinstance(value, str)]
+            self.assertEqual(logical, ["controller-1"])
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["session_id"], "web-new")
+            self.assertEqual(saved["__controller_targets__"]["controller-1"]["web"]["generation"], 5)
+            self.assertEqual(saved["__controller_execution_ownership__"]["controller-1"]["execution_target_session_id"], "web-new")
+            self.assertEqual(saved["__controller_execution_ownership__"]["controller-1"]["generation"], 8)
+            self.assertEqual([item[1]["expected_target_session_id"] for item in calls if item[0] == "verify"], ["web-current", "web-new"])
+
+    def test_session_start_stale_current_entry_ownership_generation_fails_closed(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            verifier, _calls = self.verifier_with_current_entry(
+                "web-current", target_generation=4, ownership_generation=6
+            )
+            err = StringIO()
+            with patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+            ), redirect_stderr(err):
+                code = web_bridge.main([
+                    "session-start", "--repo", str(repo), "--registry", str(registry)
+                ])
+            self.assertEqual(code, 78)
+            self.assertIn("ownership generation", err.getvalue().lower())
+
+    def test_session_start_stale_current_entry_generation_fails_closed(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            verifier, _calls = self.verifier_with_current_entry("web-current", target_generation=3, ownership_generation=7)
+            err = StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 78)
+            self.assertIn("generation", err.getvalue().lower())
+
 class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
     def test_restore_payload_allows_unborn_main_before_first_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7625,13 +8036,19 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 "__controller_sessions__": {"controller-1": {"web": ["web-session-1"]}},
             }), encoding="utf-8")
             _provision_verified_current_web_target(registry, web_session_id="web-session-1")
-            result = subprocess.run(
-                ["/usr/bin/python3", str(BRIDGE), "session-start", "--repo", str(repo), "--registry", str(registry),
-                 "--web-session-id", "web-session-1"],
-                text=True, capture_output=True, check=False,
+            from contextlib import redirect_stdout, redirect_stderr
+            from io import StringIO
+            from unittest.mock import patch
+            verifier, _calls = WebCurrentEntryDiscoveryTests.verifier_with_current_entry(
+                "web-session-1", target_generation=1, ownership_generation=1
             )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
+            out, err = StringIO(), StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), redirect_stdout(out), redirect_stderr(err):
+                code = web_bridge.main([
+                    "session-start", "--repo", str(repo), "--registry", str(registry)
+                ])
+        self.assertEqual(code, 0, err.getvalue())
+        payload = json.loads(out.getvalue())
         self.assertEqual(payload["controller_id"], "controller-1")
         self.assertEqual(payload["controller_id"], "controller-1")
         self.assertEqual(payload["controller_session_id"], "controller-1")
@@ -9786,15 +10203,14 @@ if hasattr(WebLifecycleBridgeTests, "test_same_controller_web_recovery_rotates_e
 
 
 def _session_start_requires_explicit_verified_current_target(self):
+    from contextlib import redirect_stdout, redirect_stderr
+    from io import StringIO
+    from unittest.mock import patch
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         repo = root / "repo"; repo.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
-        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
         (repo / "AGENTS.md").write_text("rules\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True)
         registry = root / "controllers.json"
         registry.write_text(json.dumps({
             "controller-1": str(repo.resolve()),
@@ -9809,13 +10225,31 @@ def _session_start_requires_explicit_verified_current_target(self):
                 "provenance": "web_entry",
             }},
         }), encoding="utf-8")
-        result = self.run_bridge(
-            "session-start", "--repo", str(repo), "--registry", str(registry),
-            "--web-session-id", "web-session-1",
-        )
-    self.assertEqual(result.returncode, 0, result.stderr)
-    payload = json.loads(result.stdout)
+        def verifier(**kwargs):
+            session = kwargs["expected_target_session_id"]
+            receipt = "hr-" + session
+            return {"identity_attested": True, "host_receipt_id": receipt, "verified_target": {
+                "provenance": "runtime_host_verifier_v1", "conversation_id": session,
+                "browser_target_id": "target-1", "top_frame_id": "top-1",
+                "loader_id": "loader-1", "secure_origin": "https://chatgpt.com",
+                "target_generation": kwargs["expected_target_generation"],
+                "ownership_generation": kwargs["expected_ownership_generation"],
+                "host_receipt_id": receipt,
+            }}
+        verifier.discover_current_entry = lambda **_kwargs: {
+            "provenance": "runtime_host_current_entry_v1", "entry_scope": "runtime_invocation",
+            "machine_source": "host_invocation_context_v1", "conversation_id": "web-session-1",
+            "browser_target_id": "target-1", "top_frame_id": "top-1", "loader_id": "loader-1",
+            "secure_origin": "https://chatgpt.com", "target_generation": 1, "ownership_generation": 1,
+            "host_receipt_id": "entry-1", "observed_at_unix_ms": int(time.time() * 1000),
+        }
+        out, err = StringIO(), StringIO()
+        with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), redirect_stdout(out), redirect_stderr(err):
+            code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+    self.assertEqual(code, 0, err.getvalue())
+    payload = json.loads(out.getvalue())
     self.assertEqual(payload["web_session_id"], "web-session-1")
+    self.assertTrue(payload["controller_actions_allowed"])
 
 
 def _session_start_foreign_or_alias_never_becomes_current(self):

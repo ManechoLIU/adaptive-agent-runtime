@@ -413,6 +413,42 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertEqual(report["web_local_adapter"]["adapter"], "ai-bridge")
         self.assertFalse(report["web_local_adapter"]["configured"])
 
+    def test_identity_capability_report_exposes_runtime_current_entry_host_contract(self):
+        from scripts.install_skill import _installed_controller_identity_capability
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            scripts = root / "scripts"; scripts.mkdir()
+            guard = scripts / "controller_target_guard.py"
+            guard.write_text(
+                "#!/usr/bin/env python3\nimport json,sys\n"
+                "print(json.dumps({'schema_version':1,'canonical_identity_cli':'controller_target_guard.py identity',"
+                "'capabilities':['controller_identity_projection','same_controller_recovery','web_session_binding','target_generation_fence','logical_agent_target_resolution','verified_execution_target_fence'],'logical_agent_target_resolution_contract':'logical_agent_target_resolution_v1','verified_execution_target_contract':'verified_execution_target_v1','supported_logical_agent_types':['controller','agent','reviewer','runtime_repair_agent'],'logical_agent_target_resolution_states':['VERIFIED','UNRESOLVED','STALE','CONFLICTED'],'ownership_resolver_scope':'controller_registry_only'}))\n",
+                encoding="utf-8",
+            )
+            guard.chmod(0o755)
+            bridge = scripts / "web_lifecycle_bridge.py"
+            bridge.write_text(
+                "def discover_current_web_entry_for_logical_agent(): pass\n"
+                "logical_agent_identity = {}\n"
+                "HOST_OPERATION = \"discover_current_entry\"\n"
+                "PROVENANCE = \"runtime_host_current_entry_v1\"\n",
+                encoding="utf-8",
+            )
+            capability = _installed_controller_identity_capability(root)
+        self.assertTrue(capability["runtime_current_entry_discovery_supported"])
+        self.assertEqual(capability["current_entry_discovery_contract"], "runtime_host_current_entry_v1")
+        self.assertEqual(capability["current_entry_host_operation"], "discover_current_entry")
+        self.assertTrue(capability["host_current_entry_required"])
+        self.assertEqual(capability["host_verifier_protocol"], "runtime_host_verifier_cli_v1")
+        self.assertEqual(capability["host_attestation"], "external_current_entry_required")
+        self.assertEqual(capability["logical_agent_target_resolution_contract"], "logical_agent_target_resolution_v1")
+        self.assertEqual(capability["verified_execution_target_contract"], "verified_execution_target_v1")
+        self.assertEqual(set(capability["supported_logical_agent_types"]), {"controller", "agent", "reviewer", "runtime_repair_agent"})
+        self.assertEqual(set(capability["logical_agent_target_resolution_states"]), {"VERIFIED", "UNRESOLVED", "STALE", "CONFLICTED"})
+        self.assertEqual(capability["ownership_resolver_scope"], "controller_registry_only")
+        self.assertEqual(capability["automatic_problem_attribution"], "post_migration_enhancement")
+        self.assertFalse(capability["strong_web_binding_available"])
+
     def test_identity_capability_report_surfaces_missing_installed_guard_as_contract_drift(self):
         from scripts.install_skill import detect_host_capabilities
         with tempfile.TemporaryDirectory() as d:
@@ -515,7 +551,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "web_lifecycle_bridge.py", "lifecycle_hook.py", "controller_scoring_hook.py",
             "web_agent_health_supervisor.py", "controller_runtime_supervisor.py",
             "web_agent_events.py", "route_contract.py", "reviewer_supervisor.py",
-            "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "assignment_lease_guard.py", "assignment_runtime.py",
+            "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "agent_target_resolution.py", "assignment_lease_guard.py", "assignment_runtime.py",
             "controller_scoring_guard.py", "project_context_guard.py", "rule_handshake.py", "evaluation_transaction.py",
         ):
             script = source / "scripts" / name
@@ -524,7 +560,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                     "#!/usr/bin/env python3\n"
                     "import json, sys\n"
                     "if len(sys.argv) > 1 and sys.argv[1] == 'capabilities':\n"
-                    "    print(json.dumps({'schema_version': 1, 'canonical_identity_cli': 'controller_target_guard.py identity', 'capabilities': ['controller_identity_projection', 'same_controller_recovery', 'web_session_binding', 'target_generation_fence']}))\n"
+                    "    print(json.dumps({'schema_version': 1, 'canonical_identity_cli': 'controller_target_guard.py identity', 'capabilities': ['controller_identity_projection', 'same_controller_recovery', 'web_session_binding', 'target_generation_fence', 'logical_agent_target_resolution', 'verified_execution_target_fence'], 'logical_agent_target_resolution_contract': 'logical_agent_target_resolution_v1', 'verified_execution_target_contract': 'verified_execution_target_v1', 'supported_logical_agent_types': ['controller', 'agent', 'reviewer', 'runtime_repair_agent'], 'logical_agent_target_resolution_states': ['VERIFIED', 'UNRESOLVED', 'STALE', 'CONFLICTED'], 'ownership_resolver_scope': 'controller_registry_only'}))\n"
                     "    raise SystemExit(0)\n"
                     "raise SystemExit(0)\n",
                     encoding="utf-8",
@@ -893,6 +929,8 @@ class InstallMigrationContractTests(unittest.TestCase):
         self.assertIn("scripts/terminal_continuation.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("scripts/assignment_runtime.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("tests/test_assignment_runtime.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("scripts/agent_target_resolution.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("tests/test_agent_target_resolution.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn(
             "tests.test_terminal_continuation.PendingTerminalReconcileTests.test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks",
             RUNTIME_RELEASE_REGRESSION_TESTS,
@@ -1102,7 +1140,17 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_identity_projection_verifies_current_desktop_target_without_changing_controller_id(self): self.assertTrue(True)\n"
                 "    def test_identity_projection_marks_old_target_stale_but_keeps_project_ownership(self): self.assertTrue(True)\n"
                 "    def test_identity_projection_reports_project_controller_conflict_without_silent_selection(self): self.assertTrue(True)\n"
-                "    def test_claim_controller_host_desktop_after_web_increments_one_cross_host_generation(self): self.assertTrue(True)\n",
+                "    def test_claim_controller_host_desktop_after_web_increments_one_cross_host_generation(self): self.assertTrue(True)\n"
+                "    def test_verified_logical_agent_target_projects_controller_and_defers_other_agent_ownership(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_agent_target_resolution.py").write_text(
+                "import unittest\n"
+                "class LogicalAgentTargetResolutionTests(unittest.TestCase):\n"
+                "    def test_identity_contract_directly_supports_controller_agent_reviewer_and_runtime_repair_agent(self): self.assertTrue(True)\n"
+                "    def test_verified_execution_target_is_generic_and_carries_double_generation_fence(self): self.assertTrue(True)\n"
+                "    def test_verified_execution_target_rejects_wrong_logical_agent_and_stale_fences(self): self.assertTrue(True)\n"
+                "    def test_resolution_status_model_is_generic_and_requires_verified_target_only_for_verified_state(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_web_lifecycle_bridge.py").write_text(
@@ -1124,6 +1172,18 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_desktop_codex_resolution_rejects_an_invalid_explicit_override(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_resolves_desktop_runtime_only_for_desktop_target(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_does_not_require_desktop_runtime_for_web_target(self): self.assertTrue(True)\n"
+                "class WebCurrentEntryDiscoveryTests(unittest.TestCase):\n"
+                "    def test_generic_current_entry_discovery_accepts_runtime_repair_agent_verified_target(self): self.assertTrue(True)\n"
+                "    def test_session_start_auto_discovers_machine_current_entry_and_allows_controller_actions(self): self.assertTrue(True)\n"
+                "    def test_session_start_without_host_current_entry_fails_closed(self): self.assertTrue(True)\n"
+                "    def test_session_start_caller_claim_of_real_canonical_conversation_is_not_current_entry_proof(self): self.assertTrue(True)\n"
+                "    def test_session_start_same_conversation_different_browser_target_fails_closed(self): self.assertTrue(True)\n"
+                "    def test_session_start_caller_claim_cannot_override_different_machine_current_entry(self): self.assertTrue(True)\n"
+                "    def test_session_start_historical_alias_discovered_by_host_is_not_restored_as_current(self): self.assertTrue(True)\n"
+                "    def test_session_start_active_tab_drift_cannot_change_discovered_invocation_identity(self): self.assertTrue(True)\n"
+                "    def test_session_start_stale_current_entry_ownership_generation_fails_closed(self): self.assertTrue(True)\n"
+                "    def test_session_start_stale_current_entry_generation_fails_closed(self): self.assertTrue(True)\n"
+                "    def test_session_start_machine_current_successor_rotates_same_controller_only(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_host_neutral_supervisor_omits_missing_desktop_codex_argument(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
@@ -1138,6 +1198,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_registered_web_verifier_timeout_covers_product_host_request_budget(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_classifies_frame_tree_timeout_as_transient(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_classifies_exact_target_ambiguous_as_transient(self): self.assertTrue(True)\n"
+                "    def test_registered_web_verifier_exposes_pinned_current_entry_discovery(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_loads_pinned_external_runtime_host_cli(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_exposes_pinned_host_submit_adapter(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_rechecks_bundle_before_each_execution(self): self.assertTrue(True)\n"
@@ -1336,6 +1397,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             (tests_dir / "test_install_skill.py").write_text(
                 "import unittest\n"
                 "class InstallCapabilityTests(unittest.TestCase):\n"
+                "    def test_identity_capability_report_exposes_runtime_current_entry_host_contract(self): self.assertTrue(True)\n"
                 "    def test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence(self): self.assertTrue(True)\n"
                 "class ProjectContextHookInstallationTests(unittest.TestCase):\n"
                 "    def test_runtime_hooks_keep_trust_stable_legacy_indices(self): self.assertTrue(True)\n"
@@ -1698,9 +1760,18 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_internal_terminal_helper_cannot_accept_fabricated_observation_without_attested_path(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
+            (tests_dir / "test_agent_target_resolution.py").write_text(
+                "import unittest\n"
+                "class LogicalAgentTargetResolutionTests(unittest.TestCase):\n"
+                "    def test_identity_contract_directly_supports_controller_agent_reviewer_and_runtime_repair_agent(self): self.assertTrue(True)\n"
+                "    def test_verified_execution_target_is_generic_and_carries_double_generation_fence(self): self.assertTrue(True)\n"
+                "    def test_verified_execution_target_rejects_wrong_logical_agent_and_stale_fences(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_install_skill.py").write_text(
                 "import unittest\n"
                 "class InstallCapabilityTests(unittest.TestCase):\n"
+                "    def test_identity_capability_report_exposes_runtime_current_entry_host_contract(self): self.assertTrue(True)\n"
                 "    def test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence(self): self.assertTrue(True)\n"
                 "class ProjectContextHookInstallationTests(unittest.TestCase):\n"
                 "    def test_runtime_hooks_keep_trust_stable_legacy_indices(self): self.assertTrue(True)\n"

@@ -296,7 +296,75 @@ class ControllerTargetGuardTests(unittest.TestCase):
             "same_controller_recovery",
             "web_session_binding",
             "target_generation_fence",
+            "logical_agent_target_resolution",
+            "verified_execution_target_fence",
         })
+        self.assertEqual(
+            capabilities["logical_agent_target_resolution_contract"],
+            "logical_agent_target_resolution_v1",
+        )
+        self.assertEqual(
+            set(capabilities["supported_logical_agent_types"]),
+            {"controller", "agent", "reviewer", "runtime_repair_agent"},
+        )
+        self.assertEqual(
+            set(capabilities["logical_agent_target_resolution_states"]),
+            {"VERIFIED", "UNRESOLVED", "STALE", "CONFLICTED"},
+        )
+        self.assertEqual(capabilities["ownership_resolver_scope"], "controller_registry_only")
+        self.assertEqual(capabilities["automatic_problem_attribution"], "post_migration_enhancement")
+
+    def test_verified_logical_agent_target_projects_controller_and_defers_other_agent_ownership(self) -> None:
+        guard = load_guard()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-current", "generation": 4,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-current",
+                    "generation": 9, "provenance": "web_entry",
+                }},
+            }), encoding="utf-8")
+            target = guard.resolve_verified_logical_agent_execution_target(
+                repo=repo, host="web",
+                logical_agent_identity={
+                    "schema_version": 1, "agent_type": "controller", "agent_id": "controller-1"
+                },
+                registry_path=registry,
+            )
+            self.assertEqual(target["contract"], "verified_execution_target_v1")
+            self.assertEqual(target["logical_agent_identity"]["agent_type"], "controller")
+            self.assertEqual(target["execution_target_session_id"], "web-current")
+            self.assertEqual(target["target_generation"], 4)
+            self.assertEqual(target["ownership_generation"], 9)
+            for agent_type in ("agent", "reviewer", "runtime_repair_agent"):
+                unresolved = guard.resolve_logical_agent_execution_target(
+                    repo=repo, host="web",
+                    logical_agent_identity={
+                        "schema_version": 1, "agent_type": agent_type, "agent_id": f"{agent_type}-7"
+                    },
+                    registry_path=registry,
+                )
+                self.assertEqual(unresolved["contract"], "logical_agent_target_resolution_v1")
+                self.assertEqual(unresolved["state"], "UNRESOLVED")
+                self.assertEqual(unresolved["reason"], "OWNERSHIP_RESOLVER_REQUIRED")
+
+            with self.assertRaisesRegex(PermissionError, "OWNERSHIP_RESOLVER_REQUIRED"):
+                guard.resolve_verified_logical_agent_execution_target(
+                    repo=repo, host="web",
+                    logical_agent_identity={
+                        "schema_version": 1, "agent_type": "runtime_repair_agent", "agent_id": "repair-7"
+                    },
+                    registry_path=registry,
+                )
 
     def test_multiple_web_aliases_without_current_target_are_stale_not_verified(self) -> None:
         guard = load_guard()

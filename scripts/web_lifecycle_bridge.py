@@ -29,6 +29,11 @@ except ModuleNotFoundError:
     from scripts import controller_target_guard as target_guard
 
 try:
+    import agent_target_resolution as agent_target
+except ModuleNotFoundError:
+    from scripts import agent_target_resolution as agent_target
+
+try:
     from web_reentry_adapter import (
         build_reentry_prompt, execute_web_reentry, resolve_reentry_session,
     )
@@ -1087,12 +1092,127 @@ def _validated_identity_evidence(
     }
 
 
+def _require_current_entry_matches_host_attestation(
+    current_entry: dict[str, Any], identity_evidence: dict[str, Any] | None
+) -> None:
+    if not isinstance(identity_evidence, dict):
+        raise PermissionError("current-entry recovery requires structured canonical Host attestation")
+    verified = identity_evidence.get("verified_target")
+    if not isinstance(verified, dict):
+        raise PermissionError("current-entry recovery requires a verified Host target")
+    for field in ("browser_target_id", "top_frame_id", "loader_id", "secure_origin"):
+        expected = str(current_entry.get(field) or "").strip()
+        observed = str(verified.get(field) or "").strip()
+        if not expected or observed != expected:
+            raise PermissionError(
+                f"Host current-entry {field} does not match canonical attested target"
+            )
+
+
+def _validated_current_web_entry_evidence(
+    value: Any,
+    *,
+    expected_target_generation: int,
+    expected_ownership_generation: int,
+    now_unix_ms: int | None = None,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise PermissionError("Host current-entry discovery did not return machine identity evidence")
+    required_text = (
+        "conversation_id", "browser_target_id", "top_frame_id", "loader_id", "host_receipt_id",
+    )
+    normalized: dict[str, Any] = dict(value)
+    for name in required_text:
+        text = str(value.get(name) or "").strip()
+        if not text or len(text.encode("utf-8")) > 512:
+            raise PermissionError(f"Host current-entry discovery requires bounded {name}")
+        normalized[name] = text
+    if value.get("provenance") != "runtime_host_current_entry_v1":
+        raise PermissionError("Host current-entry discovery provenance is not machine-trusted")
+    if value.get("entry_scope") != "runtime_invocation":
+        raise PermissionError("Host current-entry discovery must be bound to this Runtime invocation")
+    if value.get("machine_source") != "host_invocation_context_v1":
+        raise PermissionError("Host current-entry discovery source is not the invocation Host boundary")
+    if str(value.get("secure_origin") or "").strip() != "https://chatgpt.com":
+        raise PermissionError("Host current-entry discovery requires secure ChatGPT origin")
+    if value.get("target_generation") != expected_target_generation:
+        raise PermissionError("Host current-entry discovery target generation is stale or mismatched")
+    if value.get("ownership_generation") != expected_ownership_generation:
+        raise PermissionError("Host current-entry discovery ownership generation is stale or mismatched")
+    observed_at = value.get("observed_at_unix_ms")
+    if isinstance(observed_at, bool) or not isinstance(observed_at, int) or observed_at < 1:
+        raise PermissionError("Host current-entry discovery requires machine observation timestamp")
+    now_ms = int(time.time() * 1000) if now_unix_ms is None else int(now_unix_ms)
+    if observed_at > now_ms + 5_000 or now_ms - observed_at > 30_000:
+        raise PermissionError("Host current-entry discovery evidence is stale")
+    normalized["secure_origin"] = "https://chatgpt.com"
+    normalized["observed_at_unix_ms"] = observed_at
+    normalized["target_generation"] = expected_target_generation
+    normalized["ownership_generation"] = expected_ownership_generation
+    normalized["provenance"] = "runtime_host_current_entry_v1"
+    normalized["entry_scope"] = "runtime_invocation"
+    normalized["machine_source"] = "host_invocation_context_v1"
+    return normalized
+
+
+def discover_current_web_entry_for_logical_agent(
+    *, verified_current_target: object
+) -> dict[str, Any]:
+    """Ask the registered Web Host to identify this invocation for one logical Agent."""
+    target = agent_target.normalize_verified_execution_target(
+        verified_current_target, expected_host="web"
+    )
+    verifier = _registered_peer_attestation_verifier("web")
+    discover = getattr(verifier, "discover_current_entry", None) if callable(verifier) else None
+    if not callable(discover):
+        raise PermissionError(
+            "HOST_SESSION_ID_UNAVAILABLE: registered Host has no current-entry discovery capability"
+        )
+    value = discover(
+        logical_agent_identity=target["logical_agent_identity"],
+        host="web",
+        expected_target_generation=target["target_generation"],
+        expected_ownership_generation=target["ownership_generation"],
+        adapter_attempt={
+            "operation": "logical_agent_current_entry_discovery",
+            "logical_agent_identity": target["logical_agent_identity"],
+        },
+    )
+    evidence = _validated_current_web_entry_evidence(
+        value,
+        expected_target_generation=target["target_generation"],
+        expected_ownership_generation=target["ownership_generation"],
+    )
+    evidence["logical_agent_identity"] = target["logical_agent_identity"]
+    evidence["verified_execution_target_fence"] = target
+    return evidence
+
+
+def discover_current_web_entry(
+    *, repo: Path, controller_id: str, registry_path: Path
+) -> dict[str, Any]:
+    """Controller compatibility provider for generic logical-Agent target resolution."""
+    logical_agent = agent_target.logical_agent_identity(
+        agent_type="controller", agent_id=controller_id
+    )
+    verified_target = target_guard.resolve_verified_logical_agent_execution_target(
+        repo=canonical_root(repo),
+        host="web",
+        logical_agent_identity=logical_agent,
+        registry_path=registry_path,
+    )
+    return discover_current_web_entry_for_logical_agent(
+        verified_current_target=verified_target
+    )
+
+
 def recover_same_controller_web_session(
     *,
     repo: Path,
     web_session_id: str,
     registry_path: Path,
     host_identity_receipt: dict[str, Any] | None,
+    current_entry_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Rebind only the existing unique Controller after Host-attested Web identity proof."""
     repo = canonical_root(repo)
@@ -1161,6 +1281,16 @@ def recover_same_controller_web_session(
             target_guard.validate_execution_ownership_record(ownership_record)
         )
 
+    validated_current_entry: dict[str, Any] | None = None
+    if current_entry_evidence is not None:
+        validated_current_entry = _validated_current_web_entry_evidence(
+            current_entry_evidence,
+            expected_target_generation=current_target_generation,
+            expected_ownership_generation=ownership_generation,
+        )
+        if validated_current_entry["conversation_id"] != web_session_id:
+            raise PermissionError("Host current-entry discovery conversation does not match recovery target")
+
     strong_successor_rotation = current_target_session != web_session_id
     successor_authorization: dict[str, Any] | None = None
     if strong_successor_rotation:
@@ -1187,7 +1317,7 @@ def recover_same_controller_web_session(
             expected_ownership_generation=ownership_generation,
             now_unix=int(time.time()),
         )
-        if successor_authorization is None:
+        if successor_authorization is None and validated_current_entry is None:
             return {
                 "result": "DEFERRED",
                 "state": "SAME_CONTROLLER_SESSION_RECOVERY",
@@ -1203,7 +1333,11 @@ def recover_same_controller_web_session(
             "same-controller Web recovery cannot replace the canonical current target"
         )
 
-    if not strong_successor_rotation and binding.get("verification") == "VERIFIED":
+    if (
+        not strong_successor_rotation
+        and binding.get("verification") == "VERIFIED"
+        and validated_current_entry is None
+    ):
         ownership = target_guard.claim_controller_host(
             repo=repo,
             controller_id=controller_id,
@@ -1306,8 +1440,77 @@ def recover_same_controller_web_session(
         expected_session_id=web_session_id,
         expected_target_generation=prior_generation,
         expected_ownership_generation=ownership_generation,
-        structured_required=strong_successor_rotation,
+        structured_required=strong_successor_rotation or validated_current_entry is not None,
     )
+
+    if validated_current_entry is not None:
+        _require_current_entry_matches_host_attestation(
+            validated_current_entry, successor_identity_evidence
+        )
+
+    if (
+        not strong_successor_rotation
+        and validated_current_entry is not None
+        and _is_strong_web_target_record(current_target_record)
+    ):
+        lock_path = target_guard.registry_lock_path(registry_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                registry = load_json(registry_path)
+                if target_guard._matching_controller_ids_for_repo(repo, registry) != [controller_id]:
+                    raise PermissionError("project Controller changed after current-entry attestation")
+                current_record = target_guard.target_record(
+                    registry, controller_id=controller_id, host="web"
+                )
+                if not isinstance(current_record, dict):
+                    raise PermissionError("Web current target disappeared after current-entry attestation")
+                status_after, target_after, target_generation_after = (
+                    target_guard.validate_target_record(current_record, host="web")
+                )
+                owner_after = target_guard.execution_ownership_record(
+                    registry, controller_id=controller_id
+                )
+                if owner_after is None:
+                    raise PermissionError("Web ownership disappeared after current-entry attestation")
+                owner_host_after, owner_target_after, owner_generation_after = (
+                    target_guard.validate_execution_ownership_record(owner_after)
+                )
+                if (
+                    status_after != "active"
+                    or target_after != web_session_id
+                    or target_generation_after != prior_generation
+                    or owner_host_after != "web"
+                    or owner_target_after != web_session_id
+                    or owner_generation_after != ownership_generation
+                ):
+                    raise PermissionError(
+                        "Web target/ownership generation changed after current-entry attestation"
+                    )
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        recovered = target_guard.controller_identity_projection(
+            repo=repo,
+            host="web",
+            source_session_id=web_session_id,
+            registry_path=registry_path,
+        )
+        if recovered["session_binding_state"].get("verification") != "VERIFIED":
+            raise RuntimeError("current-entry attestation did not preserve verified Web binding")
+        return {
+            "result": "ALREADY_VERIFIED",
+            "state": "VERIFIED",
+            "controller_id": controller_id,
+            "execution_target_session_id": web_session_id,
+            "resume_lease_rotated": False,
+            "active_host": "web",
+            "ownership_generation": ownership_generation,
+            "target_generation": prior_generation,
+            "strong_successor_rotation": False,
+            "current_entry_attested": True,
+            "identity": recovered,
+        }
 
     lock_path = target_guard.registry_lock_path(registry_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1381,7 +1584,7 @@ def recover_same_controller_web_session(
                     expected_ownership_generation=ownership_generation,
                     now_unix=int(time.time()),
                 )
-                if refreshed_authorization is None:
+                if refreshed_authorization is None and validated_current_entry is None:
                     raise PermissionError(
                         "fresh explicit successor authorization expired or changed "
                         "after Host identity attestation"
@@ -1389,6 +1592,10 @@ def recover_same_controller_web_session(
                 owners = target_guard._session_owners(
                     registry, session_id=web_session_id, host="web"
                 )
+                if owners == {controller_id}:
+                    raise PermissionError(
+                        "historical Web alias cannot become current from Host current-entry discovery"
+                    )
                 if owners:
                     raise PermissionError(
                         "authorized Web successor became bound before strong recovery completed"
@@ -3566,6 +3773,39 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
             }
         return True
 
+    def discover_current_entry(**kwargs: Any) -> dict[str, Any]:
+        if host != "web":
+            raise PermissionError("registered Host current-entry discovery is Web-only")
+        if str(kwargs.get("host") or "").strip() != "web":
+            raise PermissionError("registered Host current-entry discovery host mismatch")
+        try:
+            logical_agent_identity = agent_target.normalize_logical_agent_identity(
+                kwargs.get("logical_agent_identity")
+            )
+        except ValueError as exc:
+            raise PermissionError(str(exc)) from exc
+        target_generation = kwargs.get("expected_target_generation")
+        ownership_generation = kwargs.get("expected_ownership_generation")
+        for value, name in ((target_generation, "target generation"), (ownership_generation, "ownership generation")):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise PermissionError(f"registered Host current-entry discovery requires positive {name}")
+        payload = run_cli({
+            "operation": "discover_current_entry",
+            "logical_agent_identity": logical_agent_identity,
+            "target_generation": target_generation,
+            "ownership_generation": ownership_generation,
+        })
+        if payload.get("operation") != "discover_current_entry":
+            raise PermissionError("registered Host current-entry discovery returned wrong operation")
+        current_entry = payload.get("current_entry")
+        if not isinstance(current_entry, dict):
+            raise PermissionError("registered Host current-entry discovery returned no machine identity")
+        return _validated_current_web_entry_evidence(
+            current_entry,
+            expected_target_generation=target_generation,
+            expected_ownership_generation=ownership_generation,
+        )
+
     def submit_reentry(**kwargs: Any) -> dict[str, Any]:
         if host != "web":
             raise PermissionError("registered Host submit adapter is Web-only")
@@ -3666,6 +3906,7 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
             }
         raise PermissionError("registered Host submit adapter returned inconsistent result semantics")
 
+    setattr(verify, "discover_current_entry", discover_current_entry)
     setattr(verify, "submit_reentry", submit_reentry)
     setattr(verify, "delivery_fingerprint", delivery_fingerprint)
     return verify
@@ -6744,67 +6985,75 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command_name == "session-start":
         repo = canonical_root(args.repo)
         registry_path = Path(args.registry).expanduser()
-        host_identity_receipt: dict[str, Any] | None = None
-        if args.host_identity_receipt_json:
-            try:
-                parsed = json.loads(args.host_identity_receipt_json)
-            except json.JSONDecodeError as exc:
-                print(f"invalid Host identity receipt JSON: {exc}", file=sys.stderr)
-                return 2
-            if not isinstance(parsed, dict):
-                print("Host identity receipt must be a JSON object", file=sys.stderr)
-                return 2
-            host_identity_receipt = parsed
         try:
             controller_id = registered_controller_for_repo(repo, registry_path)
             if controller_id is None:
                 raise ValueError(f"no registered controller for {repo}")
             try:
-                web_session_id = require_web_controller_session(
-                    controller_id=controller_id,
-                    web_session_id=args.web_session_id,
-                    registry_path=registry_path,
-                )
-                recovery = {
-                    "result": "ALREADY_VERIFIED",
-                    "controller_id": controller_id,
-                    "resume_lease_rotated": False,
-                }
-            except PermissionError:
-                recovery = recover_same_controller_web_session(
+                current_entry = discover_current_web_entry(
                     repo=repo,
-                    web_session_id=str(args.web_session_id or ""),
-                    registry_path=registry_path,
-                    host_identity_receipt=host_identity_receipt,
-                )
-                if recovery.get("result") not in {"RECOVERED", "ALREADY_VERIFIED"}:
-                    diagnostic = {
-                        "message": (
-                            "verified Web Controller Session identity required; "
-                            "project Controller ownership remains independent from current session authorization"
-                        ),
-                        "project_controller_state": recovery["identity"][
-                            "project_controller_state"
-                        ],
-                        "session_binding_state": recovery["identity"][
-                            "session_binding_state"
-                        ],
-                        "controller_actions_allowed": False,
-                        "recovery": recovery.get("state")
-                        or recovery["identity"]["session_binding_state"].get(
-                            "recovery"
-                        ),
-                    }
-                    print(
-                        json.dumps(diagnostic, ensure_ascii=False, sort_keys=True),
-                        file=sys.stderr,
-                    )
-                    return 78
-                web_session_id = require_web_controller_session(
                     controller_id=controller_id,
-                    web_session_id=args.web_session_id,
                     registry_path=registry_path,
                 )
+            except Exception as exc:
+                identity = target_guard.controller_identity_projection(
+                    repo=repo,
+                    host="web",
+                    source_session_id=None,
+                    registry_path=registry_path,
+                )
+                diagnostic = {
+                    "message": (
+                        "verified Web Controller Session identity required; "
+                        "project Controller ownership remains independent from current session authorization"
+                    ),
+                    "project_controller_state": identity["project_controller_state"],
+                    "session_binding_state": identity["session_binding_state"],
+                    "controller_actions_allowed": False,
+                    "recovery": identity["session_binding_state"].get("recovery"),
+                    "reason": "HOST_SESSION_ID_UNAVAILABLE",
+                    "host_identity_error": str(exc),
+                }
+                print(json.dumps(diagnostic, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+                return 78
+
+            web_session_id = str(current_entry["conversation_id"]).strip()
+            caller_claim = str(args.web_session_id or "").strip()
+            if caller_claim and caller_claim != web_session_id:
+                raise PermissionError(
+                    "caller-supplied Web session ID does not match Host machine current-entry identity"
+                )
+            recovery = recover_same_controller_web_session(
+                repo=repo,
+                web_session_id=web_session_id,
+                registry_path=registry_path,
+                host_identity_receipt=current_entry,
+                current_entry_evidence=current_entry,
+            )
+            if recovery.get("result") not in {"RECOVERED", "ALREADY_VERIFIED"}:
+                diagnostic = {
+                    "message": (
+                        "verified Web Controller Session identity required; "
+                        "project Controller ownership remains independent from current session authorization"
+                    ),
+                    "project_controller_state": recovery["identity"][
+                        "project_controller_state"
+                    ],
+                    "session_binding_state": recovery["identity"][
+                        "session_binding_state"
+                    ],
+                    "controller_actions_allowed": False,
+                    "recovery": recovery.get("state")
+                    or recovery["identity"]["session_binding_state"].get("recovery"),
+                    "reason": recovery.get("reason"),
+                }
+                print(json.dumps(diagnostic, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+                return 78
+            web_session_id = require_web_controller_session(
+                controller_id=controller_id,
+                web_session_id=web_session_id,
+                registry_path=registry_path,
+            )
             payload = web_session_restore_payload(
                 repo, registry_path, web_session_id=web_session_id
             )
@@ -6818,6 +7067,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload["controller_session_id"] = controller_id
         payload["web_session_id"] = web_session_id
         payload["event_source"] = "web"
+        payload["current_entry_identity"] = {
+            "provenance": current_entry["provenance"],
+            "entry_scope": current_entry["entry_scope"],
+            "machine_source": current_entry["machine_source"],
+            "conversation_id": current_entry["conversation_id"],
+            "browser_target_id": current_entry["browser_target_id"],
+            "top_frame_id": current_entry["top_frame_id"],
+            "loader_id": current_entry["loader_id"],
+            "secure_origin": current_entry["secure_origin"],
+            "target_generation": current_entry["target_generation"],
+            "ownership_generation": current_entry["ownership_generation"],
+            "host_receipt_id": current_entry["host_receipt_id"],
+            "logical_agent_identity": current_entry["logical_agent_identity"],
+            "verified_execution_target_fence": current_entry["verified_execution_target_fence"],
+        }
         payload["session_recovery_result"] = recovery
         print(json.dumps(payload, ensure_ascii=False))
         return 0

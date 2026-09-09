@@ -91,6 +91,42 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_registered_web_verifier_classifies_frame_tree_timeout_as_transient",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_classifies_exact_target_ambiguous_as_transient",
+    "tests.test_agent_target_resolution.LogicalAgentTargetResolutionTests."
+    "test_identity_contract_directly_supports_controller_agent_reviewer_and_runtime_repair_agent",
+    "tests.test_agent_target_resolution.LogicalAgentTargetResolutionTests."
+    "test_verified_execution_target_is_generic_and_carries_double_generation_fence",
+    "tests.test_agent_target_resolution.LogicalAgentTargetResolutionTests."
+    "test_verified_execution_target_rejects_wrong_logical_agent_and_stale_fences",
+    "tests.test_agent_target_resolution.LogicalAgentTargetResolutionTests."
+    "test_resolution_status_model_is_generic_and_requires_verified_target_only_for_verified_state",
+    "tests.test_controller_target_guard.ControllerTargetGuardTests."
+    "test_verified_logical_agent_target_projects_controller_and_defers_other_agent_ownership",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_registered_web_verifier_exposes_pinned_current_entry_discovery",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_generic_current_entry_discovery_accepts_runtime_repair_agent_verified_target",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_auto_discovers_machine_current_entry_and_allows_controller_actions",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_without_host_current_entry_fails_closed",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_caller_claim_of_real_canonical_conversation_is_not_current_entry_proof",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_same_conversation_different_browser_target_fails_closed",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_caller_claim_cannot_override_different_machine_current_entry",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_historical_alias_discovered_by_host_is_not_restored_as_current",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_active_tab_drift_cannot_change_discovered_invocation_identity",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_stale_current_entry_ownership_generation_fails_closed",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_stale_current_entry_generation_fails_closed",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_machine_current_successor_rotates_same_controller_only",
+    "tests.test_install_skill.InstallCapabilityTests."
+    "test_identity_capability_report_exposes_runtime_current_entry_host_contract",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_loads_pinned_external_runtime_host_cli",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
@@ -640,6 +676,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/event_scope_guard.py",
     "scripts/controller_state.py",
     "scripts/controller_target_guard.py",
+    "scripts/agent_target_resolution.py",
     "scripts/controller_scoring_guard.py",
     "scripts/controller_scoring_hook.py",
     "scripts/project_context_guard.py",
@@ -662,6 +699,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_project_context_guard.py",
     "tests/test_rule_handshake.py",
     "tests/test_controller_target_guard.py",
+    "tests/test_agent_target_resolution.py",
     "tests/test_web_lifecycle_bridge.py",
     "tests/test_web_agent_health_supervisor.py",
     "tests/test_terminal_continuation.py",
@@ -1152,6 +1190,21 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
         if skill_root is not None
         else Path(__file__).resolve().parent / "controller_target_guard.py"
     )
+    bridge = (
+        skill_root / "scripts" / "web_lifecycle_bridge.py"
+        if skill_root is not None
+        else Path(__file__).resolve().parent / "web_lifecycle_bridge.py"
+    )
+    try:
+        bridge_text = bridge.read_text(encoding="utf-8") if bridge.is_file() else ""
+    except OSError:
+        bridge_text = ""
+    runtime_current_entry_supported = (
+        "def discover_current_web_entry_for_logical_agent(" in bridge_text
+        and "logical_agent_identity" in bridge_text
+        and '"discover_current_entry"' in bridge_text
+        and "runtime_host_current_entry_v1" in bridge_text
+    )
     if not script.is_file():
         return {
             "status": "degraded",
@@ -1162,6 +1215,10 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
             "canonical_identity_cli": "controller_target_guard.py identity",
             "strong_web_binding_available": False,
             "host_attestation": "unavailable",
+            "runtime_current_entry_discovery_supported": runtime_current_entry_supported,
+            "current_entry_discovery_contract": "runtime_host_current_entry_v1" if runtime_current_entry_supported else None,
+            "current_entry_host_operation": "discover_current_entry",
+            "host_current_entry_required": runtime_current_entry_supported,
         }
     completed = subprocess.run(
         [sys.executable, str(script), "capabilities"],
@@ -1177,6 +1234,10 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
             "canonical_identity_cli": "controller_target_guard.py identity",
             "strong_web_binding_available": False,
             "host_attestation": "unavailable",
+            "runtime_current_entry_discovery_supported": runtime_current_entry_supported,
+            "current_entry_discovery_contract": "runtime_host_current_entry_v1" if runtime_current_entry_supported else None,
+            "current_entry_host_operation": "discover_current_entry",
+            "host_current_entry_required": runtime_current_entry_supported,
         }
     try:
         contract = json.loads(completed.stdout)
@@ -1184,6 +1245,18 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
         contract = {}
     capabilities = contract.get("capabilities") if isinstance(contract, dict) else None
     canonical_cli = contract.get("canonical_identity_cli") if isinstance(contract, dict) else None
+    logical_target_contract = (
+        contract.get("logical_agent_target_resolution_contract") if isinstance(contract, dict) else None
+    )
+    verified_target_contract = (
+        contract.get("verified_execution_target_contract") if isinstance(contract, dict) else None
+    )
+    supported_logical_agent_types = (
+        contract.get("supported_logical_agent_types") if isinstance(contract, dict) else None
+    )
+    logical_target_states = (
+        contract.get("logical_agent_target_resolution_states") if isinstance(contract, dict) else None
+    )
     if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
         capabilities = []
     required = {
@@ -1191,9 +1264,22 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
         "same_controller_recovery",
         "web_session_binding",
         "target_generation_fence",
+        "logical_agent_target_resolution",
+        "verified_execution_target_fence",
     }
     missing = sorted(required - set(capabilities))
-    current = not missing and canonical_cli == "controller_target_guard.py identity"
+    expected_agent_types = {"controller", "agent", "reviewer", "runtime_repair_agent"}
+    expected_resolution_states = {"VERIFIED", "UNRESOLVED", "STALE", "CONFLICTED"}
+    current = (
+        not missing
+        and canonical_cli == "controller_target_guard.py identity"
+        and logical_target_contract == "logical_agent_target_resolution_v1"
+        and verified_target_contract == "verified_execution_target_v1"
+        and isinstance(supported_logical_agent_types, list)
+        and expected_agent_types.issubset(set(supported_logical_agent_types))
+        and isinstance(logical_target_states, list)
+        and expected_resolution_states.issubset(set(logical_target_states))
+    )
     return {
         "status": "enabled" if current else "degraded",
         "configured": current,
@@ -1205,8 +1291,31 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
         "capabilities": sorted(set(capabilities)),
         "missing_capabilities": missing,
         "canonical_identity_cli": canonical_cli or "controller_target_guard.py identity",
+        "logical_agent_target_resolution_contract": logical_target_contract,
+        "verified_execution_target_contract": verified_target_contract,
+        "supported_logical_agent_types": (
+            sorted(set(supported_logical_agent_types))
+            if isinstance(supported_logical_agent_types, list)
+            else []
+        ),
+        "logical_agent_target_resolution_states": (
+            sorted(set(logical_target_states))
+            if isinstance(logical_target_states, list)
+            else []
+        ),
+        "ownership_resolver_scope": str(contract.get("ownership_resolver_scope") or "controller_registry_only"),
+        "automatic_problem_attribution": "post_migration_enhancement",
         "strong_web_binding_available": False,
-        "host_attestation": "unavailable",
+        "host_attestation": (
+            "external_current_entry_required"
+            if runtime_current_entry_supported
+            else "unavailable"
+        ),
+        "runtime_current_entry_discovery_supported": runtime_current_entry_supported,
+        "current_entry_discovery_contract": "runtime_host_current_entry_v1" if runtime_current_entry_supported else None,
+        "current_entry_host_operation": "discover_current_entry",
+        "host_current_entry_required": runtime_current_entry_supported,
+        "host_verifier_protocol": "runtime_host_verifier_cli_v1" if runtime_current_entry_supported else None,
     }
 
 
