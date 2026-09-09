@@ -2938,6 +2938,25 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
             f"registered Host verifier configuration rejected: {exc}"
         )
 
+    delivery_fingerprint_payload = {
+        "host": host,
+        "protocol": record.get("protocol"),
+        "executable": str(executable),
+        "sha256": str(digest).lower(),
+        "bundle_sha256": {
+            str(path): str(value).lower()
+            for path, value in sorted(bundle.items(), key=lambda item: str(item[0]))
+        },
+    }
+    delivery_fingerprint = __import__("hashlib").sha256(
+        json.dumps(
+            delivery_fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
     safe_env = {
         "HOME": str(Path.home()),
         "PATH": DEFAULT_RUNTIME_PATH,
@@ -3144,7 +3163,19 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
         raise PermissionError("registered Host submit adapter returned inconsistent result semantics")
 
     setattr(verify, "submit_reentry", submit_reentry)
+    setattr(verify, "delivery_fingerprint", delivery_fingerprint)
     return verify
+
+
+def _verifier_delivery_fingerprint(verifier: Any) -> str | None:
+    value = str(getattr(verifier, "delivery_fingerprint", "") or "").strip().lower()
+    if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+        return None
+    return value
+
+
+def _registered_web_host_delivery_fingerprint() -> str | None:
+    return _verifier_delivery_fingerprint(_registered_peer_attestation_verifier("web"))
 
 
 def _registered_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
@@ -4391,15 +4422,28 @@ def _rule_revision_from_state(lifecycle_state: dict[str, Any]) -> str | None:
     return None
 
 
-def _lifecycle_delivery_key(lifecycle_state: dict[str, Any]) -> str:
+def _lifecycle_delivery_key(
+    lifecycle_state: dict[str, Any], *, host_delivery_fingerprint: str | None = None
+) -> str:
+    base = ""
     for trigger in lifecycle_state.get("triggers", []):
         text = str(trigger)
         if text.startswith("rule_update_pending:"):
             revision = text.split(":", 1)[1].strip()
             if revision:
-                return f"rule-update:{revision}"
-    generation = int(lifecycle_state.get("wake_generation", 0) or 0)
-    return f"wake-generation:{generation}"
+                base = f"rule-update:{revision}"
+                break
+    if not base:
+        generation = int(lifecycle_state.get("wake_generation", 0) or 0)
+        base = f"wake-generation:{generation}"
+    fingerprint = str(host_delivery_fingerprint or "").strip().lower()
+    if len(fingerprint) == 64 and all(ch in "0123456789abcdef" for ch in fingerprint):
+        return f"{base}|host:{fingerprint}"
+    return base
+
+
+def _delivery_key_base(value: Any) -> str:
+    return str(value or "").split("|host:", 1)[0].strip()
 
 
 def schedule_guarded_rule_wake(
@@ -4639,22 +4683,35 @@ def continuation_supervisor_needs_bootstrap(
     *,
     current_registry_sha256: str | None = None,
     current_controller_wait_fence: dict[str, Any] | None = None,
+    current_host_delivery_fingerprint: str | None = None,
 ) -> bool:
     if lifecycle_state.get("pending_control_event") is not True:
         return False
     if lifecycle_state.get("requires_user") is True:
         return False
     lifecycle_fingerprint = _wake_event_fingerprint(lifecycle_state)
-    delivery_key = _lifecycle_delivery_key(lifecycle_state)
+    delivery_key = _lifecycle_delivery_key(
+        lifecycle_state,
+        host_delivery_fingerprint=current_host_delivery_fingerprint,
+    )
     terminal_key = str(supervisor_state.get("delivery_terminal_key") or "").strip()
     terminal_receipt = str(supervisor_state.get("delivery_terminal_receipt_id") or "").strip()
     terminal_outcome = str(supervisor_state.get("delivery_terminal_outcome") or "").strip()
-    if (
-        terminal_key == delivery_key
-        and terminal_receipt
-        and terminal_outcome in {"submit_confirmed", "result_unknown", "retry_exhausted"}
-    ):
-        return False
+    same_base_delivery = (
+        bool(terminal_key)
+        and _delivery_key_base(terminal_key) == _delivery_key_base(delivery_key)
+    )
+    if terminal_receipt and same_base_delivery:
+        if terminal_outcome in {"submit_confirmed", "result_unknown"}:
+            # Once dispatch may have happened, changing Host code must never authorize replay.
+            return False
+        if terminal_outcome == "retry_exhausted":
+            # Exhaustion is pre-dispatch-only. Keep it quiet for the same Host delivery
+            # implementation, but allow one new attempt after the trusted pinned bundle changes.
+            if terminal_key == delivery_key:
+                return False
+            if current_host_delivery_fingerprint is None:
+                return False
     legacy_receipt = str(supervisor_state.get("receipt_id") or "").strip()
     if (
         delivery_key.startswith("rule-update:")
@@ -4787,18 +4844,37 @@ def ensure_continuation_supervisor(
         )
     except (OSError, ValueError, PermissionError):
         current_controller_wait_fence = None
+    current_host_delivery_fingerprint = (
+        _registered_web_host_delivery_fingerprint()
+        if str(lifecycle_state.get("controller_host") or "").strip() == "web"
+        else None
+    )
     if not continuation_supervisor_needs_bootstrap(
         lifecycle_state,
         supervisor_state,
         current_registry_sha256=_file_sha256(registry),
         current_controller_wait_fence=current_controller_wait_fence,
+        current_host_delivery_fingerprint=current_host_delivery_fingerprint,
     ):
         return False
     generation = int(lifecycle_state.get("wake_generation", 0) or 0)
+    receipt_id = f"bootstrap:{generation}"
+    if (
+        supervisor_state.get("delivery_terminal_outcome") == "retry_exhausted"
+        and current_host_delivery_fingerprint
+        and _delivery_key_base(supervisor_state.get("delivery_terminal_key"))
+        == _delivery_key_base(_lifecycle_delivery_key(lifecycle_state))
+        and supervisor_state.get("delivery_terminal_key")
+        != _lifecycle_delivery_key(
+            lifecycle_state,
+            host_delivery_fingerprint=current_host_delivery_fingerprint,
+        )
+    ):
+        receipt_id += f":host-{current_host_delivery_fingerprint[:16]}"
     schedule_auto_native_stop(
         session_id=session_id,
         repo=repo,
-        receipt_id=f"bootstrap:{generation}",
+        receipt_id=receipt_id,
         registry=registry,
         codex=codex,
         delay_seconds=delay_seconds,
@@ -5198,6 +5274,7 @@ def _run_auto_native_stop_impl(
 
         fingerprint = _wake_event_fingerprint(lifecycle_state)
         verifier = _registered_peer_attestation_verifier("web")
+        host_delivery_fingerprint = _verifier_delivery_fingerprint(verifier)
         registry_data_for_web = load_json(registry)
         current_web_record = target_guard.target_record(
             registry_data_for_web, controller_id=session_id, host="web"
@@ -5359,10 +5436,17 @@ def _run_auto_native_stop_impl(
                     "completed_at_unix_ms": now_ms,
                     "returncode": 0,
                     "delivery_terminal_receipt_id": receipt_id,
-                    "delivery_terminal_key": _lifecycle_delivery_key(lifecycle_state),
+                    "delivery_terminal_key": _lifecycle_delivery_key(
+                        lifecycle_state,
+                        host_delivery_fingerprint=host_delivery_fingerprint,
+                    ),
                     "delivery_terminal_outcome": "submit_confirmed",
                     "delivery_terminal_at_unix_ms": now_ms,
                 })
+                if host_delivery_fingerprint:
+                    current["delivery_host_fingerprint"] = host_delivery_fingerprint
+                else:
+                    current.pop("delivery_host_fingerprint", None)
                 current.pop("failure_class", None)
                 current.pop("error_code", None)
                 current.pop("blocked_registry_sha256", None)
@@ -5407,11 +5491,18 @@ def _run_auto_native_stop_impl(
                     "error_code": "WEB_REENTRY_RETRY_EXHAUSTED",
                     "returncode": 78,
                     "delivery_terminal_receipt_id": receipt_id,
-                    "delivery_terminal_key": _lifecycle_delivery_key(lifecycle_state),
+                    "delivery_terminal_key": _lifecycle_delivery_key(
+                        lifecycle_state,
+                        host_delivery_fingerprint=host_delivery_fingerprint,
+                    ),
                     "delivery_terminal_outcome": "retry_exhausted",
                     "delivery_terminal_at_unix_ms": terminal_now_ms,
                     "completed_at_unix_ms": terminal_now_ms,
                 })
+                if host_delivery_fingerprint:
+                    current["delivery_host_fingerprint"] = host_delivery_fingerprint
+                else:
+                    current.pop("delivery_host_fingerprint", None)
             if failure_class == "web_reentry_identity_unavailable":
                 current.update({
                     "last_lifecycle_fingerprint": fingerprint,
@@ -5426,10 +5517,17 @@ def _run_auto_native_stop_impl(
                     terminal_now_ms = int(time.time() * 1000)
                     current.update({
                         "delivery_terminal_receipt_id": receipt_id,
-                        "delivery_terminal_key": _lifecycle_delivery_key(lifecycle_state),
+                        "delivery_terminal_key": _lifecycle_delivery_key(
+                            lifecycle_state,
+                            host_delivery_fingerprint=host_delivery_fingerprint,
+                        ),
                         "delivery_terminal_outcome": "result_unknown",
                         "delivery_terminal_at_unix_ms": terminal_now_ms,
                     })
+                    if host_delivery_fingerprint:
+                        current["delivery_host_fingerprint"] = host_delivery_fingerprint
+                    else:
+                        current.pop("delivery_host_fingerprint", None)
                 try:
                     blocked_controller_fence = _controller_web_wait_fence(
                         registry=registry, controller_id=session_id

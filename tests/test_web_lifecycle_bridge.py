@@ -4835,6 +4835,158 @@ class WebContinuationSupervisorBootstrapTests(unittest.TestCase):
         ))
 
 
+    def test_retry_exhausted_rearms_after_host_delivery_fingerprint_change(self) -> None:
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 12,
+            "triggers": ["terminal_receipt_pending"],
+        }
+        prior = {
+            "state": "WEB_REENTRY_RETRY_EXHAUSTED",
+            "pending_control_event": True,
+            "delivery_terminal_receipt_id": "bootstrap:12",
+            "delivery_terminal_key": "wake-generation:12|host:" + "a" * 64,
+            "delivery_terminal_outcome": "retry_exhausted",
+        }
+        self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle,
+            prior,
+            current_host_delivery_fingerprint="b" * 64,
+        ))
+
+    def test_retry_exhausted_same_host_delivery_fingerprint_stays_quiet(self) -> None:
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 12,
+            "triggers": ["terminal_receipt_pending"],
+        }
+        prior = {
+            "state": "WEB_REENTRY_RETRY_EXHAUSTED",
+            "pending_control_event": True,
+            "delivery_terminal_receipt_id": "bootstrap:12",
+            "delivery_terminal_key": "wake-generation:12|host:" + "a" * 64,
+            "delivery_terminal_outcome": "retry_exhausted",
+        }
+        self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle,
+            prior,
+            current_host_delivery_fingerprint="a" * 64,
+        ))
+
+    def test_legacy_retry_exhausted_gets_one_rearm_when_host_fingerprint_becomes_available(self) -> None:
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 12,
+            "triggers": ["terminal_receipt_pending"],
+        }
+        prior = {
+            "state": "WEB_REENTRY_RETRY_EXHAUSTED",
+            "pending_control_event": True,
+            "delivery_terminal_receipt_id": "post-shell:12",
+            "delivery_terminal_key": "wake-generation:12",
+            "delivery_terminal_outcome": "retry_exhausted",
+        }
+        self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle,
+            prior,
+            current_host_delivery_fingerprint="b" * 64,
+        ))
+
+    def test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change(self) -> None:
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 12,
+            "triggers": ["terminal_receipt_pending"],
+        }
+        for outcome in ("submit_confirmed", "result_unknown"):
+            with self.subTest(outcome=outcome):
+                prior = {
+                    "state": "WEB_REENTRY_SUBMITTED" if outcome == "submit_confirmed" else "WEB_REENTRY_RESULT_UNKNOWN",
+                    "pending_control_event": True,
+                    "delivery_terminal_receipt_id": "bootstrap:12",
+                    "delivery_terminal_key": "wake-generation:12|host:" + "a" * 64,
+                    "delivery_terminal_outcome": outcome,
+                }
+                self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+                    lifecycle,
+                    prior,
+                    current_host_delivery_fingerprint="b" * 64,
+                ))
+
+
+    def test_ensure_supervisor_uses_new_receipt_after_host_fingerprint_upgrade(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+            (repo / "TASK_LEDGER.md").write_text(
+                "# 任务台账\n\n## 当前目标\n- 当前活动项：无\n- 下一可见检查点：无\n\n"
+                "| ID | 状态 / 负责人 | 目标与边界 | 依赖 / 阻塞 | 验收与验证 | 证据 / 下一步 |\n"
+                "| --- | --- | --- | --- | --- | --- |\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "base"],
+                cwd=repo, check=True,
+            )
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-current", "generation": 4,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-current",
+                    "generation": 8, "provenance": "web_entry",
+                }},
+            }), encoding="utf-8")
+            state = root / "auto.json"
+            state.write_text(json.dumps({
+                "receipt_id": "post-shell:1",
+                "state": "WEB_REENTRY_RETRY_EXHAUSTED",
+                "pending_control_event": True,
+                "delivery_terminal_receipt_id": "post-shell:1",
+                "delivery_terminal_key": "wake-generation:12|host:" + "a" * 64,
+                "delivery_terminal_outcome": "retry_exhausted",
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True,
+                "requires_user": False,
+                "controller_host": "web",
+                "wake_generation": 12,
+                "triggers": ["terminal_receipt_pending"],
+            }
+            captured = {}
+            def schedule(**kwargs):
+                captured.update(kwargs)
+                return True
+            with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state), \
+                 patch.object(web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64), \
+                 patch.object(web_bridge, "schedule_auto_native_stop", side_effect=schedule):
+                self.assertTrue(web_bridge.ensure_continuation_supervisor(
+                    lifecycle_state=lifecycle,
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex="codex",
+                    delay_seconds=1.0,
+                ))
+            self.assertEqual(captured["receipt_id"], "bootstrap:12:host-" + "b" * 16)
+
+
 class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
     def run_bridge(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -9853,3 +10005,77 @@ def _transient_web_reentry_retry_budget_exhausts_without_rearm(self):
 
 WebContinuationSupervisorBootstrapTests.test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot = _non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot
 WebLocalReentryIntegrationTests.test_transient_web_reentry_retry_budget_exhausts_without_rearm = _transient_web_reentry_retry_budget_exhausts_without_rearm
+
+def _retry_exhausted_persists_host_delivery_fingerprint(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "host_attested_same_controller_recovery",
+            "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 8, "provenance": "web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id": "web-transient-fingerprint",
+            "session_id": "controller-1",
+            "repo": str(repo.resolve()),
+            "state": "WEB_REENTRY_PENDING",
+            "pending_control_event": True,
+            "retry_count": web_bridge.WEB_REENTRY_TRANSIENT_RETRY_LIMIT - 1,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 23,
+            "triggers": ["terminal_receipt_pending"],
+            "snapshot": {
+                "head": "h3", "ledger_sha256": "l3",
+                "worktree_status_sha256": "w3", "ready_ids": [],
+                "runnable_ids": [], "candidate_revisions": [],
+            },
+        }
+        attempt = {
+            "operation": "web_reentry", "result": "DEFERRED",
+            "state": "WEB_REENTRY_PENDING", "returncode": 78,
+            "failure_class": "web_reentry_unavailable",
+            "error_code": "WEB_REENTRY_UNAVAILABLE",
+            "stderr_tail": "temporary route gap",
+            "execution_target_session_id": "web-current",
+            "target_generation": 4, "ownership_generation": 8,
+            "target_mode": "explicit_current",
+            "delivery_authorization": "host_attested",
+            "host_attested": True, "strong_web_identity_established": True,
+        }
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        verifier.delivery_fingerprint = "a" * 64
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), \
+             patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), \
+             patch.object(web_bridge, "_execute_registered_web_host_reentry", return_value=attempt), \
+             patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo,
+                receipt_id="web-transient-fingerprint",
+                registry=registry, codex="codex",
+                delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 78)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WEB_REENTRY_RETRY_EXHAUSTED")
+    self.assertEqual(saved["delivery_host_fingerprint"], "a" * 64)
+    self.assertEqual(
+        saved["delivery_terminal_key"],
+        "wake-generation:23|host:" + "a" * 64,
+    )
+
+
+WebLocalReentryIntegrationTests.test_retry_exhausted_persists_host_delivery_fingerprint = _retry_exhausted_persists_host_delivery_fingerprint
