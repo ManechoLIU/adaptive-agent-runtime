@@ -804,6 +804,11 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_browser_tab_receipt_cannot_recover_an_unverified_web_session",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_manual_web_mutations_cannot_downgrade_host_attested_current_target",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target",
+            "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests.test_authorize_web_successor_records_only_fenced_fresh_session",
+            "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests.test_authorize_web_successor_cli_does_not_rotate_target",
+            "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests.test_authorized_strong_web_successor_rotates_target_and_ownership_once",
+            "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests.test_strong_web_successor_expired_authorization_does_not_call_verifier",
+            "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests.test_strong_web_successor_rechecks_target_generation_after_attestation",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_legacy_quarantined_target_keeps_manual_replacement_exit",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_does_not_rotate_manual_resume_lease",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_session_start_verified_target_does_not_rotate_manual_resume_lease",
@@ -1142,6 +1147,12 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_current_web_adapter_receipt_must_correlate_origin_call_receipt(self): self.assertTrue(True)\n"
                 "    def test_current_web_adapter_is_not_called_for_malformed_origin_attestation(self): self.assertTrue(True)\n"
                 "    def test_registered_current_web_adapter_without_ownership_is_never_called(self): self.assertTrue(True)\n"
+                "class StrongWebSuccessorHandoffTests(unittest.TestCase):\n"
+                "    def test_authorize_web_successor_records_only_fenced_fresh_session(self): self.assertTrue(True)\n"
+                "    def test_authorize_web_successor_cli_does_not_rotate_target(self): self.assertTrue(True)\n"
+                "    def test_authorized_strong_web_successor_rotates_target_and_ownership_once(self): self.assertTrue(True)\n"
+                "    def test_strong_web_successor_expired_authorization_does_not_call_verifier(self): self.assertTrue(True)\n"
+                "    def test_strong_web_successor_rechecks_target_generation_after_attestation(self): self.assertTrue(True)\n"
                 "class WebContinuationSupervisorBootstrapTests(unittest.TestCase):\n"
                 "    def test_dead_or_untracked_active_supervisor_requires_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n"
@@ -1513,6 +1524,12 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_same_receipt_live_supervisor_is_coalesced(self): self.assertTrue(True)\n"
                 "    def test_current_token_web_rearm_hands_off_with_force_rearm_proof(self): self.assertTrue(True)\n"
                 "    def test_stale_supervisor_token_exits_without_running_impl(self): self.assertTrue(True)\n"
+                "class StrongWebSuccessorHandoffTests(unittest.TestCase):\n"
+                "    def test_authorize_web_successor_records_only_fenced_fresh_session(self): self.assertTrue(True)\n"
+                "    def test_authorize_web_successor_cli_does_not_rotate_target(self): self.assertTrue(True)\n"
+                "    def test_authorized_strong_web_successor_rotates_target_and_ownership_once(self): self.assertTrue(True)\n"
+                "    def test_strong_web_successor_expired_authorization_does_not_call_verifier(self): self.assertTrue(True)\n"
+                "    def test_strong_web_successor_rechecks_target_generation_after_attestation(self): self.assertTrue(True)\n"
                 "class WebContinuationSupervisorBootstrapTests(unittest.TestCase):\n"
                 "    def test_dead_or_untracked_active_supervisor_requires_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n"

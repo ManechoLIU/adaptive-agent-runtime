@@ -129,6 +129,16 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_manual_web_mutations_cannot_downgrade_host_attested_current_target",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_authorize_web_successor_records_only_fenced_fresh_session",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_authorize_web_successor_cli_does_not_rotate_target",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_authorized_strong_web_successor_rotates_target_and_ownership_once",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_strong_web_successor_expired_authorization_does_not_call_verifier",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_strong_web_successor_rechecks_target_generation_after_attestation",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_legacy_quarantined_target_keeps_manual_replacement_exit",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."

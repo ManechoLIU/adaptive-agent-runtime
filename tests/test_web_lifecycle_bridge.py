@@ -10086,3 +10086,280 @@ def _retry_exhausted_persists_host_delivery_fingerprint(self):
 
 
 WebLocalReentryIntegrationTests.test_retry_exhausted_persists_host_delivery_fingerprint = _retry_exhausted_persists_host_delivery_fingerprint
+
+class StrongWebSuccessorHandoffTests(unittest.TestCase):
+    def make_strong_identity(self, root: Path) -> tuple[Path, Path]:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps({
+            "controller-1": str(repo.resolve()),
+            "__controller_sessions__": {
+                "controller-1": {"web": ["web-strong", "web-historical"]}
+            },
+            "__controller_targets__": {
+                "controller-1": {"web": {
+                    "status": "active",
+                    "session_id": "web-strong",
+                    "generation": 4,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only",
+                    "identity_proof": "host_attested_origin",
+                }}
+            },
+            "__controller_execution_ownership__": {
+                "controller-1": {
+                    "active_host": "web",
+                    "execution_target_session_id": "web-strong",
+                    "generation": 4,
+                    "provenance": "web_entry",
+                }
+            },
+        }), encoding="utf-8")
+        return repo, registry
+
+    @staticmethod
+    def structured_verifier(calls: list[dict]):
+        def verifier(**kwargs):
+            calls.append(dict(kwargs))
+            session = kwargs["expected_target_session_id"]
+            receipt = "hr-" + session
+            return {
+                "identity_attested": True,
+                "host_receipt_id": receipt,
+                "verified_target": {
+                    "provenance": "runtime_host_verifier_v1",
+                    "conversation_id": session,
+                    "target_generation": kwargs["expected_target_generation"],
+                    "ownership_generation": kwargs["expected_ownership_generation"],
+                    "host_receipt_id": receipt,
+                },
+            }
+        return verifier
+
+    def test_authorize_web_successor_records_only_fenced_fresh_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_strong_identity(Path(tmp))
+            result = web_bridge.authorize_web_successor(
+                repo=repo,
+                controller_id="controller-1",
+                successor_web_session_id="web-new",
+                expected_target_generation=4,
+                expected_ownership_generation=4,
+                registry_path=registry,
+                ttl_seconds=60,
+                now_unix=1000,
+            )
+            saved = json.loads(registry.read_text())
+            self.assertFalse(result["idempotent"])
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
+                "web-strong",
+            )
+            self.assertEqual(
+                saved["__controller_execution_ownership__"]["controller-1"]["generation"],
+                4,
+            )
+            self.assertNotIn(
+                "web-new", saved["__controller_sessions__"]["controller-1"]["web"]
+            )
+            auth = saved[web_bridge.WEB_SUCCESSOR_AUTH_REGISTRY_KEY]["controller-1"]
+            self.assertEqual(auth["successor_web_session_id"], "web-new")
+            self.assertEqual(auth["expires_at_unix"], 1060)
+
+            with self.assertRaisesRegex(PermissionError, "historical Web alias"):
+                web_bridge.authorize_web_successor(
+                    repo=repo,
+                    controller_id="controller-1",
+                    successor_web_session_id="web-historical",
+                    expected_target_generation=4,
+                    expected_ownership_generation=4,
+                    registry_path=registry,
+                    ttl_seconds=60,
+                    now_unix=1000,
+                )
+
+    def test_authorize_web_successor_cli_does_not_rotate_target(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_strong_identity(Path(tmp))
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = web_bridge.main([
+                    "authorize-web-successor",
+                    "--repo", str(repo),
+                    "--controller-id", "controller-1",
+                    "--successor-web-session-id", "web-new",
+                    "--expected-generation", "4",
+                    "--expected-ownership-generation", "4",
+                    "--registry", str(registry),
+                    "--ttl-seconds", "60",
+                ])
+            self.assertEqual(code, 0)
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["successor_web_session_id"], "web-new")
+            saved = json.loads(registry.read_text())
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
+                "web-strong",
+            )
+            self.assertEqual(
+                saved["__controller_execution_ownership__"]["controller-1"]["generation"],
+                4,
+            )
+            self.assertNotIn(
+                "web-new", saved["__controller_sessions__"]["controller-1"]["web"]
+            )
+
+    def test_authorized_strong_web_successor_rotates_target_and_ownership_once(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_strong_identity(Path(tmp))
+            with patch.object(web_bridge.time, "time", return_value=1000):
+                web_bridge.authorize_web_successor(
+                    repo=repo,
+                    controller_id="controller-1",
+                    successor_web_session_id="web-new",
+                    expected_target_generation=4,
+                    expected_ownership_generation=4,
+                    registry_path=registry,
+                    ttl_seconds=60,
+                )
+                calls: list[dict] = []
+                with patch.object(
+                    web_bridge,
+                    "_registered_peer_attestation_verifier",
+                    return_value=self.structured_verifier(calls),
+                ):
+                    result = web_bridge.recover_same_controller_web_session(
+                        repo=repo,
+                        web_session_id="web-new",
+                        registry_path=registry,
+                        host_identity_receipt=None,
+                    )
+
+            saved = json.loads(registry.read_text())
+            self.assertEqual(result["result"], "RECOVERED")
+            self.assertTrue(result["strong_successor_rotation"])
+            self.assertEqual(result["target_generation"], 5)
+            self.assertEqual(result["ownership_generation"], 5)
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
+                "web-new",
+            )
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["generation"],
+                5,
+            )
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["identity_proof"],
+                "host_attested_origin",
+            )
+            self.assertEqual(
+                saved["__controller_execution_ownership__"]["controller-1"],
+                {
+                    "active_host": "web",
+                    "execution_target_session_id": "web-new",
+                    "generation": 5,
+                    "provenance": "web_entry",
+                },
+            )
+            self.assertIn(
+                "web-new", saved["__controller_sessions__"]["controller-1"]["web"]
+            )
+            self.assertNotIn(web_bridge.WEB_SUCCESSOR_AUTH_REGISTRY_KEY, saved)
+            self.assertEqual(
+                [call["expected_target_session_id"] for call in calls],
+                ["web-strong", "web-new"],
+            )
+            self.assertTrue(all(call["phase"] == "identity_evidence" for call in calls))
+
+    def test_strong_web_successor_expired_authorization_does_not_call_verifier(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_strong_identity(Path(tmp))
+            web_bridge.authorize_web_successor(
+                repo=repo,
+                controller_id="controller-1",
+                successor_web_session_id="web-new",
+                expected_target_generation=4,
+                expected_ownership_generation=4,
+                registry_path=registry,
+                ttl_seconds=5,
+                now_unix=1000,
+            )
+            calls: list[dict] = []
+            with patch.object(web_bridge.time, "time", return_value=1006), patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=self.structured_verifier(calls),
+            ):
+                result = web_bridge.recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id="web-new",
+                    registry_path=registry,
+                    host_identity_receipt=None,
+                )
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(
+                result["reason"], "HOST_ATTESTED_CURRENT_TARGET_ALREADY_ACTIVE"
+            )
+            self.assertEqual(calls, [])
+            saved = json.loads(registry.read_text())
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
+                "web-strong",
+            )
+
+    def test_strong_web_successor_rechecks_target_generation_after_attestation(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_strong_identity(Path(tmp))
+            with patch.object(web_bridge.time, "time", return_value=1000):
+                web_bridge.authorize_web_successor(
+                    repo=repo,
+                    controller_id="controller-1",
+                    successor_web_session_id="web-new",
+                    expected_target_generation=4,
+                    expected_ownership_generation=4,
+                    registry_path=registry,
+                    ttl_seconds=60,
+                )
+                calls = []
+                base_verifier = self.structured_verifier(calls)
+
+                def verifier(**kwargs):
+                    value = base_verifier(**kwargs)
+                    if kwargs["expected_target_session_id"] == "web-new":
+                        changed = json.loads(registry.read_text())
+                        changed["__controller_targets__"]["controller-1"]["web"]["generation"] = 5
+                        registry.write_text(json.dumps(changed), encoding="utf-8")
+                    return value
+
+                with patch.object(
+                    web_bridge,
+                    "_registered_peer_attestation_verifier",
+                    return_value=verifier,
+                ):
+                    with self.assertRaisesRegex(
+                        PermissionError, "target generation/session changed"
+                    ):
+                        web_bridge.recover_same_controller_web_session(
+                            repo=repo,
+                            web_session_id="web-new",
+                            registry_path=registry,
+                            host_identity_receipt=None,
+                        )
+
+            saved = json.loads(registry.read_text())
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
+                "web-strong",
+            )
+            self.assertEqual(
+                saved["__controller_execution_ownership__"]["controller-1"]["generation"],
+                4,
+            )
+            self.assertIn(web_bridge.WEB_SUCCESSOR_AUTH_REGISTRY_KEY, saved)

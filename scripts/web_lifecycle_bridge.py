@@ -73,6 +73,9 @@ def _peer_host_error_is_transient(value: Any) -> bool:
 
 
 DEFAULT_MANUAL_WEB_LEASE_TTL_SECONDS = 30 * 24 * 60 * 60
+DEFAULT_WEB_SUCCESSOR_AUTH_TTL_SECONDS = 5 * 60
+MAX_WEB_SUCCESSOR_AUTH_TTL_SECONDS = 15 * 60
+WEB_SUCCESSOR_AUTH_REGISTRY_KEY = "__controller_web_successor_authorizations__"
 DEFAULT_AUDIT_LOG = (
     Path.home()
     / "Library"
@@ -205,6 +208,216 @@ def bind_web_session_to_controller(
             registry["__controller_sessions__"] = sessions
             _write_json_atomic_file(registry_path, registry)
             return registry
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+
+def _pending_web_successor_authorization(
+    *,
+    registry: dict[str, Any],
+    repo: Path,
+    controller_id: str,
+    source_web_session_id: str,
+    successor_web_session_id: str,
+    expected_target_generation: int,
+    expected_ownership_generation: int,
+    now_unix: int,
+) -> dict[str, Any] | None:
+    authorizations = registry.get(WEB_SUCCESSOR_AUTH_REGISTRY_KEY)
+    if not isinstance(authorizations, dict):
+        return None
+    record = authorizations.get(controller_id)
+    if not isinstance(record, dict):
+        return None
+    try:
+        record_repo = Path(str(record.get("repo") or "")).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if (
+        record_repo != repo.resolve()
+        or record.get("controller_id") != controller_id
+        or record.get("source_web_session_id") != source_web_session_id
+        or record.get("successor_web_session_id") != successor_web_session_id
+        or record.get("expected_target_generation") != expected_target_generation
+        or record.get("expected_ownership_generation") != expected_ownership_generation
+        or record.get("provenance") != "manual_user_authorized_successor"
+        or record.get("mode") != "host_attested_successor_only"
+    ):
+        return None
+    expires_at = record.get("expires_at_unix")
+    if (
+        isinstance(expires_at, bool)
+        or not isinstance(expires_at, int)
+        or expires_at < now_unix
+    ):
+        return None
+    return dict(record)
+
+
+def _consume_web_successor_authorization(
+    registry: dict[str, Any], *, controller_id: str
+) -> None:
+    authorizations = registry.get(WEB_SUCCESSOR_AUTH_REGISTRY_KEY)
+    if not isinstance(authorizations, dict):
+        return
+    authorizations.pop(controller_id, None)
+    if authorizations:
+        registry[WEB_SUCCESSOR_AUTH_REGISTRY_KEY] = authorizations
+    else:
+        registry.pop(WEB_SUCCESSOR_AUTH_REGISTRY_KEY, None)
+
+
+def authorize_web_successor(
+    *,
+    repo: Path,
+    controller_id: str,
+    successor_web_session_id: str,
+    expected_target_generation: int,
+    expected_ownership_generation: int,
+    registry_path: Path,
+    ttl_seconds: int = DEFAULT_WEB_SUCCESSOR_AUTH_TTL_SECONDS,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Authorize one fresh Web successor without changing the current strong target."""
+    repo = canonical_root(repo)
+    controller_id = str(controller_id or "").strip()
+    successor_web_session_id = str(successor_web_session_id or "").strip()
+    if not controller_id or not successor_web_session_id:
+        raise ValueError("controller-id and successor-web-session-id are required")
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or ttl_seconds <= 0
+        or ttl_seconds > MAX_WEB_SUCCESSOR_AUTH_TTL_SECONDS
+    ):
+        raise ValueError(
+            f"ttl-seconds must be between 1 and {MAX_WEB_SUCCESSOR_AUTH_TTL_SECONDS}"
+        )
+    for value, name in (
+        (expected_target_generation, "expected target generation"),
+        (expected_ownership_generation, "expected ownership generation"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+
+    now = int(time.time()) if now_unix is None else int(now_unix)
+    registry_path = registry_path.expanduser()
+    lock_path = target_guard.registry_lock_path(registry_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            registry = load_json(registry_path)
+            matches = target_guard._matching_controller_ids_for_repo(repo, registry)
+            if matches != [controller_id]:
+                raise PermissionError(
+                    "Web successor authorization requires the existing unique registered Controller"
+                )
+            target_guard.require_no_active_outbound_lease(
+                registry, controller_id=controller_id, host="web"
+            )
+            current_record = target_guard.target_record(
+                registry, controller_id=controller_id, host="web"
+            )
+            if not isinstance(current_record, dict):
+                raise PermissionError(
+                    "Web successor authorization requires a current Host-attested Web target"
+                )
+            status, current_session, target_generation = (
+                target_guard.validate_target_record(current_record, host="web")
+            )
+            if (
+                status != "active"
+                or not current_session
+                or not _is_strong_web_target_record(current_record)
+            ):
+                raise PermissionError(
+                    "Web successor authorization requires a current Host-attested Web target"
+                )
+            if target_generation != expected_target_generation:
+                raise PermissionError(
+                    "expected target generation does not match current Host-attested Web target"
+                )
+            ownership = target_guard.execution_ownership_record(
+                registry, controller_id=controller_id
+            )
+            if ownership is None:
+                raise PermissionError(
+                    "Web successor authorization requires current Web execution ownership"
+                )
+            ownership_host, ownership_target, ownership_generation = (
+                target_guard.validate_execution_ownership_record(ownership)
+            )
+            if (
+                ownership_host != "web"
+                or ownership_target != current_session
+                or ownership_generation != expected_ownership_generation
+            ):
+                raise PermissionError(
+                    "expected ownership generation/target does not match current Web execution ownership"
+                )
+            if successor_web_session_id == current_session:
+                raise PermissionError(
+                    "Web successor authorization requires a different successor session"
+                )
+            owners = target_guard._session_owners(
+                registry, session_id=successor_web_session_id, host="web"
+            )
+            if owners == {controller_id}:
+                raise PermissionError(
+                    "historical Web alias cannot be authorized as a new strong successor"
+                )
+            if owners:
+                raise PermissionError(
+                    "Web successor session is already bound to another Controller"
+                )
+
+            current_pending = _pending_web_successor_authorization(
+                registry=registry,
+                repo=repo,
+                controller_id=controller_id,
+                source_web_session_id=current_session,
+                successor_web_session_id=successor_web_session_id,
+                expected_target_generation=expected_target_generation,
+                expected_ownership_generation=expected_ownership_generation,
+                now_unix=now,
+            )
+            if current_pending is not None:
+                return {**current_pending, "idempotent": True}
+
+            pending_map = registry.get(WEB_SUCCESSOR_AUTH_REGISTRY_KEY)
+            if isinstance(pending_map, dict):
+                existing = pending_map.get(controller_id)
+                if isinstance(existing, dict):
+                    expires = existing.get("expires_at_unix")
+                    if (
+                        isinstance(expires, int)
+                        and not isinstance(expires, bool)
+                        and expires >= now
+                    ):
+                        raise PermissionError(
+                            "a different unexpired Web successor authorization already exists"
+                        )
+            else:
+                pending_map = {}
+
+            record = {
+                "repo": str(repo.resolve()),
+                "controller_id": controller_id,
+                "source_web_session_id": current_session,
+                "successor_web_session_id": successor_web_session_id,
+                "expected_target_generation": expected_target_generation,
+                "expected_ownership_generation": expected_ownership_generation,
+                "authorized_at_unix": now,
+                "expires_at_unix": now + ttl_seconds,
+                "provenance": "manual_user_authorized_successor",
+                "mode": "host_attested_successor_only",
+            }
+            pending_map[controller_id] = record
+            registry[WEB_SUCCESSOR_AUTH_REGISTRY_KEY] = pending_map
+            _write_json_atomic_file(registry_path, registry)
+            return {**record, "idempotent": False}
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -789,6 +1002,46 @@ def _controller_ownership_generation(registry_path: Path, controller_id: str) ->
     return generation
 
 
+def _validated_identity_evidence(
+    value: Any,
+    *,
+    expected_session_id: str,
+    expected_target_generation: int,
+    expected_ownership_generation: int,
+    structured_required: bool,
+) -> dict[str, Any] | None:
+    if value is True and not structured_required:
+        return None
+    if not isinstance(value, dict):
+        if structured_required:
+            raise PermissionError(
+                "strong Web successor recovery requires structured Host identity evidence"
+            )
+        raise PermissionError("Host Controller session identity attestation rejected")
+    receipt_id = value.get("host_receipt_id")
+    verified_target = value.get("verified_target")
+    if (
+        value.get("identity_attested") is not True
+        or not isinstance(receipt_id, str)
+        or not receipt_id.strip()
+        or len(receipt_id.encode("utf-8")) > 512
+        or not isinstance(verified_target, dict)
+        or verified_target.get("provenance") != "runtime_host_verifier_v1"
+        or verified_target.get("conversation_id") != expected_session_id
+        or verified_target.get("target_generation") != expected_target_generation
+        or verified_target.get("ownership_generation") != expected_ownership_generation
+        or verified_target.get("host_receipt_id") != receipt_id
+    ):
+        raise PermissionError(
+            "structured Host identity evidence does not match recovery fence"
+        )
+    return {
+        "identity_attested": True,
+        "host_receipt_id": receipt_id.strip(),
+        "verified_target": dict(verified_target),
+    }
+
+
 def recover_same_controller_web_session(
     *,
     repo: Path,
@@ -829,65 +1082,83 @@ def recover_same_controller_web_session(
     controller_id = str(project.get("controller_id") or "").strip()
     if not controller_id:
         raise PermissionError("same-controller recovery has no existing controller_id")
-
-    # Host attestation proves that a browser conversation exists and matches the
-    # requested generation fence; it does not prove that an arbitrary historical
-    # alias or unrelated project chat is the user's intended successor Controller.
-    # Recovery therefore may only upgrade the already-canonical current Web target
-    # in place. Any target session change requires the explicit replace-web-session
-    # path first, which records a new manual/temporary current target.
-    registry_snapshot = load_json(registry_path)
-    current_target_record = target_guard.target_record(
-        registry_snapshot, controller_id=controller_id, host="web"
-    )
-    if not isinstance(current_target_record, dict):
-        raise PermissionError(
-            "same-controller Web recovery requires an explicit canonical current target; "
-            "use replace-web-session after explicit target authorization"
-        )
-    current_status, current_target_session, _current_target_generation = (
-        target_guard.validate_target_record(current_target_record, host="web")
-    )
-    if current_status != "active" or current_target_session != web_session_id:
-        raise PermissionError(
-            "same-controller Web recovery cannot replace the canonical current target; "
-            "historical/unbound sessions require explicit replace-web-session authorization"
-        )
-
     if binding.get("verification") == "CONFLICT":
         raise PermissionError(
             "verified Web Controller Session identity required; "
             "same-controller recovery refuses conflicting session ownership"
         )
 
-    current_registry = load_json(registry_path)
+    registry_snapshot = load_json(registry_path)
     current_target_record = target_guard.target_record(
-        current_registry, controller_id=controller_id, host="web"
+        registry_snapshot, controller_id=controller_id, host="web"
     )
-    if isinstance(current_target_record, dict):
-        current_status, current_target_session_id, current_target_generation = (
-            target_guard.validate_target_record(current_target_record, host="web")
+    if not isinstance(current_target_record, dict):
+        raise PermissionError(
+            "same-controller Web recovery requires an explicit canonical current target"
         )
+    current_status, current_target_session, current_target_generation = (
+        target_guard.validate_target_record(current_target_record, host="web")
+    )
+    if current_status != "active" or not current_target_session:
+        raise PermissionError(
+            "same-controller Web recovery requires an active canonical current target"
+        )
+
+    ownership_record = target_guard.execution_ownership_record(
+        registry_snapshot, controller_id=controller_id
+    )
+    if ownership_record is None:
+        ownership_host = None
+        ownership_target = None
+        ownership_generation = 0
+    else:
+        ownership_host, ownership_target, ownership_generation = (
+            target_guard.validate_execution_ownership_record(ownership_record)
+        )
+
+    strong_successor_rotation = current_target_session != web_session_id
+    successor_authorization: dict[str, Any] | None = None
+    if strong_successor_rotation:
+        if not _is_strong_web_target_record(current_target_record):
+            raise PermissionError(
+                "same-controller Web recovery cannot replace the canonical current target; "
+                "historical/unbound sessions require explicit replace-web-session authorization"
+            )
         if (
-            current_status == "active"
-            and _is_strong_web_target_record(current_target_record)
-            and current_target_session_id != web_session_id
+            ownership_host != "web"
+            or ownership_target != current_target_session
+            or ownership_generation < 1
         ):
+            raise PermissionError(
+                "same-controller strong Web successor recovery requires matching current Web ownership"
+            )
+        successor_authorization = _pending_web_successor_authorization(
+            registry=registry_snapshot,
+            repo=repo,
+            controller_id=controller_id,
+            source_web_session_id=current_target_session,
+            successor_web_session_id=web_session_id,
+            expected_target_generation=current_target_generation,
+            expected_ownership_generation=ownership_generation,
+            now_unix=int(time.time()),
+        )
+        if successor_authorization is None:
             return {
                 "result": "DEFERRED",
                 "state": "SAME_CONTROLLER_SESSION_RECOVERY",
                 "reason": "HOST_ATTESTED_CURRENT_TARGET_ALREADY_ACTIVE",
                 "controller_id": controller_id,
-                "current_execution_target_session_id": current_target_session_id,
+                "current_execution_target_session_id": current_target_session,
                 "current_target_generation": current_target_generation,
                 "safe_control_actions_allowed": True,
                 "identity": identity,
             }
+    elif current_target_session != web_session_id:
+        raise PermissionError(
+            "same-controller Web recovery cannot replace the canonical current target"
+        )
 
-    ownership_generation = _controller_ownership_generation(
-        registry_path, controller_id
-    )
-    if binding.get("verification") == "VERIFIED":
+    if not strong_successor_rotation and binding.get("verification") == "VERIFIED":
         ownership = target_guard.claim_controller_host(
             repo=repo,
             controller_id=controller_id,
@@ -905,7 +1176,9 @@ def recover_same_controller_web_session(
             "ownership_generation": ownership["generation"],
             "resume_lease_rotated": False,
             "identity": target_guard.controller_identity_projection(
-                repo=repo, host="web", source_session_id=web_session_id,
+                repo=repo,
+                host="web",
+                source_session_id=web_session_id,
                 registry_path=registry_path,
             ),
         }
@@ -921,16 +1194,40 @@ def recover_same_controller_web_session(
             "identity": identity,
         }
 
-    prior_generation = binding.get("target_generation")
-    if not isinstance(prior_generation, int) or isinstance(prior_generation, bool):
-        prior_generation = 0
+    prior_generation = current_target_generation
+    source_identity_evidence: dict[str, Any] | None = None
+    successor_identity_evidence: dict[str, Any] | None = None
     try:
-        attested = verifier(
+        if strong_successor_rotation:
+            source_attested = verifier(
+                phase="identity_evidence",
+                controller_id=controller_id,
+                host="web",
+                expected_target_session_id=current_target_session,
+                expected_target_generation=prior_generation,
+                expected_target_mode="same_controller_successor_source",
+                expected_ownership_generation=ownership_generation,
+                host_execution_receipt=None,
+                adapter_attempt={
+                    "operation": "controller_session_successor_source_attestation",
+                    "repo": str(repo.resolve()),
+                    "controller_id": controller_id,
+                    "execution_target_session_id": current_target_session,
+                },
+            )
+        else:
+            source_attested = None
+        successor_attested = verifier(
+            phase="identity_evidence",
             controller_id=controller_id,
             host="web",
             expected_target_session_id=web_session_id,
             expected_target_generation=prior_generation,
-            expected_target_mode="same_controller_session_recovery",
+            expected_target_mode=(
+                "same_controller_authorized_successor_recovery"
+                if strong_successor_rotation
+                else "same_controller_session_recovery"
+            ),
             expected_ownership_generation=ownership_generation,
             host_execution_receipt=host_identity_receipt,
             adapter_attempt={
@@ -950,8 +1247,22 @@ def recover_same_controller_web_session(
             "verifier_error": str(exc),
             "identity": identity,
         }
-    if attested is not True:
-        raise PermissionError("Host Controller session identity attestation rejected")
+
+    if strong_successor_rotation:
+        source_identity_evidence = _validated_identity_evidence(
+            source_attested,
+            expected_session_id=current_target_session,
+            expected_target_generation=prior_generation,
+            expected_ownership_generation=ownership_generation,
+            structured_required=True,
+        )
+    successor_identity_evidence = _validated_identity_evidence(
+        successor_attested,
+        expected_session_id=web_session_id,
+        expected_target_generation=prior_generation,
+        expected_ownership_generation=ownership_generation,
+        structured_required=strong_successor_rotation,
+    )
 
     lock_path = target_guard.registry_lock_path(registry_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -970,25 +1281,82 @@ def recover_same_controller_web_session(
             current_record = target_guard.target_record(
                 registry, controller_id=controller_id, host="web"
             )
-            if current_record is None:
-                current_generation = 0
-            else:
-                _current_status, _current_target, current_generation = (
-                    target_guard.validate_target_record(current_record, host="web")
-                )
-            if current_generation != prior_generation:
+            if not isinstance(current_record, dict):
                 raise PermissionError(
-                    "Web Controller target generation changed after identity attestation; "
+                    "Web Controller current target disappeared after identity attestation"
+                )
+            current_status_after, current_target_after, current_generation = (
+                target_guard.validate_target_record(current_record, host="web")
+            )
+            if (
+                current_generation != prior_generation
+                or current_status_after != "active"
+                or current_target_after != current_target_session
+            ):
+                raise PermissionError(
+                    "Web Controller target generation/session changed after identity attestation; "
                     "stale generation cannot recover the session"
                 )
-            owners = target_guard._session_owners(
-                registry, session_id=web_session_id, host="web"
+            current_ownership = target_guard.execution_ownership_record(
+                registry, controller_id=controller_id
             )
-            foreign = {owner for owner in owners if owner != controller_id}
-            if foreign:
+            if current_ownership is None:
                 raise PermissionError(
-                    "Web session is already owned by another Controller"
+                    "Web Controller ownership disappeared after identity attestation"
                 )
+            current_ownership_host, current_ownership_target, current_ownership_generation = (
+                target_guard.validate_execution_ownership_record(current_ownership)
+            )
+            if current_ownership_generation != ownership_generation:
+                raise PermissionError(
+                    "Web Controller ownership generation changed after identity attestation; "
+                    "stale ownership cannot recover the session"
+                )
+            if strong_successor_rotation and (
+                current_ownership_host != "web"
+                or current_ownership_target != current_target_session
+            ):
+                raise PermissionError(
+                    "Web Controller ownership target changed after identity attestation; "
+                    "strong successor recovery requires the same current Web owner"
+                )
+
+            if strong_successor_rotation:
+                if not _is_strong_web_target_record(current_record):
+                    raise PermissionError(
+                        "current strong Web target lost Host-attested identity during successor recovery"
+                    )
+                refreshed_authorization = _pending_web_successor_authorization(
+                    registry=registry,
+                    repo=repo,
+                    controller_id=controller_id,
+                    source_web_session_id=current_target_session,
+                    successor_web_session_id=web_session_id,
+                    expected_target_generation=prior_generation,
+                    expected_ownership_generation=ownership_generation,
+                    now_unix=int(time.time()),
+                )
+                if refreshed_authorization is None:
+                    raise PermissionError(
+                        "fresh explicit successor authorization expired or changed "
+                        "after Host identity attestation"
+                    )
+                owners = target_guard._session_owners(
+                    registry, session_id=web_session_id, host="web"
+                )
+                if owners:
+                    raise PermissionError(
+                        "authorized Web successor became bound before strong recovery completed"
+                    )
+            else:
+                owners = target_guard._session_owners(
+                    registry, session_id=web_session_id, host="web"
+                )
+                foreign = {owner for owner in owners if owner != controller_id}
+                if foreign:
+                    raise PermissionError(
+                        "Web session is already owned by another Controller"
+                    )
 
             sessions = registry.get("__controller_sessions__")
             if sessions is None:
@@ -1028,17 +1396,19 @@ def recover_same_controller_web_session(
                 controller_targets = {}
             if not isinstance(controller_targets, dict):
                 raise ValueError("Controller target map is invalid")
-            prior = controller_targets.get("web")
-            if prior is None:
-                generation = 1
+            generation = current_generation + 1
+
+            receipt_material: Any
+            if successor_identity_evidence is not None:
+                receipt_material = {
+                    "host_receipt_id": successor_identity_evidence["host_receipt_id"],
+                    "verified_target": successor_identity_evidence["verified_target"],
+                }
             else:
-                _status, _target, generation = target_guard.validate_target_record(
-                    prior, host="web"
-                )
-                generation += 1
+                receipt_material = host_identity_receipt or {}
             receipt_fingerprint = __import__("hashlib").sha256(
                 json.dumps(
-                    host_identity_receipt or {},
+                    receipt_material,
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
@@ -1063,6 +1433,10 @@ def recover_same_controller_web_session(
                 expected_generation=ownership_generation,
                 provenance="web_entry",
             )
+            if strong_successor_rotation:
+                _consume_web_successor_authorization(
+                    registry, controller_id=controller_id
+                )
             _write_json_atomic_file(registry_path, registry)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -1074,7 +1448,9 @@ def recover_same_controller_web_session(
         registry_path=registry_path,
     )
     if recovered["session_binding_state"].get("verification") != "VERIFIED":
-        raise RuntimeError("same-controller recovery did not produce a verified current session")
+        raise RuntimeError(
+            "same-controller recovery did not produce a verified current session"
+        )
     return {
         "result": "RECOVERED",
         "state": "VERIFIED",
@@ -1085,6 +1461,21 @@ def recover_same_controller_web_session(
         "ownership_generation": ownership_claim["generation"],
         "target_generation": recovered["session_binding_state"].get(
             "target_generation"
+        ),
+        "strong_successor_rotation": strong_successor_rotation,
+        **(
+            {
+                "source_host_receipt_sha256": __import__("hashlib").sha256(
+                    source_identity_evidence["host_receipt_id"].encode("utf-8")
+                ).hexdigest(),
+                "successor_host_receipt_sha256": __import__("hashlib").sha256(
+                    successor_identity_evidence["host_receipt_id"].encode("utf-8")
+                ).hexdigest(),
+            }
+            if strong_successor_rotation
+            and source_identity_evidence is not None
+            and successor_identity_evidence is not None
+            else {}
         ),
         "identity": recovered,
     }
@@ -3054,12 +3445,19 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
             or len(receipt.encode("utf-8")) > 512
         ):
             raise PermissionError("registered Host verifier returned mismatched verified target")
-        if kwargs.get("phase") == "pre_delivery":
+        phase = kwargs.get("phase")
+        if phase == "pre_delivery":
             return {
                 "origin_host": "chatgpt_web" if host == "web" else host,
                 "origin_conversation_id": conversation_id,
                 "origin_attested": True,
                 "call_receipt": receipt.strip(),
+            }
+        if phase == "identity_evidence":
+            return {
+                "identity_attested": True,
+                "host_receipt_id": receipt.strip(),
+                "verified_target": dict(verified),
             }
         return True
 
@@ -5906,6 +6304,17 @@ def build_parser() -> argparse.ArgumentParser:
     bind_web.add_argument("--web-session-id", required=True)
     bind_web.add_argument("--registry", default=str(DEFAULT_REGISTRY))
 
+    authorize_successor = subparsers.add_parser("authorize-web-successor")
+    authorize_successor.add_argument("--repo", required=True)
+    authorize_successor.add_argument("--controller-id", required=True)
+    authorize_successor.add_argument("--successor-web-session-id", required=True)
+    authorize_successor.add_argument("--expected-generation", type=int, required=True)
+    authorize_successor.add_argument("--expected-ownership-generation", type=int, required=True)
+    authorize_successor.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    authorize_successor.add_argument(
+        "--ttl-seconds", type=int, default=DEFAULT_WEB_SUCCESSOR_AUTH_TTL_SECONDS
+    )
+
     replace_web = subparsers.add_parser("replace-web-session")
     replace_web.add_argument("--repo", required=True)
     replace_web.add_argument("--controller-id", required=True)
@@ -6087,6 +6496,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 2
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.command_name == "authorize-web-successor":
+        try:
+            result = authorize_web_successor(
+                repo=Path(args.repo).expanduser(),
+                controller_id=args.controller_id,
+                successor_web_session_id=args.successor_web_session_id,
+                expected_target_generation=args.expected_generation,
+                expected_ownership_generation=args.expected_ownership_generation,
+                registry_path=Path(args.registry).expanduser(),
+                ttl_seconds=args.ttl_seconds,
+            )
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
+        except (OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
 
     if args.command_name == "authorize-manual-web-session":
