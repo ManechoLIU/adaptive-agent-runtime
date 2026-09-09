@@ -62,6 +62,23 @@ class ExternalAgentExecutionError extends Error {
   }
 }
 
+export function classifyExternalExecutionFailure(error, { sideEffect = false } = {}) {
+  const providerFailureClass = String(error?.failureClass || "transport_error");
+  const providerBoundaryCrossed = Boolean(error?.details?.provider_started);
+  const providerResultUnknown = Boolean(error?.resultUnknown);
+  const sideEffectBoundaryUnknown = Boolean(sideEffect) && providerBoundaryCrossed && !providerResultUnknown;
+  const resultUnknown = providerResultUnknown || sideEffectBoundaryUnknown;
+  const failureClass = sideEffectBoundaryUnknown ? "result_unknown" : providerFailureClass;
+  const retrySafe = resultUnknown ? false : error?.retrySafe !== false;
+  const failureDetails = {
+    ...(error?.details && typeof error.details === "object" && !Array.isArray(error.details) ? error.details : {}),
+    ...(sideEffectBoundaryUnknown && providerFailureClass !== "result_unknown"
+      ? { underlying_failure_class: providerFailureClass, provider_failure_class: providerFailureClass }
+      : {}),
+  };
+  return { failureClass, retrySafe, resultUnknown, failureDetails };
+}
+
 function boundedEnvInteger(name, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
   const raw = process.env[name];
   if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
@@ -1270,7 +1287,7 @@ export function runMonitoredGrok(executable, args, {
     }, watchdogIntervalMs);
     child.once("error", (error) => {
       if (terminating || settled) return;
-      finish(reject, new ExternalAgentExecutionError(`cli_launch_failed: ${error.message}`, { failureClass: "cli_launch_failed", retrySafe: true, details: { provider_started: false } }));
+      finish(reject, new ExternalAgentExecutionError(`cli_launch_failed: ${error.message}`, { failureClass: "cli_launch_failed", retrySafe: true, details: { provider_started: launchConfirmed } }));
     });
     child.once("exit", (code, signal) => {
       if (terminating || settled) return;
@@ -1513,19 +1530,9 @@ async function main() {
       code = await executeExternalAgent(options);
     } catch (error) {
       if (heartbeat) clearInterval(heartbeat);
-      const providerFailureClass = String(error?.failureClass || "transport_error");
-      const providerBoundaryCrossed = Boolean(error?.details?.provider_started);
-      const resultUnknown = Boolean(error?.resultUnknown)
-        || (Boolean(options.sideEffect) && providerBoundaryCrossed);
-      const failureClass = resultUnknown ? "result_unknown" : providerFailureClass;
-      const retrySafe = resultUnknown ? false : error?.retrySafe !== false;
-      const failureDetails = {
-        ...(error?.details && typeof error.details === "object" && !Array.isArray(error.details) ? error.details : {}),
-        ...(resultUnknown && providerFailureClass !== "result_unknown" ? { underlying_failure_class: providerFailureClass } : {}),
-        ...(Boolean(options.sideEffect) && providerBoundaryCrossed && providerFailureClass !== "result_unknown"
-          ? { provider_failure_class: providerFailureClass }
-          : {}),
-      };
+      const { failureClass, retrySafe, resultUnknown, failureDetails } = classifyExternalExecutionFailure(error, {
+        sideEffect: Boolean(options.sideEffect),
+      });
       const nextAction = failureClass === "review_sharding_required"
         ? "split the immutable Reviewer contract into bounded shards and one final synthesis review"
         : failureClass === "prompt_too_large"

@@ -1398,6 +1398,49 @@ test("Grok launch deadline classifies cli_launch_timeout and terminates an uncon
   }
 });
 
+test("Grok post-launch child error preserves provider boundary evidence", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?post-launch-error=${Date.now()}`);
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 424244;
+  child.exitCode = null;
+  child.signalCode = null;
+  const previous = {
+    launch: process.env.AD_GROK_LAUNCH_TIMEOUT_MS,
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+  };
+  process.env.AD_GROK_LAUNCH_TIMEOUT_MS = "500";
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "500";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "500";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1000";
+  const spawnTimer = setTimeout(() => {
+    child.emit("spawn");
+    setTimeout(() => child.emit("error", new Error("post-launch transport error")), 10);
+  }, 10);
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, [], {
+        cwd: os.tmpdir(), env: process.env, spawnChild: () => child,
+      }),
+      (error) => error?.failureClass === "cli_launch_failed" && error?.details?.provider_started === true,
+    );
+  } finally {
+    clearTimeout(spawnTimer);
+    const names = {
+      launch: "AD_GROK_LAUNCH_TIMEOUT_MS", first: "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS",
+      stall: "AD_GROK_STALL_TIMEOUT_MS", absolute: "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS",
+    };
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[names[key]]; else process.env[names[key]] = value;
+    }
+  }
+});
+
 test("Grok first-output deadline starts after launch confirmation", async () => {
   const runtimeModule = await import(`../scripts/run_external_agent.mjs?first-after-launch=${Date.now()}`);
   const { EventEmitter } = await import("node:events");
@@ -1907,6 +1950,36 @@ test("Grok reviewer shard cannot finalize and synthesis binds exact candidate he
     evidence: [shardLocator], reviewShardReceipts: [shardLocator],
   });
   assert.equal(synthesis.status, 0, synthesis.stderr);
+});
+
+test("Grok cleanup uncertainty preserves cleanup failure class while remaining result unknown", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?cleanup-classification=${Date.now()}`);
+  assert.equal(typeof runtimeModule.classifyExternalExecutionFailure, "function");
+  const error = new Error("process group still alive");
+  error.failureClass = "process_group_cleanup_failed";
+  error.retrySafe = false;
+  error.resultUnknown = true;
+  error.details = { cleanup_confirmed: false, provider_started: true };
+  const classified = runtimeModule.classifyExternalExecutionFailure(error, { sideEffect: false });
+  assert.equal(classified.failureClass, "process_group_cleanup_failed");
+  assert.equal(classified.retrySafe, false);
+  assert.equal(classified.resultUnknown, true);
+  assert.equal(classified.failureDetails.cleanup_confirmed, false);
+});
+
+test("Grok side-effect provider uncertainty elevates a known timeout to result_unknown", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?side-effect-classification=${Date.now()}`);
+  assert.equal(typeof runtimeModule.classifyExternalExecutionFailure, "function");
+  const error = new Error("no model output");
+  error.failureClass = "first_output_timeout";
+  error.retrySafe = true;
+  error.resultUnknown = false;
+  error.details = { cleanup_confirmed: true, provider_started: true };
+  const classified = runtimeModule.classifyExternalExecutionFailure(error, { sideEffect: true });
+  assert.equal(classified.failureClass, "result_unknown");
+  assert.equal(classified.retrySafe, false);
+  assert.equal(classified.resultUnknown, true);
+  assert.equal(classified.failureDetails.provider_failure_class, "first_output_timeout");
 });
 
 test("Grok cleanup uncertainty is result unknown and not retry safe", async () => {
