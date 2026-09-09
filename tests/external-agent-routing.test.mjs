@@ -1538,6 +1538,43 @@ test("Grok generation stall timeout terminates after structured output stops", a
   assert.match(result.stderr, /generation_stalled/i);
 });
 
+test("Grok normal leader exit reaps surviving process-group descendants before success", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-leader-exit-descendant-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const descendantMarker = path.join(bin, "descendant-survived-after-leader-exit.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  const runner = path.join(bin, "grok");
+  await writeFile(runner, `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+if (process.argv[2] === "version") {
+  process.stdout.write("grok test\\n");
+} else {
+  spawn(process.execPath, ["-e", ${JSON.stringify(`setTimeout(() => require('fs').writeFileSync(${JSON.stringify(descendantMarker)}, 'survived'), 300); setTimeout(() => {}, 5000);`)}], { stdio: "ignore" }).unref();
+  process.stdout.write(JSON.stringify({type:"text",data:"done"}) + "\\n");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  process.exit(0);
+}
+`);
+  await chmod(runner, 0o755);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+  ], {
+    encoding: "utf8", input: "bounded",
+    timeout: 3000,
+    env: {
+      ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
+      AD_GROK_LAUNCH_TIMEOUT_MS: "500", AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "500", AD_GROK_STALL_TIMEOUT_MS: "1000",
+      AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "2000", AD_EXTERNAL_KILL_GRACE_MS: "25",
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  await assert.rejects(readFile(descendantMarker, "utf8"));
+});
+
 test("Grok absolute deadline kills the entire provider process group", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-process-group-timeout-"));
   const repo = await makeAssignmentRepo(bin);

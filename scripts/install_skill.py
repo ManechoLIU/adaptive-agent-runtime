@@ -596,6 +596,7 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok first-output deadline starts after launch confirmation",
     "Grok first-output timeout terminates a silent provider attempt",
     "Grok generation stall timeout terminates after structured output stops",
+    "Grok normal leader exit reaps surviving process-group descendants before success",
     "Grok absolute deadline kills the entire provider process group",
     "Grok side-effect timeout crosses provider boundary as result_unknown and disables retry",
     "Grok stall timeout persists structured canonical terminal classification",

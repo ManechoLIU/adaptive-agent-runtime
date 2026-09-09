@@ -933,6 +933,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok first-output deadline starts after launch confirmation', () => { assert.equal(1, 1); });\n"
                 "test('Grok first-output timeout terminates a silent provider attempt', () => { assert.equal(1, 1); });\n"
                 "test('Grok generation stall timeout terminates after structured output stops', () => { assert.equal(1, 1); });\n"
+                "test('Grok normal leader exit reaps surviving process-group descendants before success', () => { assert.equal(1, 1); });\n"
                 "test('Grok absolute deadline kills the entire provider process group', () => { assert.equal(1, 1); });\n"
                 "test('Grok side-effect timeout crosses provider boundary as result_unknown and disables retry', () => { assert.equal(1, 1); });\n"
                 "test('Grok stall timeout persists structured canonical terminal classification', () => { assert.equal(1, 1); });\n"

@@ -336,6 +336,17 @@ function waitForChildExit(child, timeoutMs) {
   });
 }
 
+async function waitForProcessGroupGone(pid, timeoutMs) {
+  if (!pid || process.platform === "win32") return true;
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (true) {
+    if (!processGroupExists(pid)) return true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, remaining)));
+  }
+}
+
 async function terminateProcessGroup(child, graceMs) {
   const notes = [];
   try {
@@ -344,29 +355,40 @@ async function terminateProcessGroup(child, graceMs) {
   } catch (error) {
     return { confirmed: false, diagnostic: `SIGTERM failed: ${error.message}` };
   }
-  await waitForChildExit(child, graceMs);
-  let groupAlive;
+  let groupGone = false;
   try {
-    groupAlive = process.platform === "win32" ? !childExited(child) : processGroupExists(child.pid);
+    const [, observedGroupGone] = await Promise.all([
+      waitForChildExit(child, graceMs),
+      waitForProcessGroupGone(child.pid, graceMs),
+    ]);
+    groupGone = process.platform === "win32" ? childExited(child) : observedGroupGone;
   } catch (error) {
     return { confirmed: false, diagnostic: `process-group probe failed after SIGTERM: ${error.message}` };
   }
-  if (!groupAlive && childExited(child)) return { confirmed: true, diagnostic: notes.join(";") };
+  if (groupGone && childExited(child)) return { confirmed: true, diagnostic: notes.join(";") };
   try {
     signalProcessGroup(child, "SIGKILL");
     notes.push("SIGKILL");
   } catch (error) {
+    try {
+      if (process.platform !== "win32" && !processGroupExists(child.pid) && childExited(child)) {
+        return { confirmed: true, diagnostic: `${notes.join(";")}; group disappeared before SIGKILL` };
+      }
+    } catch {}
     return { confirmed: false, diagnostic: `${notes.join(";")}; SIGKILL failed: ${error.message}` };
   }
-  await waitForChildExit(child, graceMs);
   try {
-    groupAlive = process.platform === "win32" ? !childExited(child) : processGroupExists(child.pid);
+    const [, observedGroupGone] = await Promise.all([
+      waitForChildExit(child, graceMs),
+      waitForProcessGroupGone(child.pid, graceMs),
+    ]);
+    groupGone = process.platform === "win32" ? childExited(child) : observedGroupGone;
   } catch (error) {
     return { confirmed: false, diagnostic: `${notes.join(";")}; final process-group probe failed: ${error.message}` };
   }
   return {
-    confirmed: !groupAlive && childExited(child),
-    diagnostic: !groupAlive && childExited(child) ? notes.join(";") : `${notes.join(";")}; process group still alive`,
+    confirmed: groupGone && childExited(child),
+    diagnostic: groupGone && childExited(child) ? notes.join(";") : `${notes.join(";")}; process group still alive`,
   };
 }
 
@@ -1291,14 +1313,37 @@ export function runMonitoredGrok(executable, args, {
     });
     child.once("exit", (code, signal) => {
       if (terminating || settled) return;
-      if (signal) {
-        finish(reject, new ExternalAgentExecutionError(`provider_terminated_by_signal: ${signal}`, {
-          failureClass: "provider_terminated_by_signal", retrySafe: true,
-          details: { provider_started: launchConfirmed },
-        }));
-      } else {
-        finish(resolve, code ?? 1);
-      }
+      terminating = true;
+      clearInterval(watchdog);
+      void (async () => {
+        let groupAlive = false;
+        try {
+          groupAlive = process.platform === "win32" ? false : processGroupExists(child.pid);
+        } catch (error) {
+          finish(reject, new ExternalAgentExecutionError(`process_group_cleanup_failed: terminal group probe failed: ${error.message}`, {
+            failureClass: "process_group_cleanup_failed", retrySafe: false, resultUnknown: true,
+            details: { cleanup_confirmed: false, cleanup_diagnostic: `terminal group probe failed: ${error.message}`, provider_started: launchConfirmed },
+          }));
+          return;
+        }
+        let cleanup = { confirmed: true, diagnostic: "process group already gone" };
+        if (groupAlive) cleanup = await terminateGroup(child, killGraceMs);
+        if (!cleanup.confirmed) {
+          finish(reject, new ExternalAgentExecutionError(`process_group_cleanup_failed: provider leader exited but descendants survived cleanup; cleanup=${cleanup.diagnostic}`, {
+            failureClass: "process_group_cleanup_failed", retrySafe: false, resultUnknown: true,
+            details: { cleanup_confirmed: false, cleanup_diagnostic: cleanup.diagnostic, provider_started: launchConfirmed },
+          }));
+          return;
+        }
+        if (signal) {
+          finish(reject, new ExternalAgentExecutionError(`provider_terminated_by_signal: ${signal}`, {
+            failureClass: "provider_terminated_by_signal", retrySafe: true,
+            details: { provider_started: launchConfirmed, cleanup_confirmed: true, cleanup_diagnostic: cleanup.diagnostic },
+          }));
+        } else {
+          finish(resolve, code ?? 1);
+        }
+      })();
     });
   });
 }
