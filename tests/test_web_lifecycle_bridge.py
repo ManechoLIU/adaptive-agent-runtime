@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -2855,6 +2856,136 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 web_bridge._HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND,
             )
 
+    def test_execute_native_resume_reaps_process_group_after_codex_turn_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["controller-1"]}
+                },
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "controller-1", "generation": 1,
+                }}},
+            }), encoding="utf-8")
+            codex = root / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"--version\" ]; then echo codex-test; exit 0; fi\n"
+                "printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{}}'\n"
+                "sleep 30\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+
+            started = time.monotonic()
+            attempt = web_bridge.execute_native_resume(
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                completion_grace_seconds=0.05,
+                max_runtime_seconds=2.0,
+            )
+
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertEqual(attempt["result"], "CONFIRMED")
+            self.assertEqual(attempt["state"], "RESUME_SUCCEEDED")
+            self.assertEqual(attempt["completion_source"], "codex_turn_completed")
+            self.assertEqual(attempt["returncode"], 0)
+            self.assertIn('"type":"turn.completed"', attempt["stdout_tail"])
+
+    def test_execute_native_resume_timeout_fails_closed_when_sigterm_handler_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["controller-1"]}
+                },
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "controller-1", "generation": 1,
+                }}},
+            }), encoding="utf-8")
+            codex = root / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"--version\" ]; then echo codex-test; exit 0; fi\n"
+                "trap 'exit 0' TERM\n"
+                "while :; do sleep 1; done\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+
+            attempt = web_bridge.execute_native_resume(
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                completion_grace_seconds=0.05,
+                max_runtime_seconds=0.05,
+            )
+
+            self.assertEqual(attempt["result"], "FAILED")
+            self.assertEqual(attempt["state"], "RESUME_FAILED")
+            self.assertEqual(attempt["failure_class"], "native_resume_timeout")
+            self.assertEqual(attempt["error_code"], "WEB_LIFECYCLE_RESUME_TIMEOUT")
+            self.assertEqual(attempt["returncode"], 124)
+            self.assertEqual(attempt["host_returncode"], 0)
+
+    def test_execute_native_resume_reaps_children_after_completed_leader_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["controller-1"]}
+                },
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "controller-1", "generation": 1,
+                }}},
+            }), encoding="utf-8")
+            child_pid = root / "child.pid"
+            codex = root / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"--version\" ]; then echo codex-test; exit 0; fi\n"
+                "sleep 3 &\n"
+                f"printf '%s' \"$!\" > {child_pid}\n"
+                "printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{}}'\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+
+            started = time.monotonic()
+            attempt = web_bridge.execute_native_resume(
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                completion_grace_seconds=0.05,
+                max_runtime_seconds=2.0,
+            )
+
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertEqual(attempt["result"], "CONFIRMED")
+            child = int(child_pid.read_text(encoding="utf-8"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child, 0)
+
     def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3433,8 +3564,11 @@ class WebLifecycleNativeStopTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             argv=json.loads(result.stdout)
             self.assertEqual(
-                argv[:6],
-                ["/opt/homebrew/bin/codex", "exec", "-C", str(repo.resolve()), "resume", "controller-1"],
+                argv[:7],
+                [
+                    "/opt/homebrew/bin/codex", "exec", "--json", "-C",
+                    str(repo.resolve()), "resume", "controller-1",
+                ],
             )
             self.assertNotIn("fork", argv)
 
@@ -3476,9 +3610,9 @@ class WebLifecycleNativeStopTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             argv = json.loads(result.stdout)
-            self.assertEqual(argv[4], "resume")
-            self.assertEqual(argv[5], "desktop-current")
-            self.assertNotIn("controller-old", argv[4:6])
+            self.assertEqual(argv[5], "resume")
+            self.assertEqual(argv[6], "desktop-current")
+            self.assertNotIn("controller-old", argv[5:7])
 
     def test_native_stop_missing_lifecycle_state_does_not_direct_resume(self) -> None:
         from unittest.mock import patch

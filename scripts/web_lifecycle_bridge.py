@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from contextlib import contextmanager
 import fcntl
 import json
 import os
 import secrets
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -90,6 +93,8 @@ AUTHORITATIVE_DOCUMENT_NAMES = ("SKILL.md", "SPEC.md", "DESIGN.md", "TECHNICAL.m
 RESTORE_DOCUMENT_LIMIT = 32768
 AUTO_CONTINUATION_STALL_LIMIT = 3
 WEB_REENTRY_TRANSIENT_RETRY_LIMIT = 6
+NATIVE_RESUME_MAX_RUNTIME_SECONDS = 30 * 60
+NATIVE_RESUME_COMPLETION_GRACE_SECONDS = 2.0
 _HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND = object()
 
 
@@ -2063,7 +2068,118 @@ def native_resume_command(
     pending_next_action = str(next_action or "").strip()
     if pending_next_action:
         prompt += " Persisted non-user next action: " + pending_next_action + ". Complete it before yielding."
-    return [codex, "exec", "-C", str(repo.resolve()), "resume", session_id, prompt]
+    return [codex, "exec", "--json", "-C", str(repo.resolve()), "resume", session_id, prompt]
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[str], *, grace_seconds: float
+) -> None:
+    process_group_id = process.pid
+
+    def group_exists() -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    process.poll()
+    if not group_exists():
+        return
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while group_exists() and time.monotonic() < deadline:
+        process.poll()
+        time.sleep(0.01)
+    process.poll()
+    if not group_exists():
+        if process.poll() is None:
+            process.wait(timeout=max(1.0, grace_seconds))
+        return
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        process.wait(timeout=max(1.0, grace_seconds))
+
+
+def _collect_native_resume(
+    process: subprocess.Popen[str], *, max_runtime_seconds: float,
+    completion_grace_seconds: float,
+) -> tuple[str, str, int, bool, bool]:
+    stdout_lines: deque[str] = deque(maxlen=256)
+    stderr_lines: deque[str] = deque(maxlen=256)
+    turn_completed = threading.Event()
+
+    def drain(stream: Any, output: deque[str], *, detect_completion: bool) -> None:
+        if stream is None:
+            return
+        for line in stream:
+            output.append(bounded_tail(str(line)))
+            if not detect_completion:
+                continue
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(event, dict) and event.get("type") == "turn.completed":
+                turn_completed.set()
+
+    stdout_thread = threading.Thread(
+        target=drain, args=(process.stdout, stdout_lines),
+        kwargs={"detect_completion": True}, daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=drain, args=(process.stderr, stderr_lines),
+        kwargs={"detect_completion": False}, daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    deadline = time.monotonic() + max(0.0, max_runtime_seconds)
+    completed_by_event = False
+    timed_out = False
+    while process.poll() is None:
+        if turn_completed.wait(timeout=0.1):
+            completed_by_event = True
+            try:
+                process.wait(timeout=max(0.0, completion_grace_seconds))
+            except subprocess.TimeoutExpired:
+                pass
+            _terminate_process_group(
+                process, grace_seconds=completion_grace_seconds
+            )
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            _terminate_process_group(
+                process, grace_seconds=completion_grace_seconds
+            )
+            break
+
+    stdout_thread.join(timeout=max(1.0, completion_grace_seconds))
+    stderr_thread.join(timeout=max(1.0, completion_grace_seconds))
+    if not stdout_thread.is_alive() and not stderr_thread.is_alive():
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+    stdout = bounded_tail("".join(stdout_lines))
+    stderr = bounded_tail("".join(stderr_lines))
+    if completed_by_event:
+        return stdout, stderr, 0, True, False
+    return (
+        stdout,
+        stderr,
+        process.returncode if process.returncode is not None else 78,
+        False,
+        timed_out,
+    )
 
 
 def execute_native_resume(
@@ -2078,6 +2194,8 @@ def execute_native_resume(
     supervisor_state_path: Path | None = None,
     supervisor_receipt_id: str | None = None,
     supervisor_token: str | None = None,
+    max_runtime_seconds: float = NATIVE_RESUME_MAX_RUNTIME_SECONDS,
+    completion_grace_seconds: float = NATIVE_RESUME_COMPLETION_GRACE_SECONDS,
 ) -> dict[str, Any]:
     """Run one bounded, preflighted same-thread native resume attempt."""
     try:
@@ -2171,6 +2289,7 @@ def execute_native_resume(
                         stderr=subprocess.PIPE,
                         text=True,
                         env=env,
+                        start_new_session=True,
                     )
             else:
                 process = subprocess.Popen(
@@ -2179,6 +2298,7 @@ def execute_native_resume(
                     stderr=subprocess.PIPE,
                     text=True,
                     env=env,
+                    start_new_session=True,
                 )
     except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
         target_rejected = target_receipt is None
@@ -2207,8 +2327,16 @@ def execute_native_resume(
         }
 
     try:
-        stdout, stderr = process.communicate() if process is not None else ("", "")
-        returncode = process.returncode if process is not None else 78
+        if process is None:
+            stdout, stderr, returncode, completed_by_event, timed_out = (
+                "", "", 78, False, False
+            )
+        else:
+            stdout, stderr, returncode, completed_by_event, timed_out = _collect_native_resume(
+                process,
+                max_runtime_seconds=max_runtime_seconds,
+                completion_grace_seconds=completion_grace_seconds,
+            )
     except (OSError, subprocess.SubprocessError) as exc:
         return {
             "operation": "native_resume",
@@ -2237,6 +2365,18 @@ def execute_native_resume(
         "stdout_tail": bounded_tail(stdout),
         "stderr_tail": bounded_tail(stderr),
     }
+    if completed_by_event:
+        attempt["completion_source"] = "codex_turn_completed"
+    if timed_out:
+        attempt.update({
+            "result": "FAILED",
+            "state": "RESUME_FAILED",
+            "failure_class": "native_resume_timeout",
+            "error_code": "WEB_LIFECYCLE_RESUME_TIMEOUT",
+            "host_returncode": returncode,
+            "returncode": 124,
+        })
+        return attempt
     if returncode == 0:
         attempt.update({"result": "CONFIRMED", "state": "RESUME_SUCCEEDED"})
         return attempt
