@@ -664,6 +664,13 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             web_bridge._peer_host_error_is_transient("Page.getFrameTree timed out")
         )
 
+    def test_registered_web_verifier_classifies_exact_target_ambiguous_as_transient(self) -> None:
+        self.assertTrue(
+            web_bridge._peer_host_error_is_transient(
+                "exact ChatGPT conversation target is ambiguous"
+            )
+        )
+
     def test_registered_web_verifier_classifies_exact_target_unavailable_as_transient(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:

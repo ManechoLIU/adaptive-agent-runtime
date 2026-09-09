@@ -785,6 +785,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_production_bridge_has_no_trusted_web_attestation_verifier",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_timeout_covers_product_host_request_budget",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_classifies_frame_tree_timeout_as_transient",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_classifies_exact_target_ambiguous_as_transient",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_loads_pinned_external_runtime_host_cli",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_exposes_pinned_host_submit_adapter",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_rechecks_bundle_before_each_execution",
@@ -1103,6 +1104,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_production_bridge_has_no_trusted_web_attestation_verifier(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_timeout_covers_product_host_request_budget(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_classifies_frame_tree_timeout_as_transient(self): self.assertTrue(True)\n"
+                "    def test_registered_web_verifier_classifies_exact_target_ambiguous_as_transient(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_loads_pinned_external_runtime_host_cli(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_exposes_pinned_host_submit_adapter(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_rechecks_bundle_before_each_execution(self): self.assertTrue(True)\n"
