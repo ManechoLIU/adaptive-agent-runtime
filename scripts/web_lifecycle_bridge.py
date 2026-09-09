@@ -86,6 +86,11 @@ DEFAULT_AUDIT_LOG = (
 )
 AI_BRIDGE_EXECUTABLE = "/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge"
 DEFAULT_RUNTIME_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+DESKTOP_CODEX_EXECUTABLE_ENV = "AD_DESKTOP_CODEX_EXECUTABLE"
+DEFAULT_DESKTOP_CODEX_APP_CANDIDATES = (
+    Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
+    Path("/Applications/Codex.app/Contents/Resources/codex"),
+)
 DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
 DEFAULT_DESKTOP_CANARY = (
     Path.home() / ".codex" / "state" / "adaptive-delivery-desktop-canary.json"
@@ -100,6 +105,46 @@ WEB_REENTRY_TRANSIENT_RETRY_LIMIT = 6
 NATIVE_RESUME_MAX_RUNTIME_SECONDS = 30 * 60
 NATIVE_RESUME_COMPLETION_GRACE_SECONDS = 2.0
 _HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND = object()
+
+
+def resolve_desktop_codex_executable(
+    explicit: str | Path | None = None,
+    *,
+    app_candidates: Sequence[str | Path] | None = None,
+    environ: dict[str, str] | None = None,
+) -> str:
+    """Resolve the Codex executable that belongs to the Desktop host.
+
+    A configured path is authoritative and fails closed when stale.  Without an
+    override, the Desktop app bundle is preferred over a PATH CLI so one target
+    is not resumed by a different Codex build than the app that owns it.
+    """
+    environment = os.environ if environ is None else environ
+    configured = str(explicit or environment.get(DESKTOP_CODEX_EXECUTABLE_ENV) or "").strip()
+
+    def checked(value: str | Path, *, source: str) -> str:
+        path = Path(value).expanduser().absolute()
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise ValueError(f"Desktop Codex executable from {source} is not executable: {path}")
+        return str(path)
+
+    if configured:
+        return checked(configured, source="explicit configuration")
+
+    candidates = (
+        DEFAULT_DESKTOP_CODEX_APP_CANDIDATES
+        if app_candidates is None
+        else tuple(app_candidates)
+    )
+    for candidate in candidates:
+        path = Path(candidate).expanduser().resolve(strict=False)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+
+    discovered = shutil.which("codex")
+    if discovered:
+        return checked(discovered, source="PATH")
+    raise ValueError("Desktop Codex executable is unavailable")
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -2190,7 +2235,7 @@ def reconcile_managed_web_assignments(
             session_id=controller_id,
             repo=repo,
             registry=registry,
-            codex="/opt/homebrew/bin/codex",
+            codex=None,
         )
     controller_continuation["supervisor_armed"] = supervisor_armed
 
@@ -2579,7 +2624,7 @@ def execute_native_resume(
     session_id: str,
     repo: Path,
     registry: Path,
-    codex: str,
+    codex: str | None,
     runtime_path: str | None = None,
     terminal_receipts: Sequence[str] | None = None,
     next_action: str | None = None,
@@ -2590,6 +2635,66 @@ def execute_native_resume(
     completion_grace_seconds: float = NATIVE_RESUME_COMPLETION_GRACE_SECONDS,
 ) -> dict[str, Any]:
     """Run one bounded, preflighted same-thread native resume attempt."""
+    if (
+        supervisor_state_path is not None
+        and supervisor_receipt_id is not None
+        and supervisor_token is not None
+    ):
+        try:
+            early_target = resolve_native_resume_target(
+                session_id=session_id,
+                repo=repo,
+                registry=registry,
+            )
+        except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
+            return {
+                "operation": "native_resume",
+                "controller_id": session_id,
+                "command": [],
+                "result": "FAILED",
+                "state": "RESUME_FAILED",
+                "pending_control_event": True,
+                "returncode": 78,
+                "stderr_tail": bounded_tail(
+                    f"Controller target guard rejected resume: {exc}"
+                ),
+                "error_code": "CONTROLLER_TARGET_REJECTED",
+            }
+        with _owned_supervisor_state(
+            supervisor_state_path,
+            receipt_id=supervisor_receipt_id,
+            supervisor_token=supervisor_token,
+        ) as owner:
+            if owner is None:
+                return {
+                    "operation": "native_resume",
+                    "controller_id": session_id,
+                    "execution_target_session_id": early_target.get(
+                        "execution_target_session_id"
+                    ),
+                    "target_generation": early_target.get("generation"),
+                    "target_mode": early_target.get("target_mode"),
+                    "command": [],
+                    "result": "DEFERRED",
+                    "state": "RESUME_SUPERSEDED",
+                    "pending_control_event": True,
+                    "returncode": 0,
+                    "failure_class": "supervisor_superseded",
+                }
+    try:
+        codex = resolve_desktop_codex_executable(codex)
+    except ValueError as exc:
+        return {
+            "operation": "native_resume",
+            "controller_id": session_id,
+            "command": [],
+            "result": "FAILED",
+            "state": "RESUME_FAILED",
+            "pending_control_event": True,
+            "returncode": 78,
+            "stderr_tail": bounded_tail(str(exc)),
+            "error_code": "DESKTOP_CODEX_EXECUTABLE_UNAVAILABLE",
+        }
     try:
         ok, preflight_error, env = preflight_native_resume(
             session_id=session_id,
@@ -3833,7 +3938,7 @@ def wake_existing_controller(
     session_id: str,
     repo: Path,
     registry: Path,
-    codex: str,
+    codex: str | None,
     receipt_path: Path,
     host_facts: dict[str, Any],
     resume_adapters: dict[str, Callable[..., dict[str, Any]]] | None = None,
@@ -4408,7 +4513,7 @@ def dispatch_pending_lifecycle_wake(
     session_id: str,
     repo: Path,
     registry: Path,
-    codex: str,
+    codex: str | None,
     receipt_path: Path | None = None,
     host_facts: dict[str, Any] | None = None,
     resume_adapters: dict[str, Callable[..., dict[str, Any]]] | None = None,
@@ -4750,7 +4855,7 @@ def dispatch_event(event: dict[str, Any]) -> int:
 
 def complete_web_lifecycle_dispatch(
     *, dispatch_outcome: dict[str, Any], session_id: str, repo: Path, registry: Path,
-    codex: str, receipt_prefix: str, runtime_path: str | None = None,
+    codex: str | None, receipt_prefix: str, runtime_path: str | None = None,
 ) -> int:
     """Finish a Web lifecycle transaction without losing a rejected logical Yield."""
     transport_returncode = int(dispatch_outcome.get("transport_returncode", 78) or 0)
@@ -4851,7 +4956,7 @@ def schedule_guarded_rule_wake(
     session_id: str,
     repo: Path,
     registry: Path,
-    codex: str,
+    codex: str | None,
     delay_seconds: float,
     state_path: Path,
     capture_path: Path | None = None,
@@ -4869,12 +4974,17 @@ def schedule_guarded_rule_wake(
         )
     except (OSError, ValueError, PermissionError, RuntimeError) as exc:
         return {"schedule": "blocked", "reason": str(exc)}
+    resolved_codex = (
+        resolve_desktop_codex_executable(codex)
+        if target.get("host") == "desktop_codex"
+        else None
+    )
     schedule = maybe_schedule_rule_wake(
         lifecycle_state=lifecycle_state,
         session_id=session_id,
         repo=repo,
         registry=registry,
-        codex=codex,
+        codex=resolved_codex,
         delay_seconds=delay_seconds,
         state_path=state_path,
         capture_path=capture_path,
@@ -4886,6 +4996,7 @@ def schedule_guarded_rule_wake(
         "execution_target_session_id": target.get("execution_target_session_id"),
         "target_generation": target.get("generation"),
         "ownership_generation": target.get("ownership_generation"),
+        "codex_executable": resolved_codex,
     }
 
 
@@ -4895,7 +5006,7 @@ def maybe_schedule_rule_wake(
     session_id: str,
     repo: Path,
     registry: Path,
-    codex: str,
+    codex: str | None,
     delay_seconds: float,
     state_path: Path,
     capture_path: Path | None = None,
@@ -5076,6 +5187,53 @@ def _controller_web_wait_fence(
     }
 
 
+def _controller_delivery_fence_identity(value: Any) -> tuple[str, int, int] | None:
+    if not isinstance(value, dict):
+        return None
+    target = str(value.get("execution_target_session_id") or "").strip()
+    target_generation = value.get("target_generation")
+    ownership_generation = value.get("ownership_generation")
+    if (
+        not target
+        or isinstance(target_generation, bool)
+        or not isinstance(target_generation, int)
+        or target_generation < 1
+        or isinstance(ownership_generation, bool)
+        or not isinstance(ownership_generation, int)
+        or ownership_generation < 1
+    ):
+        return None
+    return (target, target_generation, ownership_generation)
+
+
+def _delivery_controller_fence_identity(
+    supervisor_state: dict[str, Any],
+) -> tuple[str, int, int] | None:
+    explicit = _controller_delivery_fence_identity(
+        supervisor_state.get("delivery_controller_fence")
+    )
+    if explicit is not None:
+        return explicit
+    return _controller_delivery_fence_identity(supervisor_state)
+
+
+def _controller_delivery_fence_fingerprint(value: Any) -> str | None:
+    identity = _controller_delivery_fence_identity(value)
+    if identity is None:
+        return None
+    payload = json.dumps(
+        {
+            "execution_target_session_id": identity[0],
+            "target_generation": identity[1],
+            "ownership_generation": identity[2],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return __import__("hashlib").sha256(payload).hexdigest()
+
+
 def continuation_supervisor_needs_bootstrap(
     lifecycle_state: dict[str, Any],
     supervisor_state: dict[str, Any],
@@ -5106,10 +5264,18 @@ def continuation_supervisor_needs_bootstrap(
             return False
         if terminal_outcome == "retry_exhausted":
             # Exhaustion is pre-dispatch-only. Keep it quiet for the same Host delivery
-            # implementation, but allow one new attempt after the trusted pinned bundle changes.
+            # implementation and exact Controller fence. A trusted Host bundle upgrade or
+            # an explicit canonical target/ownership handoff may authorize one new attempt.
             if terminal_key == delivery_key:
-                return False
-            if current_host_delivery_fingerprint is None:
+                prior_fence = _delivery_controller_fence_identity(supervisor_state)
+                current_fence = _controller_delivery_fence_identity(
+                    current_controller_wait_fence
+                )
+                if prior_fence is None or current_fence is None:
+                    return False
+                if prior_fence == current_fence:
+                    return False
+            elif current_host_delivery_fingerprint is None:
                 return False
     legacy_receipt = str(supervisor_state.get("receipt_id") or "").strip()
     if (
@@ -5231,7 +5397,7 @@ def ensure_continuation_supervisor(
     session_id: str,
     repo: Path,
     registry: Path,
-    codex: str,
+    codex: str | None,
     runtime_path: str | None = None,
     delay_seconds: float = 1.0,
 ) -> bool:
@@ -5260,16 +5426,27 @@ def ensure_continuation_supervisor(
     receipt_id = f"bootstrap:{generation}"
     if (
         supervisor_state.get("delivery_terminal_outcome") == "retry_exhausted"
-        and current_host_delivery_fingerprint
         and _delivery_key_base(supervisor_state.get("delivery_terminal_key"))
         == _delivery_key_base(_lifecycle_delivery_key(lifecycle_state))
-        and supervisor_state.get("delivery_terminal_key")
-        != _lifecycle_delivery_key(
+    ):
+        current_delivery_key = _lifecycle_delivery_key(
             lifecycle_state,
             host_delivery_fingerprint=current_host_delivery_fingerprint,
         )
-    ):
-        receipt_id += f":host-{current_host_delivery_fingerprint[:16]}"
+        if (
+            current_host_delivery_fingerprint
+            and supervisor_state.get("delivery_terminal_key") != current_delivery_key
+        ):
+            receipt_id += f":host-{current_host_delivery_fingerprint[:16]}"
+        elif (
+            _delivery_controller_fence_identity(supervisor_state)
+            != _controller_delivery_fence_identity(current_controller_wait_fence)
+        ):
+            fence_fingerprint = _controller_delivery_fence_fingerprint(
+                current_controller_wait_fence
+            )
+            if fence_fingerprint:
+                receipt_id += f":fence-{fence_fingerprint[:16]}"
     schedule_auto_native_stop(
         session_id=session_id,
         repo=repo,
@@ -5289,7 +5466,7 @@ def _schedule_auto_native_stop_locked(
     repo: Path,
     receipt_id: str,
     registry: Path,
-    codex: str,
+    codex: str | None,
     delay_seconds: float,
     state_path: Path,
     capture_path: Path | None = None,
@@ -5385,12 +5562,13 @@ def _schedule_auto_native_stop_locked(
         "--repo", str(repo.resolve()),
         "--receipt-id", receipt_id,
         "--registry", str(registry.expanduser()),
-        "--codex", codex,
         "--delay-seconds", str(delay_seconds),
         "--state", str(state_path),
         "--runtime-path", runtime_path or DEFAULT_RUNTIME_PATH,
         "--supervisor-token", supervisor_token,
     ]
+    if codex:
+        command.extend(["--codex", codex])
     write_auto_stop_state(state_path, value)
     if capture_path is not None:
         capture_path.write_text(
@@ -5427,7 +5605,7 @@ def schedule_auto_native_stop(
     repo: Path,
     receipt_id: str,
     registry: Path,
-    codex: str,
+    codex: str | None,
     delay_seconds: float,
     state_path: Path,
     capture_path: Path | None = None,
@@ -5464,7 +5642,7 @@ def _rearm_auto_native_stop(
     repo: Path,
     receipt_id: str,
     registry: Path,
-    codex: str,
+    codex: str | None,
     delay_seconds: float,
     state_path: Path,
     runtime_path: str | None,
@@ -5603,7 +5781,7 @@ def _run_auto_native_stop_impl(
     repo: Path,
     receipt_id: str,
     registry: Path,
-    codex: str,
+    codex: str | None,
     delay_seconds: float,
     state_path: Path,
     runtime_path: str | None = None,
@@ -5902,6 +6080,16 @@ def _run_auto_native_stop_impl(
                     current["delivery_host_fingerprint"] = host_delivery_fingerprint
                 else:
                     current.pop("delivery_host_fingerprint", None)
+                try:
+                    delivery_controller_fence = _controller_web_wait_fence(
+                        registry=registry, controller_id=session_id
+                    )
+                except (OSError, ValueError, PermissionError):
+                    delivery_controller_fence = None
+                if isinstance(delivery_controller_fence, dict):
+                    current["delivery_controller_fence"] = delivery_controller_fence
+                else:
+                    current.pop("delivery_controller_fence", None)
             if failure_class == "web_reentry_identity_unavailable":
                 current.update({
                     "last_lifecycle_fingerprint": fingerprint,
@@ -6199,7 +6387,7 @@ def run_auto_native_stop(
     repo: Path,
     receipt_id: str,
     registry: Path,
-    codex: str,
+    codex: str | None,
     delay_seconds: float,
     state_path: Path,
     runtime_path: str | None = None,
@@ -6372,7 +6560,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit_once.add_argument("--auto-stop-delay-seconds", type=float, default=5.0)
     audit_once.add_argument("--auto-stop-state")
     audit_once.add_argument("--capture-auto-stop")
-    audit_once.add_argument("--codex", default="/opt/homebrew/bin/codex")
+    audit_once.add_argument("--codex")
     audit_once.add_argument("--runtime-path", default=DEFAULT_RUNTIME_PATH)
 
     arm_computer = subparsers.add_parser("arm-computer")
@@ -6387,7 +6575,7 @@ def build_parser() -> argparse.ArgumentParser:
     native_stop.add_argument("--session-id", required=True)
     native_stop.add_argument("--repo", required=True)
     native_stop.add_argument("--registry", default=str(DEFAULT_REGISTRY))
-    native_stop.add_argument("--codex", default="/opt/homebrew/bin/codex")
+    native_stop.add_argument("--codex")
     native_stop.add_argument("--runtime-path", default=DEFAULT_RUNTIME_PATH)
     native_stop.add_argument("--dry-run", action="store_true")
 
@@ -6396,7 +6584,7 @@ def build_parser() -> argparse.ArgumentParser:
     auto_stop.add_argument("--repo", required=True)
     auto_stop.add_argument("--receipt-id", required=True)
     auto_stop.add_argument("--registry", default=str(DEFAULT_REGISTRY))
-    auto_stop.add_argument("--codex", default="/opt/homebrew/bin/codex")
+    auto_stop.add_argument("--codex")
     auto_stop.add_argument("--runtime-path", default=DEFAULT_RUNTIME_PATH)
     auto_stop.add_argument("--delay-seconds", type=float, default=5.0)
     auto_stop.add_argument("--state")
@@ -6675,7 +6863,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             session_id=session_id,
             repo=repo,
             registry=registry_path,
-            codex="/opt/homebrew/bin/codex",
+            codex=None,
             receipt_prefix="post-shell",
         )
 
@@ -6942,8 +7130,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
             print(f"Controller target guard rejected native-stop: {exc}", file=sys.stderr)
             return 78
+        try:
+            codex = resolve_desktop_codex_executable(args.codex)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
         command = native_resume_command(
-            codex=args.codex,
+            codex=codex,
             session_id=str(target_receipt["execution_target_session_id"]),
             repo=repo,
         )
@@ -6956,7 +7149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             session_id=args.session_id,
             repo=repo,
             registry=Path(args.registry).expanduser(),
-            codex=args.codex,
+            codex=codex,
             runtime_path=args.runtime_path,
         )
         if wake_receipt is None:

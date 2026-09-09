@@ -662,6 +662,36 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
         self.assertEqual(results[0]["rule_wake"]["schedule"], "scheduled")
         self.assertEqual(results[0]["rule_wake"]["execution_target_session_id"], "web-current")
 
+    def test_rule_wake_defers_host_runtime_resolution_until_target_is_known(self):
+        from scripts.web_agent_health_supervisor import (
+            reconcile_registered_controller_rule_update_once,
+        )
+
+        lifecycle = {
+            "pending_control_event": True,
+            "rule_wake_policy": "immediate",
+            "triggers": ["rule_update_pending:rev-new"],
+            "snapshot": {"rule_handshake": {"installed_revision": "rev-new"}},
+        }
+        with patch.object(
+            web_lifecycle_bridge,
+            "refresh_rule_wake_state",
+            return_value=lifecycle,
+        ), patch.object(
+            web_lifecycle_bridge,
+            "schedule_guarded_rule_wake",
+            return_value={"schedule": "scheduled", "codex_executable": None},
+        ) as schedule:
+            result = reconcile_registered_controller_rule_update_once(
+                repo=self.repo,
+                registry=self.registry,
+                controller_id="controller-1",
+            )
+
+        self.assertEqual(result["schedule"], "scheduled")
+        self.assertIsNone(result["codex_executable"])
+        self.assertIsNone(schedule.call_args.kwargs["codex"])
+
     def test_global_health_cycle_does_not_schedule_rule_update_without_explicit_current_target(self):
         from unittest.mock import patch
         from scripts.web_agent_health_supervisor import reconcile_all_web_agent_health_once

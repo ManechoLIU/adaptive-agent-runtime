@@ -782,6 +782,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_governance.GovernanceTests.test_control_loop_stop_rejection_reopens_pending_event_even_if_prior_state_was_closed",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_dispatch_event_result_treats_decision_block_as_logical_yield_rejection",
             "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests.test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback",
+            "tests.test_terminal_continuation.TerminalContinuationTests.test_terminal_receipt_persists_before_desktop_runtime_is_needed",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_production_bridge_has_no_trusted_web_attestation_verifier",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_timeout_covers_product_host_request_budget",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_classifies_frame_tree_timeout_as_transient",
@@ -793,6 +794,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_strong_host_confirmed_submit_waits_without_rearm",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_retry_exhausted_rearms_after_host_delivery_fingerprint_change",
+            "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_retry_exhausted_rearms_after_controller_fence_change_same_host_fingerprint",
+            "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_ensure_supervisor_uses_new_receipt_after_controller_fence_change",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_retry_exhausted_persists_host_delivery_fingerprint",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes",
@@ -822,6 +825,12 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_execute_native_resume_marks_host_observed_active_writer_process_locally",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_desktop_codex_resolution_prefers_the_app_bundled_runtime",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_desktop_codex_resolution_rejects_an_invalid_explicit_override",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_rule_wake_resolves_desktop_runtime_only_for_desktop_target",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_rule_wake_does_not_require_desktop_runtime_for_web_target",
+            "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests.test_host_neutral_supervisor_omits_missing_desktop_codex_argument",
+            "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests.test_rule_wake_defers_host_runtime_resolution_until_target_is_known",
             "tests.test_install_skill.InstallCapabilityTests.test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence",
             "tests.test_install_skill.ProjectContextHookInstallationTests.test_runtime_hooks_keep_trust_stable_legacy_indices",
             "tests.test_install_skill.ProjectContextHookInstallationTests.test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups",
@@ -1001,6 +1010,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_global_health_cycle_refreshes_and_schedules_immediate_rule_update_for_registered_controller(self): self.assertTrue(True)\n"
                 "    def test_global_health_cycle_does_not_schedule_rule_update_without_explicit_current_target(self): self.assertTrue(True)\n"
                 "    def test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message(self): self.assertTrue(True)\n"
+                "    def test_rule_wake_defers_host_runtime_resolution_until_target_is_known(self): self.assertTrue(True)\n"
                 "    def test_canonical_runnable_reopens_continuation_without_user_message(self): self.assertTrue(True)\n"
                 "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n"
                 "    def test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback(self): self.assertTrue(True)\n",
@@ -1008,6 +1018,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
             (tests_dir / "test_terminal_continuation.py").write_text(
                 "import unittest\n"
+                "class TerminalContinuationTests(unittest.TestCase):\n"
+                "    def test_terminal_receipt_persists_before_desktop_runtime_is_needed(self): self.assertTrue(True)\n"
                 "class PendingTerminalReconcileTests(unittest.TestCase):\n"
                 "    def test_reconcile_pending_discovers_canonical_receipts_without_receipt_cli_argument(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_is_idempotent_and_does_not_mutate_lifecycle_or_dispatch_wake(self): self.assertTrue(True)\n"
@@ -1098,6 +1110,12 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_execute_native_resume_marks_host_observed_active_writer_process_locally(self): self.assertTrue(True)\n"
                 "    def test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required(self): self.assertTrue(True)\n"
                 "    def test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary(self): self.assertTrue(True)\n"
+                "    def test_desktop_codex_resolution_prefers_the_app_bundled_runtime(self): self.assertTrue(True)\n"
+                "    def test_desktop_codex_resolution_rejects_an_invalid_explicit_override(self): self.assertTrue(True)\n"
+                "    def test_rule_wake_resolves_desktop_runtime_only_for_desktop_target(self): self.assertTrue(True)\n"
+                "    def test_rule_wake_does_not_require_desktop_runtime_for_web_target(self): self.assertTrue(True)\n"
+                "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
+                "    def test_host_neutral_supervisor_omits_missing_desktop_codex_argument(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
@@ -1128,6 +1146,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_zshenv_exit_bridge_executes_and_preserves_exit_precedence(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_same_terminal_receipt_cannot_be_rescheduled(self): self.assertTrue(True)\n"
+                "    def test_host_neutral_supervisor_omits_missing_desktop_codex_argument(self): self.assertTrue(True)\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_web_reentry(self): self.assertTrue(True)\n"
                 "    def test_replacement_can_supersede_while_old_supervisor_waits_in_native_resume(self): self.assertTrue(True)\n"
                 "    def test_superseded_supervisor_cannot_start_native_recovery_bootstrap_after_resume(self): self.assertTrue(True)\n"
@@ -1160,6 +1179,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_identity_blocked_event_retries_after_registry_changes(self): self.assertTrue(True)\n"
                 "    def test_nonretryable_web_failure_same_event_and_fence_stays_quiet(self): self.assertTrue(True)\n"
                 "    def test_retry_exhausted_rearms_after_host_delivery_fingerprint_change(self): self.assertTrue(True)\n"
+                "    def test_retry_exhausted_rearms_after_controller_fence_change_same_host_fingerprint(self): self.assertTrue(True)\n"
+                "    def test_ensure_supervisor_uses_new_receipt_after_controller_fence_change(self): self.assertTrue(True)\n"
                 "    def test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change(self): self.assertTrue(True)\n"
                 "    def test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes(self): self.assertTrue(True)\n"
                 "    def test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot(self): self.assertTrue(True)\n"
@@ -1419,11 +1440,14 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_global_health_cycle_refreshes_and_schedules_immediate_rule_update_for_registered_controller(self): self.assertTrue(True)\n"
                 "    def test_global_health_cycle_does_not_schedule_rule_update_without_explicit_current_target(self): self.assertTrue(True)\n"
                 "    def test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message(self): self.assertTrue(True)\n"
+                "    def test_rule_wake_defers_host_runtime_resolution_until_target_is_known(self): self.assertTrue(True)\n"
                 "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_terminal_continuation.py").write_text(
                 "import unittest\n"
+                "class TerminalContinuationTests(unittest.TestCase):\n"
+                "    def test_terminal_receipt_persists_before_desktop_runtime_is_needed(self): self.assertTrue(True)\n"
                 "class PendingTerminalReconcileTests(unittest.TestCase):\n"
                 "    def test_reconcile_pending_discovers_canonical_receipts_without_receipt_cli_argument(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_is_idempotent_and_does_not_mutate_lifecycle_or_dispatch_wake(self): self.assertTrue(True)\n"
@@ -1508,6 +1532,12 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_execute_native_resume_marks_host_observed_active_writer_process_locally(self): self.assertTrue(True)\n"
                 "    def test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required(self): self.assertTrue(True)\n"
                 "    def test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary(self): self.assertTrue(True)\n"
+                "    def test_desktop_codex_resolution_prefers_the_app_bundled_runtime(self): self.assertTrue(True)\n"
+                "    def test_desktop_codex_resolution_rejects_an_invalid_explicit_override(self): self.assertTrue(True)\n"
+                "    def test_rule_wake_resolves_desktop_runtime_only_for_desktop_target(self): self.assertTrue(True)\n"
+                "    def test_rule_wake_does_not_require_desktop_runtime_for_web_target(self): self.assertTrue(True)\n"
+                "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
+                "    def test_host_neutral_supervisor_omits_missing_desktop_codex_argument(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
@@ -1521,6 +1551,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_replace_same_web_target_is_idempotent_and_unbind_tombstones_without_losing_alias_history(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_same_terminal_receipt_cannot_be_rescheduled(self): self.assertTrue(True)\n"
+                "    def test_host_neutral_supervisor_omits_missing_desktop_codex_argument(self): self.assertTrue(True)\n"
                 "    def test_same_receipt_live_supervisor_is_coalesced(self): self.assertTrue(True)\n"
                 "    def test_current_token_web_rearm_hands_off_with_force_rearm_proof(self): self.assertTrue(True)\n"
                 "    def test_stale_supervisor_token_exits_without_running_impl(self): self.assertTrue(True)\n"
@@ -1535,6 +1566,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_nonretryable_web_failure_same_event_and_fence_stays_quiet(self): self.assertTrue(True)\n"
                 "    def test_retry_exhausted_rearms_after_host_delivery_fingerprint_change(self): self.assertTrue(True)\n"
+                "    def test_retry_exhausted_rearms_after_controller_fence_change_same_host_fingerprint(self): self.assertTrue(True)\n"
+                "    def test_ensure_supervisor_uses_new_receipt_after_controller_fence_change(self): self.assertTrue(True)\n"
                 "    def test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change(self): self.assertTrue(True)\n"
                 "    def test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes(self): self.assertTrue(True)\n"
                 "    def test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot(self): self.assertTrue(True)\n"

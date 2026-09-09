@@ -103,7 +103,7 @@ def consume_terminal_receipt(
     receipt_path: Path,
     registry_path: Path = web_bridge.DEFAULT_REGISTRY,
     wake_dispatcher: Callable[..., dict[str, Any] | None] | None = None,
-    codex: str = "/opt/homebrew/bin/codex",
+    codex: str | None = None,
     dispatch_wake: bool = True,
 ) -> dict[str, Any]:
     repo = Path(repo).expanduser().resolve()
@@ -884,7 +884,7 @@ def notify_runtime_change(
     repo: Path,
     registry_path: Path = web_bridge.DEFAULT_REGISTRY,
     wake_dispatcher: Callable[..., dict[str, Any] | None] | None = None,
-    codex: str = "/opt/homebrew/bin/codex",
+    codex: str | None = None,
     event_source: str = "assignment_runtime_watchdog",
 ) -> dict[str, Any]:
     """Recompute canonical lifecycle state after a non-terminal runtime health change."""
@@ -943,7 +943,7 @@ def build_parser() -> argparse.ArgumentParser:
     consume.add_argument("--repo", required=True)
     consume.add_argument("--receipt", required=True)
     consume.add_argument("--registry", default=str(web_bridge.DEFAULT_REGISTRY))
-    consume.add_argument("--codex", default="/opt/homebrew/bin/codex")
+    consume.add_argument("--codex")
     reconcile = subparsers.add_parser("reconcile-pending")
     reconcile.add_argument("--repo", required=True)
     reconcile.add_argument("--registry", default=str(web_bridge.DEFAULT_REGISTRY))
@@ -993,10 +993,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     env = dict(os.environ)
     env["AD_TERMINAL_CONTINUATION_WAKE_CHILD"] = "1"
+    child_command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "consume",
+        "--repo",
+        args.repo,
+        "--receipt",
+        args.receipt,
+        "--registry",
+        args.registry,
+    ]
+    if args.codex:
+        child_command.extend(["--codex", args.codex])
     try:
         subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "consume", "--repo", args.repo,
-             "--receipt", args.receipt, "--registry", args.registry, "--codex", args.codex],
+            child_command,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=env, start_new_session=True, close_fds=True,
         )
