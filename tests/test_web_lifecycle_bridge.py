@@ -5016,6 +5016,72 @@ class WebContinuationSupervisorBootstrapTests(unittest.TestCase):
             current_host_delivery_fingerprint="a" * 64,
         ))
 
+    def test_retry_exhausted_rearms_after_controller_fence_change_same_host_fingerprint(self) -> None:
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 12,
+            "triggers": ["terminal_receipt_pending"],
+        }
+        prior = {
+            "state": "WEB_REENTRY_RETRY_EXHAUSTED",
+            "pending_control_event": True,
+            "execution_target_session_id": "web-old",
+            "target_generation": 6,
+            "ownership_generation": 6,
+            "delivery_terminal_receipt_id": "bootstrap:12",
+            "delivery_terminal_key": "wake-generation:12|host:" + "a" * 64,
+            "delivery_terminal_outcome": "retry_exhausted",
+        }
+        current_fence = {
+            "execution_target_session_id": "web-new",
+            "target_generation": 7,
+            "ownership_generation": 7,
+            "target_provenance": "host_attested_same_controller_recovery",
+            "target_binding_mode": "resume_only",
+            "target_host_attested": None,
+            "ownership_provenance": "web_entry",
+        }
+        self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle,
+            prior,
+            current_controller_wait_fence=current_fence,
+            current_host_delivery_fingerprint="a" * 64,
+        ))
+
+    def test_confirmed_or_result_unknown_never_rearm_for_controller_fence_change(self) -> None:
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 12,
+            "triggers": ["terminal_receipt_pending"],
+        }
+        current_fence = {
+            "execution_target_session_id": "web-new",
+            "target_generation": 7,
+            "ownership_generation": 7,
+        }
+        for outcome in ("submit_confirmed", "result_unknown"):
+            with self.subTest(outcome=outcome):
+                prior = {
+                    "state": "WAITING_FOR_CONTROLLER_PROGRESS" if outcome == "submit_confirmed" else "WEB_REENTRY_RESULT_UNKNOWN",
+                    "pending_control_event": True,
+                    "execution_target_session_id": "web-old",
+                    "target_generation": 6,
+                    "ownership_generation": 6,
+                    "delivery_terminal_receipt_id": "bootstrap:12",
+                    "delivery_terminal_key": "wake-generation:12|host:" + "a" * 64,
+                    "delivery_terminal_outcome": outcome,
+                }
+                self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+                    lifecycle,
+                    prior,
+                    current_controller_wait_fence=current_fence,
+                    current_host_delivery_fingerprint="a" * 64,
+                ))
+
     def test_legacy_retry_exhausted_gets_one_rearm_when_host_fingerprint_becomes_available(self) -> None:
         lifecycle = {
             "pending_control_event": True,
@@ -5060,6 +5126,74 @@ class WebContinuationSupervisorBootstrapTests(unittest.TestCase):
                     current_host_delivery_fingerprint="b" * 64,
                 ))
 
+
+    def test_ensure_supervisor_uses_new_receipt_after_controller_fence_change(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+            (repo / "TASK_LEDGER.md").write_text(
+                "# 任务台账\n\n## 当前目标\n- 当前活动项：无\n- 下一可见检查点：无\n\n"
+                "| ID | 状态 / 负责人 | 目标与边界 | 依赖 / 阻塞 | 验收与验证 | 证据 / 下一步 |\n"
+                "| --- | --- | --- | --- | --- | --- |\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "base"],
+                cwd=repo, check=True,
+            )
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-new", "generation": 7,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-new",
+                    "generation": 7, "provenance": "web_entry",
+                }},
+            }), encoding="utf-8")
+            state = root / "auto.json"
+            state.write_text(json.dumps({
+                "receipt_id": "bootstrap:12",
+                "state": "WEB_REENTRY_RETRY_EXHAUSTED",
+                "pending_control_event": True,
+                "execution_target_session_id": "web-old",
+                "target_generation": 6,
+                "ownership_generation": 6,
+                "delivery_terminal_receipt_id": "bootstrap:12",
+                "delivery_terminal_key": "wake-generation:12|host:" + "a" * 64,
+                "delivery_terminal_outcome": "retry_exhausted",
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True,
+                "requires_user": False,
+                "controller_host": "web",
+                "wake_generation": 12,
+                "triggers": ["terminal_receipt_pending"],
+            }
+            captured = {}
+            def schedule(**kwargs):
+                captured.update(kwargs)
+                return True
+            with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state), \
+                 patch.object(web_bridge, "_registered_web_host_delivery_fingerprint", return_value="a" * 64), \
+                 patch.object(web_bridge, "schedule_auto_native_stop", side_effect=schedule):
+                self.assertTrue(web_bridge.ensure_continuation_supervisor(
+                    lifecycle_state=lifecycle,
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex="codex",
+                    delay_seconds=1.0,
+                ))
+            self.assertTrue(captured["receipt_id"].startswith("bootstrap:12:fence-"))
+            self.assertNotEqual(captured["receipt_id"], "bootstrap:12")
 
     def test_ensure_supervisor_uses_new_receipt_after_host_fingerprint_upgrade(self) -> None:
         from unittest.mock import patch

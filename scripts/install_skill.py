@@ -105,6 +105,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_strong_host_confirmed_submit_waits_without_rearm",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_retry_exhausted_rearms_after_host_delivery_fingerprint_change",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_retry_exhausted_rearms_after_controller_fence_change_same_host_fingerprint",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_ensure_supervisor_uses_new_receipt_after_controller_fence_change",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_retry_exhausted_persists_host_delivery_fingerprint",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."

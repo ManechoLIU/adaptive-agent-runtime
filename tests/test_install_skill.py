@@ -794,6 +794,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_strong_host_confirmed_submit_waits_without_rearm",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_retry_exhausted_rearms_after_host_delivery_fingerprint_change",
+            "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_retry_exhausted_rearms_after_controller_fence_change_same_host_fingerprint",
+            "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_ensure_supervisor_uses_new_receipt_after_controller_fence_change",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_retry_exhausted_persists_host_delivery_fingerprint",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes",
@@ -1177,6 +1179,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_identity_blocked_event_retries_after_registry_changes(self): self.assertTrue(True)\n"
                 "    def test_nonretryable_web_failure_same_event_and_fence_stays_quiet(self): self.assertTrue(True)\n"
                 "    def test_retry_exhausted_rearms_after_host_delivery_fingerprint_change(self): self.assertTrue(True)\n"
+                "    def test_retry_exhausted_rearms_after_controller_fence_change_same_host_fingerprint(self): self.assertTrue(True)\n"
+                "    def test_ensure_supervisor_uses_new_receipt_after_controller_fence_change(self): self.assertTrue(True)\n"
                 "    def test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change(self): self.assertTrue(True)\n"
                 "    def test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes(self): self.assertTrue(True)\n"
                 "    def test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot(self): self.assertTrue(True)\n"
@@ -1562,6 +1566,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_nonretryable_web_failure_same_event_and_fence_stays_quiet(self): self.assertTrue(True)\n"
                 "    def test_retry_exhausted_rearms_after_host_delivery_fingerprint_change(self): self.assertTrue(True)\n"
+                "    def test_retry_exhausted_rearms_after_controller_fence_change_same_host_fingerprint(self): self.assertTrue(True)\n"
+                "    def test_ensure_supervisor_uses_new_receipt_after_controller_fence_change(self): self.assertTrue(True)\n"
                 "    def test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change(self): self.assertTrue(True)\n"
                 "    def test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes(self): self.assertTrue(True)\n"
                 "    def test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot(self): self.assertTrue(True)\n"

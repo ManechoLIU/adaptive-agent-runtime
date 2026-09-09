@@ -5187,6 +5187,53 @@ def _controller_web_wait_fence(
     }
 
 
+def _controller_delivery_fence_identity(value: Any) -> tuple[str, int, int] | None:
+    if not isinstance(value, dict):
+        return None
+    target = str(value.get("execution_target_session_id") or "").strip()
+    target_generation = value.get("target_generation")
+    ownership_generation = value.get("ownership_generation")
+    if (
+        not target
+        or isinstance(target_generation, bool)
+        or not isinstance(target_generation, int)
+        or target_generation < 1
+        or isinstance(ownership_generation, bool)
+        or not isinstance(ownership_generation, int)
+        or ownership_generation < 1
+    ):
+        return None
+    return (target, target_generation, ownership_generation)
+
+
+def _delivery_controller_fence_identity(
+    supervisor_state: dict[str, Any],
+) -> tuple[str, int, int] | None:
+    explicit = _controller_delivery_fence_identity(
+        supervisor_state.get("delivery_controller_fence")
+    )
+    if explicit is not None:
+        return explicit
+    return _controller_delivery_fence_identity(supervisor_state)
+
+
+def _controller_delivery_fence_fingerprint(value: Any) -> str | None:
+    identity = _controller_delivery_fence_identity(value)
+    if identity is None:
+        return None
+    payload = json.dumps(
+        {
+            "execution_target_session_id": identity[0],
+            "target_generation": identity[1],
+            "ownership_generation": identity[2],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return __import__("hashlib").sha256(payload).hexdigest()
+
+
 def continuation_supervisor_needs_bootstrap(
     lifecycle_state: dict[str, Any],
     supervisor_state: dict[str, Any],
@@ -5217,10 +5264,18 @@ def continuation_supervisor_needs_bootstrap(
             return False
         if terminal_outcome == "retry_exhausted":
             # Exhaustion is pre-dispatch-only. Keep it quiet for the same Host delivery
-            # implementation, but allow one new attempt after the trusted pinned bundle changes.
+            # implementation and exact Controller fence. A trusted Host bundle upgrade or
+            # an explicit canonical target/ownership handoff may authorize one new attempt.
             if terminal_key == delivery_key:
-                return False
-            if current_host_delivery_fingerprint is None:
+                prior_fence = _delivery_controller_fence_identity(supervisor_state)
+                current_fence = _controller_delivery_fence_identity(
+                    current_controller_wait_fence
+                )
+                if prior_fence is None or current_fence is None:
+                    return False
+                if prior_fence == current_fence:
+                    return False
+            elif current_host_delivery_fingerprint is None:
                 return False
     legacy_receipt = str(supervisor_state.get("receipt_id") or "").strip()
     if (
@@ -5371,16 +5426,27 @@ def ensure_continuation_supervisor(
     receipt_id = f"bootstrap:{generation}"
     if (
         supervisor_state.get("delivery_terminal_outcome") == "retry_exhausted"
-        and current_host_delivery_fingerprint
         and _delivery_key_base(supervisor_state.get("delivery_terminal_key"))
         == _delivery_key_base(_lifecycle_delivery_key(lifecycle_state))
-        and supervisor_state.get("delivery_terminal_key")
-        != _lifecycle_delivery_key(
+    ):
+        current_delivery_key = _lifecycle_delivery_key(
             lifecycle_state,
             host_delivery_fingerprint=current_host_delivery_fingerprint,
         )
-    ):
-        receipt_id += f":host-{current_host_delivery_fingerprint[:16]}"
+        if (
+            current_host_delivery_fingerprint
+            and supervisor_state.get("delivery_terminal_key") != current_delivery_key
+        ):
+            receipt_id += f":host-{current_host_delivery_fingerprint[:16]}"
+        elif (
+            _delivery_controller_fence_identity(supervisor_state)
+            != _controller_delivery_fence_identity(current_controller_wait_fence)
+        ):
+            fence_fingerprint = _controller_delivery_fence_fingerprint(
+                current_controller_wait_fence
+            )
+            if fence_fingerprint:
+                receipt_id += f":fence-{fence_fingerprint[:16]}"
     schedule_auto_native_stop(
         session_id=session_id,
         repo=repo,
@@ -6014,6 +6080,16 @@ def _run_auto_native_stop_impl(
                     current["delivery_host_fingerprint"] = host_delivery_fingerprint
                 else:
                     current.pop("delivery_host_fingerprint", None)
+                try:
+                    delivery_controller_fence = _controller_web_wait_fence(
+                        registry=registry, controller_id=session_id
+                    )
+                except (OSError, ValueError, PermissionError):
+                    delivery_controller_fence = None
+                if isinstance(delivery_controller_fence, dict):
+                    current["delivery_controller_fence"] = delivery_controller_fence
+                else:
+                    current.pop("delivery_controller_fence", None)
             if failure_class == "web_reentry_identity_unavailable":
                 current.update({
                     "last_lifecycle_fingerprint": fingerprint,
