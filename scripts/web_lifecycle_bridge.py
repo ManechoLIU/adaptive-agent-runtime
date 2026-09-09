@@ -3791,7 +3791,6 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
                 raise PermissionError(f"registered Host current-entry discovery requires positive {name}")
         payload = run_cli({
             "operation": "discover_current_entry",
-            "logical_agent_identity": logical_agent_identity,
             "target_generation": target_generation,
             "ownership_generation": ownership_generation,
         })
