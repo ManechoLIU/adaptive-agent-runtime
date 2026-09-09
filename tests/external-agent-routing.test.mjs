@@ -1582,6 +1582,99 @@ test("Grok unstructured stdout does not satisfy structured first-output progress
   }
 });
 
+
+test("Grok 1.0.13 streaming text output satisfies first-output progress then stalls", async () => {
+  const runtimeModule = await import("../scripts/run_external_agent.mjs?grok-stream-text=" + Date.now());
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-stream-text-"));
+  const code = 'process.stdout.write(JSON.stringify({type:"text",data:"reviewing"})+"\\n"); setTimeout(()=>{},1000);';
+  const previous = {
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "120";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "160";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1500";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      (error) => error?.failureClass === "generation_stalled",
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      const envName = key === "first" ? "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS"
+        : key === "stall" ? "AD_GROK_STALL_TIMEOUT_MS"
+          : key === "absolute" ? "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS"
+            : "AD_EXTERNAL_KILL_GRACE_MS";
+      if (value === undefined) delete process.env[envName]; else process.env[envName] = value;
+    }
+  }
+});
+
+test("Grok 1.0.13 streaming thought tool-call and tool-update events count as model progress", async () => {
+  const runtimeModule = await import("../scripts/run_external_agent.mjs?grok-stream-thought-tool=" + Date.now());
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-stream-thought-tool-"));
+  const code = 'process.stdout.write(JSON.stringify({type:"thought",data:"checking"})+"\\n"); setTimeout(()=>process.stdout.write(JSON.stringify({type:"tool_call",toolCallId:"call-1",toolName:"read_file",title:"read_file",kind:"read",status:"pending",rawInput:{target_file:"x"},content:[],locations:[]})+"\\n"),70); setTimeout(()=>process.stdout.write(JSON.stringify({type:"tool_call_update",toolCallId:"call-1",status:null,content:[],rawOutput:null,locations:[{path:"x"}]})+"\\n"),140); setTimeout(()=>{},1000);';
+  const previous = {
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "120";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "160";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1500";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      (error) => error?.failureClass === "generation_stalled",
+    );
+    assert.ok(Date.now() - started >= 260, "later valid streaming updates should extend the stall deadline");
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      const envName = key === "first" ? "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS"
+        : key === "stall" ? "AD_GROK_STALL_TIMEOUT_MS"
+          : key === "absolute" ? "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS"
+            : "AD_EXTERNAL_KILL_GRACE_MS";
+      if (value === undefined) delete process.env[envName]; else process.env[envName] = value;
+    }
+  }
+});
+
+test("Grok 1.0.13 bare type and metadata events cannot spoof model progress", async () => {
+  const runtimeModule = await import("../scripts/run_external_agent.mjs?grok-stream-spoof=" + Date.now());
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-stream-spoof-"));
+  const code = 'const items=[{type:"tool_call"},{type:"text",data:""},{type:"usage",usage:{input_tokens:1}},{type:"available_commands",tools:[],commands:[]}]; let i=0; const timer=setInterval(()=>process.stdout.write(JSON.stringify(items[(i++)%items.length])+"\\n"),25); setTimeout(()=>{clearInterval(timer);process.exit(0)},1000);';
+  const previous = {
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "120";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "1000";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1500";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      (error) => error?.failureClass === "first_output_timeout",
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      const envName = key === "first" ? "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS"
+        : key === "stall" ? "AD_GROK_STALL_TIMEOUT_MS"
+          : key === "absolute" ? "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS"
+            : "AD_EXTERNAL_KILL_GRACE_MS";
+      if (value === undefined) delete process.env[envName]; else process.env[envName] = value;
+    }
+  }
+});
+
 test("Grok malformed stdout after one structured event does not prevent generation stall", async () => {
   const runtimeModule = await import("../scripts/run_external_agent.mjs");
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-unstructured-stall-"));

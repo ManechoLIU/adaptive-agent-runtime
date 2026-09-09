@@ -19,6 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+try:
+    import controller_target_guard as target_guard
+except ModuleNotFoundError:
+    from scripts import controller_target_guard as target_guard
+
 UTC = timezone.utc
 PRODUCT_NAME = "Adaptive Agent Runtime"
 SKILL_ID = "adaptive-agent-runtime"
@@ -85,6 +90,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_classifies_frame_tree_timeout_as_transient",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_registered_web_verifier_classifies_exact_target_ambiguous_as_transient",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_loads_pinned_external_runtime_host_cli",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_exposes_pinned_host_submit_adapter",
@@ -96,6 +103,12 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_strong_host_confirmed_submit_waits_without_rearm",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_retry_exhausted_rearms_after_host_delivery_fingerprint_change",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_retry_exhausted_persists_host_delivery_fingerprint",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
@@ -116,6 +129,16 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_manual_web_mutations_cannot_downgrade_host_attested_current_target",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_authorize_web_successor_records_only_fenced_fresh_session",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_authorize_web_successor_cli_does_not_rotate_target",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_authorized_strong_web_successor_rotates_target_and_ownership_once",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_strong_web_successor_expired_authorization_does_not_call_verifier",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_strong_web_successor_rechecks_target_generation_after_attestation",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_legacy_quarantined_target_keeps_manual_replacement_exit",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
@@ -558,6 +581,9 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "oversized non-reviewer Grok prompt fails before spawn without sharding",
     "Grok stderr and assignment heartbeat do not satisfy first stdout progress",
     "Grok unstructured stdout does not satisfy structured first-output progress",
+    "Grok 1.0.13 streaming text output satisfies first-output progress then stalls",
+    "Grok 1.0.13 streaming thought tool-call and tool-update events count as model progress",
+    "Grok 1.0.13 bare type and metadata events cannot spoof model progress",
     "Grok malformed stdout after one structured event does not prevent generation stall",
     "Grok structured metadata stdout does not satisfy model first-output progress",
     "Grok metadata after agent activity does not prevent generation stall",
@@ -724,8 +750,61 @@ DESKTOP_CANARY_SEQUENCE = (
 DESKTOP_CANARY_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
+def _desktop_canary_registry_fence_current(
+    receipt: dict[str, Any], *, registry_path: Path
+) -> bool:
+    controller_id = str(receipt.get("controller_id") or "").strip()
+    target_session_id = str(receipt.get("execution_target_session_id") or "").strip()
+    repo_value = str(receipt.get("canonical_repo") or "").strip()
+    registry_value = str(receipt.get("controller_registry_path") or "").strip()
+    if not controller_id or not target_session_id or not repo_value or not registry_value:
+        return False
+    expected_registry_path = registry_path.expanduser().resolve()
+    try:
+        repo = Path(repo_value).expanduser().resolve()
+        if Path(registry_value).expanduser().resolve() != expected_registry_path:
+            return False
+    except OSError:
+        return False
+    try:
+        with target_guard.locked_registry(expected_registry_path) as registry:
+            registered_controller = target_guard.unique_controller_id_for_repo_in_registry(
+                repo, registry
+            )
+            if registered_controller != controller_id:
+                return False
+            target = target_guard.target_record(
+                registry, controller_id=controller_id, host="desktop_codex"
+            )
+            owner = target_guard.execution_ownership_record(
+                registry, controller_id=controller_id
+            )
+            if target is None or owner is None:
+                return False
+            target_status, registered_target, target_generation = (
+                target_guard.validate_target_record(target, host="desktop_codex")
+            )
+            ownership_host, ownership_target, ownership_generation = (
+                target_guard.validate_execution_ownership_record(owner)
+            )
+    except (OSError, ValueError, PermissionError):
+        return False
+    return (
+        target_status == "active"
+        and registered_target == target_session_id
+        and target_generation == receipt.get("target_generation")
+        and ownership_host == "desktop_codex"
+        and ownership_target == target_session_id
+        and ownership_generation == receipt.get("ownership_generation")
+    )
+
+
 def _valid_desktop_canary(
-    path: Path, *, hooks_path: Path, skill_root: Path | None
+    path: Path,
+    *,
+    hooks_path: Path,
+    skill_root: Path | None,
+    controller_registry_path: Path,
 ) -> bool:
     if skill_root is None:
         return False
@@ -750,11 +829,24 @@ def _valid_desktop_canary(
     if age_seconds < 0 or age_seconds > DESKTOP_CANARY_MAX_AGE_SECONDS:
         return False
     observations = receipt.get("observations")
+    target_generation = receipt.get("target_generation")
+    ownership_generation = receipt.get("ownership_generation")
     return (
-        receipt.get("schema_version") == 3
+        receipt.get("schema_version") == 4
         and receipt.get("status") == "passed"
+        and isinstance(receipt.get("controller_id"), str)
+        and bool(receipt.get("controller_id"))
         and isinstance(receipt.get("controller_session_id"), str)
         and bool(receipt.get("controller_session_id"))
+        and receipt.get("controller_session_id") == receipt.get("controller_id")
+        and isinstance(receipt.get("execution_target_session_id"), str)
+        and bool(receipt.get("execution_target_session_id"))
+        and isinstance(target_generation, int)
+        and not isinstance(target_generation, bool)
+        and target_generation > 0
+        and isinstance(ownership_generation, int)
+        and not isinstance(ownership_generation, bool)
+        and ownership_generation > 0
         and isinstance(receipt.get("run_id"), str)
         and len(receipt.get("run_id")) >= 16
         and receipt.get("sequence_index") == len(DESKTOP_CANARY_SEQUENCE)
@@ -763,6 +855,9 @@ def _valid_desktop_canary(
         and receipt.get("lifecycle_sha256") == lifecycle_sha256
         and receipt.get("controller_target_guard_sha256") == target_guard_sha256
         and observations == list(DESKTOP_CANARY_SEQUENCE)
+        and _desktop_canary_registry_fence_current(
+            receipt, registry_path=controller_registry_path
+        )
     )
 
 
@@ -1098,6 +1193,7 @@ def detect_host_capabilities(
     health_service_plist: str | Path = DEFAULT_WEB_AGENT_HEALTH_PLIST,
     web_event_source_receipt: str | Path = DEFAULT_WEB_AGENT_EVENT_SOURCE,
     runtime_supervisor_heartbeat: str | Path = DEFAULT_CONTROLLER_RUNTIME_HEARTBEAT,
+    controller_registry: str | Path = DEFAULT_CONTROLLER_REGISTRY,
 ) -> dict[str, dict[str, Any]]:
     codex_path = Path(codex_executable).expanduser() if codex_executable else None
     if codex_path is None:
@@ -1107,6 +1203,7 @@ def detect_host_capabilities(
     hooks_path = Path(hooks_file).expanduser()
     zshenv_path = Path(zshenv_file).expanduser()
     desktop_canary_path = Path(desktop_canary_file).expanduser()
+    controller_registry_path = Path(controller_registry).expanduser().resolve()
     skill_root_path = Path(skill_root).expanduser().resolve() if skill_root is not None else None
     health_service_path = Path(health_service_plist).expanduser().resolve(strict=False)
     health_service_configured = _health_service_plist_matches(
@@ -1154,7 +1251,10 @@ def detect_host_capabilities(
         )
     )
     canary_valid = _valid_desktop_canary(
-        desktop_canary_path, hooks_path=hooks_path, skill_root=skill_root_path
+        desktop_canary_path,
+        hooks_path=hooks_path,
+        skill_root=skill_root_path,
+        controller_registry_path=controller_registry_path,
     )
     if not codex_available:
         desktop = {
@@ -1509,6 +1609,7 @@ def configure_host_adapters(
     zshenv_file: str | Path = DEFAULT_ZSHENV,
     python_executable: str | None = None,
     configure_ai_bridge: bool = True,
+    controller_registry: str | Path = DEFAULT_CONTROLLER_REGISTRY,
 ) -> dict[str, dict[str, Any]]:
     target_path = Path(target).expanduser().resolve()
     codex_path = Path(codex_executable).expanduser() if codex_executable else None
@@ -1526,6 +1627,7 @@ def configure_host_adapters(
         hooks_file=hooks_file,
         zshenv_file=zshenv_file,
         skill_root=target_path,
+        controller_registry=controller_registry,
     )
 
 
@@ -1765,6 +1867,7 @@ def install_skill(
     stop_condition: str,
     previous_revision: str | None = None,
     now: datetime | None = None,
+    controller_registry: str | Path = DEFAULT_CONTROLLER_REGISTRY,
 ) -> dict[str, Any]:
     source_path = Path(source).expanduser().resolve()
     target_path = Path(target).expanduser().resolve()
@@ -1812,7 +1915,9 @@ def install_skill(
         tracked = _materialize_revision(source_path, revision, stage)
         hashes = {relative: _sha256(stage / relative) for relative in tracked}
         installed_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        staged_capabilities = detect_host_capabilities(skill_root=target_path)
+        staged_capabilities = detect_host_capabilities(
+            skill_root=target_path, controller_registry=controller_registry
+        )
         staged_capabilities["controller_identity"] = _installed_controller_identity_capability(stage)
         manifest: dict[str, Any] = {
             "schema_version": 1,
@@ -1996,6 +2101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest = install_skill(
                     args.source, target_path, summary=args.summary, impact=args.impact,
                     stop_condition=args.stop_condition, previous_revision=args.previous_revision,
+                    controller_registry=args.controller_registry,
                 )
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
                 print(f"adaptive-agent-runtime-install: blocked: {error}")
@@ -2035,6 +2141,7 @@ def _run_install_transaction(
             manifest = install_skill(
                 args.source, target_path, summary=args.summary, impact=args.impact,
                 stop_condition=args.stop_condition, previous_revision=args.previous_revision,
+                controller_registry=args.controller_registry,
             )
             if not args.no_configure_runtime_services:
                 service = configure_runtime_services(
@@ -2051,6 +2158,7 @@ def _run_install_transaction(
                     hooks_file=hooks_path,
                     zshenv_file=zshenv_path,
                     configure_ai_bridge=not args.no_configure_ai_bridge,
+                    controller_registry=args.controller_registry,
                 )
             manifest["capabilities"] = detect_host_capabilities(
                 codex_executable=args.codex,
@@ -2059,6 +2167,7 @@ def _run_install_transaction(
                 zshenv_file=zshenv_path,
                 skill_root=target_path,
                 health_service_plist=health_service_path,
+                controller_registry=args.controller_registry,
             )
             _write_json_atomic(target_path / MANIFEST_NAME, manifest)
         except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:

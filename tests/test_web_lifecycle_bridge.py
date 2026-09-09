@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -661,6 +662,13 @@ class WebLifecycleBridgeTests(unittest.TestCase):
     def test_registered_web_verifier_classifies_frame_tree_timeout_as_transient(self) -> None:
         self.assertTrue(
             web_bridge._peer_host_error_is_transient("Page.getFrameTree timed out")
+        )
+
+    def test_registered_web_verifier_classifies_exact_target_ambiguous_as_transient(self) -> None:
+        self.assertTrue(
+            web_bridge._peer_host_error_is_transient(
+                "exact ChatGPT conversation target is ambiguous"
+            )
         )
 
     def test_registered_web_verifier_classifies_exact_target_unavailable_as_transient(self) -> None:
@@ -2574,6 +2582,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
             self.assertEqual(wake["ownership_generation"], 7)
 
     def test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required(self) -> None:
+        import hashlib
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2593,6 +2602,30 @@ class WebLifecycleAuditTests(unittest.TestCase):
                     "execution_target_session_id": "desktop-current",
                     "generation": 7,
                 }},
+            }), encoding="utf-8")
+            runtime_state = repo / ".git" / "adaptive-delivery"
+            runtime_state.mkdir()
+            (runtime_state / "rule-handshake.json").write_text(json.dumps({
+                "live_e2e_required": True,
+                "installed_revision": "rev-2",
+                "loaded_revision": "rev-2",
+            }), encoding="utf-8")
+            hooks = root / "hooks.json"
+            hooks.write_text('{"hooks":{}}\n', encoding="utf-8")
+            canary = root / "desktop-canary.json"
+            canary.write_text(json.dumps({
+                "schema_version": 4,
+                "controller_id": "controller-1",
+                "controller_session_id": "controller-1",
+                "execution_target_session_id": "desktop-current",
+                "target_generation": 4,
+                "ownership_generation": 7,
+                "canonical_repo": str(repo.resolve()),
+                "controller_registry_path": str(registry.resolve()),
+                "status": "armed",
+                "sequence_index": 0,
+                "observations": [],
+                "hooks_sha256": hashlib.sha256(hooks.read_bytes()).hexdigest(),
             }), encoding="utf-8")
             state = root / "auto-stop.json"
             state.write_text(json.dumps({
@@ -2615,13 +2648,20 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 "target_mode": "explicit_current",
                 "host_observation": web_bridge._HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND,
             }
+            actual_reload_gate = web_bridge.desktop_host_reload_required
+
+            def reload_required(**kwargs):
+                return actual_reload_gate(
+                    **kwargs, canary_path=canary, hooks_path=hooks
+                )
+
             with patch.object(
                 web_bridge, "_load_lifecycle_state", return_value=lifecycle
             ), patch.object(
                 web_bridge, "execute_native_resume", return_value=already_foreground
             ), patch.object(
-                web_bridge, "desktop_host_reload_required", return_value=True
-            ), patch.object(web_bridge, "_rearm_auto_native_stop") as rearm:
+                web_bridge, "desktop_host_reload_required", side_effect=reload_required
+            ) as reload_gate, patch.object(web_bridge, "_rearm_auto_native_stop") as rearm:
                 code = web_bridge.run_auto_native_stop(
                     session_id="controller-1", repo=repo,
                     receipt_id="rule-update:rev-2", registry=registry,
@@ -2629,6 +2669,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 )
 
             self.assertEqual(code, 0)
+            self.assertEqual(reload_gate.call_args.kwargs["registry_path"], registry)
             rearm.assert_not_called()
             self.assertFalse(web_bridge.default_wake_receipt_path(repo).exists())
             persisted = json.loads(state.read_text(encoding="utf-8"))
@@ -2656,6 +2697,18 @@ class WebLifecycleAuditTests(unittest.TestCase):
             }), encoding="utf-8")
             hooks = root / "hooks.json"
             hooks.write_text('{"hooks":{}}\n', encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }), encoding="utf-8")
             canary = root / "desktop-canary.json"
             value = {
                 "controller_session_id": "controller-1",
@@ -2666,16 +2719,39 @@ class WebLifecycleAuditTests(unittest.TestCase):
             }
             canary.write_text(json.dumps(value), encoding="utf-8")
 
-            self.assertTrue(web_bridge.desktop_host_reload_required(
+            self.assertFalse(web_bridge.desktop_host_reload_required(
                 session_id="controller-1", repo=repo,
                 canary_path=canary, hooks_path=hooks,
             ))
+            value.update({
+                "schema_version": 4,
+                "controller_id": "controller-1",
+                "execution_target_session_id": "desktop-current",
+                "target_generation": 4,
+                "ownership_generation": 7,
+                "canonical_repo": str(repo.resolve()),
+                "controller_registry_path": str(registry.resolve()),
+            })
+            canary.write_text(json.dumps(value), encoding="utf-8")
+            self.assertTrue(web_bridge.desktop_host_reload_required(
+                session_id="controller-1", repo=repo,
+                canary_path=canary, hooks_path=hooks, registry_path=registry,
+            ))
+            conflicted_registry = json.loads(registry.read_text(encoding="utf-8"))
+            conflicted_registry["controller-2"] = str(repo.resolve())
+            registry.write_text(json.dumps(conflicted_registry), encoding="utf-8")
+            self.assertFalse(web_bridge.desktop_host_reload_required(
+                session_id="controller-1", repo=repo,
+                canary_path=canary, hooks_path=hooks, registry_path=registry,
+            ))
+            conflicted_registry.pop("controller-2")
+            registry.write_text(json.dumps(conflicted_registry), encoding="utf-8")
             value["sequence_index"] = 1
             value["observations"] = ["session_started"]
             canary.write_text(json.dumps(value), encoding="utf-8")
             self.assertFalse(web_bridge.desktop_host_reload_required(
                 session_id="controller-1", repo=repo,
-                canary_path=canary, hooks_path=hooks,
+                canary_path=canary, hooks_path=hooks, registry_path=registry,
             ))
 
     def test_mocked_active_writer_without_host_observation_still_rearms(self) -> None:
@@ -2786,6 +2862,136 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 attempt["host_observation"],
                 web_bridge._HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND,
             )
+
+    def test_execute_native_resume_reaps_process_group_after_codex_turn_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["controller-1"]}
+                },
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "controller-1", "generation": 1,
+                }}},
+            }), encoding="utf-8")
+            codex = root / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"--version\" ]; then echo codex-test; exit 0; fi\n"
+                "printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{}}'\n"
+                "sleep 30\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+
+            started = time.monotonic()
+            attempt = web_bridge.execute_native_resume(
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                completion_grace_seconds=0.05,
+                max_runtime_seconds=2.0,
+            )
+
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertEqual(attempt["result"], "CONFIRMED")
+            self.assertEqual(attempt["state"], "RESUME_SUCCEEDED")
+            self.assertEqual(attempt["completion_source"], "codex_turn_completed")
+            self.assertEqual(attempt["returncode"], 0)
+            self.assertIn('"type":"turn.completed"', attempt["stdout_tail"])
+
+    def test_execute_native_resume_timeout_fails_closed_when_sigterm_handler_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["controller-1"]}
+                },
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "controller-1", "generation": 1,
+                }}},
+            }), encoding="utf-8")
+            codex = root / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"--version\" ]; then echo codex-test; exit 0; fi\n"
+                "trap 'exit 0' TERM\n"
+                "while :; do sleep 1; done\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+
+            attempt = web_bridge.execute_native_resume(
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                completion_grace_seconds=0.05,
+                max_runtime_seconds=0.05,
+            )
+
+            self.assertEqual(attempt["result"], "FAILED")
+            self.assertEqual(attempt["state"], "RESUME_FAILED")
+            self.assertEqual(attempt["failure_class"], "native_resume_timeout")
+            self.assertEqual(attempt["error_code"], "WEB_LIFECYCLE_RESUME_TIMEOUT")
+            self.assertEqual(attempt["returncode"], 124)
+            self.assertEqual(attempt["host_returncode"], 0)
+
+    def test_execute_native_resume_reaps_children_after_completed_leader_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["controller-1"]}
+                },
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "controller-1", "generation": 1,
+                }}},
+            }), encoding="utf-8")
+            child_pid = root / "child.pid"
+            codex = root / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"--version\" ]; then echo codex-test; exit 0; fi\n"
+                "sleep 3 &\n"
+                f"printf '%s' \"$!\" > {child_pid}\n"
+                "printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{}}'\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+
+            started = time.monotonic()
+            attempt = web_bridge.execute_native_resume(
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=str(codex),
+                completion_grace_seconds=0.05,
+                max_runtime_seconds=2.0,
+            )
+
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertEqual(attempt["result"], "CONFIRMED")
+            child = int(child_pid.read_text(encoding="utf-8"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child, 0)
 
     def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3365,8 +3571,11 @@ class WebLifecycleNativeStopTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             argv=json.loads(result.stdout)
             self.assertEqual(
-                argv[:6],
-                ["/opt/homebrew/bin/codex", "exec", "-C", str(repo.resolve()), "resume", "controller-1"],
+                argv[:7],
+                [
+                    "/opt/homebrew/bin/codex", "exec", "--json", "-C",
+                    str(repo.resolve()), "resume", "controller-1",
+                ],
             )
             self.assertNotIn("fork", argv)
 
@@ -3408,9 +3617,9 @@ class WebLifecycleNativeStopTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             argv = json.loads(result.stdout)
-            self.assertEqual(argv[4], "resume")
-            self.assertEqual(argv[5], "desktop-current")
-            self.assertNotIn("controller-old", argv[4:6])
+            self.assertEqual(argv[5], "resume")
+            self.assertEqual(argv[6], "desktop-current")
+            self.assertNotIn("controller-old", argv[5:7])
 
     def test_native_stop_missing_lifecycle_state_does_not_direct_resume(self) -> None:
         from unittest.mock import patch
@@ -4207,6 +4416,10 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                 web_bridge, "execute_native_resume", side_effect=resume_then_supersede
             ), patch.object(
                 web_bridge, "preflight_native_resume", return_value=(True, "", {})
+            ), patch.object(
+                web_bridge.target_guard,
+                "unique_controller_id_for_repo_in_registry",
+                return_value="controller-1",
             ), patch.object(web_bridge.subprocess, "run", bootstrap):
                 code = web_bridge.run_auto_native_stop(
                     session_id="controller-1", repo=repo, receipt_id="r1", registry=registry,
@@ -4247,6 +4460,7 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                 result = web_bridge.recover_incompatible_native_target(
                     session_id="controller-1", repo=repo, registry=registry, codex="codex",
                     failed_target_session_id="desktop-bad", expected_generation=1,
+                    expected_ownership_generation=1,
                     supervisor_state_path=state, supervisor_receipt_id="r1",
                     supervisor_token=old_token,
                 )
@@ -4376,6 +4590,7 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                 result = web_bridge.recover_incompatible_native_target(
                     session_id="controller-1", repo=repo, registry=registry, codex="codex",
                     failed_target_session_id="desktop-bad", expected_generation=1,
+                    expected_ownership_generation=1,
                     runtime_path="/usr/bin:/bin", terminal_receipts=["terminal.json"],
                     next_action="continue", supervisor_state_path=state,
                     supervisor_receipt_id="r1", supervisor_token=old_token,
@@ -4432,6 +4647,10 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                     "controller_host": "desktop_codex", "wake_generation": 1,
                 }), patch.object(web_bridge, "execute_native_resume", side_effect=native_resume), patch.object(
                     web_bridge.subprocess, "Popen", return_value=Mock(pid=2222)
+                ), patch.object(
+                    web_bridge.target_guard,
+                    "unique_controller_id_for_repo_in_registry",
+                    return_value="controller-1",
                 ), patch.object(web_bridge, "_pid_is_alive", return_value=True):
                     old_thread.start(); self.assertTrue(resume_entered.wait(1))
                     replacement_thread.start()
@@ -4469,7 +4688,7 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
                 finally: done.set()
             t=threading.Thread(target=old)
             try:
-                with patch.object(web_bridge,"_load_lifecycle_state",side_effect=lifecycle), patch.object(web_bridge,"execute_native_resume",return_value=confirmed), patch.object(web_bridge.subprocess,"Popen",return_value=Mock(pid=2222)), patch.object(web_bridge,"_pid_is_alive",return_value=True):
+                with patch.object(web_bridge,"_load_lifecycle_state",side_effect=lifecycle), patch.object(web_bridge,"execute_native_resume",return_value=confirmed), patch.object(web_bridge.subprocess,"Popen",return_value=Mock(pid=2222)), patch.object(web_bridge.target_guard,"unique_controller_id_for_repo_in_registry",return_value="controller-1"), patch.object(web_bridge,"_pid_is_alive",return_value=True):
                     t.start(); self.assertTrue(second_read.wait(1)); self.assertTrue(web_bridge.schedule_auto_native_stop(session_id="controller-1",repo=repo,receipt_id="r1",registry=registry,codex="codex",delay_seconds=1,state_path=state,force_rearm=True,replace_supervisor_token=old_token)); new_token=json.loads(state.read_text())["supervisor_token"]; release.set(); self.assertTrue(done.wait(2))
             finally: release.set(); t.join(2)
             final=json.loads(state.read_text()); self.assertEqual(final["supervisor_token"],new_token); self.assertEqual(final["supervisor_pid"],2222); self.assertEqual(final["state"],"RESUME_PENDING")
@@ -4621,6 +4840,158 @@ class WebContinuationSupervisorBootstrapTests(unittest.TestCase):
             {"pending_control_event": True, "requires_user": True},
             {"state": "RESUME_CONFIRMED", "pending_control_event": True},
         ))
+
+
+    def test_retry_exhausted_rearms_after_host_delivery_fingerprint_change(self) -> None:
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 12,
+            "triggers": ["terminal_receipt_pending"],
+        }
+        prior = {
+            "state": "WEB_REENTRY_RETRY_EXHAUSTED",
+            "pending_control_event": True,
+            "delivery_terminal_receipt_id": "bootstrap:12",
+            "delivery_terminal_key": "wake-generation:12|host:" + "a" * 64,
+            "delivery_terminal_outcome": "retry_exhausted",
+        }
+        self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle,
+            prior,
+            current_host_delivery_fingerprint="b" * 64,
+        ))
+
+    def test_retry_exhausted_same_host_delivery_fingerprint_stays_quiet(self) -> None:
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 12,
+            "triggers": ["terminal_receipt_pending"],
+        }
+        prior = {
+            "state": "WEB_REENTRY_RETRY_EXHAUSTED",
+            "pending_control_event": True,
+            "delivery_terminal_receipt_id": "bootstrap:12",
+            "delivery_terminal_key": "wake-generation:12|host:" + "a" * 64,
+            "delivery_terminal_outcome": "retry_exhausted",
+        }
+        self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle,
+            prior,
+            current_host_delivery_fingerprint="a" * 64,
+        ))
+
+    def test_legacy_retry_exhausted_gets_one_rearm_when_host_fingerprint_becomes_available(self) -> None:
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 12,
+            "triggers": ["terminal_receipt_pending"],
+        }
+        prior = {
+            "state": "WEB_REENTRY_RETRY_EXHAUSTED",
+            "pending_control_event": True,
+            "delivery_terminal_receipt_id": "post-shell:12",
+            "delivery_terminal_key": "wake-generation:12",
+            "delivery_terminal_outcome": "retry_exhausted",
+        }
+        self.assertTrue(web_bridge.continuation_supervisor_needs_bootstrap(
+            lifecycle,
+            prior,
+            current_host_delivery_fingerprint="b" * 64,
+        ))
+
+    def test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change(self) -> None:
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 12,
+            "triggers": ["terminal_receipt_pending"],
+        }
+        for outcome in ("submit_confirmed", "result_unknown"):
+            with self.subTest(outcome=outcome):
+                prior = {
+                    "state": "WEB_REENTRY_SUBMITTED" if outcome == "submit_confirmed" else "WEB_REENTRY_RESULT_UNKNOWN",
+                    "pending_control_event": True,
+                    "delivery_terminal_receipt_id": "bootstrap:12",
+                    "delivery_terminal_key": "wake-generation:12|host:" + "a" * 64,
+                    "delivery_terminal_outcome": outcome,
+                }
+                self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
+                    lifecycle,
+                    prior,
+                    current_host_delivery_fingerprint="b" * 64,
+                ))
+
+
+    def test_ensure_supervisor_uses_new_receipt_after_host_fingerprint_upgrade(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+            (repo / "TASK_LEDGER.md").write_text(
+                "# 任务台账\n\n## 当前目标\n- 当前活动项：无\n- 下一可见检查点：无\n\n"
+                "| ID | 状态 / 负责人 | 目标与边界 | 依赖 / 阻塞 | 验收与验证 | 证据 / 下一步 |\n"
+                "| --- | --- | --- | --- | --- | --- |\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "TASK_LEDGER.md"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "base"],
+                cwd=repo, check=True,
+            )
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-current", "generation": 4,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-current",
+                    "generation": 8, "provenance": "web_entry",
+                }},
+            }), encoding="utf-8")
+            state = root / "auto.json"
+            state.write_text(json.dumps({
+                "receipt_id": "post-shell:1",
+                "state": "WEB_REENTRY_RETRY_EXHAUSTED",
+                "pending_control_event": True,
+                "delivery_terminal_receipt_id": "post-shell:1",
+                "delivery_terminal_key": "wake-generation:12|host:" + "a" * 64,
+                "delivery_terminal_outcome": "retry_exhausted",
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True,
+                "requires_user": False,
+                "controller_host": "web",
+                "wake_generation": 12,
+                "triggers": ["terminal_receipt_pending"],
+            }
+            captured = {}
+            def schedule(**kwargs):
+                captured.update(kwargs)
+                return True
+            with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state), \
+                 patch.object(web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64), \
+                 patch.object(web_bridge, "schedule_auto_native_stop", side_effect=schedule):
+                self.assertTrue(web_bridge.ensure_continuation_supervisor(
+                    lifecycle_state=lifecycle,
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex="codex",
+                    delay_seconds=1.0,
+                ))
+            self.assertEqual(captured["receipt_id"], "bootstrap:12:host-" + "b" * 16)
 
 
 class WebLifecycleNativeStopRootFixTests(unittest.TestCase):
@@ -6788,6 +7159,13 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                         "status": "active", "session_id": "desktop-bad", "generation": 1,
                     }}
                 },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "desktop_codex",
+                        "execution_target_session_id": "desktop-bad",
+                        "generation": 1,
+                    }
+                },
             }), encoding="utf-8")
             state = root / "auto-stop.json"
             state.write_text(json.dumps({
@@ -6805,7 +7183,26 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 "operation": "native_target_recovery", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
                 "pending_control_event": True, "returncode": 0, "stdout_tail": "continued", "stderr_tail": "",
                 "execution_target_session_id": "desktop-good", "target_generation": 2,
+                "replacement_execution_target_session_id": "desktop-good",
+                "ownership_generation": 2,
             }
+
+            def recover_and_rotate(**_kwargs):
+                saved_registry = json.loads(registry.read_text(encoding="utf-8"))
+                saved_registry["__controller_sessions__"]["controller-1"]["desktop_codex"].append(
+                    "desktop-good"
+                )
+                saved_registry["__controller_targets__"]["controller-1"]["desktop_codex"] = {
+                    "status": "active", "session_id": "desktop-good", "generation": 2,
+                }
+                saved_registry["__controller_execution_ownership__"]["controller-1"] = {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-good",
+                    "generation": 2,
+                }
+                registry.write_text(json.dumps(saved_registry), encoding="utf-8")
+                return recovered
+
             with patch.object(web_bridge, "_load_lifecycle_state", side_effect=[{
                 "pending_control_event": True,
                 "requires_user": False,
@@ -6815,7 +7212,7 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 "requires_user": False,
                 "controller_host": "desktop_codex",
             }]), patch.object(web_bridge, "execute_native_resume", return_value=incompatible), patch.object(
-                web_bridge, "recover_incompatible_native_target", return_value=recovered
+                web_bridge, "recover_incompatible_native_target", side_effect=recover_and_rotate
             ) as recover, patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
                 code = web_bridge.run_auto_native_stop(
                     session_id="controller-1", repo=repo, receipt_id="pending-schema-1",
@@ -6824,12 +7221,61 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 )
             self.assertEqual(code, 0)
             recover.assert_called_once()
+            self.assertEqual(recover.call_args.kwargs["expected_ownership_generation"], 1)
             schedule.assert_not_called()
             saved = json.loads(state.read_text())
             self.assertEqual(saved["state"], "CONTINUATION_CLOSED")
             self.assertEqual(saved["execution_target_session_id"], "desktop-good")
             self.assertEqual(saved["target_generation"], 2)
             self.assertFalse(saved["pending_control_event"])
+
+    def test_desktop_target_replacement_uses_requested_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-bad"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {"desktop_codex": {
+                        "status": "active",
+                        "session_id": "desktop-bad",
+                        "generation": 1,
+                    }}
+                },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "desktop_codex",
+                        "execution_target_session_id": "desktop-bad",
+                        "generation": 1,
+                    }
+                },
+            }), encoding="utf-8")
+
+            receipt = web_bridge.replace_desktop_execution_target(
+                controller_id="controller-1",
+                desktop_session_id="desktop-good",
+                repo=repo,
+                expected_generation=1,
+                expected_ownership_generation=1,
+                registry=registry,
+            )
+
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            target = saved["__controller_targets__"]["controller-1"]["desktop_codex"]
+            ownership = saved["__controller_execution_ownership__"]["controller-1"]
+            self.assertEqual(target["session_id"], "desktop-good")
+            self.assertEqual(target["generation"], 2)
+            self.assertEqual(ownership["execution_target_session_id"], "desktop-good")
+            self.assertEqual(ownership["generation"], 2)
+            self.assertEqual(receipt["execution_target_session_id"], "desktop-good")
+            self.assertEqual(receipt["generation"], 2)
+            self.assertEqual(receipt["ownership_generation"], 2)
 
     def test_recover_incompatible_target_replaces_only_execution_target_then_resumes(self) -> None:
         from unittest.mock import patch
@@ -6858,7 +7304,7 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
             codex.chmod(0o755)
             replacement_receipt = {
                 "controller_id": "controller-1", "execution_target_session_id": "desktop-good",
-                "status": "active", "generation": 2,
+                "status": "active", "generation": 2, "ownership_generation": 2,
             }
             resumed = {
                 "operation": "native_resume", "result": "CONFIRMED", "state": "RESUME_SUCCEEDED",
@@ -6872,6 +7318,7 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
                 result = web_bridge.recover_incompatible_native_target(
                     session_id="controller-1", repo=repo, registry=registry, codex=str(codex),
                     failed_target_session_id="desktop-bad", expected_generation=1,
+                    expected_ownership_generation=1,
                     runtime_path="/usr/bin:/bin", terminal_receipts=["terminal.json"],
                     next_action="execute step 2",
                 )
@@ -6880,11 +7327,12 @@ class WebSessionRestoreAndResumeClassificationTests(unittest.TestCase):
             self.assertEqual(result["target_generation"], 2)
             replace.assert_called_once_with(
                 controller_id="controller-1", desktop_session_id="desktop-good", repo=repo,
-                expected_generation=1, registry=registry,
+                expected_generation=1, expected_ownership_generation=1, registry=registry,
             )
             resume.assert_called_once()
             self.assertEqual(resume.call_args.kwargs["session_id"], "controller-1")
             self.assertEqual(resume.call_args.kwargs["next_action"], "execute step 2")
+            self.assertEqual(result["ownership_generation"], 2)
 
     def test_active_writer_message_without_thread_store_prefix_is_still_deferred(self) -> None:
         classified = web_bridge.classify_native_resume_failure(
@@ -9564,3 +10012,354 @@ def _transient_web_reentry_retry_budget_exhausts_without_rearm(self):
 
 WebContinuationSupervisorBootstrapTests.test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot = _non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot
 WebLocalReentryIntegrationTests.test_transient_web_reentry_retry_budget_exhausts_without_rearm = _transient_web_reentry_retry_budget_exhausts_without_rearm
+
+def _retry_exhausted_persists_host_delivery_fingerprint(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "host_attested_same_controller_recovery",
+            "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 8, "provenance": "web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id": "web-transient-fingerprint",
+            "session_id": "controller-1",
+            "repo": str(repo.resolve()),
+            "state": "WEB_REENTRY_PENDING",
+            "pending_control_event": True,
+            "retry_count": web_bridge.WEB_REENTRY_TRANSIENT_RETRY_LIMIT - 1,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "web",
+            "wake_generation": 23,
+            "triggers": ["terminal_receipt_pending"],
+            "snapshot": {
+                "head": "h3", "ledger_sha256": "l3",
+                "worktree_status_sha256": "w3", "ready_ids": [],
+                "runnable_ids": [], "candidate_revisions": [],
+            },
+        }
+        attempt = {
+            "operation": "web_reentry", "result": "DEFERRED",
+            "state": "WEB_REENTRY_PENDING", "returncode": 78,
+            "failure_class": "web_reentry_unavailable",
+            "error_code": "WEB_REENTRY_UNAVAILABLE",
+            "stderr_tail": "temporary route gap",
+            "execution_target_session_id": "web-current",
+            "target_generation": 4, "ownership_generation": 8,
+            "target_mode": "explicit_current",
+            "delivery_authorization": "host_attested",
+            "host_attested": True, "strong_web_identity_established": True,
+        }
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        verifier.delivery_fingerprint = "a" * 64
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), \
+             patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), \
+             patch.object(web_bridge, "_execute_registered_web_host_reentry", return_value=attempt), \
+             patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo,
+                receipt_id="web-transient-fingerprint",
+                registry=registry, codex="codex",
+                delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 78)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WEB_REENTRY_RETRY_EXHAUSTED")
+    self.assertEqual(saved["delivery_host_fingerprint"], "a" * 64)
+    self.assertEqual(
+        saved["delivery_terminal_key"],
+        "wake-generation:23|host:" + "a" * 64,
+    )
+
+
+WebLocalReentryIntegrationTests.test_retry_exhausted_persists_host_delivery_fingerprint = _retry_exhausted_persists_host_delivery_fingerprint
+
+class StrongWebSuccessorHandoffTests(unittest.TestCase):
+    def make_strong_identity(self, root: Path) -> tuple[Path, Path]:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps({
+            "controller-1": str(repo.resolve()),
+            "__controller_sessions__": {
+                "controller-1": {"web": ["web-strong", "web-historical"]}
+            },
+            "__controller_targets__": {
+                "controller-1": {"web": {
+                    "status": "active",
+                    "session_id": "web-strong",
+                    "generation": 4,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only",
+                    "identity_proof": "host_attested_origin",
+                }}
+            },
+            "__controller_execution_ownership__": {
+                "controller-1": {
+                    "active_host": "web",
+                    "execution_target_session_id": "web-strong",
+                    "generation": 4,
+                    "provenance": "web_entry",
+                }
+            },
+        }), encoding="utf-8")
+        return repo, registry
+
+    @staticmethod
+    def structured_verifier(calls: list[dict]):
+        def verifier(**kwargs):
+            calls.append(dict(kwargs))
+            session = kwargs["expected_target_session_id"]
+            receipt = "hr-" + session
+            return {
+                "identity_attested": True,
+                "host_receipt_id": receipt,
+                "verified_target": {
+                    "provenance": "runtime_host_verifier_v1",
+                    "conversation_id": session,
+                    "target_generation": kwargs["expected_target_generation"],
+                    "ownership_generation": kwargs["expected_ownership_generation"],
+                    "host_receipt_id": receipt,
+                },
+            }
+        return verifier
+
+    def test_authorize_web_successor_records_only_fenced_fresh_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_strong_identity(Path(tmp))
+            result = web_bridge.authorize_web_successor(
+                repo=repo,
+                controller_id="controller-1",
+                successor_web_session_id="web-new",
+                expected_target_generation=4,
+                expected_ownership_generation=4,
+                registry_path=registry,
+                ttl_seconds=60,
+                now_unix=1000,
+            )
+            saved = json.loads(registry.read_text())
+            self.assertFalse(result["idempotent"])
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
+                "web-strong",
+            )
+            self.assertEqual(
+                saved["__controller_execution_ownership__"]["controller-1"]["generation"],
+                4,
+            )
+            self.assertNotIn(
+                "web-new", saved["__controller_sessions__"]["controller-1"]["web"]
+            )
+            auth = saved[web_bridge.WEB_SUCCESSOR_AUTH_REGISTRY_KEY]["controller-1"]
+            self.assertEqual(auth["successor_web_session_id"], "web-new")
+            self.assertEqual(auth["expires_at_unix"], 1060)
+
+            with self.assertRaisesRegex(PermissionError, "historical Web alias"):
+                web_bridge.authorize_web_successor(
+                    repo=repo,
+                    controller_id="controller-1",
+                    successor_web_session_id="web-historical",
+                    expected_target_generation=4,
+                    expected_ownership_generation=4,
+                    registry_path=registry,
+                    ttl_seconds=60,
+                    now_unix=1000,
+                )
+
+    def test_authorize_web_successor_cli_does_not_rotate_target(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_strong_identity(Path(tmp))
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = web_bridge.main([
+                    "authorize-web-successor",
+                    "--repo", str(repo),
+                    "--controller-id", "controller-1",
+                    "--successor-web-session-id", "web-new",
+                    "--expected-generation", "4",
+                    "--expected-ownership-generation", "4",
+                    "--registry", str(registry),
+                    "--ttl-seconds", "60",
+                ])
+            self.assertEqual(code, 0)
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["successor_web_session_id"], "web-new")
+            saved = json.loads(registry.read_text())
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
+                "web-strong",
+            )
+            self.assertEqual(
+                saved["__controller_execution_ownership__"]["controller-1"]["generation"],
+                4,
+            )
+            self.assertNotIn(
+                "web-new", saved["__controller_sessions__"]["controller-1"]["web"]
+            )
+
+    def test_authorized_strong_web_successor_rotates_target_and_ownership_once(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_strong_identity(Path(tmp))
+            with patch.object(web_bridge.time, "time", return_value=1000):
+                web_bridge.authorize_web_successor(
+                    repo=repo,
+                    controller_id="controller-1",
+                    successor_web_session_id="web-new",
+                    expected_target_generation=4,
+                    expected_ownership_generation=4,
+                    registry_path=registry,
+                    ttl_seconds=60,
+                )
+                calls: list[dict] = []
+                with patch.object(
+                    web_bridge,
+                    "_registered_peer_attestation_verifier",
+                    return_value=self.structured_verifier(calls),
+                ):
+                    result = web_bridge.recover_same_controller_web_session(
+                        repo=repo,
+                        web_session_id="web-new",
+                        registry_path=registry,
+                        host_identity_receipt=None,
+                    )
+
+            saved = json.loads(registry.read_text())
+            self.assertEqual(result["result"], "RECOVERED")
+            self.assertTrue(result["strong_successor_rotation"])
+            self.assertEqual(result["target_generation"], 5)
+            self.assertEqual(result["ownership_generation"], 5)
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
+                "web-new",
+            )
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["generation"],
+                5,
+            )
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["identity_proof"],
+                "host_attested_origin",
+            )
+            self.assertEqual(
+                saved["__controller_execution_ownership__"]["controller-1"],
+                {
+                    "active_host": "web",
+                    "execution_target_session_id": "web-new",
+                    "generation": 5,
+                    "provenance": "web_entry",
+                },
+            )
+            self.assertIn(
+                "web-new", saved["__controller_sessions__"]["controller-1"]["web"]
+            )
+            self.assertNotIn(web_bridge.WEB_SUCCESSOR_AUTH_REGISTRY_KEY, saved)
+            self.assertEqual(
+                [call["expected_target_session_id"] for call in calls],
+                ["web-strong", "web-new"],
+            )
+            self.assertTrue(all(call["phase"] == "identity_evidence" for call in calls))
+
+    def test_strong_web_successor_expired_authorization_does_not_call_verifier(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_strong_identity(Path(tmp))
+            web_bridge.authorize_web_successor(
+                repo=repo,
+                controller_id="controller-1",
+                successor_web_session_id="web-new",
+                expected_target_generation=4,
+                expected_ownership_generation=4,
+                registry_path=registry,
+                ttl_seconds=5,
+                now_unix=1000,
+            )
+            calls: list[dict] = []
+            with patch.object(web_bridge.time, "time", return_value=1006), patch.object(
+                web_bridge,
+                "_registered_peer_attestation_verifier",
+                return_value=self.structured_verifier(calls),
+            ):
+                result = web_bridge.recover_same_controller_web_session(
+                    repo=repo,
+                    web_session_id="web-new",
+                    registry_path=registry,
+                    host_identity_receipt=None,
+                )
+            self.assertEqual(result["result"], "DEFERRED")
+            self.assertEqual(
+                result["reason"], "HOST_ATTESTED_CURRENT_TARGET_ALREADY_ACTIVE"
+            )
+            self.assertEqual(calls, [])
+            saved = json.loads(registry.read_text())
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
+                "web-strong",
+            )
+
+    def test_strong_web_successor_rechecks_target_generation_after_attestation(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_strong_identity(Path(tmp))
+            with patch.object(web_bridge.time, "time", return_value=1000):
+                web_bridge.authorize_web_successor(
+                    repo=repo,
+                    controller_id="controller-1",
+                    successor_web_session_id="web-new",
+                    expected_target_generation=4,
+                    expected_ownership_generation=4,
+                    registry_path=registry,
+                    ttl_seconds=60,
+                )
+                calls = []
+                base_verifier = self.structured_verifier(calls)
+
+                def verifier(**kwargs):
+                    value = base_verifier(**kwargs)
+                    if kwargs["expected_target_session_id"] == "web-new":
+                        changed = json.loads(registry.read_text())
+                        changed["__controller_targets__"]["controller-1"]["web"]["generation"] = 5
+                        registry.write_text(json.dumps(changed), encoding="utf-8")
+                    return value
+
+                with patch.object(
+                    web_bridge,
+                    "_registered_peer_attestation_verifier",
+                    return_value=verifier,
+                ):
+                    with self.assertRaisesRegex(
+                        PermissionError, "target generation/session changed"
+                    ):
+                        web_bridge.recover_same_controller_web_session(
+                            repo=repo,
+                            web_session_id="web-new",
+                            registry_path=registry,
+                            host_identity_receipt=None,
+                        )
+
+            saved = json.loads(registry.read_text())
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"]["session_id"],
+                "web-strong",
+            )
+            self.assertEqual(
+                saved["__controller_execution_ownership__"]["controller-1"]["generation"],
+                4,
+            )
+            self.assertIn(web_bridge.WEB_SUCCESSOR_AUTH_REGISTRY_KEY, saved)

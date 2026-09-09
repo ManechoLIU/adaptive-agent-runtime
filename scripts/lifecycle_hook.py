@@ -1319,7 +1319,7 @@ def _desktop_canary_identity(
     lifecycle = root / "scripts" / "lifecycle_hook.py"
     target_guard_path = root / "scripts" / "controller_target_guard.py"
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "skill_root": str(root),
         "hooks_sha256": sha256_bytes(hooks_path.read_bytes()),
         "lifecycle_sha256": sha256_bytes(lifecycle.read_bytes()),
@@ -1330,13 +1330,95 @@ def _desktop_canary_identity(
 def arm_desktop_canary(
     controller_session_id: str,
     *,
+    repo: Path | None = None,
+    registry_path: Path = REGISTRY_PATH,
+    execution_target_session_id: str | None = None,
+    target_generation: int | None = None,
+    ownership_generation: int | None = None,
     canary_path: Path = DESKTOP_CANARY_PATH,
     hooks_path: Path = CODEX_HOOKS_PATH,
     skill_root: Path | None = None,
 ) -> dict[str, Any]:
-    session_id = controller_session_id.strip()
-    if not session_id:
+    controller_id = controller_session_id.strip()
+    if not controller_id:
         raise ValueError("controller session is required to arm desktop canary")
+    canonical_repo: str | None = None
+    controller_registry_path: str | None = None
+    if repo is not None:
+        canonical_root = canonical_main_root(repo)
+        if canonical_root is None:
+            raise ValueError("desktop canary requires a canonical Git project")
+        with target_guard.locked_registry(registry_path) as registry:
+            _validated_controller_registry(
+                registry=registry,
+                controller_id=controller_id,
+                canonical_root=canonical_root,
+            )
+            if target_guard.unique_controller_id_for_repo_in_registry(
+                canonical_root, registry
+            ) != controller_id:
+                raise PermissionError(
+                    "desktop canary requires the unique project Controller"
+                )
+            target_record = target_guard.target_record(
+                registry, controller_id=controller_id, host=DESKTOP_SESSION_HOST
+            )
+            ownership_record = target_guard.execution_ownership_record(
+                registry, controller_id=controller_id
+            )
+            if target_record is None or ownership_record is None:
+                raise PermissionError(
+                    "desktop canary requires current target and execution ownership records"
+                )
+            target_status, registered_target, registered_target_generation = (
+                target_guard.validate_target_record(
+                    target_record, host=DESKTOP_SESSION_HOST
+                )
+            )
+            ownership_host, ownership_target, registered_ownership_generation = (
+                target_guard.validate_execution_ownership_record(ownership_record)
+            )
+            if (
+                target_status != "active"
+                or ownership_host != DESKTOP_SESSION_HOST
+                or not registered_target
+                or registered_target != ownership_target
+            ):
+                raise PermissionError(
+                    "desktop canary target does not match current execution ownership"
+                )
+        requested = (
+            (execution_target_session_id, registered_target, "execution target session"),
+            (target_generation, registered_target_generation, "target generation"),
+            (ownership_generation, registered_ownership_generation, "ownership generation"),
+        )
+        for supplied, registered, label in requested:
+            if supplied is not None and supplied != registered:
+                raise PermissionError(f"{label} does not match the controller registry")
+        execution_target_session_id = registered_target
+        target_generation = registered_target_generation
+        ownership_generation = registered_ownership_generation
+        canonical_repo = str(canonical_root.resolve())
+        controller_registry_path = str(registry_path.expanduser().resolve())
+    if (
+        execution_target_session_id is None
+        or target_generation is None
+        or ownership_generation is None
+    ):
+        raise ValueError(
+            "schema 4 desktop canary requires exact target and ownership generations"
+        )
+    target_session_id = str(execution_target_session_id).strip()
+    if not target_session_id:
+        raise ValueError("execution target session is required to arm desktop canary")
+    for generation, label in (
+        (target_generation, "target generation"),
+        (ownership_generation, "ownership generation"),
+    ):
+        if generation is not None and (
+            isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
+        ):
+            raise ValueError(f"{label} must be a positive integer")
     identity = _desktop_canary_identity(
         hooks_path=hooks_path, skill_root=skill_root
     )
@@ -1344,7 +1426,13 @@ def arm_desktop_canary(
     receipt = {
         **identity,
         "status": "armed",
-        "controller_session_id": session_id,
+        "controller_id": controller_id,
+        "controller_session_id": controller_id,
+        "execution_target_session_id": target_session_id,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+        "canonical_repo": canonical_repo,
+        "controller_registry_path": controller_registry_path,
         "run_id": secrets.token_hex(16),
         "sequence_index": 0,
         "observations": [],
@@ -1384,8 +1472,32 @@ def record_desktop_canary_observation(
                 return current
             if current.get("status") not in {"armed", "pending"}:
                 return current
-            session_id = str(event.get("session_id", "")).strip()
-            if session_id != str(current.get("controller_session_id", "")):
+            session_id = str(
+                event.get("source_session_id") or event.get("session_id", "")
+            ).strip()
+            execution_target_session_id = str(
+                current.get("execution_target_session_id")
+                or current.get("controller_session_id", "")
+            ).strip()
+            if session_id != execution_target_session_id:
+                return current
+            expected_target_generation = current.get("target_generation")
+            if (
+                expected_target_generation is not None
+                and event.get("controller_target_generation") != expected_target_generation
+            ):
+                return current
+            if str(event.get("controller_session_id") or "").strip() != str(
+                current.get("controller_id") or ""
+            ).strip():
+                return current
+            if event.get("controller_ownership_generation") != current.get(
+                "ownership_generation"
+            ):
+                return current
+            if event.get("controller_registry_path") != current.get(
+                "controller_registry_path"
+            ):
                 return current
             observations = [
                 str(item) for item in current.get("observations", []) if str(item).strip()
@@ -2642,6 +2754,7 @@ def _reject_cross_controller_desktop_owner(
 def replace_desktop_session(
     *, controller_id: str, desktop_session_id: str, repo: Path, expected_generation: int,
     expected_ownership_generation: int | None = None,
+    registry_path: Path | None = None,
 ) -> dict[str, Any]:
     controller_id = controller_id.strip()
     desktop_session_id = desktop_session_id.strip()
@@ -2650,12 +2763,13 @@ def replace_desktop_session(
     canonical_root = canonical_main_root(repo)
     if canonical_root is None:
         raise ValueError("desktop session replacement requires a canonical Git project")
-    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + ".lock")
+    registry_path = REGISTRY_PATH if registry_path is None else registry_path.expanduser()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = registry_path.with_suffix(registry_path.suffix + ".lock")
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            registry = load_json(REGISTRY_PATH)
+            registry = load_json(registry_path)
             _validated_controller_registry(
                 registry=registry,
                 controller_id=controller_id,
@@ -2727,7 +2841,7 @@ def replace_desktop_session(
                     expected_generation=expected_ownership_generation,
                     provenance="desktop_entry",
                 )
-            write_json(REGISTRY_PATH, registry)
+            write_json(registry_path, registry)
             return {
                 "controller_id": controller_id,
                 "controller_session_id": controller_id,
@@ -3023,8 +3137,18 @@ def run_hook() -> int:
         except (OSError, ValueError, PermissionError, subprocess.SubprocessError):
             post_outbound_request = None
     path = state_path(controller_id)
+    canary_ownership_current = False
+    normalized_event["controller_registry_path"] = str(
+        REGISTRY_PATH.expanduser().resolve()
+    )
     with target_guard.locked_registry(REGISTRY_PATH) as registry:
-        if target_guard.active_source_controller_id(
+        try:
+            unique_controller_id = target_guard.unique_controller_id_for_repo_in_registry(
+                expected_root, registry
+            )
+        except (OSError, ValueError, PermissionError):
+            return 0
+        if unique_controller_id != controller_id or target_guard.active_source_controller_id(
             registry,
             source_session_id=source_session_id,
             host=DESKTOP_SESSION_HOST,
@@ -3047,6 +3171,23 @@ def run_hook() -> int:
             if target_status != "active" or target_session_id != source_session_id:
                 return 0
             normalized_event["controller_target_generation"] = target_generation
+        ownership_record = target_guard.execution_ownership_record(
+            registry, controller_id=controller_id
+        )
+        if ownership_record is not None:
+            try:
+                ownership_host, ownership_target, ownership_generation = (
+                    target_guard.validate_execution_ownership_record(ownership_record)
+                )
+            except (PermissionError, ValueError):
+                pass
+            else:
+                canary_ownership_current = (
+                    ownership_host == DESKTOP_SESSION_HOST
+                    and ownership_target == source_session_id
+                )
+                if canary_ownership_current:
+                    normalized_event["controller_ownership_generation"] = ownership_generation
         output, next_state = persist_event_state(path, normalized_event, snapshot)
     if post_outbound_request is not None and _tool_use_id(normalized_event):
         action, target_session_id = post_outbound_request
@@ -3073,10 +3214,11 @@ def run_hook() -> int:
             expected_target_session_id=target_session_id,
             registry_path=REGISTRY_PATH,
         )
-    try:
-        record_desktop_canary_observation(normalized_event, output, next_state)
-    except (OSError, ValueError, json.JSONDecodeError):
-        pass
+    if canary_ownership_current:
+        try:
+            record_desktop_canary_observation(normalized_event, output, next_state)
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
     if output:
         print(json.dumps(output, ensure_ascii=False))
     return 0
@@ -3117,9 +3259,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="CONTROLLER_SESSION_ID",
         help="arm one ordered live desktop hook canary for the registered controller",
     )
+    parser.add_argument("--repo", help="canonical project checkout for canary binding")
     args = parser.parse_args(argv)
     if args.arm_desktop_canary:
-        receipt = arm_desktop_canary(args.arm_desktop_canary)
+        if not args.repo:
+            print("--repo is required with --arm-desktop-canary", file=sys.stderr)
+            return 2
+        try:
+            receipt = arm_desktop_canary(
+                args.arm_desktop_canary,
+                repo=Path(args.repo).expanduser().resolve(),
+            )
+        except PermissionError as error:
+            print(str(error), file=sys.stderr)
+            return 78
+        except (OSError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            return 2
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
         return 0
     if args.print_machine_trace:

@@ -104,6 +104,44 @@ function externalKillGraceMs() {
 
 function grokModelProgressKind(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return null;
+
+  // Grok Build 1.0.13 streaming-json emits model/tool activity as top-level
+  // typed records rather than only the older ACP session-update envelope.
+  // Match the observed provider schema narrowly so metadata or a caller-crafted
+  // bare type field cannot keep a stalled provider alive.
+  const streamingType = typeof event.type === "string" ? event.type.trim() : "";
+  if (streamingType === "text" || streamingType === "thought") {
+    return typeof event.data === "string" && event.data.trim()
+      ? streamingType
+      : null;
+  }
+  if (streamingType === "tool_call") {
+    const toolCallId = [event.toolCallId, event.tool_call_id].find(
+      (value) => typeof value === "string" && value.trim(),
+    );
+    const toolName = [event.toolName, event.tool_name].find(
+      (value) => typeof value === "string" && value.trim(),
+    );
+    const rawInput = event.rawInput ?? event.raw_input;
+    if (toolCallId && toolName && rawInput && typeof rawInput === "object" && !Array.isArray(rawInput)) {
+      return streamingType;
+    }
+    return null;
+  }
+  if (streamingType === "tool_call_update") {
+    const toolCallId = [event.toolCallId, event.tool_call_id].find(
+      (value) => typeof value === "string" && value.trim(),
+    );
+    if (!toolCallId) return null;
+    const hasStatus = typeof event.status === "string" && event.status.trim();
+    const hasContent = Array.isArray(event.content) && event.content.length > 0;
+    const hasRawOutput = event.rawOutput != null || event.raw_output != null;
+    const hasLocations = Array.isArray(event.locations) && event.locations.length > 0;
+    return hasStatus || hasContent || hasRawOutput || hasLocations
+      ? streamingType
+      : null;
+  }
+
   const sessionId = [event.sessionId, event.session_id].find(
     (value) => typeof value === "string" && value.trim(),
   );
