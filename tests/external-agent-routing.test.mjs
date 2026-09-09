@@ -1349,6 +1349,104 @@ test("oversized Grok reviewer prompt fails before provider spawn with sharding e
   await assert.rejects(readFile(marker, "utf8"));
 });
 
+test("Grok launch deadline classifies cli_launch_timeout and terminates an unconfirmed process group", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?launch-timeout=${Date.now()}`);
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 424242;
+  child.exitCode = null;
+  child.signalCode = null;
+  let cleanupCalled = false;
+  const previous = {
+    launch: process.env.AD_GROK_LAUNCH_TIMEOUT_MS,
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_LAUNCH_TIMEOUT_MS = "30";
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "500";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "500";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1000";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "20";
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", "process.exit(0)"], {
+        cwd: os.tmpdir(), env: process.env,
+        spawnChild: () => child,
+        terminateGroup: async (observedChild) => {
+          assert.equal(observedChild, child);
+          cleanupCalled = true;
+          child.exitCode = 1;
+          return { confirmed: true, diagnostic: "fake launch-timeout group reaped" };
+        },
+      }),
+      (error) => error?.failureClass === "cli_launch_timeout" && error?.retrySafe === true && error?.resultUnknown === false,
+    );
+    assert.equal(cleanupCalled, true);
+  } finally {
+    const names = {
+      launch: "AD_GROK_LAUNCH_TIMEOUT_MS", first: "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS",
+      stall: "AD_GROK_STALL_TIMEOUT_MS", absolute: "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS", grace: "AD_EXTERNAL_KILL_GRACE_MS",
+    };
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[names[key]]; else process.env[names[key]] = value;
+    }
+  }
+});
+
+test("Grok first-output deadline starts after launch confirmation", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?first-after-launch=${Date.now()}`);
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 424243;
+  child.exitCode = null;
+  child.signalCode = null;
+  const previous = {
+    launch: process.env.AD_GROK_LAUNCH_TIMEOUT_MS,
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_LAUNCH_TIMEOUT_MS = "250";
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "70";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "500";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1000";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "20";
+  const started = Date.now();
+  const spawnTimer = setTimeout(() => child.emit("spawn"), 90);
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", "process.exit(0)"], {
+        cwd: os.tmpdir(), env: process.env,
+        spawnChild: () => child,
+        terminateGroup: async () => {
+          child.exitCode = 1;
+          return { confirmed: true, diagnostic: "fake first-output group reaped" };
+        },
+      }),
+      (error) => error?.failureClass === "first_output_timeout",
+    );
+    assert.ok(Date.now() - started >= 135, `first-output clock started before launch: ${Date.now() - started}ms`);
+  } finally {
+    clearTimeout(spawnTimer);
+    const names = {
+      launch: "AD_GROK_LAUNCH_TIMEOUT_MS", first: "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS",
+      stall: "AD_GROK_STALL_TIMEOUT_MS", absolute: "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS", grace: "AD_EXTERNAL_KILL_GRACE_MS",
+    };
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[names[key]]; else process.env[names[key]] = value;
+    }
+  }
+});
+
 test("Grok first-output timeout terminates a silent provider attempt", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-first-output-timeout-"));
   const repo = await makeAssignmentRepo(bin);
@@ -1429,9 +1527,51 @@ if (process.argv[2] === "version") {
     },
   });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /attempt_deadline_exceeded/i);
+  assert.match(result.stderr, /provider_timeout/i);
   await new Promise((resolve) => setTimeout(resolve, 500));
   await assert.rejects(readFile(descendantMarker, "utf8"));
+});
+
+test("Grok side-effect timeout crosses provider boundary as result_unknown and disables retry", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-side-effect-unknown-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const runtimeReceipts = path.join(bin, "runtime-receipts.jsonl");
+  const terminalReceipt = path.join(bin, "external-terminal.json");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, {
+    assignment_id: "side-effect-timeout", side_effect: true, idempotency_key: "publish:timeout-1",
+  }, repo);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--assignment-id", "side-effect-timeout", "--task-id", "T1", "--agent-id", "writer", "--session-id", "side-effect-timeout-s1",
+    "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts, "--terminal-receipt", terminalReceipt,
+  ], {
+    encoding: "utf8", input: "bounded side-effect contract",
+    env: {
+      ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
+      FAKE_RUNNER_DELAY_BEFORE_OUTPUT_MS: "1000",
+      AD_GROK_LAUNCH_TIMEOUT_MS: "200", AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "50", AD_GROK_STALL_TIMEOUT_MS: "500",
+      AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "1000", AD_EXTERNAL_KILL_GRACE_MS: "25",
+    },
+  });
+  assert.equal(result.status, 1);
+  const receipts = (await readFile(runtimeReceipts, "utf8")).trim().split("\n").map(JSON.parse);
+  const terminal = receipts.at(-1);
+  assert.equal(terminal.failure_class, "result_unknown");
+  assert.equal(terminal.retry_class, "result_unknown");
+  assert.equal(terminal.retry_safe, false);
+  assert.equal(terminal.result_unknown, true);
+  assert.equal(terminal.failure_details.provider_failure_class, "first_output_timeout");
+  const durable = JSON.parse(await readFile(terminalReceipt, "utf8"));
+  assert.equal(durable.failure_class, "result_unknown");
+  assert.equal(durable.retry_class, "result_unknown");
+  assert.equal(durable.retry_safe, false);
+  assert.equal(durable.result_unknown, true);
+  assert.equal(durable.failure_details.provider_failure_class, "first_output_timeout");
 });
 
 test("Grok stall timeout persists structured canonical terminal classification", async () => {

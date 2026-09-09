@@ -39,6 +39,7 @@ const CURRENT_HOST_FALLBACK_FAILURES = new Set([
 
 const DEFAULT_GROK_MAX_PROMPT_BYTES = 128 * 1024;
 const DEFAULT_GROK_REVIEW_SHARD_TARGET_BYTES = 64 * 1024;
+const DEFAULT_GROK_LAUNCH_TIMEOUT_MS = 10_000;
 const DEFAULT_GROK_FIRST_OUTPUT_TIMEOUT_MS = 90_000;
 const DEFAULT_GROK_STALL_TIMEOUT_MS = 180_000;
 const DEFAULT_EXTERNAL_ATTEMPT_TIMEOUT_MS = 600_000;
@@ -78,6 +79,10 @@ function grokMaxPromptBytes() {
 function grokReviewShardTargetBytes(maxBytes = grokMaxPromptBytes()) {
   const fallback = Math.min(DEFAULT_GROK_REVIEW_SHARD_TARGET_BYTES, maxBytes);
   return boundedEnvInteger("AD_GROK_REVIEW_SHARD_TARGET_BYTES", fallback, { min: 32, max: maxBytes });
+}
+
+function grokLaunchTimeoutMs() {
+  return boundedEnvInteger("AD_GROK_LAUNCH_TIMEOUT_MS", DEFAULT_GROK_LAUNCH_TIMEOUT_MS, { min: 10, max: 60_000 });
 }
 
 function grokFirstOutputTimeoutMs() {
@@ -1152,25 +1157,28 @@ function runAttached(executable, args, { cwd, env }) {
 
 export function runMonitoredGrok(executable, args, {
   cwd, env, progressDeadlineMinutes = null, onStructuredProgress = null,
-  terminateGroup = terminateProcessGroup,
+  terminateGroup = terminateProcessGroup, spawnChild = spawn,
 }) {
+  const launchTimeoutMs = grokLaunchTimeoutMs();
   const absoluteTimeoutMs = externalAttemptTimeoutMs(progressDeadlineMinutes);
   const firstOutputTimeoutMs = grokFirstOutputTimeoutMs();
   const stallTimeoutMs = grokStallTimeoutMs();
   const killGraceMs = externalKillGraceMs();
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
     let child;
     try {
-      child = spawn(executable, args, {
+      child = spawnChild(executable, args, {
         cwd, env,
         stdio: ["ignore", "pipe", "pipe"],
         detached: process.platform !== "win32",
       });
     } catch (error) {
-      reject(new ExternalAgentExecutionError(`cli_launch_failed: ${error.message}`, { failureClass: "cli_launch_failed", retrySafe: true }));
+      reject(new ExternalAgentExecutionError(`cli_launch_failed: ${error.message}`, { failureClass: "cli_launch_failed", retrySafe: true, details: { provider_started: false } }));
       return;
     }
-    const startedAt = Date.now();
+    let launchConfirmed = false;
+    let launchedAt = null;
     let firstStructuredOutputAt = null;
     let lastStructuredOutputAt = startedAt;
     let stdoutBuffer = "";
@@ -1209,6 +1217,13 @@ export function runMonitoredGrok(executable, args, {
       }
     };
 
+    child.once("spawn", () => {
+      const now = Date.now();
+      launchConfirmed = true;
+      launchedAt = now;
+      lastStructuredOutputAt = now;
+    });
+
     child.stdout?.on("data", (chunk) => {
       process.stdout.write(chunk);
       observeStructuredLines(chunk.toString("utf8"));
@@ -1228,20 +1243,24 @@ export function runMonitoredGrok(executable, args, {
         failureClass: finalClass,
         retrySafe: cleanup.confirmed,
         resultUnknown: !cleanup.confirmed,
-        details: { cleanup_confirmed: cleanup.confirmed, cleanup_diagnostic: cleanup.diagnostic },
+        details: { cleanup_confirmed: cleanup.confirmed, cleanup_diagnostic: cleanup.diagnostic, provider_started: launchConfirmed },
       }));
     };
 
-    const smallestDeadline = Math.max(10, Math.min(firstOutputTimeoutMs, stallTimeoutMs, absoluteTimeoutMs));
+    const smallestDeadline = Math.max(10, Math.min(launchTimeoutMs, firstOutputTimeoutMs, stallTimeoutMs, absoluteTimeoutMs));
     const watchdogIntervalMs = Math.max(10, Math.min(250, Math.floor(smallestDeadline / 4)));
     const watchdog = setInterval(() => {
       if (settled || terminating) return;
       const now = Date.now();
-      if (now - startedAt >= absoluteTimeoutMs) {
-        void terminateFor("attempt_deadline_exceeded", `absolute deadline ${absoluteTimeoutMs}ms exceeded`);
+      if (!launchConfirmed && now - startedAt >= launchTimeoutMs) {
+        void terminateFor("cli_launch_timeout", `Grok CLI launch was not confirmed within ${launchTimeoutMs}ms`);
         return;
       }
-      if (firstStructuredOutputAt === null && now - startedAt >= firstOutputTimeoutMs) {
+      if (now - startedAt >= absoluteTimeoutMs) {
+        void terminateFor("provider_timeout", `absolute provider deadline ${absoluteTimeoutMs}ms exceeded`);
+        return;
+      }
+      if (launchConfirmed && firstStructuredOutputAt === null && now - (launchedAt ?? startedAt) >= firstOutputTimeoutMs) {
         void terminateFor("first_output_timeout", `no structured Grok stdout within ${firstOutputTimeoutMs}ms`);
         return;
       }
@@ -1249,17 +1268,16 @@ export function runMonitoredGrok(executable, args, {
         void terminateFor("generation_stalled", `no structured Grok stdout progress within ${stallTimeoutMs}ms`);
       }
     }, watchdogIntervalMs);
-    watchdog.unref();
-
     child.once("error", (error) => {
       if (terminating || settled) return;
-      finish(reject, new ExternalAgentExecutionError(`cli_launch_failed: ${error.message}`, { failureClass: "cli_launch_failed", retrySafe: true }));
+      finish(reject, new ExternalAgentExecutionError(`cli_launch_failed: ${error.message}`, { failureClass: "cli_launch_failed", retrySafe: true, details: { provider_started: false } }));
     });
     child.once("exit", (code, signal) => {
       if (terminating || settled) return;
       if (signal) {
         finish(reject, new ExternalAgentExecutionError(`provider_terminated_by_signal: ${signal}`, {
           failureClass: "provider_terminated_by_signal", retrySafe: true,
+          details: { provider_started: launchConfirmed },
         }));
       } else {
         finish(resolve, code ?? 1);
@@ -1495,12 +1513,19 @@ async function main() {
       code = await executeExternalAgent(options);
     } catch (error) {
       if (heartbeat) clearInterval(heartbeat);
-      const failureClass = String(error?.failureClass || "transport_error");
-      const retrySafe = error?.retrySafe !== false;
-      const resultUnknown = Boolean(options.sideEffect) || Boolean(error?.resultUnknown);
-      const failureDetails = error?.details && typeof error.details === "object" && !Array.isArray(error.details)
-        ? error.details
-        : {};
+      const providerFailureClass = String(error?.failureClass || "transport_error");
+      const providerBoundaryCrossed = Boolean(error?.details?.provider_started);
+      const resultUnknown = Boolean(error?.resultUnknown)
+        || (Boolean(options.sideEffect) && providerBoundaryCrossed);
+      const failureClass = resultUnknown ? "result_unknown" : providerFailureClass;
+      const retrySafe = resultUnknown ? false : error?.retrySafe !== false;
+      const failureDetails = {
+        ...(error?.details && typeof error.details === "object" && !Array.isArray(error.details) ? error.details : {}),
+        ...(resultUnknown && providerFailureClass !== "result_unknown" ? { underlying_failure_class: providerFailureClass } : {}),
+        ...(Boolean(options.sideEffect) && providerBoundaryCrossed && providerFailureClass !== "result_unknown"
+          ? { provider_failure_class: providerFailureClass }
+          : {}),
+      };
       const nextAction = failureClass === "review_sharding_required"
         ? "split the immutable Reviewer contract into bounded shards and one final synthesis review"
         : failureClass === "prompt_too_large"
@@ -1551,24 +1576,37 @@ async function main() {
         deliveryError = error;
       }
     }
-    const finalFailureClass = deliveryError
+    const underlyingFinalFailureClass = deliveryError
       ? "delivery_receipt_invalid"
       : code === 0
         ? null
         : "provider_exit";
-    const finalRetryClass = delivery?.retry_class || finalFailureClass || "none";
-    const finalRetrySafe = finalFailureClass === "delivery_receipt_invalid"
-      ? false
-      : finalFailureClass === "provider_exit"
-        ? !Boolean(options.sideEffect)
-        : null;
     const finalResultUnknown = Boolean(options.sideEffect)
       && (code !== 0 || deliveryError !== null || delivery?.delivery_outcome === "unresolved" || delivery === null);
+    const finalFailureClass = finalResultUnknown ? "result_unknown" : underlyingFinalFailureClass;
+    const finalRetryClass = finalResultUnknown
+      ? "result_unknown"
+      : delivery?.retry_class || finalFailureClass || "none";
+    const finalRetrySafe = finalResultUnknown
+      ? false
+      : finalFailureClass === "delivery_receipt_invalid"
+        ? false
+        : finalFailureClass === "provider_exit"
+          ? true
+          : null;
     const finalFailureDetails = deliveryError
-      ? { validation_error: deliveryError.message }
+      ? {
+          validation_error: deliveryError.message,
+          ...(finalResultUnknown ? { underlying_failure_class: "delivery_receipt_invalid" } : {}),
+        }
       : code !== 0
-        ? { provider_exit_code: code }
-        : null;
+        ? {
+            provider_exit_code: code,
+            ...(finalResultUnknown ? { underlying_failure_class: "provider_exit", provider_failure_class: "provider_exit" } : {}),
+          }
+        : finalResultUnknown
+          ? { underlying_failure_class: "provider_result_unreconciled" }
+          : null;
     const finalSummary = delivery?.summary || deliveryError?.message
       || (code === 0 ? "external agent process completed" : `external agent exited ${code}`);
     recordRuntimeReceipt(options, "assignment_terminal", eventSeq, {
