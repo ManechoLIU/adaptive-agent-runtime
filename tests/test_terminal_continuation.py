@@ -12,6 +12,60 @@ SCRIPT = ROOT / "scripts" / "terminal_continuation.py"
 
 
 class TerminalContinuationTests(unittest.TestCase):
+    def test_terminal_receipt_persists_before_desktop_runtime_is_needed(self) -> None:
+        module = self._load_module("terminal_continuation_persist_before_wake_test")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(
+                json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8"
+            )
+            receipt = root / "terminal.json"
+            receipt.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "event_type": "external_agent_terminal",
+                    "engine": "codex-native",
+                    "model": "gpt",
+                    "repo": str(repo.resolve()),
+                    "exit_code": 0,
+                    "summary": "writer completed",
+                    "agent_id": "writer-1",
+                }),
+                encoding="utf-8",
+            )
+            state_root = root / "state"
+            snapshot = {
+                "root": str(repo.resolve()),
+                "ready_ids": [],
+                "runnable_ids": [],
+                "candidate_revisions": [],
+                "assignment_liveness": {},
+                "rule_handshake": {},
+            }
+            with patch.object(module.lifecycle, "STATE_ROOT", state_root), patch.object(
+                module.lifecycle, "project_snapshot", return_value=snapshot
+            ), patch.object(
+                module.web_bridge,
+                "resolve_desktop_codex_executable",
+                side_effect=ValueError("desktop runtime unavailable"),
+            ):
+                result = module.consume_terminal_receipt(
+                    repo=repo,
+                    receipt_path=receipt,
+                    registry_path=registry,
+                    dispatch_wake=False,
+                )
+
+            state = json.loads(
+                (state_root / "controller-1.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(state["pending_control_event"])
+            self.assertEqual(result["wake_result"], None)
+
     def test_terminal_receipt_marks_existing_controller_pending_and_dispatches_wake(self) -> None:
         self.assertTrue(SCRIPT.exists(), "terminal continuation consumer must exist")
         spec = importlib.util.spec_from_file_location("terminal_continuation_test", SCRIPT)
@@ -54,6 +108,10 @@ class TerminalContinuationTests(unittest.TestCase):
             }
             with patch.object(module.lifecycle, "STATE_ROOT", state_root), patch.object(
                 module.lifecycle, "project_snapshot", return_value=snapshot
+            ), patch.object(
+                module.web_bridge,
+                "resolve_desktop_codex_executable",
+                side_effect=AssertionError("host-neutral terminal receipt resolved Desktop runtime"),
             ):
                 result = module.consume_terminal_receipt(
                     repo=repo, receipt_path=receipt, registry_path=registry, wake_dispatcher=fake_wake
@@ -65,6 +123,7 @@ class TerminalContinuationTests(unittest.TestCase):
             self.assertEqual(result["controller_id"], "controller-1")
             self.assertEqual(len(wake_calls), 1)
             self.assertEqual(wake_calls[0]["session_id"], "controller-1")
+            self.assertIsNone(wake_calls[0]["codex"])
             self.assertEqual(wake_calls[0]["lifecycle_state"]["pending_terminal_receipts"], [str(receipt.resolve())])
 
     def test_runtime_health_change_marks_same_controller_pending_and_dispatches_wake(self) -> None:
@@ -92,6 +151,10 @@ class TerminalContinuationTests(unittest.TestCase):
                 return {"result": "CONFIRMED", "controller_id": kwargs["session_id"]}
             with patch.object(module.lifecycle, "STATE_ROOT", state_root), patch.object(
                 module.lifecycle, "project_snapshot", return_value=snapshot
+            ), patch.object(
+                module.web_bridge,
+                "resolve_desktop_codex_executable",
+                side_effect=AssertionError("host-neutral runtime event resolved Desktop runtime"),
             ):
                 result = module.notify_runtime_change(
                     repo=repo, registry_path=registry, wake_dispatcher=fake_wake
@@ -99,6 +162,7 @@ class TerminalContinuationTests(unittest.TestCase):
             state = json.loads((state_root / "controller-1.json").read_text(encoding="utf-8"))
             self.assertTrue(state["pending_control_event"])
             self.assertIn("active_without_progress:T-1", state["triggers"])
+            self.assertIsNone(wake_calls[0]["codex"])
             self.assertEqual(result["controller_id"], "controller-1")
             self.assertEqual(len(wake_calls), 1)
             self.assertEqual(wake_calls[0]["session_id"], "controller-1")

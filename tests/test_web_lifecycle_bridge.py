@@ -2856,6 +2856,118 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 web_bridge._HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND,
             )
 
+    def test_desktop_codex_resolution_prefers_the_app_bundled_runtime(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundled = root / "ChatGPT.app" / "Contents" / "Resources" / "codex"
+            bundled.parent.mkdir(parents=True)
+            bundled.write_text("#!/bin/sh\n", encoding="utf-8")
+            bundled.chmod(0o755)
+            path_cli = root / "homebrew" / "codex"
+            path_cli.parent.mkdir(parents=True)
+            path_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+            path_cli.chmod(0o755)
+
+            with patch.object(web_bridge.shutil, "which", return_value=str(path_cli)):
+                selected = web_bridge.resolve_desktop_codex_executable(
+                    app_candidates=[bundled],
+                    environ={},
+                )
+
+            self.assertEqual(selected, str(bundled.resolve()))
+
+    def test_desktop_codex_resolution_rejects_an_invalid_explicit_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing-codex"
+            with self.assertRaisesRegex(ValueError, "Desktop Codex executable"):
+                web_bridge.resolve_desktop_codex_executable(
+                    explicit=str(missing),
+                    app_candidates=[],
+                    environ={},
+                )
+
+    def test_rule_wake_resolves_desktop_runtime_only_for_desktop_target(self) -> None:
+        from unittest.mock import patch
+
+        lifecycle = {
+            "pending_control_event": True,
+            "rule_wake_policy": "immediate",
+            "triggers": ["rule_update_pending:rev-new"],
+            "snapshot": {"rule_handshake": {"installed_revision": "rev-new"}},
+        }
+        target = {
+            "host": "desktop_codex",
+            "execution_target_session_id": "desktop-current",
+            "generation": 4,
+            "ownership_generation": 4,
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            web_bridge, "canonical_rule_wake_target", return_value=target
+        ), patch.object(
+            web_bridge,
+            "resolve_desktop_codex_executable",
+            return_value="/Applications/ChatGPT.app/Contents/Resources/codex",
+        ) as resolve, patch.object(
+            web_bridge, "maybe_schedule_rule_wake", return_value="scheduled"
+        ) as schedule:
+            result = web_bridge.schedule_guarded_rule_wake(
+                lifecycle_state=lifecycle,
+                session_id="controller-1",
+                repo=Path(tmp),
+                registry=Path(tmp) / "registry.json",
+                codex=None,
+                delay_seconds=1.0,
+                state_path=Path(tmp) / "state.json",
+            )
+
+        resolve.assert_called_once_with(None)
+        self.assertEqual(
+            schedule.call_args.kwargs["codex"],
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+        )
+        self.assertEqual(
+            result["codex_executable"],
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+        )
+
+    def test_rule_wake_does_not_require_desktop_runtime_for_web_target(self) -> None:
+        from unittest.mock import patch
+
+        lifecycle = {
+            "pending_control_event": True,
+            "rule_wake_policy": "immediate",
+            "triggers": ["rule_update_pending:rev-new"],
+            "snapshot": {"rule_handshake": {"installed_revision": "rev-new"}},
+        }
+        target = {
+            "host": "web",
+            "execution_target_session_id": "web-current",
+            "generation": 4,
+            "ownership_generation": 4,
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            web_bridge, "canonical_rule_wake_target", return_value=target
+        ), patch.object(
+            web_bridge, "resolve_desktop_codex_executable"
+        ) as resolve, patch.object(
+            web_bridge, "maybe_schedule_rule_wake", return_value="scheduled"
+        ) as schedule:
+            result = web_bridge.schedule_guarded_rule_wake(
+                lifecycle_state=lifecycle,
+                session_id="controller-1",
+                repo=Path(tmp),
+                registry=Path(tmp) / "registry.json",
+                codex=None,
+                delay_seconds=1.0,
+                state_path=Path(tmp) / "state.json",
+            )
+
+        resolve.assert_not_called()
+        self.assertIsNone(schedule.call_args.kwargs["codex"])
+        self.assertIsNone(result["codex_executable"])
+
     def test_execute_native_resume_reaps_process_group_after_codex_turn_completed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3689,6 +3801,26 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
         registry.write_text(json.dumps({"controller-1": str(repo.resolve())}), encoding="utf-8")
         state = root / "auto-stop.json"
         return repo, registry, state
+
+    def test_host_neutral_supervisor_omits_missing_desktop_codex_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            capture = Path(tmp) / "command.json"
+
+            self.assertTrue(web_bridge.schedule_auto_native_stop(
+                session_id="controller-1",
+                repo=repo,
+                receipt_id="r1",
+                registry=registry,
+                codex=None,
+                delay_seconds=1,
+                state_path=state,
+                capture_path=capture,
+            ))
+
+            command = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertNotIn(None, command)
+            self.assertNotIn("--codex", command)
 
     def test_same_receipt_live_supervisor_is_coalesced(self) -> None:
         from unittest.mock import Mock, patch

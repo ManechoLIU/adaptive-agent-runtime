@@ -134,12 +134,12 @@ def reconcile_web_agent_health_once(
 
 
 def reconcile_registered_controller_rule_update_once(
-    *, repo: Path, registry: Path, controller_id: str, codex: str = "/opt/homebrew/bin/codex"
+    *, repo: Path, registry: Path, controller_id: str, codex: str | None = None
 ) -> dict[str, Any]:
     lifecycle_state = web_lifecycle_bridge.refresh_rule_wake_state(
         session_id=controller_id, repo=repo
     )
-    return web_lifecycle_bridge.schedule_guarded_rule_wake(
+    result = web_lifecycle_bridge.schedule_guarded_rule_wake(
         lifecycle_state=lifecycle_state,
         session_id=controller_id,
         repo=repo,
@@ -148,6 +148,7 @@ def reconcile_registered_controller_rule_update_once(
         delay_seconds=1.0,
         state_path=web_lifecycle_bridge.default_auto_stop_state_path(controller_id),
     )
+    return result
 
 
 def reconcile_all_web_agent_health_once(

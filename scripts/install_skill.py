@@ -281,12 +281,26 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_desktop_codex_resolution_prefers_the_app_bundled_runtime",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_desktop_codex_resolution_rejects_an_invalid_explicit_override",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_rule_wake_resolves_desktop_runtime_only_for_desktop_target",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_rule_wake_does_not_require_desktop_runtime_for_web_target",
+    "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."
+    "test_host_neutral_supervisor_omits_missing_desktop_codex_argument",
+    "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
+    "test_rule_wake_defers_host_runtime_resolution_until_target_is_known",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_no_canonical_work_does_not_reopen_after_observation_only_turn",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback",
+    "tests.test_terminal_continuation.TerminalContinuationTests."
+    "test_terminal_receipt_persists_before_desktop_runtime_is_needed",
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
     "test_reconcile_pending_discovers_canonical_receipts_without_receipt_cli_argument",
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
