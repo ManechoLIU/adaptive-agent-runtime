@@ -612,6 +612,8 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok metadata after agent activity does not prevent generation stall",
     "Grok misleading type or event fields do not count as ACP model progress",
     "ordinary Grok provider exit and invalid delivery persist durable failure classification",
+    "Grok delivery validator binds synthesis evidence to exact assigned shard receipts",
+    "Grok delivery validator requires explicit reviewer phase",
     "Grok reviewer shard cannot finalize and synthesis binds exact candidate head",
     "Grok reviewer requires explicit phase and immutable candidate commit",
     "Grok synthesis validates canonical same-candidate shard receipts",

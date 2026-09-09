@@ -879,7 +879,9 @@ function isTraceableLocator(value, schemes) {
   return schemes.has(token.slice(0, separator)) && token.slice(separator + 1).trim().length > 0;
 }
 
-function readDeliveryReceipt(pathname, { assignmentRole = null, candidateRevision = null, reviewPhase = null } = {}) {
+export function readDeliveryReceipt(pathname, {
+  assignmentRole = null, candidateRevision = null, reviewPhase = null, reviewShardReceipts = [],
+} = {}) {
   if (!pathname) return null;
   let receipt;
   try {
@@ -910,6 +912,21 @@ function readDeliveryReceipt(pathname, { assignmentRole = null, candidateRevisio
   if (receipt.reconciliation_evidence !== undefined && !Array.isArray(receipt.reconciliation_evidence)) {
     throw new Error("delivery-receipt reconciliation_evidence must be an array when provided");
   }
+  const normalizedRole = String(assignmentRole || "").trim().toLowerCase();
+  const normalizedPhase = String(reviewPhase || "").trim().toLowerCase();
+  if (normalizedRole === "reviewer" && !REVIEW_PHASES.has(normalizedPhase)) {
+    throw new Error("reviewer delivery validation requires explicit review_phase=full|shard|synthesis");
+  }
+  const expectedShardReceipts = Array.isArray(reviewShardReceipts)
+    ? reviewShardReceipts.map((item) => String(item || "").trim())
+    : [];
+  if (normalizedRole === "reviewer" && normalizedPhase === "synthesis") {
+    if (expectedShardReceipts.length === 0
+        || expectedShardReceipts.some((item) => !item.startsWith("receipt:") || item.slice(8).trim().length === 0)
+        || new Set(expectedShardReceipts).size !== expectedShardReceipts.length) {
+      throw new Error("reviewer synthesis delivery requires exact assigned review_shard_receipts");
+    }
+  }
   let reviewVerdict;
   if (receipt.review_verdict !== undefined) {
     const verdict = receipt.review_verdict;
@@ -927,8 +944,6 @@ function readDeliveryReceipt(pathname, { assignmentRole = null, candidateRevisio
     }
     const expectedOutcome = verdict.verdict === "PASS" ? "pass" : "fail";
     if (deliveryOutcome !== expectedOutcome) throw new Error("delivery-receipt review_verdict conflicts with delivery_outcome");
-    const normalizedRole = String(assignmentRole || "").trim().toLowerCase();
-    const normalizedPhase = String(reviewPhase || "full").trim().toLowerCase();
     const expectedHead = String(candidateRevision || "").trim();
     if (normalizedRole !== "reviewer") {
       throw new Error("delivery-receipt review_verdict is valid only for reviewer assignments");
@@ -942,13 +957,16 @@ function readDeliveryReceipt(pathname, { assignmentRole = null, candidateRevisio
     if (normalizedPhase === "shard") {
       throw new Error("reviewer shard cannot publish a final review_verdict; one final synthesis review is required");
     }
-    if (normalizedPhase === "synthesis" && !receipt.evidence.some((item) => typeof item === "string" && item.startsWith("receipt:"))) {
-      throw new Error("reviewer synthesis review requires shard receipt evidence");
+    if (normalizedPhase === "synthesis") {
+      const evidenceReceipts = receipt.evidence
+        .filter((item) => typeof item === "string" && item.trim().startsWith("receipt:"))
+        .map((item) => item.trim());
+      if (JSON.stringify([...evidenceReceipts].sort()) !== JSON.stringify([...expectedShardReceipts].sort())) {
+        throw new Error("reviewer synthesis evidence must exactly match assigned review_shard_receipts");
+      }
     }
     reviewVerdict = verdict;
   }
-  const normalizedRole = String(assignmentRole || "").trim().toLowerCase();
-  const normalizedPhase = String(reviewPhase || "full").trim().toLowerCase();
   if (normalizedRole === "reviewer" && normalizedPhase !== "shard"
       && new Set(["pass", "fail"]).has(deliveryOutcome) && !reviewVerdict) {
     throw new Error("full or synthesis reviewer delivery requires structured review_verdict");
@@ -1623,6 +1641,7 @@ async function main() {
           assignmentRole: options.assignmentRole,
           candidateRevision: options.candidateRevision,
           reviewPhase: options.reviewPhase,
+          reviewShardReceipts: options.reviewShardReceipts,
         });
       } catch (error) {
         deliveryError = error;

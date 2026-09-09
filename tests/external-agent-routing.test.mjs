@@ -1922,6 +1922,39 @@ test("Grok malformed stdout after one structured event does not prevent generati
   }
 });
 
+test("Grok delivery validator binds synthesis evidence to exact assigned shard receipts", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?synthesis-evidence=${Date.now()}`);
+  assert.equal(typeof runtimeModule.readDeliveryReceipt, "function");
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-synthesis-delivery-validator-"));
+  const head = "a".repeat(40);
+  const delivery = path.join(bin, "delivery.json");
+  await writeFile(delivery, JSON.stringify({
+    delivery_outcome: "pass", summary: "synthesis", evidence: ["receipt:wrong-shard"], artifacts: [`git:${head}`],
+    next_action: "integrate", retry_class: "none",
+    review_verdict: { reviewed_head: head, verdict: "PASS", critical: [], important: [], minor: [] },
+  }));
+  assert.throws(() => runtimeModule.readDeliveryReceipt(delivery, {
+    assignmentRole: "reviewer", candidateRevision: head, reviewPhase: "synthesis",
+    reviewShardReceipts: ["receipt:expected-shard"],
+  }), /exact|review_shard_receipts|shard receipt/i);
+});
+
+test("Grok delivery validator requires explicit reviewer phase", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-phase=${Date.now()}`);
+  assert.equal(typeof runtimeModule.readDeliveryReceipt, "function");
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-review-delivery-phase-"));
+  const head = "b".repeat(40);
+  const delivery = path.join(bin, "delivery.json");
+  await writeFile(delivery, JSON.stringify({
+    delivery_outcome: "pass", summary: "full review", evidence: [`git:${head}`], artifacts: [`git:${head}`],
+    next_action: "integrate", retry_class: "none",
+    review_verdict: { reviewed_head: head, verdict: "PASS", critical: [], important: [], minor: [] },
+  }));
+  assert.throws(() => runtimeModule.readDeliveryReceipt(delivery, {
+    assignmentRole: "reviewer", candidateRevision: head,
+  }), /review_phase|full\|shard\|synthesis|explicit/i);
+});
+
 test("Grok reviewer shard cannot finalize and synthesis binds exact candidate head", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-review-phase-"));
   const repo = await makeAssignmentRepo(bin);

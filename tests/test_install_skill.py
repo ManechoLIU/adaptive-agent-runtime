@@ -949,6 +949,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok metadata after agent activity does not prevent generation stall', () => { assert.equal(1, 1); });\n"
                 "test('Grok misleading type or event fields do not count as ACP model progress', () => { assert.equal(1, 1); });\n"
                 "test('ordinary Grok provider exit and invalid delivery persist durable failure classification', () => { assert.equal(1, 1); });\n"
+                "test('Grok delivery validator binds synthesis evidence to exact assigned shard receipts', () => { assert.equal(1, 1); });\n"
+                "test('Grok delivery validator requires explicit reviewer phase', () => { assert.equal(1, 1); });\n"
                 "test('Grok reviewer shard cannot finalize and synthesis binds exact candidate head', () => { assert.equal(1, 1); });\n"
                 "test('Grok reviewer requires explicit phase and immutable candidate commit', () => { assert.equal(1, 1); });\n"
                 "test('Grok synthesis validates canonical same-candidate shard receipts', () => { assert.equal(1, 1); });\n"
