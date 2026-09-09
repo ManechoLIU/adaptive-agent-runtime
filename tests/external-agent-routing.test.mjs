@@ -1566,7 +1566,7 @@ if (process.argv[2] === "version") {
     timeout: 3000,
     env: {
       ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
-      AD_GROK_LAUNCH_TIMEOUT_MS: "500", AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "500", AD_GROK_STALL_TIMEOUT_MS: "1000",
+      AD_GROK_LAUNCH_TIMEOUT_MS: "1000", AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "1000", AD_GROK_STALL_TIMEOUT_MS: "1000",
       AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "2000", AD_EXTERNAL_KILL_GRACE_MS: "25",
     },
   });
