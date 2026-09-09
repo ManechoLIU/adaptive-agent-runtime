@@ -786,12 +786,16 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_production_bridge_has_no_trusted_web_attestation_verifier",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_timeout_covers_product_host_request_budget",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_classifies_frame_tree_timeout_as_transient",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_classifies_exact_target_ambiguous_as_transient",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_loads_pinned_external_runtime_host_cli",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_exposes_pinned_host_submit_adapter",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_rechecks_bundle_before_each_execution",
             "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests.test_registered_external_web_host_submit_adapter_is_used_without_caller_injection",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_strong_host_confirmed_submit_waits_without_rearm",
+            "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_retry_exhausted_rearms_after_host_delivery_fingerprint_change",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_retry_exhausted_persists_host_delivery_fingerprint",
+            "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_transient_web_reentry_retry_budget_exhausts_without_rearm",
@@ -801,6 +805,11 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_browser_tab_receipt_cannot_recover_an_unverified_web_session",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_manual_web_mutations_cannot_downgrade_host_attested_current_target",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target",
+            "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests.test_authorize_web_successor_records_only_fenced_fresh_session",
+            "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests.test_authorize_web_successor_cli_does_not_rotate_target",
+            "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests.test_authorized_strong_web_successor_rotates_target_and_ownership_once",
+            "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests.test_strong_web_successor_expired_authorization_does_not_call_verifier",
+            "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests.test_strong_web_successor_rechecks_target_generation_after_attestation",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_legacy_quarantined_target_keeps_manual_replacement_exit",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_same_controller_web_recovery_does_not_rotate_manual_resume_lease",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_session_start_verified_target_does_not_rotate_manual_resume_lease",
@@ -1116,6 +1125,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_production_bridge_has_no_trusted_web_attestation_verifier(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_timeout_covers_product_host_request_budget(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_classifies_frame_tree_timeout_as_transient(self): self.assertTrue(True)\n"
+                "    def test_registered_web_verifier_classifies_exact_target_ambiguous_as_transient(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_loads_pinned_external_runtime_host_cli(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_exposes_pinned_host_submit_adapter(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_rechecks_bundle_before_each_execution(self): self.assertTrue(True)\n"
@@ -1154,16 +1164,25 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_current_web_adapter_receipt_must_correlate_origin_call_receipt(self): self.assertTrue(True)\n"
                 "    def test_current_web_adapter_is_not_called_for_malformed_origin_attestation(self): self.assertTrue(True)\n"
                 "    def test_registered_current_web_adapter_without_ownership_is_never_called(self): self.assertTrue(True)\n"
+                "class StrongWebSuccessorHandoffTests(unittest.TestCase):\n"
+                "    def test_authorize_web_successor_records_only_fenced_fresh_session(self): self.assertTrue(True)\n"
+                "    def test_authorize_web_successor_cli_does_not_rotate_target(self): self.assertTrue(True)\n"
+                "    def test_authorized_strong_web_successor_rotates_target_and_ownership_once(self): self.assertTrue(True)\n"
+                "    def test_strong_web_successor_expired_authorization_does_not_call_verifier(self): self.assertTrue(True)\n"
+                "    def test_strong_web_successor_rechecks_target_generation_after_attestation(self): self.assertTrue(True)\n"
                 "class WebContinuationSupervisorBootstrapTests(unittest.TestCase):\n"
                 "    def test_dead_or_untracked_active_supervisor_requires_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again(self): self.assertTrue(True)\n"
                 "    def test_identity_blocked_event_retries_after_registry_changes(self): self.assertTrue(True)\n"
                 "    def test_nonretryable_web_failure_same_event_and_fence_stays_quiet(self): self.assertTrue(True)\n"
+                "    def test_retry_exhausted_rearms_after_host_delivery_fingerprint_change(self): self.assertTrue(True)\n"
+                "    def test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change(self): self.assertTrue(True)\n"
                 "    def test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes(self): self.assertTrue(True)\n"
                 "    def test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot(self): self.assertTrue(True)\n"
                 "class WebLocalReentryIntegrationTests(unittest.TestCase):\n"
                 "    def test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target(self): self.assertTrue(True)\n"
+                "    def test_retry_exhausted_persists_host_delivery_fingerprint(self): self.assertTrue(True)\n"
                 "    def test_strong_host_confirmed_submit_waits_without_rearm(self): self.assertTrue(True)\n"
                 "    def test_transient_web_reentry_retry_budget_exhausts_without_rearm(self): self.assertTrue(True)\n"
                 "    def test_detached_supervisor_retries_transient_registered_host_attestation_failure(self): self.assertTrue(True)\n"
@@ -1532,13 +1551,22 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_same_receipt_live_supervisor_is_coalesced(self): self.assertTrue(True)\n"
                 "    def test_current_token_web_rearm_hands_off_with_force_rearm_proof(self): self.assertTrue(True)\n"
                 "    def test_stale_supervisor_token_exits_without_running_impl(self): self.assertTrue(True)\n"
+                "class StrongWebSuccessorHandoffTests(unittest.TestCase):\n"
+                "    def test_authorize_web_successor_records_only_fenced_fresh_session(self): self.assertTrue(True)\n"
+                "    def test_authorize_web_successor_cli_does_not_rotate_target(self): self.assertTrue(True)\n"
+                "    def test_authorized_strong_web_successor_rotates_target_and_ownership_once(self): self.assertTrue(True)\n"
+                "    def test_strong_web_successor_expired_authorization_does_not_call_verifier(self): self.assertTrue(True)\n"
+                "    def test_strong_web_successor_rechecks_target_generation_after_attestation(self): self.assertTrue(True)\n"
                 "class WebContinuationSupervisorBootstrapTests(unittest.TestCase):\n"
                 "    def test_dead_or_untracked_active_supervisor_requires_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_live_active_supervisor_does_not_need_duplicate_bootstrap(self): self.assertTrue(True)\n"
                 "    def test_nonretryable_web_failure_same_event_and_fence_stays_quiet(self): self.assertTrue(True)\n"
+                "    def test_retry_exhausted_rearms_after_host_delivery_fingerprint_change(self): self.assertTrue(True)\n"
+                "    def test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change(self): self.assertTrue(True)\n"
                 "    def test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes(self): self.assertTrue(True)\n"
                 "    def test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot(self): self.assertTrue(True)\n"
                 "class WebLocalReentryIntegrationTests(unittest.TestCase):\n"
+                "    def test_retry_exhausted_persists_host_delivery_fingerprint(self): self.assertTrue(True)\n"
                 "    def test_registered_host_nonretryable_failure_persists_quiet_fence(self): self.assertTrue(True)\n"
                 "    def test_registered_host_result_unknown_persists_quiet_fence(self): self.assertTrue(True)\n"
                 "    def test_confirmed_web_reentry_clears_stale_nonretryable_block_evidence(self): self.assertTrue(True)\n",

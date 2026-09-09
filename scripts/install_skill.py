@@ -90,6 +90,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_classifies_frame_tree_timeout_as_transient",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_registered_web_verifier_classifies_exact_target_ambiguous_as_transient",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_loads_pinned_external_runtime_host_cli",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_exposes_pinned_host_submit_adapter",
@@ -101,6 +103,12 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_detached_supervisor_uses_registered_host_submit_adapter_for_strong_web_target",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_strong_host_confirmed_submit_waits_without_rearm",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_retry_exhausted_rearms_after_host_delivery_fingerprint_change",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_retry_exhausted_persists_host_delivery_fingerprint",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
@@ -121,6 +129,16 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_manual_web_mutations_cannot_downgrade_host_attested_current_target",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_same_controller_web_recovery_cannot_replace_different_host_attested_current_target",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_authorize_web_successor_records_only_fenced_fresh_session",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_authorize_web_successor_cli_does_not_rotate_target",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_authorized_strong_web_successor_rotates_target_and_ownership_once",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_strong_web_successor_expired_authorization_does_not_call_verifier",
+    "tests.test_web_lifecycle_bridge.StrongWebSuccessorHandoffTests."
+    "test_strong_web_successor_rechecks_target_generation_after_attestation",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_legacy_quarantined_target_keeps_manual_replacement_exit",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
