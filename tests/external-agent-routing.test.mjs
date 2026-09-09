@@ -2253,6 +2253,33 @@ test("ordinary Grok provider exit and invalid delivery persist durable failure c
   assert.match(invalidDurable.failure_details.validation_error, /delivery PASS requires evidence and artifact/i);
 });
 
+test("Grok empty tool-call updates do not count as provider progress", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?empty-tool-update=${Date.now()}`);
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-empty-tool-update-"));
+  const code = 'let i=0; const vals=["",{},[]]; const timer=setInterval(()=>process.stdout.write(JSON.stringify({type:"tool_call_update",toolCallId:"call-1",rawOutput:vals[(i++)%vals.length]})+"\\n"),25); setTimeout(()=>{clearInterval(timer);process.exit(0)},1000);';
+  const previous = {
+    first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS,
+    stall: process.env.AD_GROK_STALL_TIMEOUT_MS,
+    absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS,
+    grace: process.env.AD_EXTERNAL_KILL_GRACE_MS,
+  };
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "120";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "1000";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1500";
+  process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
+  try {
+    await assert.rejects(
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      (error) => error?.failureClass === "first_output_timeout",
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      const envName = key === "first" ? "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS" : key === "stall" ? "AD_GROK_STALL_TIMEOUT_MS" : key === "absolute" ? "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS" : "AD_EXTERNAL_KILL_GRACE_MS";
+      if (value === undefined) delete process.env[envName]; else process.env[envName] = value;
+    }
+  }
+});
+
 test("Grok misleading type or event fields do not count as ACP model progress", async () => {
   const runtimeModule = await import("../scripts/run_external_agent.mjs");
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-misleading-json-"));

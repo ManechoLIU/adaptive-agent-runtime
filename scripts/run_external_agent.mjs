@@ -124,6 +124,14 @@ function externalKillGraceMs() {
   return boundedEnvInteger("AD_EXTERNAL_KILL_GRACE_MS", DEFAULT_EXTERNAL_KILL_GRACE_MS, { min: 10, max: 60_000 });
 }
 
+function meaningfulStreamValue(value) {
+  if (value === null || value === undefined) return false;
+  if (typeof value === "string") return Boolean(value.trim());
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return typeof value === "number" || typeof value === "boolean";
+}
+
 function grokModelProgressKind(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return null;
 
@@ -156,9 +164,13 @@ function grokModelProgressKind(event) {
     );
     if (!toolCallId) return null;
     const hasStatus = typeof event.status === "string" && event.status.trim();
-    const hasContent = Array.isArray(event.content) && event.content.length > 0;
-    const hasRawOutput = event.rawOutput != null || event.raw_output != null;
-    const hasLocations = Array.isArray(event.locations) && event.locations.length > 0;
+    const hasContent = Array.isArray(event.content) && event.content.some((item) => meaningfulStreamValue(item));
+    const rawOutput = event.rawOutput ?? event.raw_output;
+    const hasRawOutput = meaningfulStreamValue(rawOutput);
+    const hasLocations = Array.isArray(event.locations) && event.locations.some(
+      (item) => item && typeof item === "object" && !Array.isArray(item)
+        && typeof item.path === "string" && item.path.trim(),
+    );
     return hasStatus || hasContent || hasRawOutput || hasLocations
       ? streamingType
       : null;
