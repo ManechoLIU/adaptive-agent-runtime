@@ -1014,6 +1014,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok 1.0.13 json-schema envelope validates structuredOutput as Reviewer verdict', () => { assert.equal(1, 1); });\n"
                 "test('Grok json-schema envelope rejects conflicting text and structuredOutput', () => { assert.equal(1, 1); });\n"
                 "test('Grok Reviewer returns validated verdict after bounded cleanup even if CLI does not exit', () => { assert.equal(1, 1); });\n"
+                "test('run_external_agent direct execution survives symlinked filesystem path', () => { assert.equal(1, 1); });\n"
                 "test('cleanup failure preserves prior Grok provider exit evidence', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
@@ -1503,6 +1504,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok 1.0.13 json-schema envelope validates structuredOutput as Reviewer verdict', () => { assert.equal(1, 1); });\n"
                 "test('Grok json-schema envelope rejects conflicting text and structuredOutput', () => { assert.equal(1, 1); });\n"
                 "test('Grok Reviewer returns validated verdict after bounded cleanup even if CLI does not exit', () => { assert.equal(1, 1); });\n"
+                "test('run_external_agent direct execution survives symlinked filesystem path', () => { assert.equal(1, 1); });\n"
                 "test('cleanup failure preserves prior Grok provider exit evidence', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )

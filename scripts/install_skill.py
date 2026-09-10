@@ -682,6 +682,7 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok 1.0.13 json-schema envelope validates structuredOutput as Reviewer verdict",
     "Grok json-schema envelope rejects conflicting text and structuredOutput",
     "Grok Reviewer returns validated verdict after bounded cleanup even if CLI does not exit",
+    "run_external_agent direct execution survives symlinked filesystem path",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_runtime_supervisor.py",

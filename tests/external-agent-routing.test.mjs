@@ -2900,3 +2900,24 @@ test("Grok Reviewer returns validated verdict after bounded cleanup even if CLI 
     oldStall === undefined ? delete process.env.AD_GROK_STALL_TIMEOUT_MS : process.env.AD_GROK_STALL_TIMEOUT_MS = oldStall;
   }
 });
+
+test("run_external_agent direct execution survives symlinked filesystem path", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-runner-symlink-entry-"));
+  const realDir = path.join(root, "real");
+  const linkDir = path.join(root, "link");
+  await mkdir(realDir, { recursive: true });
+  const copied = path.join(realDir, "run_external_agent.mjs");
+  await copyFile(adapter, copied);
+  const { symlink } = await import("node:fs/promises");
+  await symlink(realDir, linkDir, "dir");
+  const viaLink = path.join(linkDir, "run_external_agent.mjs");
+  const result = spawnSync(process.execPath, [viaLink,
+    "--render-status-card", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low",
+    "--work-package", "SYMLINK-DIRECT", "--category", "backend", "--status", "running",
+    "--detail", "direct entry executed",
+  ], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /SYMLINK-DIRECT/);
+  assert.match(result.stdout, /direct entry executed/);
+});

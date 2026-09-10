@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -2340,6 +2340,15 @@ async function main() {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === new URL(import.meta.url).pathname) {
+function sameExecutablePath(argvPath, moduleUrl) {
+  const modulePath = fileURLToPath(moduleUrl);
+  try {
+    return realpathSync(path.resolve(argvPath)) === realpathSync(modulePath);
+  } catch {
+    return path.resolve(argvPath) === path.resolve(modulePath);
+  }
+}
+
+if (process.argv[1] && sameExecutablePath(process.argv[1], import.meta.url)) {
   await main();
 }
