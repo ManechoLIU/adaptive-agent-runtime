@@ -681,6 +681,7 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok Reviewer waits for stdio close before classifying final verdict",
     "Grok 1.0.13 json-schema envelope validates structuredOutput as Reviewer verdict",
     "Grok json-schema envelope rejects conflicting text and structuredOutput",
+    "Grok Reviewer returns validated verdict after bounded cleanup even if CLI does not exit",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_runtime_supervisor.py",

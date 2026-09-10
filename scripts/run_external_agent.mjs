@@ -1646,8 +1646,10 @@ export function runMonitoredGrokReview(executable, args, {
     let stderr = "";
     let terminating = false;
     let settled = false;
+    let verdictCleanupStarted = false;
     let watchdog = null;
     let closeDrainTimer = null;
+    let verdictCleanupTimer = null;
     let observedExitCode = null;
     let observedExitSignal = null;
     let exitObserved = false;
@@ -1667,6 +1669,7 @@ export function runMonitoredGrokReview(executable, args, {
       settled = true;
       if (watchdog) clearInterval(watchdog);
       if (closeDrainTimer) clearTimeout(closeDrainTimer);
+      if (verdictCleanupTimer) clearTimeout(verdictCleanupTimer);
       removeSignalHandlers();
       resolve(terminal);
     };
@@ -1711,6 +1714,46 @@ export function runMonitoredGrokReview(executable, args, {
       launchConfirmed = true;
       launchedAt = Date.now();
     });
+    const maybeFinishFromValidatedVerdict = () => {
+      if (settled || terminating || verdictCleanupStarted || !stdout.trim()) return;
+      let validated;
+      try {
+        validated = parseGrokReviewOutput(stdout, { candidateRevision });
+      } catch {
+        return;
+      }
+      verdictCleanupStarted = true;
+      if (watchdog) clearInterval(watchdog);
+      if (closeDrainTimer) clearTimeout(closeDrainTimer);
+      const naturalExitGraceMs = Math.max(25, Math.min(100, killGraceMs));
+      verdictCleanupTimer = setTimeout(() => {
+        if (settled || terminating) return;
+        terminating = true;
+        void (async () => {
+          let cleanup = { confirmed: true, diagnostic: "process group already gone" };
+          try {
+            const groupAlive = child?.pid && process.platform !== "win32" ? processGroupExists(child.pid) : !childExited(child);
+            if (groupAlive || !childExited(child)) cleanup = await terminateGroup(child, killGraceMs);
+          } catch (error) {
+            cleanup = { confirmed: false, diagnostic: `verdict-terminal cleanup failed: ${error.message}` };
+          }
+          if (!cleanup.confirmed) {
+            finish({
+              reviewStatus: "REVIEW_PROCESS_STUCK", deliveryOutcome: "unresolved", retrySafe: false, hadModelOutput: true,
+              cleanupDiagnostic: cleanup.diagnostic, validatedReviewVerdict: validated.reviewVerdict,
+            });
+            return;
+          }
+          finish({
+            ...validated,
+            hadModelOutput: true,
+            cleanupDiagnostic: cleanup.diagnostic,
+            providerTerminatedAfterVerdict: true,
+          });
+        })();
+      }, naturalExitGraceMs);
+    };
+
     child.stdout?.on("data", (chunk) => {
       const text = chunk.toString("utf8");
       process.stdout.write(chunk);
@@ -1720,6 +1763,7 @@ export function runMonitoredGrokReview(executable, args, {
         if (firstOutputAt === null) firstOutputAt = now;
         lastOutputAt = now;
       }
+      maybeFinishFromValidatedVerdict();
     });
     child.stderr?.on("data", (chunk) => {
       process.stderr.write(chunk);

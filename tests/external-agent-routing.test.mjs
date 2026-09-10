@@ -2864,3 +2864,39 @@ test("Grok json-schema envelope rejects conflicting text and structuredOutput", 
   assert.equal(terminal.reviewStatus, "REVIEW_OUTPUT_INVALID");
   assert.match(terminal.validationError, /structuredOutput.*text|text.*structuredOutput/i);
 });
+
+test("Grok Reviewer returns validated verdict after bounded cleanup even if CLI does not exit", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-verdict-first=${Date.now()}`);
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const child = new EventEmitter();
+  child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.pid = 575757; child.exitCode = null; child.signalCode = null;
+  const head = "3".repeat(40);
+  let cleaned = 0;
+  const oldReview = process.env.AD_GROK_REVIEW_ATTEMPT_TIMEOUT_MS;
+  const oldStall = process.env.AD_GROK_STALL_TIMEOUT_MS;
+  process.env.AD_GROK_REVIEW_ATTEMPT_TIMEOUT_MS = "1000";
+  process.env.AD_GROK_STALL_TIMEOUT_MS = "800";
+  try {
+    const promise = runtimeModule.runMonitoredGrokReview("grok", [], {
+      cwd: os.tmpdir(), env: process.env, candidateRevision: head,
+      spawnChild: () => {
+        queueMicrotask(() => {
+          child.emit("spawn");
+          child.stdout.write(JSON.stringify({ reviewed_head: head, critical: 0, important: 0, minor: [], findings: [], verdict: "PASS" }));
+          // Intentionally never emit exit/close. Runtime must stop the provider group after verdict.
+        });
+        return child;
+      },
+      terminateGroup: async () => { cleaned += 1; child.exitCode = 0; return { confirmed: true, diagnostic: "verdict-terminal-group-gone" }; },
+    });
+    const terminal = await promise;
+    assert.equal(terminal.reviewStatus, "REVIEW_PASS");
+    assert.equal(terminal.reviewVerdict.verdict, "PASS");
+    assert.equal(cleaned, 1);
+    assert.match(terminal.cleanupDiagnostic, /verdict-terminal-group-gone/);
+  } finally {
+    oldReview === undefined ? delete process.env.AD_GROK_REVIEW_ATTEMPT_TIMEOUT_MS : process.env.AD_GROK_REVIEW_ATTEMPT_TIMEOUT_MS = oldReview;
+    oldStall === undefined ? delete process.env.AD_GROK_STALL_TIMEOUT_MS : process.env.AD_GROK_STALL_TIMEOUT_MS = oldStall;
+  }
+});
