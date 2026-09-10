@@ -3211,7 +3211,11 @@ def unbind_desktop_session(
 
 
 def controller_event_is_managed(
-    event: dict[str, Any], cwd: Path, expected_root: Path
+    event: dict[str, Any],
+    cwd: Path,
+    expected_root: Path,
+    *,
+    snapshot: dict[str, Any] | None = None,
 ) -> bool:
     session_id = str(event.get("session_id", "")).strip()
     if not session_id or registered_root(session_id) != expected_root.resolve():
@@ -3222,7 +3226,8 @@ def controller_event_is_managed(
         return False
     if registered_controller_surface(session_id, expected_root) != invocation_root:
         return False
-    snapshot = project_snapshot(cwd)
+    if snapshot is None:
+        snapshot = project_snapshot(cwd)
     if snapshot is None or Path(snapshot["root"]).resolve() != expected_root.resolve():
         return False
     return snapshot.get("git_common_dir") == str(git_common_dir(expected_root))
@@ -3402,7 +3407,9 @@ def run_hook() -> int:
             ), ensure_ascii=False))
             return 0
     snapshot = project_snapshot(cwd)
-    if snapshot is None or not controller_event_is_managed(event, cwd, expected_root):
+    if snapshot is None or not controller_event_is_managed(
+        event, cwd, expected_root, snapshot=snapshot
+    ):
         return 0
     normalized_event = dict(event)
     normalized_event["source_session_id"] = source_session_id

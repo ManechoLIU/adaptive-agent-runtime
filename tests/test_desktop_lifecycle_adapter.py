@@ -1289,7 +1289,7 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             old_registry = lifecycle_hook.REGISTRY_PATH
             lifecycle_hook.REGISTRY_PATH = registry
             try:
-                def mutate_registered_root(*_args):
+                def mutate_registered_root(*_args, **_kwargs):
                     saved = lifecycle_hook.load_json(registry)
                     saved["controller-1"] = str(replacement.resolve())
                     lifecycle_hook.write_json(registry, saved)
@@ -1452,6 +1452,43 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
                 lifecycle_hook.REGISTRY_PATH = old_registry
 
         self.assertFalse(managed)
+
+    def test_controller_event_management_reuses_the_current_hook_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-current"]},
+                },
+                "__controller_targets__": {
+                    "controller-1": {"desktop_codex": {
+                        "status": "active", "session_id": "desktop-current", "generation": 4,
+                    }},
+                },
+            }), encoding="utf-8")
+            snapshot = self.snapshot(repo)
+            snapshot["git_common_dir"] = str(lifecycle_hook.git_common_dir(repo))
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                with patch.object(
+                    lifecycle_hook,
+                    "project_snapshot",
+                    side_effect=AssertionError("must not recompute an existing hook snapshot"),
+                ):
+                    managed = lifecycle_hook.controller_event_is_managed(
+                        {"session_id": "desktop-current"},
+                        repo,
+                        repo,
+                        snapshot=snapshot,
+                    )
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertTrue(managed)
 
     def test_matching_post_tool_keeps_its_lease_until_lifecycle_state_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

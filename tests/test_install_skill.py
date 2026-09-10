@@ -2142,6 +2142,16 @@ class HostAdapterInstallationTests(unittest.TestCase):
             )
             self.assertIn('"matcher": "*"', json.dumps(config["hooks"]["PreToolUse"]))
             self.assertIn('"matcher": "*"', json.dumps(config["hooks"]["PostToolUse"]))
+            for event in (
+                "SessionStart", "PreToolUse", "PostToolUse", "SubagentStop", "UserPromptSubmit", "Stop",
+            ):
+                lifecycle_handlers = [
+                    handler
+                    for group in config["hooks"][event]
+                    for handler in group.get("hooks", [])
+                    if "lifecycle_hook.py" in str(handler.get("command", ""))
+                ]
+                self.assertEqual([20], [handler["timeout"] for handler in lifecycle_handlers])
 
     def test_codex_hook_install_preserves_other_handlers_inside_same_group(self):
         import json

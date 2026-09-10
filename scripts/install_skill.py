@@ -1795,7 +1795,7 @@ def install_codex_hooks(
         if not isinstance(entries, list):
             raise ValueError(f"{event_name} hooks must be a list")
         handler: dict[str, Any] = {
-            "type": "command", "command": lifecycle_command, "timeout": 5, "statusMessage": status,
+            "type": "command", "command": lifecycle_command, "timeout": 20, "statusMessage": status,
         }
         if inject_context:
             handler["additionalContextLimit"] = 4096
