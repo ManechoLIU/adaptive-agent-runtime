@@ -113,6 +113,8 @@ RUNTIME_WEB_TURN_WATCH_MAX_SECONDS = 35 * 60
 _RUNTIME_WEB_TURN_END_UNAVAILABLE_MARKERS = (
     "no active chatgpt generation",
     "generation ended during machine observation",
+    "no active web-host generation",
+    "web-host generation ended during machine observation",
 )
 NATIVE_RESUME_MAX_RUNTIME_SECONDS = 30 * 60
 NATIVE_RESUME_COMPLETION_GRACE_SECONDS = 2.0

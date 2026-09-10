@@ -118,7 +118,7 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_governance.WebMachineTurnLifecycleTests."
     "test_unverified_web_session_start_cannot_rotate_turn",
     "tests.test_governance.WebMachineTurnLifecycleTests."
-    "test_verified_web_post_tool_cannot_start_new_turn_without_session_boundary",
+    "test_web_post_tool_cannot_start_next_turn_without_session_boundary",
     "tests.test_governance.WebMachineTurnLifecycleTests."
     "test_verified_web_event_rejects_stale_target_and_ownership_fences",
     "tests.test_governance.WebMachineTurnLifecycleTests."
@@ -187,6 +187,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_post_shell_without_host_turn_token_reuses_active_runtime_lease",
     "tests.test_web_lifecycle_bridge.RuntimeWebTurnEndClassificationTests."
     "test_only_explicit_generation_end_errors_count_as_turn_end",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnEndClassificationTests."
+    "test_generic_web_host_generation_end_markers_are_explicit_terminal_edges",
     "tests.test_web_lifecycle_bridge.RuntimeWebTurnEndClassificationTests."
     "test_missed_generation_end_edge_never_false_resets_next_active_generation",
     "tests.test_web_lifecycle_bridge.RuntimeWebTurnStaleFenceWatcherTests."

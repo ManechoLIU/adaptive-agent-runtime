@@ -11770,6 +11770,14 @@ class RuntimeWebTurnEndClassificationTests(WebCurrentEntryDiscoveryTests):
         ):
             self.assertFalse(web_bridge._runtime_web_turn_end_error(value), value)
 
+    def test_generic_web_host_generation_end_markers_are_explicit_terminal_edges(self) -> None:
+        self.assertTrue(web_bridge._runtime_web_turn_end_error(
+            "HOST_CURRENT_ENTRY_UNAVAILABLE: no active Web-host generation"
+        ))
+        self.assertTrue(web_bridge._runtime_web_turn_end_error(
+            "HOST_CURRENT_ENTRY_UNAVAILABLE: Web-host generation ended during machine observation"
+        ))
+
     def test_missed_generation_end_edge_never_false_resets_next_active_generation(self) -> None:
         # A new same-conversation generation may already be active before the watcher polls.
         # Without an explicit end edge, Runtime must leave the current lease ACTIVE rather than guessing.
