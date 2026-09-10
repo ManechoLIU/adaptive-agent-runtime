@@ -841,6 +841,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_controller_without_explicit_surface_uses_its_registered_canonical_repo",
             "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_explicit_controller_surface_rejects_another_checkout",
             "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_run_hook_reuses_one_project_snapshot_for_management_fence",
+            "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_current_desktop_user_prompt_persists_confirmed_native_wake",
             "tests.test_governance.GovernanceTests.test_candidate_inventory_batches_ancestry_for_multiple_worktrees",
             "tests.test_controller_target_guard.ControllerTargetGuardTests.test_claim_controller_host_desktop_after_web_increments_one_cross_host_generation",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_direct_wake_rejects_confirmed_web_result_after_desktop_handoff",
@@ -1469,7 +1470,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions(self): self.assertTrue(True)\n"
                 "    def test_controller_without_explicit_surface_uses_its_registered_canonical_repo(self): self.assertTrue(True)\n"
                 "    def test_explicit_controller_surface_rejects_another_checkout(self): self.assertTrue(True)\n"
-                "    def test_run_hook_reuses_one_project_snapshot_for_management_fence(self): self.assertTrue(True)\n",
+                "    def test_run_hook_reuses_one_project_snapshot_for_management_fence(self): self.assertTrue(True)\n"
+                "    def test_current_desktop_user_prompt_persists_confirmed_native_wake(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_goal_display_sync.py").write_text(
@@ -1867,7 +1869,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions(self): self.assertTrue(True)\n"
                 "    def test_controller_without_explicit_surface_uses_its_registered_canonical_repo(self): self.assertTrue(True)\n"
                 "    def test_explicit_controller_surface_rejects_another_checkout(self): self.assertTrue(True)\n"
-                "    def test_run_hook_reuses_one_project_snapshot_for_management_fence(self): self.assertTrue(True)\n",
+                "    def test_run_hook_reuses_one_project_snapshot_for_management_fence(self): self.assertTrue(True)\n"
+                "    def test_current_desktop_user_prompt_persists_confirmed_native_wake(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_goal_display_sync.py").write_text(

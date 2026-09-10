@@ -3098,6 +3098,58 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def persist_confirmed_desktop_native_wake(
+    repo: Path, event: dict[str, Any], state: dict[str, Any]
+) -> None:
+    """Normalize one fenced Desktop UserPromptSubmit into the shared wake receipt."""
+    if event.get("hook_event_name") != "UserPromptSubmit":
+        return
+    controller_id = str(event.get("controller_session_id") or "").strip()
+    source_session_id = str(event.get("source_session_id") or "").strip()
+    target_generation = event.get("controller_target_generation")
+    ownership_generation = event.get("controller_ownership_generation")
+    common_dir = git_common_dir(repo)
+    if (
+        not controller_id
+        or not source_session_id
+        or common_dir is None
+        or not isinstance(target_generation, int)
+        or isinstance(target_generation, bool)
+        or target_generation < 0
+        or not isinstance(ownership_generation, int)
+        or isinstance(ownership_generation, bool)
+        or ownership_generation <= 0
+    ):
+        return
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    write_json(
+        common_dir / "adaptive-delivery" / "controller-wake-receipt.json",
+        {
+            "schema_version": 1,
+            "canonical_common_dir": str(common_dir),
+            "controller_id": controller_id,
+            "event_fingerprint": pending_event_fingerprint(state),
+            "preferred_host": DESKTOP_SESSION_HOST,
+            "selected_host": DESKTOP_SESSION_HOST,
+            "decision": "RESUME_CURRENT_HOST",
+            "reason": (
+                "native UserPromptSubmit matched the current Desktop target and "
+                "execution ownership fence"
+            ),
+            "started_at_unix_ms": now_ms,
+            "completed_at_unix_ms": now_ms,
+            "operation": "desktop_native_user_prompt",
+            "result": "CONFIRMED",
+            "pending_control_event": state.get("pending_control_event") is True,
+            "execution_target_session_id": source_session_id,
+            "target_generation": target_generation,
+            "ownership_generation": ownership_generation,
+            "target_mode": "explicit_current",
+            "host_attested": True,
+        },
+    )
+
+
 def registered_controller_id(session_id: str) -> str | None:
     session_id = session_id.strip()
     if not session_id:
@@ -3864,6 +3916,15 @@ def run_hook() -> int:
                 if canary_ownership_current:
                     normalized_event["controller_ownership_generation"] = ownership_generation
         output, next_state = persist_event_state(path, normalized_event, snapshot)
+        if canary_ownership_current:
+            try:
+                persist_confirmed_desktop_native_wake(
+                    expected_root, normalized_event, next_state
+                )
+            except OSError:
+                # Fail closed: without a durable receipt the release handshake
+                # remains pending, while ordinary lifecycle handling can continue.
+                pass
     if post_outbound_request is not None and _tool_use_id(normalized_event):
         action, target_session_id = post_outbound_request
         try:

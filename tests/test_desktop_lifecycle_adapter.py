@@ -632,6 +632,53 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             code = lifecycle_hook.run_hook()
         return code, output.getvalue()
 
+    def test_current_desktop_user_prompt_persists_confirmed_native_wake(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-current"]}},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }), encoding="utf-8")
+            old_registry, old_state_root = lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
+            lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = registry, root / "state"
+            try:
+                with patch.object(lifecycle_hook, "registered_controller_id", return_value="controller-1"), patch.object(lifecycle_hook, "registered_root", return_value=repo), patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch.object(lifecycle_hook, "controller_event_is_managed", return_value=True):
+                    before_ms = int(time.time() * 1000)
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": "desktop-current",
+                        "turn_id": "turn-native-wake",
+                        "cwd": str(repo),
+                    })
+                    after_ms = int(time.time() * 1000)
+            finally:
+                lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = old_registry, old_state_root
+
+            receipt_path = repo / ".git" / "adaptive-delivery" / "controller-wake-receipt.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+        self.assertEqual(receipt["result"], "CONFIRMED")
+        self.assertEqual(receipt["operation"], "desktop_native_user_prompt")
+        self.assertEqual(receipt["controller_id"], "controller-1")
+        self.assertEqual(receipt["selected_host"], "desktop_codex")
+        self.assertEqual(receipt["execution_target_session_id"], "desktop-current")
+        self.assertEqual(receipt["target_generation"], 4)
+        self.assertEqual(receipt["ownership_generation"], 7)
+        self.assertGreaterEqual(receipt["completed_at_unix_ms"], before_ms)
+        self.assertLessEqual(receipt["completed_at_unix_ms"], after_ms)
+
     def test_managed_controller_rejects_unbounded_dev_commands_before_state_write(self) -> None:
         commands = (
             ("Bash", "pnpm --filter @selfalone/server dev"),
