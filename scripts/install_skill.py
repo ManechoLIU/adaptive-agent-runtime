@@ -374,6 +374,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_rule_wake_defers_host_runtime_resolution_until_target_is_known",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
+    "test_global_health_cycle_isolates_one_repo_git_failure",
+    "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_no_canonical_work_does_not_reopen_after_observation_only_turn",

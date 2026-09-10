@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -191,7 +192,7 @@ def reconcile_all_web_agent_health_once(
                 repo=repo, registry=registry, controller_id=controller_id
             )
             results.append({**health_result, "rule_wake": rule_wake})
-        except (OSError, ValueError, PermissionError, RuntimeError):
+        except (OSError, ValueError, PermissionError, RuntimeError, subprocess.SubprocessError):
             # Canonical state remains durable; a later KeepAlive cycle retries.
             continue
     return results

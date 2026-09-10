@@ -662,6 +662,45 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
         self.assertEqual(results[0]["rule_wake"]["schedule"], "scheduled")
         self.assertEqual(results[0]["rule_wake"]["execution_target_session_id"], "web-current")
 
+    def test_global_health_cycle_isolates_one_repo_git_failure(self):
+        from unittest.mock import patch
+        from scripts import web_agent_health_supervisor as supervisor
+
+        other_repo = self.repo.parent / "other-repo"
+        other_repo.mkdir()
+        self.registry.write_text(json.dumps({
+            "controller-broken": str(self.repo),
+            "controller-healthy": str(other_repo),
+        }), encoding="utf-8")
+        health_results = [
+            subprocess.CalledProcessError(128, ["git", "rev-parse", "main"]),
+            {"controller_id": "controller-healthy", "health": []},
+        ]
+        with patch.object(
+            web_lifecycle_bridge,
+            "_registered_controller_for_common_dir",
+            side_effect=lambda repo, _registry: (
+                "controller-broken" if repo == self.repo.resolve() else "controller-healthy"
+            ),
+        ), patch.object(
+            supervisor,
+            "reconcile_web_agent_health_once",
+            side_effect=health_results,
+        ) as reconcile, patch.object(
+            supervisor,
+            "reconcile_registered_controller_rule_update_once",
+            return_value={"schedule": "not_needed"},
+        ), patch.object(
+            supervisor, "machine_event_source_ready", return_value=False
+        ):
+            results = supervisor.reconcile_all_web_agent_health_once(
+                registry_path=self.registry, now=T0
+            )
+
+        self.assertEqual(reconcile.call_count, 2)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["controller_id"], "controller-healthy")
+
     def test_rule_wake_defers_host_runtime_resolution_until_target_is_known(self):
         from scripts.web_agent_health_supervisor import (
             reconcile_registered_controller_rule_update_once,

@@ -875,6 +875,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_rule_wake_does_not_require_desktop_runtime_for_web_target",
             "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests.test_host_neutral_supervisor_omits_missing_desktop_codex_argument",
             "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests.test_rule_wake_defers_host_runtime_resolution_until_target_is_known",
+            "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests.test_global_health_cycle_isolates_one_repo_git_failure",
             "tests.test_install_skill.InstallCapabilityTests.test_installer_web_bridge_preserves_shell_and_lifecycle_exit_precedence",
             "tests.test_install_skill.ProjectContextHookInstallationTests.test_runtime_hooks_keep_trust_stable_legacy_indices",
             "tests.test_install_skill.ProjectContextHookInstallationTests.test_shifted_runtime_hook_groups_migrate_back_without_moving_user_groups",
@@ -1086,6 +1087,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_global_health_cycle_does_not_schedule_rule_update_without_explicit_current_target(self): self.assertTrue(True)\n"
                 "    def test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_defers_host_runtime_resolution_until_target_is_known(self): self.assertTrue(True)\n"
+                "    def test_global_health_cycle_isolates_one_repo_git_failure(self): self.assertTrue(True)\n"
                 "    def test_canonical_runnable_reopens_continuation_without_user_message(self): self.assertTrue(True)\n"
                 "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n"
                 "    def test_health_tick_reopens_persisted_non_user_next_action_without_stop_callback(self): self.assertTrue(True)\n",
@@ -1567,6 +1569,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_global_health_cycle_does_not_schedule_rule_update_without_explicit_current_target(self): self.assertTrue(True)\n"
                 "    def test_health_tick_with_runnable_and_no_child_event_arms_same_controller_without_user_message(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_defers_host_runtime_resolution_until_target_is_known(self): self.assertTrue(True)\n"
+                "    def test_global_health_cycle_isolates_one_repo_git_failure(self): self.assertTrue(True)\n"
                 "    def test_no_canonical_work_does_not_reopen_after_observation_only_turn(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
