@@ -1351,6 +1351,108 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
         self.assertEqual(saved["controller-1"], str(repo.resolve()))
         self.assertEqual(saved["__controller_surfaces__"]["controller-1"], str(surface.resolve()))
 
+    def test_controller_without_explicit_surface_uses_its_registered_canonical_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "other-controller": str((root / "other-project").resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-current"]},
+                },
+                "__controller_targets__": {
+                    "controller-1": {"desktop_codex": {
+                        "status": "active", "session_id": "desktop-current", "generation": 4,
+                    }},
+                },
+                "__controller_surfaces__": {
+                    "other-controller": str((root / "other-surface").resolve()),
+                },
+            }), encoding="utf-8")
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                surface = lifecycle_hook.registered_controller_surface(
+                    "desktop-current", repo
+                )
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertEqual(surface, repo.resolve())
+
+    def test_explicit_controller_surface_remains_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            explicit_surface = root / "controller-surface"
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-current"]},
+                },
+                "__controller_targets__": {
+                    "controller-1": {"desktop_codex": {
+                        "status": "active", "session_id": "desktop-current", "generation": 4,
+                    }},
+                },
+                "__controller_surfaces__": {
+                    "controller-1": str(explicit_surface.resolve()),
+                },
+            }), encoding="utf-8")
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                surface = lifecycle_hook.registered_controller_surface(
+                    "desktop-current", repo
+                )
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertEqual(surface, explicit_surface.resolve())
+
+    def test_explicit_controller_surface_rejects_another_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "tests@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Tests"], check=True)
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+            explicit_surface = root / "controller-surface"
+            subprocess.run([
+                "git", "-C", str(repo), "worktree", "add", "-qb", "controller",
+                str(explicit_surface),
+            ], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-current"]},
+                },
+                "__controller_targets__": {
+                    "controller-1": {"desktop_codex": {
+                        "status": "active", "session_id": "desktop-current", "generation": 4,
+                    }},
+                },
+                "__controller_surfaces__": {
+                    "controller-1": str(explicit_surface.resolve()),
+                },
+            }), encoding="utf-8")
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                managed = lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "desktop-current"}, repo, repo
+                )
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertFalse(managed)
+
     def test_matching_post_tool_keeps_its_lease_until_lifecycle_state_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

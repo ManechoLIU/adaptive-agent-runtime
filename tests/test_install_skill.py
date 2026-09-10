@@ -838,6 +838,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_goal_display_sync.GoalDisplaySyncTests.test_missing_host_capability_is_degraded_and_exact_target_change_is_fenced",
             "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_managed_controller_rejects_unbounded_dev_commands_before_state_write",
             "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions",
+            "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_controller_without_explicit_surface_uses_its_registered_canonical_repo",
+            "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_explicit_controller_surface_rejects_another_checkout",
             "tests.test_controller_target_guard.ControllerTargetGuardTests.test_claim_controller_host_desktop_after_web_increments_one_cross_host_generation",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_direct_wake_rejects_confirmed_web_result_after_desktop_handoff",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_desktop_result_cannot_persist_or_rearm_after_web_handoff",
@@ -1459,7 +1461,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_hard_yield_gate_does_not_invent_work_from_status_only_message(self): self.assertTrue(True)\n"
                 "class DesktopOutboundLeaseHookTests(unittest.TestCase):\n"
                 "    def test_managed_controller_rejects_unbounded_dev_commands_before_state_write(self): self.assertTrue(True)\n"
-                "    def test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions(self): self.assertTrue(True)\n",
+                "    def test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions(self): self.assertTrue(True)\n"
+                "    def test_controller_without_explicit_surface_uses_its_registered_canonical_repo(self): self.assertTrue(True)\n"
+                "    def test_explicit_controller_surface_rejects_another_checkout(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_goal_display_sync.py").write_text(
@@ -1853,7 +1857,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_hard_yield_gate_does_not_invent_work_from_status_only_message(self): self.assertTrue(True)\n"
                 "class DesktopOutboundLeaseHookTests(unittest.TestCase):\n"
                 "    def test_managed_controller_rejects_unbounded_dev_commands_before_state_write(self): self.assertTrue(True)\n"
-                "    def test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions(self): self.assertTrue(True)\n",
+                "    def test_foreground_command_gate_allows_bounded_work_and_skips_unmanaged_sessions(self): self.assertTrue(True)\n"
+                "    def test_controller_without_explicit_surface_uses_its_registered_canonical_repo(self): self.assertTrue(True)\n"
+                "    def test_explicit_controller_surface_rejects_another_checkout(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_goal_display_sync.py").write_text(

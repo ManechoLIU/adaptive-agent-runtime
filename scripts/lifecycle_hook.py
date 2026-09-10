@@ -2824,6 +2824,8 @@ def registered_controller_surface(session_id: str, expected_root: Path) -> Path 
         return expected_root.resolve()
     if not isinstance(surfaces, dict):
         return None
+    if controller_id not in surfaces:
+        return expected_root.resolve()
     value = surfaces.get(controller_id)
     if not isinstance(value, str) or not value.strip():
         return None
