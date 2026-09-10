@@ -1621,6 +1621,10 @@ export function runMonitoredGrokReview(executable, args, {
     let terminating = false;
     let settled = false;
     let watchdog = null;
+    let closeDrainTimer = null;
+    let observedExitCode = null;
+    let observedExitSignal = null;
+    let exitObserved = false;
     const parentSignalHandlers = [];
 
     const appendBounded = (current, chunk) => {
@@ -1636,6 +1640,7 @@ export function runMonitoredGrokReview(executable, args, {
       if (settled) return;
       settled = true;
       if (watchdog) clearInterval(watchdog);
+      if (closeDrainTimer) clearTimeout(closeDrainTimer);
       removeSignalHandlers();
       resolve(terminal);
     };
@@ -1737,8 +1742,40 @@ export function runMonitoredGrokReview(executable, args, {
 
     child.once("exit", (code, signal) => {
       if (settled || terminating) return;
+      exitObserved = true;
+      observedExitCode = code;
+      observedExitSignal = signal;
+      if (watchdog) clearInterval(watchdog);
+      closeDrainTimer = setTimeout(() => {
+        if (settled || terminating) return;
+        terminating = true;
+        void (async () => {
+          let cleanup = { confirmed: true, diagnostic: "process group already gone" };
+          try {
+            const groupAlive = process.platform === "win32" ? false : processGroupExists(child.pid);
+            if (groupAlive) cleanup = await terminateGroup(child, killGraceMs);
+          } catch (error) {
+            cleanup = { confirmed: false, diagnostic: `stdio-close process-group probe failed: ${error.message}` };
+          }
+          if (!cleanup.confirmed) {
+            finish({ reviewStatus: "REVIEW_PROCESS_STUCK", deliveryOutcome: "unresolved", retrySafe: false, hadModelOutput: firstOutputAt !== null, cleanupDiagnostic: cleanup.diagnostic });
+            return;
+          }
+          finish({
+            reviewStatus: "REVIEW_PROVIDER_ERROR", deliveryOutcome: "unresolved", retrySafe: false,
+            hadModelOutput: firstOutputAt !== null,
+            providerError: "stdio_close_timeout: provider exited but stdout/stderr did not close within bounded drain window",
+            cleanupDiagnostic: cleanup.diagnostic,
+          });
+        })();
+      }, Math.max(100, Math.min(2_000, killGraceMs)));
+    });
+
+    child.once("close", (code, signal) => {
+      if (settled || terminating) return;
       terminating = true;
       if (watchdog) clearInterval(watchdog);
+      if (closeDrainTimer) clearTimeout(closeDrainTimer);
       void (async () => {
         let cleanup = { confirmed: true, diagnostic: "process group already gone" };
         try {
@@ -1751,8 +1788,10 @@ export function runMonitoredGrokReview(executable, args, {
           finish({ reviewStatus: "REVIEW_PROCESS_STUCK", deliveryOutcome: "unresolved", retrySafe: false, hadModelOutput: firstOutputAt !== null, cleanupDiagnostic: cleanup.diagnostic });
           return;
         }
+        const finalSignal = signal || observedExitSignal;
+        const finalCode = code ?? observedExitCode;
         const terminal = classifyGrokReviewTerminal({
-          exitCode: signal ? 1 : (code ?? 1),
+          exitCode: finalSignal ? 1 : (finalCode ?? 1),
           stdout, stderr,
           timedOut: false,
           cleanupConfirmed: true,
@@ -1760,7 +1799,8 @@ export function runMonitoredGrokReview(executable, args, {
           hadModelOutput: firstOutputAt !== null,
         });
         terminal.cleanupDiagnostic = cleanup.diagnostic;
-        if (signal) terminal.providerSignal = signal;
+        terminal.exitObservedBeforeClose = exitObserved;
+        if (finalSignal) terminal.providerSignal = finalSignal;
         finish(terminal);
       })();
     });

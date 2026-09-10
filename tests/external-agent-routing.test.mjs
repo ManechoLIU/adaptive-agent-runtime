@@ -2795,7 +2795,8 @@ process.stdout.write(JSON.stringify({ reviewed_head: process.env.REVIEW_HEAD, cr
   ], { encoding: "utf8", input: "complete source packet", env: {
     ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
     COUNT_FILE: countFile, REVIEW_HEAD: head,
-    AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "300", AD_GROK_STALL_TIMEOUT_MS: "300", AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "1000", AD_EXTERNAL_KILL_GRACE_MS: "30",
+    // This case verifies retry semantics, not cold-start watchdog sensitivity. Dedicated timeout tests cover 30-300ms deadlines.
+    AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "1500", AD_GROK_STALL_TIMEOUT_MS: "1500", AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "4000", AD_EXTERNAL_KILL_GRACE_MS: "30",
   } });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(Number((await readFile(countFile, "utf8")).trim()), 2);
@@ -2803,4 +2804,33 @@ process.stdout.write(JSON.stringify({ reviewed_head: process.env.REVIEW_HEAD, cr
   const terminal = receipts.at(-1);
   assert.equal(terminal.review_status, "REVIEW_PASS");
   assert.equal(terminal.delivery_outcome, "pass");
+});
+
+test("Grok Reviewer waits for stdio close before classifying final verdict", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-close-drain=${Date.now()}`);
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const child = new EventEmitter();
+  child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.pid = 565656; child.exitCode = null; child.signalCode = null;
+  const head = "f".repeat(40);
+  const promise = runtimeModule.runMonitoredGrokReview("grok", [], {
+    cwd: os.tmpdir(), env: process.env, candidateRevision: head,
+    spawnChild: () => {
+      queueMicrotask(() => {
+        child.emit("spawn");
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+        setTimeout(() => {
+          child.stdout.write(JSON.stringify({ reviewed_head: head, critical: 0, important: 0, minor: [], findings: [], verdict: "PASS" }));
+          child.stdout.end(); child.stderr.end();
+          child.emit("close", 0, null);
+        }, 20);
+      });
+      return child;
+    },
+    terminateGroup: async () => ({ confirmed: true, diagnostic: "group-gone" }),
+  });
+  const terminal = await promise;
+  assert.equal(terminal.reviewStatus, "REVIEW_PASS");
+  assert.equal(terminal.reviewVerdict.verdict, "PASS");
 });
