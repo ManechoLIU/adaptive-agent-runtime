@@ -6402,3 +6402,64 @@ class RuntimeWebTurnMachineTraceAcceptanceTests(unittest.TestCase):
             self.assertEqual(evidence["terminal_status"], "CLOSED")
             self.assertEqual(evidence["controller_id"], "controller-1")
             self.assertTrue(evidence_path.is_file())
+
+class UnboundWebPostToolIsolationTests(unittest.TestCase):
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
+            "ready_ids": [], "runnable_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {}, "control_loop_required": False,
+        }
+
+    def active_state(self) -> tuple[dict[str, object], str]:
+        identity = lifecycle_hook.agent_target.logical_agent_identity(agent_type="controller", agent_id="controller-1")
+        target = lifecycle_hook.agent_target.verified_execution_target(
+            logical_agent=identity, host="web", execution_target_session_id="web-current",
+            target_generation=8, ownership_generation=8, provenance="test",
+        )
+        turn = lifecycle_hook.agent_target.verified_execution_turn(
+            verified_target=target, runtime_invocation_id="machine-A",
+            provenance="runtime_host_current_entry_v1",
+        )
+        event = {
+            "hook_event_name":"SessionStart", "session_id":"controller-1",
+            "controller_session_id":"controller-1", "controller_host":"web",
+            "execution_host":"web", "event_source":"web", "web_session_id":"web-current",
+            "source_session_id":"web-current", "turn_id":turn["turn_id"],
+            "verified_execution_turn":turn,
+        }
+        _, state = lifecycle_hook.evaluate_event(event, snapshot=self.snapshot(), prior_state=None)
+        state["tool_trace"] = [{"turn_id":turn["turn_id"],"tool_use_id":"existing","tool_name":"Shell","input_sha256":"x","response_status":0}]
+        state["tool_trace_overflow"] = True
+        state["inflight_tool_use_ids"] = ["still-running"]
+        return state, turn["turn_id"]
+
+    def assert_unbound_event_preserves_turn_local_state(self, event: dict[str, object]) -> None:
+        prior, turn_id = self.active_state()
+        output, state = lifecycle_hook.evaluate_event(event, snapshot=self.snapshot(), prior_state=prior)
+        self.assertEqual(output.get("decision"), "block")
+        self.assertEqual(state["active_turn_id"], turn_id)
+        self.assertEqual(state["inflight_tool_use_ids"], ["still-running"])
+        self.assertEqual([item["tool_use_id"] for item in state["tool_trace"]], ["existing"])
+        self.assertTrue(state["tool_trace_overflow"])
+
+    def test_unverified_web_post_tool_without_turn_id_cannot_mutate_active_turn(self) -> None:
+        self.assert_unbound_event_preserves_turn_local_state({
+            "hook_event_name":"PostToolUse", "session_id":"controller-1",
+            "controller_session_id":"controller-1", "controller_host":"web",
+            "execution_host":"web", "event_source":"web", "web_session_id":"web-current",
+            "source_session_id":"web-current", "tool_use_id":"still-running",
+            "tool_name":"AI-Bridge.shell_command", "tool_input":{"command":"git status --short"},
+            "tool_response":{"exit_code":0},
+        })
+
+    def test_legacy_audit_unbound_web_post_tool_cannot_mutate_active_turn(self) -> None:
+        self.assert_unbound_event_preserves_turn_local_state({
+            "hook_event_name":"PostToolUse", "session_id":"controller-1",
+            "controller_session_id":"controller-1", "controller_host":"web",
+            "execution_host":"web", "event_source":"web", "web_session_id":"web-current",
+            "source_session_id":"web-current", "legacy_audit_unbound":True,
+            "tool_use_id":"still-running", "tool_name":"AI-Bridge.shell_command",
+            "tool_input":{"command":"python3 control_event_guard.py --repo ."},
+            "tool_response":{"exit_code":0,"output":"control-event: allowed"},
+        })

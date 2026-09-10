@@ -119,6 +119,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_unverified_web_session_start_cannot_rotate_turn",
     "tests.test_governance.WebMachineTurnLifecycleTests."
     "test_web_post_tool_cannot_start_next_turn_without_session_boundary",
+    "tests.test_governance.UnboundWebPostToolIsolationTests."
+    "test_unverified_web_post_tool_without_turn_id_cannot_mutate_active_turn",
     "tests.test_governance.WebMachineTurnLifecycleTests."
     "test_direct_host_turn_cannot_abandon_active_runtime_fallback_lease",
     "tests.test_governance.WebMachineTurnLifecycleTests."

@@ -1439,6 +1439,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_stale_watcher_cannot_end_newer_lease(self): self.assertTrue(True)\n"
                 "class RuntimeWebTurnMachineTraceAcceptanceTests(unittest.TestCase):\n"
                 "    def test_recovered_web_turn_produces_machine_trace_and_clean_closed_cycle_evidence(self): self.assertTrue(True)\n"
+                "class UnboundWebPostToolIsolationTests(unittest.TestCase):\n"
+                "    def test_unverified_web_post_tool_without_turn_id_cannot_mutate_active_turn(self): self.assertTrue(True)\n"
                 "class WebMachineTurnLifecycleTests(unittest.TestCase):\n"
                 "    def test_new_machine_web_turn_resets_old_trace_overflow(self): self.assertTrue(True)\n"
                 "    def test_same_machine_web_turn_does_not_reset_existing_trace_or_overflow(self): self.assertTrue(True)\n"

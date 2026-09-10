@@ -440,14 +440,26 @@ def _verified_web_turn_evidence(event: dict[str, Any]) -> dict[str, Any]:
 
 def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
     turn_id = _event_turn_id(event)
-    if not turn_id:
-        return None
     web_turn: dict[str, Any] | None = None
     is_web_machine_event = (
         str(event.get("controller_host") or "").strip() == "web"
         and str(event.get("execution_host") or "").strip() == "web"
         and str(event.get("event_source") or "").strip() == "web"
     )
+    if (
+        is_web_machine_event
+        and event.get("hook_event_name") == "PostToolUse"
+        and not isinstance(event.get("verified_execution_turn"), dict)
+    ):
+        state["adapter_fault"] = {
+            "code": "unverified_web_tool_event",
+            "turn_id": turn_id,
+            "active_turn_id": str(state.get("active_turn_id", "")),
+            "reason": "Web PostToolUse requires verified execution-turn evidence before turn-local mutation",
+        }
+        return "Web tool result rejected: verified execution-turn evidence is required."
+    if not turn_id:
+        return None
     if is_web_machine_event:
         try:
             web_turn = _verified_web_turn_evidence(event)
