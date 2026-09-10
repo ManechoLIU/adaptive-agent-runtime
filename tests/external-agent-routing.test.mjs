@@ -2628,7 +2628,9 @@ process.exit(${exitCode});`;
     "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts,
   ], { encoding: "utf8", input: `Complete source packet for immutable candidate ${head}. Do not read repository.`, env: {
     ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, COUNT_FILE: countFile,
-    AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "300", AD_GROK_STALL_TIMEOUT_MS: "300", AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "1000", AD_EXTERNAL_KILL_GRACE_MS: "30",
+    // These cases verify Reviewer terminal semantics, not provider cold-start watchdog sensitivity.
+    // Dedicated launch/first-output/stall tests exercise sub-second deadlines separately.
+    AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "1500", AD_GROK_STALL_TIMEOUT_MS: "1500", AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "4000", AD_EXTERNAL_KILL_GRACE_MS: "30",
   } });
   const receipts = (await readFile(runtimeReceipts, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
   const callCount = (await readFile(countFile, "utf8")).trim().split("\n").filter(Boolean).length;
