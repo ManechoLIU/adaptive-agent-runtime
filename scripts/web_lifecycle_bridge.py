@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import fcntl
 import json
 import os
+import queue
 import secrets
 import signal
 import shutil
@@ -109,7 +110,20 @@ AUTO_CONTINUATION_STALL_LIMIT = 3
 WEB_REENTRY_TRANSIENT_RETRY_LIMIT = 6
 NATIVE_RESUME_MAX_RUNTIME_SECONDS = 30 * 60
 NATIVE_RESUME_COMPLETION_GRACE_SECONDS = 2.0
+CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS = 20.0
 _HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND = object()
+
+
+class CodexAppServerError(RuntimeError):
+    """The official Codex app-server rejected or lost a protocol operation."""
+
+
+class CodexAppServerActiveWriter(CodexAppServerError):
+    """The target task is already owned by another live Codex writer."""
+
+
+class CodexAppServerResultUnknown(CodexAppServerError):
+    """A turn submit was attempted, but no matching terminal result was observed."""
 
 
 def resolve_desktop_codex_executable(
@@ -2680,6 +2694,497 @@ def preflight_native_resume(
     return True, "", env
 
 
+def _app_server_error_text(error: object) -> str:
+    if not isinstance(error, dict):
+        return str(error or "Codex app-server request failed")
+    message = str(error.get("message") or "Codex app-server request failed").strip()
+    data = error.get("data")
+    if data not in (None, "", {}):
+        message += ": " + json.dumps(data, ensure_ascii=False, sort_keys=True)
+    return message
+
+
+def _terminate_app_server(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=3)
+
+
+def execute_codex_app_server_turn(
+    *,
+    codex: str,
+    execution_target: str,
+    repo: Path,
+    prompt: str,
+    submit_fence: Callable[[], Any],
+    env: dict[str, str],
+    max_runtime_seconds: float,
+    request_timeout_seconds: float = CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Run one existing task turn through the bundled official app-server protocol."""
+    command = [codex, "-c", "mcp_servers={}", "app-server", "--stdio"]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+        start_new_session=True,
+    )
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        _terminate_app_server(process)
+        raise CodexAppServerError("Codex app-server stdio is unavailable")
+
+    stdout_queue: queue.Queue[str | None] = queue.Queue()
+    stderr_lines: deque[str] = deque(maxlen=80)
+    notifications: deque[dict[str, Any]] = deque()
+
+    def read_stdout() -> None:
+        try:
+            for line in process.stdout:
+                stdout_queue.put(line)
+        finally:
+            stdout_queue.put(None)
+
+    def read_stderr() -> None:
+        for line in process.stderr:
+            stderr_lines.append(line)
+
+    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    next_request_id = 1
+
+    def send(method: str, params: dict[str, Any], *, notification: bool = False) -> int | None:
+        nonlocal next_request_id
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method, "params": params}
+        request_id: int | None = None
+        if not notification:
+            request_id = next_request_id
+            next_request_id += 1
+            message["id"] = request_id
+        try:
+            process.stdin.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise CodexAppServerError("Codex app-server connection closed before submit") from exc
+        return request_id
+
+    def receive(timeout_seconds: float) -> dict[str, Any]:
+        try:
+            line = stdout_queue.get(timeout=max(0.01, timeout_seconds))
+        except queue.Empty as exc:
+            raise TimeoutError("Codex app-server response timed out") from exc
+        if line is None:
+            detail = bounded_tail("".join(stderr_lines))
+            raise CodexAppServerError(
+                "Codex app-server exited before a terminal response"
+                + (f": {detail}" if detail else "")
+            )
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CodexAppServerError("Codex app-server returned invalid JSON") from exc
+        if not isinstance(message, dict):
+            raise CodexAppServerError("Codex app-server returned a non-object message")
+        return message
+
+    def await_response(request_id: int, timeout_seconds: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Codex app-server request timed out")
+            message = receive(remaining)
+            if message.get("id") == request_id:
+                if "error" in message:
+                    error_text = _app_server_error_text(message.get("error"))
+                    if "already has an active writer" in error_text.lower():
+                        raise CodexAppServerActiveWriter(error_text)
+                    raise CodexAppServerError(error_text)
+                result = message.get("result")
+                if not isinstance(result, dict):
+                    raise CodexAppServerError("Codex app-server returned an invalid result")
+                return result
+            if isinstance(message.get("method"), str):
+                notifications.append(message)
+
+    submit_attempted = False
+    try:
+        initialize_id = send(
+            "initialize",
+            {
+                "clientInfo": {"name": "adaptive-agent-runtime", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            },
+        )
+        assert initialize_id is not None
+        await_response(initialize_id, request_timeout_seconds)
+        send("initialized", {}, notification=True)
+
+        resume_id = send(
+            "thread/resume",
+            {"threadId": execution_target, "excludeTurns": True},
+        )
+        assert resume_id is not None
+        resumed = await_response(resume_id, request_timeout_seconds)
+        thread = resumed.get("thread")
+        if not isinstance(thread, dict) or thread.get("id") != execution_target:
+            raise CodexAppServerError("Codex app-server resumed the wrong task")
+        status = thread.get("status")
+        status_type = status.get("type") if isinstance(status, dict) else None
+        if status_type != "idle" or thread.get("canAcceptDirectInput") is not True:
+            raise CodexAppServerError(
+                f"Codex app-server task is not ready for direct input: status={status_type!r}"
+            )
+
+        with submit_fence() as fence_receipt:
+            if fence_receipt is None:
+                return {
+                    "status": "superseded",
+                    "command": command,
+                    "stderr_tail": bounded_tail("".join(stderr_lines)),
+                }
+            # From this point forward, any transport or protocol failure is
+            # result-unknown: the Host may have accepted bytes even when the
+            # matching JSON-RPC response never reaches this client.
+            submit_attempted = True
+            turn_id_request = send(
+                "turn/start",
+                {
+                    "threadId": execution_target,
+                    "input": [{"type": "text", "text": prompt}],
+                    "cwd": str(repo.resolve()),
+                    "approvalPolicy": "never",
+                    "turnTrigger": "adaptive-agent-runtime",
+                },
+            )
+            assert turn_id_request is not None
+            started = await_response(turn_id_request, request_timeout_seconds)
+            turn = started.get("turn")
+            if not isinstance(turn, dict) or not str(turn.get("id") or "").strip():
+                raise CodexAppServerError("Codex app-server did not confirm a turn id")
+            turn_id = str(turn["id"])
+
+        deadline = time.monotonic() + max_runtime_seconds
+        while True:
+            for message in list(notifications):
+                if message.get("method") != "turn/completed":
+                    continue
+                params = message.get("params")
+                completed_turn = params.get("turn") if isinstance(params, dict) else None
+                if (
+                    isinstance(params, dict)
+                    and params.get("threadId") == execution_target
+                    and isinstance(completed_turn, dict)
+                    and completed_turn.get("id") == turn_id
+                ):
+                    turn_status = str(completed_turn.get("status") or "")
+                    return {
+                        "status": turn_status,
+                        "turn_id": turn_id,
+                        "turn_error": completed_turn.get("error"),
+                        "command": command,
+                        "stderr_tail": bounded_tail("".join(stderr_lines)),
+                    }
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Codex app-server turn completion timed out")
+            try:
+                notifications.append(receive(min(remaining, 5.0)))
+            except TimeoutError:
+                continue
+    except (TimeoutError, CodexAppServerError) as exc:
+        if submit_attempted:
+            if isinstance(exc, CodexAppServerResultUnknown):
+                raise
+            raise CodexAppServerResultUnknown(
+                "Codex app-server turn result is unknown after submit"
+            ) from exc
+        raise
+    finally:
+        _terminate_app_server(process)
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def native_resume_prompt(
+    *, terminal_receipts: Sequence[str] | None = None, next_action: str | None = None
+) -> str:
+    prompt = (
+        "Adaptive Agent Runtime Desktop checkpoint. Continue this existing registered controller "
+        "task only; do not create or fork another controller. Reconcile any pending lifecycle "
+        "control event against the real main, ledger, live tasks, READY queue and candidates. "
+        "Even when pending_control_event is false, perform one project-wide Goal rollover check: "
+        "if the just-closed Goal has completed and the project still has executable open work, "
+        "recompute readiness and roll to the next Goal before yielding; if everything is blocked, "
+        "require the project-wide blocking proof. Obey the installed lifecycle hooks and "
+        "control_event_guard; if no pending control action or Goal rollover remains, stop without "
+        "starting unrelated work."
+    )
+    receipts = [str(item).strip() for item in (terminal_receipts or []) if str(item).strip()]
+    if receipts:
+        prompt += " Pending terminal receipts: " + "; ".join(receipts) + ". Read these durable results first and continue from them."
+    pending_next_action = str(next_action or "").strip()
+    if pending_next_action:
+        prompt += " Persisted non-user next action: " + pending_next_action + ". Complete it before yielding."
+    return prompt
+
+
+def execute_desktop_host_resume(
+    *,
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    terminal_receipts: Sequence[str] | None = None,
+    next_action: str | None = None,
+    supervisor_state_path: Path | None = None,
+    supervisor_receipt_id: str | None = None,
+    supervisor_token: str | None = None,
+    runtime_path: str | None = None,
+    max_runtime_seconds: float = NATIVE_RESUME_MAX_RUNTIME_SECONDS,
+) -> dict[str, Any]:
+    base = {
+        "operation": "desktop_host_reentry",
+        "controller_id": session_id,
+        "command": [],
+        "pending_control_event": True,
+    }
+    try:
+        codex = resolve_desktop_codex_executable(None)
+    except ValueError as exc:
+        return {
+            **base,
+            "result": "FAILED",
+            "state": "DESKTOP_HOST_ADAPTER_UNAVAILABLE",
+            "returncode": 78,
+            "failure_class": "desktop_host_adapter_unavailable",
+            "error_code": "DESKTOP_HOST_ADAPTER_UNAVAILABLE",
+            "stderr_tail": bounded_tail(str(exc)),
+        }
+
+    target_receipt: dict[str, Any] | None = None
+    try:
+        def resolve_desktop_fence(registry_data: dict[str, Any]) -> dict[str, Any]:
+            registered = target_guard.unique_controller_id_for_repo_in_registry(
+                repo, registry_data
+            )
+            if registered != session_id:
+                raise PermissionError(
+                    "Desktop Host resume Controller does not match the registered project Controller"
+                )
+            target = target_guard.target_record(
+                registry_data,
+                controller_id=session_id,
+                host=target_guard.DESKTOP_SESSION_HOST,
+            )
+            if not isinstance(target, dict):
+                raise PermissionError("Desktop Host resume requires an explicit current Desktop target")
+            status, target_session, target_generation = target_guard.validate_target_record(
+                target, host=target_guard.DESKTOP_SESSION_HOST
+            )
+            if status != "active" or not target_session:
+                raise PermissionError("Desktop Host resume requires an active current Desktop target")
+            aliases = target_guard.host_sessions(
+                registry_data,
+                controller_id=session_id,
+                host=target_guard.DESKTOP_SESSION_HOST,
+            )
+            if target_session != session_id and target_session not in aliases:
+                raise PermissionError("Desktop Host resume target is not a bound Controller entry")
+            ownership = target_guard.execution_ownership_record(
+                registry_data, controller_id=session_id
+            )
+            if not isinstance(ownership, dict):
+                raise PermissionError("Desktop Host resume requires canonical execution ownership")
+            ownership_host, ownership_target, ownership_generation = (
+                target_guard.validate_execution_ownership_record(ownership)
+            )
+            if (
+                ownership_host != target_guard.DESKTOP_SESSION_HOST
+                or ownership_target != target_session
+            ):
+                raise PermissionError(
+                    "Desktop Host resume ownership does not match the current Desktop target"
+                )
+            return {
+                "controller_id": session_id,
+                "execution_target_session_id": target_session,
+                "generation": target_generation,
+                "target_mode": "explicit_current",
+                "ownership_generation": ownership_generation,
+            }
+
+        with target_guard.locked_registry(registry) as registry_data:
+            resolved = resolve_desktop_fence(registry_data)
+            target_receipt = {
+                "execution_target_session_id": resolved["execution_target_session_id"],
+                "target_generation": resolved["generation"],
+                "target_mode": resolved["target_mode"],
+                "ownership_generation": resolved["ownership_generation"],
+            }
+        execution_target = str(target_receipt["execution_target_session_id"] or "").strip()
+        if not execution_target:
+            raise PermissionError("Desktop Host resume requires a current Desktop task")
+
+        @contextmanager
+        def submit_fence() -> Any:
+            with target_guard.locked_registry(registry) as registry_data:
+                current = resolve_desktop_fence(registry_data)
+                if (
+                    current.get("controller_id") != session_id
+                    or current.get("execution_target_session_id") != execution_target
+                    or current.get("generation") != target_receipt.get("target_generation")
+                    or current.get("ownership_generation") != target_receipt.get("ownership_generation")
+                ):
+                    raise PermissionError(
+                        "Desktop Host target or ownership generation changed before turn submit"
+                    )
+                if (
+                    supervisor_state_path is not None
+                    and supervisor_receipt_id is not None
+                    and supervisor_token is not None
+                ):
+                    with _owned_supervisor_state(
+                        supervisor_state_path,
+                        receipt_id=supervisor_receipt_id,
+                        supervisor_token=supervisor_token,
+                    ) as owner:
+                        yield current if owner is not None else None
+                else:
+                    yield current
+
+        response = execute_codex_app_server_turn(
+            codex=codex,
+            execution_target=execution_target,
+            repo=repo,
+            prompt=native_resume_prompt(
+                terminal_receipts=terminal_receipts,
+                next_action=next_action,
+            ),
+            submit_fence=submit_fence,
+            env=native_runtime_env(runtime_path),
+            max_runtime_seconds=max_runtime_seconds,
+        )
+    except CodexAppServerActiveWriter as exc:
+        return {
+            **base,
+            **(target_receipt or {}),
+            "result": "DEFERRED",
+            "state": "RESUME_DEFERRED_ACTIVE_WRITER",
+            "returncode": 0,
+            "failure_class": "active_writer_present",
+            "stderr_tail": bounded_tail(str(exc)),
+            "host_observation": _HOST_OBSERVED_CANONICAL_TARGET_FOREGROUND,
+            "host_transport": "codex_app_server_stdio",
+        }
+    except TimeoutError as exc:
+        return {
+            **base,
+            **(target_receipt or {}),
+            "result": "FAILED",
+            "state": "DESKTOP_HOST_ADAPTER_UNAVAILABLE",
+            "returncode": 78,
+            "failure_class": "desktop_host_adapter_unavailable",
+            "error_code": "DESKTOP_HOST_ADAPTER_UNAVAILABLE",
+            "stderr_tail": bounded_tail(str(exc)),
+        }
+    except CodexAppServerResultUnknown as exc:
+        return {
+            **base,
+            **(target_receipt or {}),
+            "result": "FAILED",
+            "state": "DESKTOP_HOST_REENTRY_RESULT_UNKNOWN",
+            "returncode": 78,
+            "failure_class": "desktop_host_result_unknown",
+            "error_code": "DESKTOP_HOST_REENTRY_RESULT_UNKNOWN",
+            "stderr_tail": bounded_tail(str(exc)),
+            "host_transport": "codex_app_server_stdio",
+        }
+    except CodexAppServerError as exc:
+        return {
+            **base,
+            **(target_receipt or {}),
+            "result": "FAILED",
+            "state": "RESUME_FAILED",
+            "returncode": 78,
+            "failure_class": "desktop_host_submit_rejected",
+            "error_code": "DESKTOP_HOST_SUBMIT_REJECTED",
+            "stderr_tail": bounded_tail(str(exc)),
+            "host_transport": "codex_app_server_stdio",
+        }
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        target_rejected = target_receipt is None or isinstance(exc, PermissionError)
+        return {
+            **base,
+            **(target_receipt or {}),
+            "result": "FAILED",
+            "state": "RESUME_FAILED",
+            "returncode": 78,
+            "failure_class": "controller_target_rejected" if target_rejected else "desktop_host_submit_rejected",
+            "error_code": "CONTROLLER_TARGET_REJECTED" if target_rejected else "DESKTOP_HOST_SUBMIT_REJECTED",
+            "stderr_tail": bounded_tail(str(exc)),
+        }
+
+    if response.get("status") == "superseded":
+        return {
+            **base,
+            **(target_receipt or {}),
+            "result": "DEFERRED",
+            "state": "RESUME_SUPERSEDED",
+            "returncode": 0,
+            "failure_class": "supervisor_superseded",
+            "host_transport": "codex_app_server_stdio",
+        }
+    turn_status = str(response.get("status") or "")
+    if turn_status != "completed":
+        return {
+            **base,
+            **(target_receipt or {}),
+            "result": "FAILED",
+            "state": "RESUME_FAILED",
+            "returncode": 78,
+            "failure_class": "desktop_host_turn_failed",
+            "error_code": "DESKTOP_HOST_TURN_FAILED",
+            "turn_id": response.get("turn_id"),
+            "turn_status": turn_status,
+            "stderr_tail": bounded_tail(
+                json.dumps(response.get("turn_error"), ensure_ascii=False)
+            ),
+            "host_transport": "codex_app_server_stdio",
+        }
+    return {
+        **base,
+        **(target_receipt or {}),
+        "result": "CONFIRMED",
+        "state": "RESUME_SUCCEEDED",
+        "returncode": 0,
+        "turn_id": response.get("turn_id"),
+        "stderr_tail": response.get("stderr_tail"),
+        "host_transport": "codex_app_server_stdio",
+        "command": response.get("command", []),
+    }
+
+
 def rotate_launcher_log(path: Path, max_bytes: int = LAUNCHER_LOG_LIMIT) -> None:
     try:
         if not path.exists() or path.stat().st_size < max_bytes:
@@ -2695,23 +3200,10 @@ def native_resume_command(
     *, codex: str, session_id: str, repo: Path, terminal_receipts: Sequence[str] | None = None,
     next_action: str | None = None,
 ) -> list[str]:
-    prompt = (
-        "Adaptive Agent Runtime Web Stop checkpoint. Continue this existing registered controller "
-        "thread only; do not create or fork another controller. Reconcile any pending lifecycle "
-        "control event against the real main, ledger, live tasks, READY queue and candidates. "
-        "Even when pending_control_event is false, perform one project-wide Goal rollover check: "
-        "if the just-closed Goal has completed and the project still has executable open work, "
-        "recompute readiness and roll to the next Goal before yielding; if everything is blocked, "
-        "require the project-wide blocking proof. Obey the installed lifecycle hooks and "
-        "control_event_guard; if no pending control action or Goal rollover remains, stop without "
-        "starting unrelated work."
+    prompt = native_resume_prompt(
+        terminal_receipts=terminal_receipts,
+        next_action=next_action,
     )
-    receipts = [str(item).strip() for item in (terminal_receipts or []) if str(item).strip()]
-    if receipts:
-        prompt += " Pending terminal receipts: " + "; ".join(receipts) + ". Read these durable results first and continue from them."
-    pending_next_action = str(next_action or "").strip()
-    if pending_next_action:
-        prompt += " Persisted non-user next action: " + pending_next_action + ". Complete it before yielding."
     return [codex, "exec", "--json", "-C", str(repo.resolve()), "resume", session_id, prompt]
 
 
@@ -2842,6 +3334,19 @@ def execute_native_resume(
     completion_grace_seconds: float = NATIVE_RESUME_COMPLETION_GRACE_SECONDS,
 ) -> dict[str, Any]:
     """Run one bounded, preflighted same-thread native resume attempt."""
+    if codex is None:
+        return execute_desktop_host_resume(
+            session_id=session_id,
+            repo=repo,
+            registry=registry,
+            terminal_receipts=terminal_receipts,
+            next_action=next_action,
+            supervisor_state_path=supervisor_state_path,
+            supervisor_receipt_id=supervisor_receipt_id,
+            supervisor_token=supervisor_token,
+            runtime_path=runtime_path,
+            max_runtime_seconds=max_runtime_seconds,
+        )
     if (
         supervisor_state_path is not None
         and supervisor_receipt_id is not None
@@ -5214,11 +5719,7 @@ def schedule_guarded_rule_wake(
         )
     except (OSError, ValueError, PermissionError, RuntimeError) as exc:
         return {"schedule": "blocked", "reason": str(exc)}
-    resolved_codex = (
-        resolve_desktop_codex_executable(codex)
-        if target.get("host") == "desktop_codex"
-        else None
-    )
+    resolved_codex = codex if target.get("host") == "desktop_codex" else None
     schedule = maybe_schedule_rule_wake(
         lifecycle_state=lifecycle_state,
         session_id=session_id,
@@ -5236,7 +5737,13 @@ def schedule_guarded_rule_wake(
         "execution_target_session_id": target.get("execution_target_session_id"),
         "target_generation": target.get("generation"),
         "ownership_generation": target.get("ownership_generation"),
-        "codex_executable": resolved_codex,
+        **(
+            {"codex_executable": resolved_codex, "desktop_resume_transport": "legacy_standalone_cli"}
+            if resolved_codex
+            else {"desktop_resume_transport": "codex_app_server_stdio"}
+            if target.get("host") == "desktop_codex"
+            else {"codex_executable": None}
+        ),
     }
 
 
@@ -7393,15 +7900,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
             print(f"Controller target guard rejected native-stop: {exc}", file=sys.stderr)
             return 78
-        try:
-            codex = resolve_desktop_codex_executable(args.codex)
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            return 78
-        command = native_resume_command(
-            codex=codex,
-            session_id=str(target_receipt["execution_target_session_id"]),
-            repo=repo,
+        codex = args.codex
+        command = (
+            native_resume_command(
+                codex=resolve_desktop_codex_executable(codex),
+                session_id=str(target_receipt["execution_target_session_id"]),
+                repo=repo,
+            )
+            if codex
+            else [
+                "codex app-server thread/resume + turn/start",
+                str(target_receipt["execution_target_session_id"]),
+            ]
         )
         if args.dry_run:
             print(json.dumps(command, ensure_ascii=False))

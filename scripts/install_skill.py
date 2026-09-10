@@ -350,7 +350,23 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_desktop_codex_resolution_rejects_an_invalid_explicit_override",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
-    "test_rule_wake_resolves_desktop_runtime_only_for_desktop_target",
+    "test_rule_wake_uses_desktop_host_adapter_without_resolving_cli",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_codex_app_server_turn_uses_official_protocol_and_waits_for_completion",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_codex_app_server_active_writer_fails_before_turn_submit",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_codex_app_server_turn_start_response_timeout_is_result_unknown",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_codex_app_server_eof_after_turn_start_confirmation_is_result_unknown",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_desktop_host_resume_uses_app_server_under_target_and_ownership_fence",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_desktop_host_resume_missing_app_server_fails_closed_without_cli_fallback",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_desktop_host_resume_web_ownership_never_starts_app_server",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_execute_native_resume_without_explicit_cli_uses_desktop_host_adapter",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_rule_wake_does_not_require_desktop_runtime_for_web_target",
     "tests.test_web_lifecycle_bridge.WebAutoStopSupervisorCoalescingTests."

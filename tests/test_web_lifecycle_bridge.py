@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+from contextlib import contextmanager
 import importlib.util
 import json
 import os
@@ -2989,7 +2990,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
                     environ={},
                 )
 
-    def test_rule_wake_resolves_desktop_runtime_only_for_desktop_target(self) -> None:
+    def test_rule_wake_uses_desktop_host_adapter_without_resolving_cli(self) -> None:
         from unittest.mock import patch
 
         lifecycle = {
@@ -3009,7 +3010,6 @@ class WebLifecycleAuditTests(unittest.TestCase):
         ), patch.object(
             web_bridge,
             "resolve_desktop_codex_executable",
-            return_value="/Applications/ChatGPT.app/Contents/Resources/codex",
         ) as resolve, patch.object(
             web_bridge, "maybe_schedule_rule_wake", return_value="scheduled"
         ) as schedule:
@@ -3023,15 +3023,318 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 state_path=Path(tmp) / "state.json",
             )
 
-        resolve.assert_called_once_with(None)
-        self.assertEqual(
-            schedule.call_args.kwargs["codex"],
-            "/Applications/ChatGPT.app/Contents/Resources/codex",
-        )
-        self.assertEqual(
-            result["codex_executable"],
-            "/Applications/ChatGPT.app/Contents/Resources/codex",
-        )
+        resolve.assert_not_called()
+        self.assertIsNone(schedule.call_args.kwargs["codex"])
+        self.assertEqual(result["desktop_resume_transport"], "codex_app_server_stdio")
+        self.assertNotIn("codex_executable", result)
+
+    def test_codex_app_server_turn_uses_official_protocol_and_waits_for_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_codex = root / "fake-codex"
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "for line in sys.stdin:\n"
+                "    message = json.loads(line)\n"
+                "    method = message.get('method')\n"
+                "    if method == 'initialize':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':{}}), flush=True)\n"
+                "    elif method == 'thread/resume':\n"
+                "        thread_id = message['params']['threadId']\n"
+                "        result = {'thread': {'id':thread_id,'status':{'type':'idle'},'canAcceptDirectInput':True}}\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':result}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        thread_id = message['params']['threadId']\n"
+                "        turn = {'id':'turn-1','status':'inProgress','items':[]}\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':{'turn':turn}}), flush=True)\n"
+                "        done = {'jsonrpc':'2.0','method':'turn/completed','params':{'threadId':thread_id,'turn':{'id':'turn-1','status':'completed','items':[]}}}\n"
+                "        print(json.dumps(done), flush=True)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o700)
+            fence_calls = []
+
+            @contextmanager
+            def submit_fence():
+                fence_calls.append("entered")
+                yield {"generation": 4, "ownership_generation": 7}
+
+            result = web_bridge.execute_codex_app_server_turn(
+                codex=str(fake_codex),
+                execution_target="desktop-current",
+                repo=root,
+                prompt="continue current Goal",
+                submit_fence=submit_fence,
+                env=dict(os.environ),
+                max_runtime_seconds=5,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["turn_id"], "turn-1")
+        self.assertEqual(fence_calls, ["entered"])
+
+    def test_codex_app_server_active_writer_fails_before_turn_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "turn-started"
+            fake_codex = root / "fake-codex"
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                f"marker = pathlib.Path({str(marker)!r})\n"
+                "for line in sys.stdin:\n"
+                "    message = json.loads(line)\n"
+                "    method = message.get('method')\n"
+                "    if method == 'initialize':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':{}}), flush=True)\n"
+                "    elif method == 'thread/resume':\n"
+                "        error = {'code':-32603,'message':'thread-store conflict: thread desktop-current already has an active writer'}\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':message['id'],'error':error}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        marker.write_text('unexpected')\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o700)
+
+            @contextmanager
+            def submit_fence():
+                yield {"generation": 4, "ownership_generation": 7}
+
+            with self.assertRaises(web_bridge.CodexAppServerActiveWriter):
+                web_bridge.execute_codex_app_server_turn(
+                    codex=str(fake_codex),
+                    execution_target="desktop-current",
+                    repo=root,
+                    prompt="continue current Goal",
+                    submit_fence=submit_fence,
+                    env=dict(os.environ),
+                    max_runtime_seconds=5,
+                )
+
+        self.assertFalse(marker.exists())
+
+    def test_codex_app_server_turn_start_response_timeout_is_result_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_codex = root / "fake-codex"
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys, time\n"
+                "for line in sys.stdin:\n"
+                "    message = json.loads(line)\n"
+                "    method = message.get('method')\n"
+                "    if method == 'initialize':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':{}}), flush=True)\n"
+                "    elif method == 'thread/resume':\n"
+                "        thread_id = message['params']['threadId']\n"
+                "        result = {'thread': {'id':thread_id,'status':{'type':'idle'},'canAcceptDirectInput':True}}\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':result}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        time.sleep(5)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o700)
+
+            @contextmanager
+            def submit_fence():
+                yield {"generation": 4, "ownership_generation": 7}
+
+            with self.assertRaisesRegex(
+                web_bridge.CodexAppServerError, "result is unknown after submit"
+            ):
+                web_bridge.execute_codex_app_server_turn(
+                    codex=str(fake_codex),
+                    execution_target="desktop-current",
+                    repo=root,
+                    prompt="continue current Goal",
+                    submit_fence=submit_fence,
+                    env=dict(os.environ),
+                    max_runtime_seconds=5,
+                    request_timeout_seconds=1.0,
+                )
+
+    def test_codex_app_server_eof_after_turn_start_confirmation_is_result_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_codex = root / "fake-codex"
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "for line in sys.stdin:\n"
+                "    message = json.loads(line)\n"
+                "    method = message.get('method')\n"
+                "    if method == 'initialize':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':{}}), flush=True)\n"
+                "    elif method == 'thread/resume':\n"
+                "        thread_id = message['params']['threadId']\n"
+                "        result = {'thread': {'id':thread_id,'status':{'type':'idle'},'canAcceptDirectInput':True}}\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':result}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        turn = {'id':'turn-1','status':'inProgress','items':[]}\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':{'turn':turn}}), flush=True)\n"
+                "        raise SystemExit(0)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o700)
+
+            @contextmanager
+            def submit_fence():
+                yield {"generation": 4, "ownership_generation": 7}
+
+            with self.assertRaisesRegex(
+                web_bridge.CodexAppServerError, "result is unknown after submit"
+            ):
+                web_bridge.execute_codex_app_server_turn(
+                    codex=str(fake_codex),
+                    execution_target="desktop-current",
+                    repo=root,
+                    prompt="continue current Goal",
+                    submit_fence=submit_fence,
+                    env=dict(os.environ),
+                    max_runtime_seconds=5,
+                )
+
+    def test_desktop_host_resume_uses_app_server_under_target_and_ownership_fence(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                }},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current", "generation": 7,
+                }},
+            }), encoding="utf-8")
+            def execute_app_server(**kwargs):
+                with kwargs["submit_fence"]() as receipt:
+                    self.assertEqual(receipt["execution_target_session_id"], "desktop-current")
+                    self.assertEqual(receipt["generation"], 4)
+                    self.assertEqual(receipt["ownership_generation"], 7)
+                return {"status": "completed", "turn_id": "turn-1", "command": ["codex", "app-server"]}
+
+            with patch.object(
+                web_bridge,
+                "resolve_desktop_codex_executable",
+                return_value="/Applications/ChatGPT.app/Contents/Resources/codex",
+            ) as resolve_cli, patch.object(
+                web_bridge,
+                "execute_codex_app_server_turn",
+                side_effect=execute_app_server,
+            ) as execute:
+                attempt = web_bridge.execute_desktop_host_resume(
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    terminal_receipts=["terminal.json"],
+                    next_action="continue current Goal",
+                )
+
+            self.assertEqual(attempt["result"], "CONFIRMED")
+            self.assertEqual(attempt["operation"], "desktop_host_reentry")
+            self.assertEqual(attempt["execution_target_session_id"], "desktop-current")
+            self.assertEqual(attempt["target_generation"], 4)
+            self.assertEqual(attempt["ownership_generation"], 7)
+            self.assertEqual(execute.call_args.kwargs["execution_target"], "desktop-current")
+            self.assertIn("terminal.json", execute.call_args.kwargs["prompt"])
+            self.assertIn("continue current Goal", execute.call_args.kwargs["prompt"])
+            self.assertEqual(attempt["host_transport"], "codex_app_server_stdio")
+            resolve_cli.assert_called_once_with(None)
+
+    def test_desktop_host_resume_missing_app_server_fails_closed_without_cli_fallback(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            registry = Path(tmp) / "registry.json"
+            with patch.object(
+                web_bridge,
+                "resolve_desktop_codex_executable",
+                side_effect=ValueError("Desktop Codex executable is unavailable"),
+            ), patch.object(web_bridge, "execute_codex_app_server_turn") as execute:
+                attempt = web_bridge.execute_desktop_host_resume(
+                    session_id="controller-1", repo=repo, registry=registry,
+                )
+
+            self.assertEqual(attempt["result"], "FAILED")
+            self.assertEqual(attempt["error_code"], "DESKTOP_HOST_ADAPTER_UNAVAILABLE")
+            self.assertEqual(attempt["failure_class"], "desktop_host_adapter_unavailable")
+            execute.assert_not_called()
+
+    def test_desktop_host_resume_web_ownership_never_starts_app_server(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                    "web": ["web-current"],
+                }},
+                "__controller_targets__": {"controller-1": {
+                    "desktop_codex": {
+                        "status": "active", "session_id": "desktop-current", "generation": 4,
+                    },
+                    "web": {
+                        "status": "active", "session_id": "web-current", "generation": 5,
+                    },
+                }},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web",
+                    "execution_target_session_id": "web-current", "generation": 8,
+                }},
+            }), encoding="utf-8")
+            with patch.object(
+                web_bridge,
+                "resolve_desktop_codex_executable",
+                return_value="/Applications/ChatGPT.app/Contents/Resources/codex",
+            ), patch.object(web_bridge, "execute_codex_app_server_turn") as execute:
+                attempt = web_bridge.execute_desktop_host_resume(
+                    session_id="controller-1", repo=repo, registry=registry,
+                )
+
+            self.assertEqual(attempt["result"], "FAILED")
+            self.assertEqual(attempt["error_code"], "CONTROLLER_TARGET_REJECTED")
+            self.assertIn("ownership", attempt["stderr_tail"])
+            execute.assert_not_called()
+
+    def test_execute_native_resume_without_explicit_cli_uses_desktop_host_adapter(self) -> None:
+        from unittest.mock import patch
+
+        expected = {"operation": "desktop_host_reentry", "result": "CONFIRMED"}
+        with patch.object(
+            web_bridge, "execute_desktop_host_resume", return_value=expected
+        ) as resume, patch.object(web_bridge.subprocess, "Popen") as popen:
+            result = web_bridge.execute_native_resume(
+                session_id="controller-1",
+                repo=Path("/tmp/repo"),
+                registry=Path("/tmp/registry.json"),
+                codex=None,
+                terminal_receipts=["terminal.json"],
+                next_action="continue",
+            )
+
+        self.assertIs(result, expected)
+        self.assertEqual(resume.call_args.kwargs["session_id"], "controller-1")
+        self.assertEqual(resume.call_args.kwargs["terminal_receipts"], ["terminal.json"])
+        popen.assert_not_called()
 
     def test_rule_wake_does_not_require_desktop_runtime_for_web_target(self) -> None:
         from unittest.mock import patch
