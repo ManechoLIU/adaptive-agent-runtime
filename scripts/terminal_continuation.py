@@ -337,6 +337,7 @@ def reconcile_pending_terminal_receipts(
                                     "exit_code": receipt.get("exit_code"),
                                     "summary": str(receipt.get("summary") or "")[:4000],
                                     "result_path": str(receipt.get("result_path") or "").strip() or None,
+                                    "review_status": str(receipt.get("review_status") or "").strip() or None,
                                     "review_verdict": receipt.get("review_verdict") if isinstance(receipt.get("review_verdict"), dict) else None,
                                     "verification_state": verification_state,
                                     "verification_error": verification_error,

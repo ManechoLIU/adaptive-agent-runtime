@@ -55,6 +55,12 @@ IMPACTS = {"none", "live_assignments"}
 RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_assignment_runtime.ExternalFailureEvidencePersistenceTests."
     "test_terminal_persists_external_failure_class_retry_safety_and_details",
+    "tests.test_assignment_runtime.ReviewerRuntimeContractTests."
+    "test_reviewer_terminal_persists_structured_review_status",
+    "tests.test_assignment_runtime.ReviewerRuntimeContractTests."
+    "test_reviewer_terminal_rejects_review_status_that_conflicts_with_delivery",
+    "tests.test_assignment_runtime.ReviewerRuntimeContractTests."
+    "test_reviewer_infra_status_requires_unresolved_delivery_and_no_verdict",
     "tests.test_reviewer_supervisor.ReviewerSupervisorRoutingTests."
     "test_web_controller_review_does_not_launch_codex_directly",
     "tests.test_reviewer_supervisor.ReviewerSupervisorWebHandoffTests."
@@ -662,6 +668,16 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok prompt preparation cleans a temp directory when prompt write fails",
     "Grok prompt write plus cleanup failure is fail closed",
     "cleanup failure preserves prior Grok provider exit evidence",
+    "Grok pure-packet Reviewer uses no tools, no planning, structured verdict, and sufficient turn budget",
+    "Grok Reviewer structured PASS and FAIL are validated independently from process exit",
+    "Grok Reviewer max turns without verdict is REVIEW_MAX_TURNS, never PASS",
+    "Grok Reviewer timeout with residual process group is REVIEW_PROCESS_STUCK",
+    "Grok work_type=review accepts only structured PASS into canonical acceptance",
+    "Grok work_type=review valid FAIL is terminal findings and is never retried into PASS",
+    "Grok work_type=review malformed verdict persists REVIEW_OUTPUT_INVALID and no retry",
+    "Grok Reviewer stall after stdout closes reaps TERM-resistant relay descendants",
+    "ordinary Grok parent SIGTERM also performs bounded process-group cleanup",
+    "Grok work_type=review retries transient pre-output failure only once then accepts PASS",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_runtime_supervisor.py",

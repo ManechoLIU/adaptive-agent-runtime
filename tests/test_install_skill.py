@@ -1000,6 +1000,16 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok payload or data wrappers cannot spoof ACP model progress', () => { assert.equal(1, 1); });\n"
                 "test('Grok prompt preparation cleans a temp directory when prompt write fails', () => { assert.equal(1, 1); });\n"
                 "test('Grok prompt write plus cleanup failure is fail closed', () => { assert.equal(1, 1); });\n"
+                "test('Grok pure-packet Reviewer uses no tools, no planning, structured verdict, and sufficient turn budget', () => { assert.equal(1, 1); });\n"
+                "test('Grok Reviewer structured PASS and FAIL are validated independently from process exit', () => { assert.equal(1, 1); });\n"
+                "test('Grok Reviewer max turns without verdict is REVIEW_MAX_TURNS, never PASS', () => { assert.equal(1, 1); });\n"
+                "test('Grok Reviewer timeout with residual process group is REVIEW_PROCESS_STUCK', () => { assert.equal(1, 1); });\n"
+                "test('Grok work_type=review accepts only structured PASS into canonical acceptance', () => { assert.equal(1, 1); });\n"
+                "test('Grok work_type=review valid FAIL is terminal findings and is never retried into PASS', () => { assert.equal(1, 1); });\n"
+                "test('Grok work_type=review malformed verdict persists REVIEW_OUTPUT_INVALID and no retry', () => { assert.equal(1, 1); });\n"
+                "test('Grok Reviewer stall after stdout closes reaps TERM-resistant relay descendants', () => { assert.equal(1, 1); });\n"
+                "test('ordinary Grok parent SIGTERM also performs bounded process-group cleanup', () => { assert.equal(1, 1); });\n"
+                "test('Grok work_type=review retries transient pre-output failure only once then accepts PASS', () => { assert.equal(1, 1); });\n"
                 "test('cleanup failure preserves prior Grok provider exit evidence', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
@@ -1007,7 +1017,11 @@ class InstallMigrationContractTests(unittest.TestCase):
             (tests_dir / "test_assignment_runtime.py").write_text(
                 "import unittest\n"
                 "class ExternalFailureEvidencePersistenceTests(unittest.TestCase):\n"
-                "    def test_terminal_persists_external_failure_class_retry_safety_and_details(self): self.assertTrue(True)\n",
+                "    def test_terminal_persists_external_failure_class_retry_safety_and_details(self): self.assertTrue(True)\n"
+                "class ReviewerRuntimeContractTests(unittest.TestCase):\n"
+                "    def test_reviewer_terminal_persists_structured_review_status(self): self.assertTrue(True)\n"
+                "    def test_reviewer_terminal_rejects_review_status_that_conflicts_with_delivery(self): self.assertTrue(True)\n"
+                "    def test_reviewer_infra_status_requires_unresolved_delivery_and_no_verdict(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_reviewer_supervisor.py").write_text(
@@ -1471,6 +1485,16 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok payload or data wrappers cannot spoof ACP model progress', () => { assert.equal(1, 1); });\n"
                 "test('Grok prompt preparation cleans a temp directory when prompt write fails', () => { assert.equal(1, 1); });\n"
                 "test('Grok prompt write plus cleanup failure is fail closed', () => { assert.equal(1, 1); });\n"
+                "test('Grok pure-packet Reviewer uses no tools, no planning, structured verdict, and sufficient turn budget', () => { assert.equal(1, 1); });\n"
+                "test('Grok Reviewer structured PASS and FAIL are validated independently from process exit', () => { assert.equal(1, 1); });\n"
+                "test('Grok Reviewer max turns without verdict is REVIEW_MAX_TURNS, never PASS', () => { assert.equal(1, 1); });\n"
+                "test('Grok Reviewer timeout with residual process group is REVIEW_PROCESS_STUCK', () => { assert.equal(1, 1); });\n"
+                "test('Grok work_type=review accepts only structured PASS into canonical acceptance', () => { assert.equal(1, 1); });\n"
+                "test('Grok work_type=review valid FAIL is terminal findings and is never retried into PASS', () => { assert.equal(1, 1); });\n"
+                "test('Grok work_type=review malformed verdict persists REVIEW_OUTPUT_INVALID and no retry', () => { assert.equal(1, 1); });\n"
+                "test('Grok Reviewer stall after stdout closes reaps TERM-resistant relay descendants', () => { assert.equal(1, 1); });\n"
+                "test('ordinary Grok parent SIGTERM also performs bounded process-group cleanup', () => { assert.equal(1, 1); });\n"
+                "test('Grok work_type=review retries transient pre-output failure only once then accepts PASS', () => { assert.equal(1, 1); });\n"
                 "test('cleanup failure preserves prior Grok provider exit evidence', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
@@ -1478,7 +1502,11 @@ class InstallMigrationContractTests(unittest.TestCase):
             (tests_dir / "test_assignment_runtime.py").write_text(
                 "import unittest\n"
                 "class ExternalFailureEvidencePersistenceTests(unittest.TestCase):\n"
-                "    def test_terminal_persists_external_failure_class_retry_safety_and_details(self): self.assertTrue(True)\n",
+                "    def test_terminal_persists_external_failure_class_retry_safety_and_details(self): self.assertTrue(True)\n"
+                "class ReviewerRuntimeContractTests(unittest.TestCase):\n"
+                "    def test_reviewer_terminal_persists_structured_review_status(self): self.assertTrue(True)\n"
+                "    def test_reviewer_terminal_rejects_review_status_that_conflicts_with_delivery(self): self.assertTrue(True)\n"
+                "    def test_reviewer_infra_status_requires_unresolved_delivery_and_no_verdict(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_reviewer_supervisor.py").write_text(

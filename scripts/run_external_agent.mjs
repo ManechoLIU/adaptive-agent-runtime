@@ -43,7 +43,40 @@ const DEFAULT_GROK_LAUNCH_TIMEOUT_MS = 10_000;
 const DEFAULT_GROK_FIRST_OUTPUT_TIMEOUT_MS = 90_000;
 const DEFAULT_GROK_STALL_TIMEOUT_MS = 180_000;
 const DEFAULT_EXTERNAL_ATTEMPT_TIMEOUT_MS = 600_000;
+const DEFAULT_GROK_REVIEW_ATTEMPT_TIMEOUT_MS = 90_000;
 const DEFAULT_EXTERNAL_KILL_GRACE_MS = 5_000;
+const GROK_REVIEW_MAX_TURNS = 2;
+const GROK_REVIEW_SYSTEM_PROMPT = [
+  "You are an independent pure-packet code Reviewer.",
+  "The user prompt is the complete source packet and the only review source.",
+  "Do not read or inspect the repository, do not call tools, do not browse, and do not enter planning mode.",
+  "Your first valid model response must be the final structured verdict; do not preface it with planning or narration.",
+  "PASS is allowed if and only if critical=0 and important=0. Otherwise verdict must be FAIL.",
+].join(" ");
+const GROK_REVIEW_JSON_SCHEMA = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  required: ["reviewed_head", "critical", "important", "minor", "findings", "verdict"],
+  properties: {
+    reviewed_head: { type: "string", minLength: 1 },
+    critical: { type: "integer", minimum: 0 },
+    important: { type: "integer", minimum: 0 },
+    minor: { type: "array", items: { type: "string", minLength: 1 } },
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["severity", "message"],
+        properties: {
+          severity: { type: "string", enum: ["critical", "important"] },
+          message: { type: "string", minLength: 1 },
+        },
+      },
+    },
+    verdict: { type: "string", enum: ["PASS", "FAIL"] },
+  },
+});
 const GROK_MODEL_PROGRESS_SESSION_UPDATES = new Set([
   "agent_message_chunk",
   "agent_thought_chunk",
@@ -52,13 +85,14 @@ const GROK_MODEL_PROGRESS_SESSION_UPDATES = new Set([
 ]);
 
 class ExternalAgentExecutionError extends Error {
-  constructor(message, { failureClass = "transport_error", retrySafe = true, resultUnknown = false, details = {} } = {}) {
+  constructor(message, { failureClass = "transport_error", retrySafe = true, resultUnknown = false, details = {}, reviewStatus = null } = {}) {
     super(message);
     this.name = "ExternalAgentExecutionError";
     this.failureClass = failureClass;
     this.retrySafe = Boolean(retrySafe);
     this.resultUnknown = Boolean(resultUnknown);
     this.details = details && typeof details === "object" && !Array.isArray(details) ? details : {};
+    this.reviewStatus = reviewStatus ? String(reviewStatus) : null;
   }
 }
 
@@ -123,6 +157,15 @@ function externalAttemptTimeoutMs(progressDeadlineMinutes) {
 function externalKillGraceMs() {
   return boundedEnvInteger("AD_EXTERNAL_KILL_GRACE_MS", DEFAULT_EXTERNAL_KILL_GRACE_MS, { min: 10, max: 60_000 });
 }
+function grokReviewAttemptTimeoutMs(progressDeadlineMinutes) {
+  const outerBound = externalAttemptTimeoutMs(progressDeadlineMinutes);
+  const fallback = Math.min(DEFAULT_GROK_REVIEW_ATTEMPT_TIMEOUT_MS, outerBound);
+  const configured = boundedEnvInteger(
+    "AD_GROK_REVIEW_ATTEMPT_TIMEOUT_MS", fallback, { min: 10, max: 10 * 60 * 1000 },
+  );
+  return Math.min(configured, outerBound);
+}
+
 
 function meaningfulStreamValue(value) {
   if (value === null || value === undefined) return false;
@@ -1056,7 +1099,7 @@ function atomicWriteJson(pathname, payload) {
 
 function persistExternalTerminalReceipt(options, {
   exitCode, summary, deliveryOutcome = "unresolved", failureClass = null, retryClass = null,
-  retrySafe = null, resultUnknown = null, failureDetails = null,
+  retrySafe = null, resultUnknown = null, failureDetails = null, reviewStatus = null, reviewVerdict = null,
 }) {
   if (!options.terminalReceipt) return null;
   const target = atomicWriteJson(options.terminalReceipt, {
@@ -1085,6 +1128,8 @@ function persistExternalTerminalReceipt(options, {
     ...(typeof retrySafe === "boolean" ? { retry_safe: retrySafe } : {}),
     ...(typeof resultUnknown === "boolean" ? { result_unknown: resultUnknown } : {}),
     ...(failureDetails && typeof failureDetails === "object" && !Array.isArray(failureDetails) ? { failure_details: failureDetails } : {}),
+    ...(reviewStatus ? { review_status: reviewStatus } : {}),
+    ...(reviewVerdict && typeof reviewVerdict === "object" && !Array.isArray(reviewVerdict) ? { review_verdict: reviewVerdict } : {}),
     completed_at: new Date().toISOString(),
   });
   const helper = process.env.AD_TERMINAL_CONTINUATION_HELPER || fileURLToPath(new URL("./terminal_continuation.py", import.meta.url));
@@ -1205,6 +1250,169 @@ function kimiApiBaseUrl() {
   return "https://api.moonshot.ai/v1";
 }
 
+export function buildGrokReviewArgs(model, promptFile, reasoningEffort) {
+  return [
+    "--no-auto-update",
+    "--no-subagents",
+    "--no-memory",
+    "--sandbox", "workspace",
+    "--no-plan",
+    "--disable-web-search",
+    "--tools", "",
+    "-m", model,
+    "--prompt-file", promptFile,
+    "--json-schema", JSON.stringify(GROK_REVIEW_JSON_SCHEMA),
+    "--max-turns", String(GROK_REVIEW_MAX_TURNS),
+    "--system-prompt-override", GROK_REVIEW_SYSTEM_PROMPT,
+    "--verbatim",
+    "--reasoning-effort", reasoningEffort,
+  ];
+}
+
+function reviewOutputError(message, details = {}) {
+  return new ExternalAgentExecutionError(`review_output_invalid: ${message}`, {
+    failureClass: "review_output_invalid",
+    retrySafe: false,
+    resultUnknown: false,
+    reviewStatus: "REVIEW_OUTPUT_INVALID",
+    details,
+  });
+}
+
+export function validateGrokReviewResult(value, { candidateRevision = null } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw reviewOutputError("review verdict must be one JSON object");
+  }
+  const expectedKeys = ["critical", "findings", "important", "minor", "reviewed_head", "verdict"].sort();
+  if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(expectedKeys)) {
+    throw reviewOutputError("review verdict keys are invalid");
+  }
+  const reviewedHead = String(value.reviewed_head || "").trim();
+  if (!reviewedHead) throw reviewOutputError("reviewed_head is required");
+  const expectedHead = String(candidateRevision || "").trim();
+  if (expectedHead && reviewedHead !== expectedHead) {
+    throw reviewOutputError("reviewed_head must equal immutable candidate_revision", { reviewed_head: reviewedHead, candidate_revision: expectedHead });
+  }
+  for (const key of ["critical", "important"]) {
+    if (!Number.isSafeInteger(value[key]) || value[key] < 0) {
+      throw reviewOutputError(`${key} must be a non-negative integer`);
+    }
+  }
+  if (!Array.isArray(value.minor) || !value.minor.every((item) => typeof item === "string" && item.trim())) {
+    throw reviewOutputError("minor must be an array of non-empty strings");
+  }
+  if (!Array.isArray(value.findings)) throw reviewOutputError("findings must be an array");
+  const critical = [];
+  const important = [];
+  for (const finding of value.findings) {
+    if (!finding || typeof finding !== "object" || Array.isArray(finding)) {
+      throw reviewOutputError("each finding must be an object");
+    }
+    if (JSON.stringify(Object.keys(finding).sort()) !== JSON.stringify(["message", "severity"])) {
+      throw reviewOutputError("finding keys are invalid");
+    }
+    const severity = String(finding.severity || "").trim().toLowerCase();
+    const message = String(finding.message || "").trim();
+    if (!message || !new Set(["critical", "important"]).has(severity)) {
+      throw reviewOutputError("finding requires severity critical|important and non-empty message");
+    }
+    (severity === "critical" ? critical : important).push(message);
+  }
+  if (critical.length !== value.critical || important.length !== value.important) {
+    throw reviewOutputError("critical/important counts must match findings");
+  }
+  if (!new Set(["PASS", "FAIL"]).has(value.verdict)) {
+    throw reviewOutputError("verdict must be PASS or FAIL");
+  }
+  const shouldPass = value.critical === 0 && value.important === 0;
+  if ((value.verdict === "PASS") !== shouldPass) {
+    throw reviewOutputError("PASS iff critical=0 and important=0");
+  }
+  const reviewStatus = shouldPass ? "REVIEW_PASS" : "REVIEW_FAIL";
+  return {
+    reviewStatus,
+    deliveryOutcome: shouldPass ? "pass" : "fail",
+    retrySafe: false,
+    rawVerdict: {
+      reviewed_head: reviewedHead,
+      critical: value.critical,
+      important: value.important,
+      minor: value.minor.map((item) => item.trim()),
+      findings: value.findings.map((item) => ({ severity: item.severity, message: item.message.trim() })),
+      verdict: value.verdict,
+    },
+    reviewVerdict: {
+      reviewed_head: reviewedHead,
+      verdict: shouldPass ? "PASS" : "FINDINGS",
+      critical,
+      important,
+      minor: value.minor.map((item) => item.trim()),
+    },
+  };
+}
+
+export function parseGrokReviewOutput(stdout, { candidateRevision = null } = {}) {
+  const text = String(stdout || "").trim();
+  if (!text) {
+    throw new ExternalAgentExecutionError("review_no_verdict: Reviewer produced no verdict", {
+      failureClass: "review_no_verdict", retrySafe: false, reviewStatus: "REVIEW_NO_VERDICT",
+    });
+  }
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw reviewOutputError(`malformed JSON verdict: ${error.message}`);
+  }
+  return validateGrokReviewResult(value, { candidateRevision });
+}
+
+export function classifyGrokReviewTerminal({
+  exitCode = null, stdout = "", stderr = "", timedOut = false, cleanupConfirmed = true,
+  candidateRevision = null, hadModelOutput = null,
+} = {}) {
+  const stdoutText = String(stdout || "");
+  const stderrText = String(stderr || "");
+  const observedModelOutput = typeof hadModelOutput === "boolean" ? hadModelOutput : Boolean(stdoutText.trim());
+  if (!cleanupConfirmed) {
+    return { reviewStatus: "REVIEW_PROCESS_STUCK", deliveryOutcome: "unresolved", retrySafe: false, hadModelOutput: observedModelOutput };
+  }
+  if (timedOut) {
+    return { reviewStatus: "REVIEW_TIMEOUT", deliveryOutcome: "unresolved", retrySafe: !observedModelOutput, hadModelOutput: observedModelOutput };
+  }
+  if (/max\s+turns\s+reached/i.test(`${stdoutText}\n${stderrText}`)) {
+    return { reviewStatus: "REVIEW_MAX_TURNS", deliveryOutcome: "unresolved", retrySafe: false, hadModelOutput: observedModelOutput };
+  }
+  if (exitCode !== 0) {
+    const transient = !observedModelOutput && /(relay|websocket|transport|disconnect|connection|startup|spawn|temporar|unavailable)/i.test(stderrText);
+    return { reviewStatus: "REVIEW_PROVIDER_ERROR", deliveryOutcome: "unresolved", retrySafe: transient, hadModelOutput: observedModelOutput };
+  }
+  if (!stdoutText.trim()) {
+    return { reviewStatus: "REVIEW_NO_VERDICT", deliveryOutcome: "unresolved", retrySafe: false, hadModelOutput: false };
+  }
+  try {
+    return { ...parseGrokReviewOutput(stdoutText, { candidateRevision }), hadModelOutput: true };
+  } catch (error) {
+    if (error?.reviewStatus === "REVIEW_NO_VERDICT") {
+      return { reviewStatus: "REVIEW_NO_VERDICT", deliveryOutcome: "unresolved", retrySafe: false, hadModelOutput: observedModelOutput };
+    }
+    return { reviewStatus: "REVIEW_OUTPUT_INVALID", deliveryOutcome: "unresolved", retrySafe: false, hadModelOutput: observedModelOutput, validationError: String(error?.message || error) };
+  }
+}
+
+export function grokReviewRetryDecision(terminal, { attempt = 1 } = {}) {
+  const status = String(terminal?.reviewStatus || "");
+  if (attempt >= 2) return { retry: false, reason: "retry_budget_exhausted" };
+  if (new Set(["REVIEW_FAIL", "REVIEW_MAX_TURNS", "REVIEW_OUTPUT_INVALID", "REVIEW_PROCESS_STUCK", "REVIEW_NO_VERDICT", "REVIEW_PASS"]).has(status)) {
+    return { retry: false, reason: "terminal_review_outcome" };
+  }
+  if (terminal?.hadModelOutput) return { retry: false, reason: "model_output_observed" };
+  if (terminal?.retrySafe === true && new Set(["REVIEW_TIMEOUT", "REVIEW_PROVIDER_ERROR"]).has(status)) {
+    return { retry: true, reason: "transient_before_model_output" };
+  }
+  return { retry: false, reason: "not_retry_safe" };
+}
+
 function commonGrokArgs(model, promptFile, reasoningEffort) {
   return [
     "--no-auto-update", "--no-subagents", "--no-memory", "--sandbox", "workspace",
@@ -1226,7 +1434,7 @@ function runAttached(executable, args, { cwd, env }) {
 
 export function runMonitoredGrok(executable, args, {
   cwd, env, progressDeadlineMinutes = null, onStructuredProgress = null,
-  terminateGroup = terminateProcessGroup, spawnChild = spawn,
+  terminateGroup = terminateProcessGroup, spawnChild = spawn, parentProcess = process,
 }) {
   const launchTimeoutMs = grokLaunchTimeoutMs();
   const absoluteTimeoutMs = externalAttemptTimeoutMs(progressDeadlineMinutes);
@@ -1253,11 +1461,17 @@ export function runMonitoredGrok(executable, args, {
     let stdoutBuffer = "";
     let terminating = false;
     let settled = false;
+    const parentSignalHandlers = [];
 
+    const removeParentSignalHandlers = () => {
+      for (const [signal, handler] of parentSignalHandlers) parentProcess.off(signal, handler);
+      parentSignalHandlers.length = 0;
+    };
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
       clearInterval(watchdog);
+      removeParentSignalHandlers();
       fn(value);
     };
 
@@ -1337,6 +1551,13 @@ export function runMonitoredGrok(executable, args, {
         void terminateFor("generation_stalled", `no structured Grok stdout progress within ${stallTimeoutMs}ms`);
       }
     }, watchdogIntervalMs);
+    for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+      const handler = () => {
+        void terminateFor("provider_timeout", `parent process received ${signal}; terminating Grok process group`);
+      };
+      parentSignalHandlers.push([signal, handler]);
+      parentProcess.once(signal, handler);
+    }
     child.once("error", (error) => {
       if (terminating || settled) return;
       finish(reject, new ExternalAgentExecutionError(`cli_launch_failed: ${error.message}`, { failureClass: "cli_launch_failed", retrySafe: true, details: { provider_started: launchConfirmed } }));
@@ -1373,6 +1594,174 @@ export function runMonitoredGrok(executable, args, {
         } else {
           finish(resolve, code ?? 1);
         }
+      })();
+    });
+  });
+}
+
+export function runMonitoredGrokReview(executable, args, {
+  cwd, env, progressDeadlineMinutes = null, candidateRevision = null,
+  terminateGroup = terminateProcessGroup, spawnChild = spawn, parentProcess = process,
+} = {}) {
+  const launchTimeoutMs = grokLaunchTimeoutMs();
+  const absoluteTimeoutMs = grokReviewAttemptTimeoutMs(progressDeadlineMinutes);
+  const firstOutputTimeoutMs = grokFirstOutputTimeoutMs();
+  const stallTimeoutMs = grokStallTimeoutMs();
+  const killGraceMs = externalKillGraceMs();
+  const maxCaptureBytes = 2 * 1024 * 1024;
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    let child = null;
+    let launchConfirmed = false;
+    let launchedAt = null;
+    let firstOutputAt = null;
+    let lastOutputAt = null;
+    let stdout = "";
+    let stderr = "";
+    let terminating = false;
+    let settled = false;
+    let watchdog = null;
+    const parentSignalHandlers = [];
+
+    const appendBounded = (current, chunk) => {
+      const next = current + chunk;
+      if (Buffer.byteLength(next, "utf8") <= maxCaptureBytes) return next;
+      return Buffer.from(next, "utf8").subarray(0, maxCaptureBytes).toString("utf8");
+    };
+    const removeSignalHandlers = () => {
+      for (const [signal, handler] of parentSignalHandlers) parentProcess.off(signal, handler);
+      parentSignalHandlers.length = 0;
+    };
+    const finish = (terminal) => {
+      if (settled) return;
+      settled = true;
+      if (watchdog) clearInterval(watchdog);
+      removeSignalHandlers();
+      resolve(terminal);
+    };
+    const classify = (extra = {}) => classifyGrokReviewTerminal({
+      exitCode: child?.exitCode ?? null,
+      stdout, stderr,
+      candidateRevision: extra.candidateRevision || candidateRevision || null,
+      hadModelOutput: firstOutputAt !== null,
+      ...extra,
+    });
+    const terminateForTimeout = async (reason, { parentSignal = null } = {}) => {
+      if (terminating || settled) return;
+      terminating = true;
+      if (watchdog) clearInterval(watchdog);
+      let cleanup = { confirmed: true, diagnostic: "provider process was not launched" };
+      if (child) cleanup = await terminateGroup(child, killGraceMs);
+      const terminal = classify({
+        timedOut: true,
+        cleanupConfirmed: cleanup.confirmed,
+      });
+      terminal.cleanupDiagnostic = cleanup.diagnostic;
+      terminal.timeoutReason = reason;
+      if (parentSignal) terminal.parentSignal = parentSignal;
+      finish(terminal);
+    };
+
+    try {
+      child = spawnChild(executable, args, {
+        cwd, env,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: process.platform !== "win32",
+      });
+    } catch (error) {
+      finish({
+        reviewStatus: "REVIEW_PROVIDER_ERROR", deliveryOutcome: "unresolved", retrySafe: true,
+        hadModelOutput: false, providerError: `cli_launch_failed: ${error.message}`,
+      });
+      return;
+    }
+
+    child.once("spawn", () => {
+      launchConfirmed = true;
+      launchedAt = Date.now();
+    });
+    child.stdout?.on("data", (chunk) => {
+      const text = chunk.toString("utf8");
+      process.stdout.write(chunk);
+      stdout = appendBounded(stdout, text);
+      if (text.trim()) {
+        const now = Date.now();
+        if (firstOutputAt === null) firstOutputAt = now;
+        lastOutputAt = now;
+      }
+    });
+    child.stderr?.on("data", (chunk) => {
+      process.stderr.write(chunk);
+      stderr = appendBounded(stderr, chunk.toString("utf8"));
+    });
+
+    const smallestDeadline = Math.max(10, Math.min(launchTimeoutMs, firstOutputTimeoutMs, stallTimeoutMs, absoluteTimeoutMs));
+    watchdog = setInterval(() => {
+      if (settled || terminating) return;
+      const now = Date.now();
+      if (!launchConfirmed && now - startedAt >= launchTimeoutMs) {
+        void terminateForTimeout(`review launch timeout after ${launchTimeoutMs}ms`);
+        return;
+      }
+      if (now - startedAt >= absoluteTimeoutMs) {
+        void terminateForTimeout(`review absolute timeout after ${absoluteTimeoutMs}ms`);
+        return;
+      }
+      if (launchConfirmed && firstOutputAt === null && now - (launchedAt ?? startedAt) >= firstOutputTimeoutMs) {
+        void terminateForTimeout(`review first-output timeout after ${firstOutputTimeoutMs}ms`);
+        return;
+      }
+      if (firstOutputAt !== null && lastOutputAt !== null && now - lastOutputAt >= stallTimeoutMs) {
+        void terminateForTimeout(`review output stalled after ${stallTimeoutMs}ms`);
+      }
+    }, Math.max(10, Math.min(250, Math.floor(smallestDeadline / 4))));
+
+    for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+      const handler = () => { void terminateForTimeout(`parent process received ${signal}`, { parentSignal: signal }); };
+      parentSignalHandlers.push([signal, handler]);
+      parentProcess.once(signal, handler);
+    }
+
+    child.once("error", async (error) => {
+      if (settled || terminating) return;
+      terminating = true;
+      if (watchdog) clearInterval(watchdog);
+      let cleanup = { confirmed: true, diagnostic: "provider process never became active" };
+      if (child?.pid) cleanup = await terminateGroup(child, killGraceMs);
+      if (!cleanup.confirmed) {
+        finish({ reviewStatus: "REVIEW_PROCESS_STUCK", deliveryOutcome: "unresolved", retrySafe: false, hadModelOutput: firstOutputAt !== null, cleanupDiagnostic: cleanup.diagnostic });
+        return;
+      }
+      finish({ reviewStatus: "REVIEW_PROVIDER_ERROR", deliveryOutcome: "unresolved", retrySafe: firstOutputAt === null, hadModelOutput: firstOutputAt !== null, providerError: `cli_launch_failed: ${error.message}`, cleanupDiagnostic: cleanup.diagnostic });
+    });
+
+    child.once("exit", (code, signal) => {
+      if (settled || terminating) return;
+      terminating = true;
+      if (watchdog) clearInterval(watchdog);
+      void (async () => {
+        let cleanup = { confirmed: true, diagnostic: "process group already gone" };
+        try {
+          const groupAlive = process.platform === "win32" ? false : processGroupExists(child.pid);
+          if (groupAlive) cleanup = await terminateGroup(child, killGraceMs);
+        } catch (error) {
+          cleanup = { confirmed: false, diagnostic: `terminal process-group probe failed: ${error.message}` };
+        }
+        if (!cleanup.confirmed) {
+          finish({ reviewStatus: "REVIEW_PROCESS_STUCK", deliveryOutcome: "unresolved", retrySafe: false, hadModelOutput: firstOutputAt !== null, cleanupDiagnostic: cleanup.diagnostic });
+          return;
+        }
+        const terminal = classifyGrokReviewTerminal({
+          exitCode: signal ? 1 : (code ?? 1),
+          stdout, stderr,
+          timedOut: false,
+          cleanupConfirmed: true,
+          candidateRevision,
+          hadModelOutput: firstOutputAt !== null,
+        });
+        terminal.cleanupDiagnostic = cleanup.diagnostic;
+        if (signal) terminal.providerSignal = signal;
+        finish(terminal);
       })();
     });
   });
@@ -1429,6 +1818,7 @@ async function loginExternalAgent({ cwd, engine, region, deviceAuth }) {
 async function executeExternalAgent({
   cwd, engine, model, reasoningEffort, authMode, sideEffect, idempotencyKey,
   assignmentRole = null, progressDeadlineMinutes = null, onStructuredProgress = null,
+  workType = null, candidateRevision = null, reviewPhase = null,
 }) {
   assertDirectory(cwd);
   const rawPrompt = await readStdin();
@@ -1436,6 +1826,15 @@ async function executeExternalAgent({
   const prompt = sideEffect && idempotencyKey
     ? `[Adaptive Agent Runtime side-effect contract] Any external side effect in this execution MUST use the exact idempotency key: ${idempotencyKey}. Do not perform the side effect without applying this key through the provider/API mechanism.\n\n${rawPrompt}`
     : rawPrompt;
+  const normalizedWorkType = String(workType || "").trim().toLowerCase();
+  const normalizedRole = String(assignmentRole || "").trim().toLowerCase();
+  const normalizedReviewPhase = String(reviewPhase || "").trim().toLowerCase();
+  const purePacketReview = engine === "grok-build" && normalizedWorkType === "review";
+  if (purePacketReview && (normalizedRole !== "reviewer" || !new Set(["full", "synthesis"]).has(normalizedReviewPhase))) {
+    throw new ExternalAgentExecutionError("review_policy_invalid: work_type=review requires reviewer role and full|synthesis review_phase", {
+      failureClass: "review_policy_invalid", retrySafe: false, reviewStatus: "REVIEW_OUTPUT_INVALID",
+    });
+  }
 
   const executable = resolveExecutable(routes[engine]);
   let args;
@@ -1487,7 +1886,9 @@ async function executeExternalAgent({
       cleanups.push({ label: "prompt_file", cleanup: grokPrompt.cleanup });
       const isolatedHome = mkdtempSync(path.join(tmpdir(), "adaptive-delivery-grok-api-"));
       cleanups.push({ label: "grok_home", cleanup: () => removeDirectoryConfirmed(isolatedHome) });
-      args = commonGrokArgs(model, grokPrompt.path, reasoningEffort);
+      args = purePacketReview
+        ? buildGrokReviewArgs(model, grokPrompt.path, reasoningEffort)
+        : commonGrokArgs(model, grokPrompt.path, reasoningEffort);
       env = { ...process.env, GROK_HOME: isolatedHome, XAI_API_KEY: apiKey };
     } else {
       if (!credentialState(engine, authMode).configured) {
@@ -1495,7 +1896,9 @@ async function executeExternalAgent({
       }
       const grokPrompt = prepareGrokPrompt(prompt, { assignmentRole });
       cleanups.push({ label: "prompt_file", cleanup: grokPrompt.cleanup });
-      args = commonGrokArgs(model, grokPrompt.path, reasoningEffort);
+      args = purePacketReview
+        ? buildGrokReviewArgs(model, grokPrompt.path, reasoningEffort)
+        : commonGrokArgs(model, grokPrompt.path, reasoningEffort);
       env = sanitizedEnvironment([], ["XAI_API_KEY"]);
     }
 
@@ -1503,6 +1906,24 @@ async function executeExternalAgent({
       env.ADAPTIVE_AGENT_IDEMPOTENCY_KEY = idempotencyKey;
     }
     if (engine === "grok-build") {
+      if (purePacketReview) {
+        let reviewTerminal = null;
+        let reviewAttempt = 1;
+        while (reviewAttempt <= 2) {
+          reviewTerminal = await runMonitoredGrokReview(executable, args, {
+            cwd, env, progressDeadlineMinutes, candidateRevision,
+          });
+          const retry = grokReviewRetryDecision(reviewTerminal, { attempt: reviewAttempt });
+          if (!retry.retry) {
+            if (reviewAttempt >= 2 && reviewTerminal.retrySafe === true) reviewTerminal.retrySafe = false;
+            break;
+          }
+          reviewAttempt += 1;
+        }
+        reviewTerminal.attempts = reviewAttempt;
+        const validVerdict = new Set(["REVIEW_PASS", "REVIEW_FAIL"]).has(reviewTerminal.reviewStatus);
+        return { code: validVerdict ? 0 : 1, reviewTerminal };
+      }
       const code = await runMonitoredGrok(executable, args, {
         cwd, env, progressDeadlineMinutes, onStructuredProgress,
       });
@@ -1601,8 +2022,15 @@ async function main() {
     }, runtimeHeartbeatIntervalMs()) : null;
     heartbeat?.unref();
     let code;
+    let reviewTerminal = null;
     try {
-      code = await executeExternalAgent(options);
+      const executionResult = await executeExternalAgent(options);
+      if (executionResult && typeof executionResult === "object" && !Array.isArray(executionResult) && "reviewTerminal" in executionResult) {
+        code = executionResult.code;
+        reviewTerminal = executionResult.reviewTerminal;
+      } else {
+        code = executionResult;
+      }
     } catch (error) {
       if (heartbeat) clearInterval(heartbeat);
       const { failureClass, retrySafe, resultUnknown, failureDetails } = classifyExternalExecutionFailure(error, {
@@ -1643,6 +2071,83 @@ async function main() {
         });
         previousSnapshot = finalSnapshot;
       }
+    }
+    if (reviewTerminal) {
+      eventSeq += 1;
+      const reviewStatus = reviewTerminal.reviewStatus;
+      const validVerdict = new Set(["REVIEW_PASS", "REVIEW_FAIL"]).has(reviewStatus);
+      const deliveryOutcome = validVerdict ? reviewTerminal.deliveryOutcome : "unresolved";
+      const transportCompleted = new Set(["REVIEW_PASS", "REVIEW_FAIL", "REVIEW_OUTPUT_INVALID", "REVIEW_NO_VERDICT"]).has(reviewStatus);
+      const terminalState = transportCompleted ? "completed" : "failed";
+      const transportOutcome = transportCompleted ? "completed" : "failed";
+      const failureClassByStatus = {
+        REVIEW_NO_VERDICT: "review_no_verdict",
+        REVIEW_MAX_TURNS: "review_max_turns",
+        REVIEW_TIMEOUT: "review_timeout",
+        REVIEW_PROCESS_STUCK: "review_process_stuck",
+        REVIEW_OUTPUT_INVALID: "review_output_invalid",
+        REVIEW_PROVIDER_ERROR: "review_provider_error",
+      };
+      const failureClass = validVerdict ? null : (failureClassByStatus[reviewStatus] || "review_provider_error");
+      const resultUnknown = reviewStatus === "REVIEW_PROCESS_STUCK";
+      const retrySafe = validVerdict ? false : Boolean(reviewTerminal.retrySafe) && !resultUnknown;
+      const evidence = validVerdict
+        ? (options.reviewPhase === "synthesis" ? [...options.reviewShardReceipts] : [`git:${options.candidateRevision}`])
+        : [];
+      const artifacts = validVerdict ? [`git:${options.candidateRevision}`] : [];
+      const summary = reviewStatus === "REVIEW_PASS"
+        ? "Grok Reviewer returned a validated PASS verdict"
+        : reviewStatus === "REVIEW_FAIL"
+          ? "Grok Reviewer returned validated Critical/Important findings"
+          : `Grok Reviewer terminal outcome: ${reviewStatus}`;
+      const nextAction = reviewStatus === "REVIEW_PASS"
+        ? "continue candidate acceptance"
+        : reviewStatus === "REVIEW_FAIL"
+          ? "return exact candidate to rework without Reviewer retry"
+          : reviewStatus === "REVIEW_MAX_TURNS"
+            ? "repair Reviewer invocation policy; do not repeat the same max-turns command"
+            : retrySafe
+              ? "retry the same pure-packet review at most once after verified process cleanup"
+              : "do not retry automatically; inspect Reviewer terminal evidence";
+      const failureDetails = validVerdict ? null : {
+        review_status: reviewStatus,
+        attempts: reviewTerminal.attempts || 1,
+        had_model_output: Boolean(reviewTerminal.hadModelOutput),
+        ...(reviewTerminal.cleanupDiagnostic ? { cleanup_diagnostic: reviewTerminal.cleanupDiagnostic } : {}),
+        ...(reviewTerminal.timeoutReason ? { timeout_reason: reviewTerminal.timeoutReason } : {}),
+        ...(reviewTerminal.validationError ? { validation_error: reviewTerminal.validationError } : {}),
+        ...(reviewTerminal.providerError ? { provider_error: reviewTerminal.providerError } : {}),
+      };
+      recordRuntimeReceipt(options, "assignment_terminal", eventSeq, {
+        terminal_state: terminalState,
+        transport_outcome: transportOutcome,
+        delivery_outcome: deliveryOutcome,
+        summary,
+        evidence,
+        artifacts,
+        next_action: nextAction,
+        retry_class: failureClass || "none",
+        ...(failureClass ? { failure_class: failureClass } : {}),
+        retry_safe: retrySafe,
+        ...(failureDetails ? { failure_details: failureDetails } : {}),
+        ...(reviewTerminal.reviewVerdict ? { review_verdict: reviewTerminal.reviewVerdict } : {}),
+        review_status: reviewStatus,
+        result_unknown: resultUnknown,
+      });
+      persistExternalTerminalReceipt(options, {
+        exitCode: code,
+        summary,
+        deliveryOutcome,
+        failureClass,
+        retryClass: failureClass || "none",
+        retrySafe,
+        resultUnknown,
+        failureDetails,
+        reviewStatus,
+        reviewVerdict: reviewTerminal.reviewVerdict || null,
+      });
+      process.exitCode = validVerdict ? 0 : 1;
+      return;
     }
     eventSeq += 1;
     let delivery = null;

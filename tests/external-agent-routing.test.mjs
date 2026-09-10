@@ -2403,3 +2403,404 @@ test("cleanup failure preserves prior Grok provider exit evidence", async () => 
     },
   );
 });
+
+test("Grok pure-packet Reviewer uses no tools, no planning, structured verdict, and sufficient turn budget", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-policy=${Date.now()}`);
+  assert.equal(typeof runtimeModule.buildGrokReviewArgs, "function");
+  const args = runtimeModule.buildGrokReviewArgs("grok-4.6", "/tmp/review-packet.txt", "high");
+  const valueAfter = (flag) => args[args.indexOf(flag) + 1];
+  assert.equal(valueAfter("--tools"), "");
+  assert.equal(valueAfter("--max-turns"), "2");
+  assert.equal(args.includes("--disable-web-search"), true);
+  assert.equal(args.includes("--no-plan"), true);
+  assert.equal(args.includes("--no-subagents"), true);
+  assert.equal(args.includes("--json-schema"), true);
+  assert.equal(args.includes("--system-prompt-override"), true);
+  assert.equal(args.includes("--prompt-file"), true);
+  assert.equal(args.includes("--output-format"), false);
+  assert.equal(args.includes("--always-approve"), false);
+  const system = valueAfter("--system-prompt-override");
+  assert.match(system, /complete source packet/i);
+  assert.match(system, /do not.*read.*repo|do not.*repository/i);
+  assert.match(system, /first.*valid.*response.*verdict|verdict.*first.*valid.*response/i);
+});
+
+test("Grok Reviewer structured PASS and FAIL are validated independently from process exit", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-verdict=${Date.now()}`);
+  assert.equal(typeof runtimeModule.validateGrokReviewResult, "function");
+  const head = "a".repeat(40);
+  const pass = runtimeModule.validateGrokReviewResult({
+    reviewed_head: head, critical: 0, important: 0, minor: [], findings: [], verdict: "PASS",
+  }, { candidateRevision: head });
+  assert.equal(pass.reviewStatus, "REVIEW_PASS");
+  assert.equal(pass.deliveryOutcome, "pass");
+  assert.equal(pass.reviewVerdict.verdict, "PASS");
+
+  const fail = runtimeModule.validateGrokReviewResult({
+    reviewed_head: head,
+    critical: 1,
+    important: 1,
+    minor: ["minor note"],
+    findings: [
+      { severity: "critical", message: "critical bug" },
+      { severity: "important", message: "important bug" },
+    ],
+    verdict: "FAIL",
+  }, { candidateRevision: head });
+  assert.equal(fail.reviewStatus, "REVIEW_FAIL");
+  assert.equal(fail.deliveryOutcome, "fail");
+  assert.deepEqual(fail.reviewVerdict.critical, ["critical bug"]);
+  assert.deepEqual(fail.reviewVerdict.important, ["important bug"]);
+  assert.deepEqual(fail.reviewVerdict.minor, ["minor note"]);
+  assert.equal(fail.reviewVerdict.verdict, "FINDINGS");
+});
+
+test("Grok Reviewer rejects malformed JSON and inconsistent PASS counts", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-invalid=${Date.now()}`);
+  const head = "b".repeat(40);
+  assert.throws(
+    () => runtimeModule.parseGrokReviewOutput("not-json", { candidateRevision: head }),
+    (error) => error?.failureClass === "review_output_invalid" && error?.reviewStatus === "REVIEW_OUTPUT_INVALID",
+  );
+  assert.throws(
+    () => runtimeModule.validateGrokReviewResult({
+      reviewed_head: head, critical: 1, important: 0, minor: [],
+      findings: [{ severity: "critical", message: "bug" }], verdict: "PASS",
+    }, { candidateRevision: head }),
+    (error) => error?.failureClass === "review_output_invalid" && error?.reviewStatus === "REVIEW_OUTPUT_INVALID",
+  );
+});
+
+test("Grok Reviewer max turns without verdict is REVIEW_MAX_TURNS, never PASS", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-max-turns=${Date.now()}`);
+  const terminal = runtimeModule.classifyGrokReviewTerminal({
+    exitCode: 1,
+    stdout: "I'll review this first. First I'll load the candidate diff...\n",
+    stderr: "Max turns reached\nError: max turns reached\n",
+    timedOut: false,
+    cleanupConfirmed: true,
+    candidateRevision: "c".repeat(40),
+  });
+  assert.equal(terminal.reviewStatus, "REVIEW_MAX_TURNS");
+  assert.equal(terminal.retrySafe, false);
+  assert.equal(terminal.deliveryOutcome, "unresolved");
+});
+
+test("Grok Reviewer timeout distinguishes clean timeout from stuck residual process", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-timeout-class=${Date.now()}`);
+  const clean = runtimeModule.classifyGrokReviewTerminal({
+    exitCode: null, stdout: "", stderr: "", timedOut: true, cleanupConfirmed: true,
+    candidateRevision: "d".repeat(40), hadModelOutput: false,
+  });
+  assert.equal(clean.reviewStatus, "REVIEW_TIMEOUT");
+  assert.equal(clean.retrySafe, true);
+  const stuck = runtimeModule.classifyGrokReviewTerminal({
+    exitCode: null, stdout: "", stderr: "", timedOut: true, cleanupConfirmed: false,
+    candidateRevision: "d".repeat(40), hadModelOutput: false,
+  });
+  assert.equal(stuck.reviewStatus, "REVIEW_PROCESS_STUCK");
+  assert.equal(stuck.retrySafe, false);
+});
+
+test("Grok Reviewer retry policy never retries findings, max-turns, or invalid verdict", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-retry=${Date.now()}`);
+  assert.equal(typeof runtimeModule.grokReviewRetryDecision, "function");
+  for (const reviewStatus of ["REVIEW_FAIL", "REVIEW_MAX_TURNS", "REVIEW_OUTPUT_INVALID", "REVIEW_PROCESS_STUCK", "REVIEW_NO_VERDICT"]) {
+    assert.deepEqual(runtimeModule.grokReviewRetryDecision({ reviewStatus, retrySafe: false }, { attempt: 1 }), { retry: false, reason: "terminal_review_outcome" });
+  }
+  assert.deepEqual(
+    runtimeModule.grokReviewRetryDecision({ reviewStatus: "REVIEW_TIMEOUT", retrySafe: true, hadModelOutput: false }, { attempt: 1 }),
+    { retry: true, reason: "transient_before_model_output" },
+  );
+  assert.deepEqual(
+    runtimeModule.grokReviewRetryDecision({ reviewStatus: "REVIEW_TIMEOUT", retrySafe: true, hadModelOutput: true }, { attempt: 1 }),
+    { retry: false, reason: "model_output_observed" },
+  );
+  assert.deepEqual(
+    runtimeModule.grokReviewRetryDecision({ reviewStatus: "REVIEW_TIMEOUT", retrySafe: true, hadModelOutput: false }, { attempt: 2 }),
+    { retry: false, reason: "retry_budget_exhausted" },
+  );
+});
+
+test("Grok Reviewer timeout performs bounded cleanup before REVIEW_TIMEOUT", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-monitor-timeout=${Date.now()}`);
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const child = new EventEmitter();
+  child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.pid = 515151; child.exitCode = null; child.signalCode = null;
+  let cleaned = 0;
+  const old = { first: process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS, absolute: process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS, launch: process.env.AD_GROK_LAUNCH_TIMEOUT_MS, stall: process.env.AD_GROK_STALL_TIMEOUT_MS };
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "30"; process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "200"; process.env.AD_GROK_LAUNCH_TIMEOUT_MS = "100"; process.env.AD_GROK_STALL_TIMEOUT_MS = "100";
+  try {
+    const promise = runtimeModule.runMonitoredGrokReview("grok", [], {
+      cwd: os.tmpdir(), env: process.env,
+      spawnChild: () => { queueMicrotask(() => child.emit("spawn")); return child; },
+      terminateGroup: async () => { cleaned += 1; child.exitCode = 1; return { confirmed: true, diagnostic: "TERM;KILL;reaped;group-gone" }; },
+    });
+    const terminal = await promise;
+    assert.equal(terminal.reviewStatus, "REVIEW_TIMEOUT");
+    assert.equal(terminal.retrySafe, true);
+    assert.equal(cleaned, 1);
+    assert.match(terminal.cleanupDiagnostic, /group-gone/);
+  } finally {
+    for (const [key,name] of [["first","AD_GROK_FIRST_OUTPUT_TIMEOUT_MS"],["absolute","AD_EXTERNAL_ATTEMPT_TIMEOUT_MS"],["launch","AD_GROK_LAUNCH_TIMEOUT_MS"],["stall","AD_GROK_STALL_TIMEOUT_MS"]]) old[key] === undefined ? delete process.env[name] : process.env[name] = old[key];
+  }
+});
+
+test("Grok Reviewer timeout with residual process group is REVIEW_PROCESS_STUCK", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-monitor-stuck=${Date.now()}`);
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const child = new EventEmitter();
+  child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.pid = 525252; child.exitCode = null; child.signalCode = null;
+  const old = process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS; process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "30";
+  try {
+    const terminal = await runtimeModule.runMonitoredGrokReview("grok", [], {
+      cwd: os.tmpdir(), env: process.env,
+      spawnChild: () => { queueMicrotask(() => child.emit("spawn")); return child; },
+      terminateGroup: async () => ({ confirmed: false, diagnostic: "SIGTERM;SIGKILL; process group still alive" }),
+    });
+    assert.equal(terminal.reviewStatus, "REVIEW_PROCESS_STUCK");
+    assert.equal(terminal.retrySafe, false);
+    assert.match(terminal.cleanupDiagnostic, /still alive/);
+  } finally { old === undefined ? delete process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS : process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = old; }
+});
+
+test("Grok Reviewer parent SIGTERM cleans detached provider group before returning", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-parent-signal=${Date.now()}`);
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.pid = 535353; child.exitCode = null; child.signalCode = null;
+  const parent = new EventEmitter();
+  let cleaned = 0;
+  const promise = runtimeModule.runMonitoredGrokReview("grok", [], {
+    cwd: os.tmpdir(), env: process.env, parentProcess: parent,
+    spawnChild: () => { queueMicrotask(() => { child.emit("spawn"); parent.emit("SIGTERM"); }); return child; },
+    terminateGroup: async () => { cleaned += 1; child.exitCode = 1; return { confirmed: true, diagnostic: "parent-signal-group-gone" }; },
+  });
+  const terminal = await promise;
+  assert.equal(cleaned, 1);
+  assert.equal(terminal.reviewStatus, "REVIEW_TIMEOUT");
+  assert.equal(terminal.parentSignal, "SIGTERM");
+});
+
+async function reviewerFakeRunner(bin, body) {
+  const target = path.join(bin, "grok");
+  await writeFile(target, `#!/usr/bin/env node\n${body}\n`);
+  await chmod(target, 0o755);
+  return target;
+}
+
+async function runPurePacketReview({ verdict, stderr = "", exitCode = 0, body = null, assignmentId = "pure-review" }) {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-pure-review-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const runtimeReceipts = path.join(bin, "runtime-receipts.jsonl");
+  const countFile = path.join(bin, "calls.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const ack = await assignmentAckFile(bin, {
+    assignment_id: assignmentId, task_id: assignmentId, agent_id: "reviewer", role: "reviewer",
+    candidate_revision: head, reviewer_for_revision: head, review_phase: "full",
+  }, repo);
+  const script = body || `
+import fs from "node:fs";
+fs.appendFileSync(process.env.COUNT_FILE, "1\\n");
+if (process.argv[2] === "version") { process.stdout.write("grok test\\n"); process.exit(0); }
+const args = process.argv.slice(2);
+if (!args.includes("--json-schema") || !args.includes("--no-plan") || !args.includes("--disable-web-search")) process.exit(91);
+const tools = args.indexOf("--tools"); if (tools < 0 || args[tools + 1] !== "") process.exit(92);
+const turns = args.indexOf("--max-turns"); if (turns < 0 || args[turns + 1] !== "2") process.exit(93);
+${stderr ? `process.stderr.write(${JSON.stringify(stderr)});` : ""}
+${verdict !== undefined ? `process.stdout.write(${JSON.stringify(typeof verdict === "string" ? verdict : JSON.stringify(verdict))});` : ""}
+process.exit(${exitCode});`;
+  await reviewerFakeRunner(bin, script);
+  const inputVerdict = verdict && typeof verdict === "object" ? { ...verdict, reviewed_head: verdict.reviewed_head || head } : verdict;
+  if (body === null && verdict && typeof verdict === "object") {
+    const text = JSON.stringify(inputVerdict);
+    await reviewerFakeRunner(bin, script.replace(JSON.stringify(JSON.stringify(verdict)), JSON.stringify(text)));
+  }
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo, "--work-type", "review",
+    "--assignment-id", assignmentId, "--task-id", assignmentId, "--agent-id", "reviewer", "--session-id", `${assignmentId}-s1`,
+    "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts,
+  ], { encoding: "utf8", input: `Complete source packet for immutable candidate ${head}. Do not read repository.`, env: {
+    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, COUNT_FILE: countFile,
+    AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "300", AD_GROK_STALL_TIMEOUT_MS: "300", AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "1000", AD_EXTERNAL_KILL_GRACE_MS: "30",
+  } });
+  const receipts = (await readFile(runtimeReceipts, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+  const callCount = (await readFile(countFile, "utf8")).trim().split("\n").filter(Boolean).length;
+  return { result, receipts, terminal: receipts.at(-1), head, callCount };
+}
+
+test("Grok work_type=review accepts only structured PASS into canonical acceptance", async () => {
+  const { result, terminal, head, callCount } = await runPurePacketReview({
+    verdict: { critical: 0, important: 0, minor: [], findings: [], verdict: "PASS" },
+    assignmentId: "review-pass",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(callCount, 1);
+  assert.equal(terminal.terminal_state, "completed");
+  assert.equal(terminal.transport_outcome, "completed");
+  assert.equal(terminal.delivery_outcome, "pass");
+  assert.equal(terminal.review_status, "REVIEW_PASS");
+  assert.equal(terminal.review_verdict.reviewed_head, head);
+  assert.equal(terminal.review_verdict.verdict, "PASS");
+});
+
+test("Grok work_type=review valid FAIL is terminal findings and is never retried into PASS", async () => {
+  const { result, terminal, callCount } = await runPurePacketReview({
+    verdict: {
+      critical: 0, important: 1, minor: [],
+      findings: [{ severity: "important", message: "real defect" }], verdict: "FAIL",
+    },
+    assignmentId: "review-fail",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(callCount, 1);
+  assert.equal(terminal.terminal_state, "completed");
+  assert.equal(terminal.transport_outcome, "completed");
+  assert.equal(terminal.delivery_outcome, "fail");
+  assert.equal(terminal.review_status, "REVIEW_FAIL");
+  assert.equal(terminal.review_verdict.verdict, "FINDINGS");
+  assert.deepEqual(terminal.review_verdict.important, ["real defect"]);
+});
+
+test("Grok work_type=review max turns without verdict persists REVIEW_MAX_TURNS and no retry", async () => {
+  const { result, terminal, callCount } = await runPurePacketReview({
+    verdict: "I'll review first...",
+    stderr: "Max turns reached\nError: max turns reached\n",
+    exitCode: 1,
+    assignmentId: "review-max-turns",
+  });
+  assert.equal(result.status, 1);
+  assert.equal(callCount, 1);
+  assert.equal(terminal.review_status, "REVIEW_MAX_TURNS");
+  assert.equal(terminal.delivery_outcome, "unresolved");
+  assert.equal(terminal.retry_safe, false);
+});
+
+test("Grok work_type=review malformed verdict persists REVIEW_OUTPUT_INVALID and no retry", async () => {
+  const { result, terminal, callCount } = await runPurePacketReview({
+    verdict: "{malformed",
+    assignmentId: "review-invalid-output",
+  });
+  assert.equal(result.status, 1);
+  assert.equal(callCount, 1);
+  assert.equal(terminal.review_status, "REVIEW_OUTPUT_INVALID");
+  assert.equal(terminal.delivery_outcome, "unresolved");
+  assert.equal(terminal.retry_safe, false);
+});
+
+test("Grok Reviewer stall after stdout closes reaps TERM-resistant relay descendants", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-review-relay-cleanup-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "relay-survived.txt");
+  const runtimeReceipts = path.join(bin, "runtime-receipts.jsonl");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const ack = await assignmentAckFile(bin, {
+    assignment_id: "review-relay-timeout", task_id: "review-relay-timeout", agent_id: "reviewer", role: "reviewer",
+    candidate_revision: head, reviewer_for_revision: head, review_phase: "full",
+  }, repo);
+  await reviewerFakeRunner(bin, `
+import { spawn } from "node:child_process";
+if (process.argv[2] === "version") { process.stdout.write("grok test\\n"); process.exit(0); }
+process.on("SIGTERM", () => {});
+spawn(process.execPath, ["-e", ${JSON.stringify(`process.on('SIGTERM',()=>{}); setTimeout(()=>require('fs').writeFileSync(${JSON.stringify(marker)},'survived'),450); setInterval(()=>{},1000);`)}], { stdio: "ignore" });
+process.stdout.write("Reviewer started but no verdict yet\\n");
+process.stdout.end();
+setInterval(() => {}, 1000);
+`);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo, "--work-type", "review",
+    "--assignment-id", "review-relay-timeout", "--task-id", "review-relay-timeout", "--agent-id", "reviewer", "--session-id", "review-relay-timeout-s1",
+    "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts,
+  ], { encoding: "utf8", input: "complete source packet", env: {
+    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
+    AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "300", AD_GROK_STALL_TIMEOUT_MS: "60", AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "1000", AD_EXTERNAL_KILL_GRACE_MS: "30",
+  } });
+  assert.equal(result.status, 1);
+  const receipts = (await readFile(runtimeReceipts, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+  const terminal = receipts.at(-1);
+  assert.equal(terminal.review_status, "REVIEW_TIMEOUT");
+  assert.equal(terminal.retry_safe, false); // model output existed; never blind-retry
+  assert.match(terminal.failure_details.cleanup_diagnostic, /SIGTERM;SIGKILL/);
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
+test("ordinary Grok parent SIGTERM also performs bounded process-group cleanup", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?ordinary-parent-signal=${Date.now()}`);
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.pid = 545454; child.exitCode = null; child.signalCode = null;
+  const parent = new EventEmitter();
+  let cleaned = 0;
+  const promise = runtimeModule.runMonitoredGrok("grok", [], {
+    cwd: os.tmpdir(), env: process.env, parentProcess: parent,
+    spawnChild: () => { queueMicrotask(() => { child.emit("spawn"); parent.emit("SIGTERM"); }); return child; },
+    terminateGroup: async () => { cleaned += 1; child.exitCode = 1; return { confirmed: true, diagnostic: "ordinary-parent-group-gone" }; },
+  });
+  await assert.rejects(promise, (error) => error?.failureClass === "provider_timeout" && error?.details?.cleanup_confirmed === true);
+  assert.equal(cleaned, 1);
+});
+
+test("Grok Reviewer distinguishes REVIEW_NO_VERDICT and REVIEW_PROVIDER_ERROR", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-other-status=${Date.now()}`);
+  const head = "e".repeat(40);
+  const noVerdict = runtimeModule.classifyGrokReviewTerminal({
+    exitCode: 0, stdout: "", stderr: "", timedOut: false, cleanupConfirmed: true, candidateRevision: head,
+  });
+  assert.equal(noVerdict.reviewStatus, "REVIEW_NO_VERDICT");
+  assert.equal(noVerdict.retrySafe, false);
+  const provider = runtimeModule.classifyGrokReviewTerminal({
+    exitCode: 1, stdout: "", stderr: "relay disconnected before response", timedOut: false, cleanupConfirmed: true, candidateRevision: head,
+  });
+  assert.equal(provider.reviewStatus, "REVIEW_PROVIDER_ERROR");
+  assert.equal(provider.retrySafe, true);
+});
+
+test("Grok work_type=review retries transient pre-output failure only once then accepts PASS", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-review-transient-retry-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const runtimeReceipts = path.join(bin, "runtime-receipts.jsonl");
+  const countFile = path.join(bin, "calls.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const ack = await assignmentAckFile(bin, {
+    assignment_id: "review-transient", task_id: "review-transient", agent_id: "reviewer", role: "reviewer",
+    candidate_revision: head, reviewer_for_revision: head, review_phase: "full",
+  }, repo);
+  await reviewerFakeRunner(bin, `
+import fs from "node:fs";
+if (process.argv[2] === "version") { process.stdout.write("grok test\\n"); process.exit(0); }
+let count = 0; try { count = Number(fs.readFileSync(process.env.COUNT_FILE, "utf8").trim() || 0); } catch {}
+count += 1; fs.writeFileSync(process.env.COUNT_FILE, String(count));
+if (count === 1) { process.stderr.write("relay disconnected before response\\n"); process.exit(1); }
+process.stdout.write(JSON.stringify({ reviewed_head: process.env.REVIEW_HEAD, critical: 0, important: 0, minor: [], findings: [], verdict: "PASS" }));
+`);
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo, "--work-type", "review",
+    "--assignment-id", "review-transient", "--task-id", "review-transient", "--agent-id", "reviewer", "--session-id", "review-transient-s1",
+    "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts,
+  ], { encoding: "utf8", input: "complete source packet", env: {
+    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
+    COUNT_FILE: countFile, REVIEW_HEAD: head,
+    AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "300", AD_GROK_STALL_TIMEOUT_MS: "300", AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "1000", AD_EXTERNAL_KILL_GRACE_MS: "30",
+  } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(Number((await readFile(countFile, "utf8")).trim()), 2);
+  const receipts = (await readFile(runtimeReceipts, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+  const terminal = receipts.at(-1);
+  assert.equal(terminal.review_status, "REVIEW_PASS");
+  assert.equal(terminal.delivery_outcome, "pass");
+});

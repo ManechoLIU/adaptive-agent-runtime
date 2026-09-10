@@ -45,6 +45,10 @@ PASS_EVIDENCE_SCHEMES = {"test-log", "green-test", "receipt", "git", "file", "ar
 PASS_ARTIFACT_SCHEMES = {"git", "file", "artifact"}
 RECONCILIATION_EVIDENCE_SCHEMES = {"receipt", "artifact"}
 REVIEW_PHASES = {"full", "shard", "synthesis"}
+REVIEW_STATUSES = {
+    "REVIEW_PASS", "REVIEW_FAIL", "REVIEW_NO_VERDICT", "REVIEW_MAX_TURNS",
+    "REVIEW_TIMEOUT", "REVIEW_PROCESS_STUCK", "REVIEW_OUTPUT_INVALID", "REVIEW_PROVIDER_ERROR",
+}
 
 @dataclass(frozen=True)
 class RuntimePolicy:
@@ -568,6 +572,33 @@ def apply_receipt(state: dict[str, Any], receipt: dict[str, Any], now: datetime 
                     ):
                         raise ValueError("synthesis shard receipt is not a completed same-candidate shard review")
             lease["review_verdict"] = json.loads(json.dumps(verdict))
+        review_status = receipt.get("review_status")
+        if review_status is not None:
+            if lease.get("execution_role") != "reviewer":
+                raise ValueError("review_status is only valid for a reviewer Assignment")
+            if not isinstance(review_status, str) or review_status not in REVIEW_STATUSES:
+                raise ValueError("review_status is invalid")
+            verdict = receipt.get("review_verdict")
+            if review_status == "REVIEW_PASS":
+                if delivery_outcome != "pass" or transport_outcome != "completed" or terminal != "completed" or not isinstance(verdict, dict) or verdict.get("verdict") != "PASS":
+                    raise ValueError("review_status REVIEW_PASS conflicts with terminal delivery/verdict")
+            elif review_status == "REVIEW_FAIL":
+                if delivery_outcome != "fail" or transport_outcome != "completed" or terminal != "completed" or not isinstance(verdict, dict) or verdict.get("verdict") != "FINDINGS":
+                    raise ValueError("review_status REVIEW_FAIL conflicts with terminal delivery/verdict")
+            else:
+                if delivery_outcome != "unresolved" or verdict is not None:
+                    raise ValueError("review_status infrastructure outcome requires unresolved delivery and no review_verdict")
+                if review_status in {"REVIEW_NO_VERDICT", "REVIEW_OUTPUT_INVALID"}:
+                    if terminal != "completed" or transport_outcome != "completed":
+                        raise ValueError("review_status completed-provider output failure requires completed transport")
+                else:
+                    if terminal != "failed" or transport_outcome != "failed":
+                        raise ValueError("review_status provider/timeout failure requires failed transport")
+                if review_status == "REVIEW_PROCESS_STUCK" and receipt.get("result_unknown") is not True:
+                    raise ValueError("review_status REVIEW_PROCESS_STUCK requires result_unknown=true")
+            lease["review_status"] = review_status
+        else:
+            lease.pop("review_status", None)
         lease["last_progress_phase"] = "DELIVERY"
     lease["runtime_receipt_id"] = receipt.get("receipt_id") or lease.get("runtime_receipt_id")
     return out

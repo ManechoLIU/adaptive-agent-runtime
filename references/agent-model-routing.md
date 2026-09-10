@@ -54,6 +54,7 @@ Adaptive Agent Runtime 负责把项目目标拆成可验收工作包，为每个
 
 - Codex 自定义 Provider 当前要求 Responses API。Moonshot 的 Kimi API 当前公开的是 Chat Completions 兼容接口，因此 Kimi K3 的两种认证模式都经 Kimi Code CLI 执行，不能把 API 模式伪装成原生 Codex Provider。OAuth 使用 Kimi Code 管理的会话与模型别名；API 模式使用临时 `KIMI_MODEL_*` 配置，密钥不写进合同。
 - Grok 的两种认证模式都经 Grok Build CLI 执行。OAuth 使用 `grok login` 的可刷新会话；API 模式必须隔离 OAuth 会话后注入 `XAI_API_KEY`，从而保证不会因为本机已有登录而走错计费通道。
+- Grok Reviewer 若父层已提供完整 immutable source packet，必须走 `work_type=review` 的 pure-packet 路径；该路径不允许 repo exploration / planning / tools / Web search，首个有效模型响应必须是结构化 verdict。普通 coding Agent 与 Reviewer 不共享这套调用策略。
 - 外部模型执行前确认：运行器存在、模型标识可解析、认证已配置、工作目录与文件所有权正确、工具权限和停止条件明确。
 - API/订阅可能计费。未获得本轮付费授权时，只验证配置、命令发现、假服务或 dry-run，不发送真实推理请求。
 - Desktop / Web 等宿主使用 same current-snapshot 路由事实，并在首选外部通道失败后统一调用 `scripts/run_external_agent.mjs --resolve-route`。只有 `provider_unavailable / cli_unavailable / transport_failure_before_write / no_valid_result` 这类已知无副作用的外部失败可自动降级；机械窄任务选 `gpt-5.6-luna`，常规实现 / 调试 / 审查选 `gpt-5.6-terra`，架构 / 复杂根因 / 高风险选 `gpt-5.6-sol`，模型档位与宿主切换是两个独立决策。

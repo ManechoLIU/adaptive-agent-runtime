@@ -1045,6 +1045,57 @@ class ReviewerRuntimeContractTests(unittest.TestCase):
         state = apply_receipt({}, payload, now=T0)
         self.assertEqual(state["leases"]["a1"]["review_phase"], "full")
 
+    def test_reviewer_terminal_persists_structured_review_status(self):
+        head = "a" * 40
+        state = apply_receipt({}, receipt(
+            "assignment_started", agent_id="reviewer", execution_role="reviewer",
+            execution_transport="external_process", candidate_revision=head, review_phase="full",
+        ), now=T0)
+        terminal = receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), event_seq=2, agent_id="reviewer",
+            terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
+            summary="validated reviewer PASS", evidence=[f"git:{head}"], artifacts=[f"git:{head}"],
+            next_action="accept", retry_class="none", result_unknown=False,
+            review_status="REVIEW_PASS",
+            review_verdict={"reviewed_head": head, "verdict": "PASS", "critical": [], "important": [], "minor": []},
+        )
+        state = apply_receipt(state, terminal, now=T0 + timedelta(minutes=1))
+        lease = state["leases"]["a1"]
+        self.assertEqual(lease["review_status"], "REVIEW_PASS")
+        self.assertEqual(lease["review_verdict"]["verdict"], "PASS")
+
+    def test_reviewer_terminal_rejects_review_status_that_conflicts_with_delivery(self):
+        head = "b" * 40
+        state = apply_receipt({}, receipt(
+            "assignment_started", agent_id="reviewer", execution_role="reviewer",
+            execution_transport="external_process", candidate_revision=head, review_phase="full",
+        ), now=T0)
+        terminal = receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), event_seq=2, agent_id="reviewer",
+            terminal_state="completed", transport_outcome="completed", delivery_outcome="pass",
+            summary="conflicting reviewer result", evidence=[f"git:{head}"], artifacts=[f"git:{head}"],
+            next_action="stop", retry_class="none", result_unknown=False,
+            review_status="REVIEW_FAIL",
+            review_verdict={"reviewed_head": head, "verdict": "PASS", "critical": [], "important": [], "minor": []},
+        )
+        with self.assertRaisesRegex(ValueError, "review_status"):
+            apply_receipt(state, terminal, now=T0 + timedelta(minutes=1))
+
+    def test_reviewer_infra_status_requires_unresolved_delivery_and_no_verdict(self):
+        head = "c" * 40
+        state = apply_receipt({}, receipt(
+            "assignment_started", agent_id="reviewer", execution_role="reviewer",
+            execution_transport="external_process", candidate_revision=head, review_phase="full",
+        ), now=T0)
+        terminal = receipt(
+            "assignment_terminal", T0 + timedelta(minutes=1), event_seq=2, agent_id="reviewer",
+            terminal_state="failed", transport_outcome="failed", delivery_outcome="unresolved",
+            summary="review timeout", evidence=[], artifacts=[], next_action="inspect", retry_class="review_timeout",
+            result_unknown=False, review_status="REVIEW_TIMEOUT",
+        )
+        state = apply_receipt(state, terminal, now=T0 + timedelta(minutes=1))
+        self.assertEqual(state["leases"]["a1"]["review_status"], "REVIEW_TIMEOUT")
+
 class ExternalFailureEvidencePersistenceTests(unittest.TestCase):
     def test_terminal_persists_external_failure_class_retry_safety_and_details(self):
         state = apply_receipt({}, receipt("assignment_started"), now=T0)
