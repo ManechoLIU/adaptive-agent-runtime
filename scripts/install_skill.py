@@ -678,6 +678,9 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok Reviewer stall after stdout closes reaps TERM-resistant relay descendants",
     "ordinary Grok parent SIGTERM also performs bounded process-group cleanup",
     "Grok work_type=review retries transient pre-output failure only once then accepts PASS",
+    "Grok Reviewer waits for stdio close before classifying final verdict",
+    "Grok 1.0.13 json-schema envelope validates structuredOutput as Reviewer verdict",
+    "Grok json-schema envelope rejects conflicting text and structuredOutput",
 )
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_runtime_supervisor.py",

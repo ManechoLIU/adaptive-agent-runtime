@@ -1010,6 +1010,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok Reviewer stall after stdout closes reaps TERM-resistant relay descendants', () => { assert.equal(1, 1); });\n"
                 "test('ordinary Grok parent SIGTERM also performs bounded process-group cleanup', () => { assert.equal(1, 1); });\n"
                 "test('Grok work_type=review retries transient pre-output failure only once then accepts PASS', () => { assert.equal(1, 1); });\n"
+                "test('Grok Reviewer waits for stdio close before classifying final verdict', () => { assert.equal(1, 1); });\n"
+                "test('Grok 1.0.13 json-schema envelope validates structuredOutput as Reviewer verdict', () => { assert.equal(1, 1); });\n"
+                "test('Grok json-schema envelope rejects conflicting text and structuredOutput', () => { assert.equal(1, 1); });\n"
                 "test('cleanup failure preserves prior Grok provider exit evidence', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )
@@ -1495,6 +1498,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test('Grok Reviewer stall after stdout closes reaps TERM-resistant relay descendants', () => { assert.equal(1, 1); });\n"
                 "test('ordinary Grok parent SIGTERM also performs bounded process-group cleanup', () => { assert.equal(1, 1); });\n"
                 "test('Grok work_type=review retries transient pre-output failure only once then accepts PASS', () => { assert.equal(1, 1); });\n"
+                "test('Grok Reviewer waits for stdio close before classifying final verdict', () => { assert.equal(1, 1); });\n"
+                "test('Grok 1.0.13 json-schema envelope validates structuredOutput as Reviewer verdict', () => { assert.equal(1, 1); });\n"
+                "test('Grok json-schema envelope rejects conflicting text and structuredOutput', () => { assert.equal(1, 1); });\n"
                 "test('cleanup failure preserves prior Grok provider exit evidence', () => { assert.equal(1, 1); });\n",
                 encoding="utf-8",
             )

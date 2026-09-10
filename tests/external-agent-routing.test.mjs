@@ -2834,3 +2834,33 @@ test("Grok Reviewer waits for stdio close before classifying final verdict", asy
   assert.equal(terminal.reviewStatus, "REVIEW_PASS");
   assert.equal(terminal.reviewVerdict.verdict, "PASS");
 });
+
+test("Grok 1.0.13 json-schema envelope validates structuredOutput as Reviewer verdict", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-envelope=${Date.now()}`);
+  const head = "1".repeat(40);
+  const verdict = { reviewed_head: head, critical: 0, important: 0, minor: [], findings: [], verdict: "PASS" };
+  const stdout = JSON.stringify({
+    text: JSON.stringify(verdict), stopReason: "end_turn", sessionId: "s", requestId: "r",
+    usage: { input_tokens: 1, output_tokens: 1 }, num_turns: 1,
+    structuredOutput: verdict,
+  });
+  const terminal = runtimeModule.classifyGrokReviewTerminal({
+    exitCode: 0, stdout, stderr: "", timedOut: false, cleanupConfirmed: true, candidateRevision: head,
+  });
+  assert.equal(terminal.reviewStatus, "REVIEW_PASS");
+  assert.equal(terminal.reviewVerdict.verdict, "PASS");
+});
+
+test("Grok json-schema envelope rejects conflicting text and structuredOutput", async () => {
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-envelope-conflict=${Date.now()}`);
+  const head = "2".repeat(40);
+  const structured = { reviewed_head: head, critical: 0, important: 0, minor: [], findings: [], verdict: "PASS" };
+  const conflicting = { reviewed_head: head, critical: 0, important: 1, minor: [], findings: [{ severity: "important", message: "bug" }], verdict: "FAIL" };
+  const terminal = runtimeModule.classifyGrokReviewTerminal({
+    exitCode: 0,
+    stdout: JSON.stringify({ text: JSON.stringify(conflicting), structuredOutput: structured, stopReason: "end_turn" }),
+    stderr: "", timedOut: false, cleanupConfirmed: true, candidateRevision: head,
+  });
+  assert.equal(terminal.reviewStatus, "REVIEW_OUTPUT_INVALID");
+  assert.match(terminal.validationError, /structuredOutput.*text|text.*structuredOutput/i);
+});

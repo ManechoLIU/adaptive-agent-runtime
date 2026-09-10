@@ -1351,6 +1351,14 @@ export function validateGrokReviewResult(value, { candidateRevision = null } = {
   };
 }
 
+function canonicalReviewJson(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalReviewJson(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalReviewJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 export function parseGrokReviewOutput(stdout, { candidateRevision = null } = {}) {
   const text = String(stdout || "").trim();
   if (!text) {
@@ -1363,6 +1371,24 @@ export function parseGrokReviewOutput(stdout, { candidateRevision = null } = {})
     value = JSON.parse(text);
   } catch (error) {
     throw reviewOutputError(`malformed JSON verdict: ${error.message}`);
+  }
+  if (value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, "structuredOutput")) {
+    const structured = value.structuredOutput;
+    if (!structured || typeof structured !== "object" || Array.isArray(structured)) {
+      throw reviewOutputError("Grok json-schema envelope structuredOutput must be one object");
+    }
+    if (typeof value.text === "string" && value.text.trim()) {
+      let textVerdict;
+      try {
+        textVerdict = JSON.parse(value.text);
+      } catch (error) {
+        throw reviewOutputError(`Grok json-schema envelope text is not matching verdict JSON: ${error.message}`);
+      }
+      if (canonicalReviewJson(textVerdict) !== canonicalReviewJson(structured)) {
+        throw reviewOutputError("Grok json-schema envelope structuredOutput conflicts with text verdict");
+      }
+    }
+    value = structured;
   }
   return validateGrokReviewResult(value, { candidateRevision });
 }
