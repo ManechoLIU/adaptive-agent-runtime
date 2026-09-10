@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 const KIMI_KEYCHAIN_SERVICE = "adaptive-delivery-kimi-k3";
 const XAI_KEYCHAIN_SERVICE = "adaptive-delivery-xai-grok";
 const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+const GROK_EXECUTION_WORK_TYPES = new Set(["implementation", "review"]);
 const CARD_CATEGORIES = new Set(["frontend", "backend", "general"]);
 const REVIEW_PHASES = new Set(["full", "shard", "synthesis"]);
 const CARD_STATUSES = {
@@ -725,6 +726,18 @@ export function parseArgs(argv) {
     throw new Error("--execute requires --authorized-external-call after current user authorization");
   }
   if (options.execute) {
+    if (options.engine === "grok-build") {
+      options.workType = String(options.workType || "").trim().toLowerCase();
+      if (!options.workType) {
+        throw new Error("Grok Build --execute requires explicit --work-type");
+      }
+      if (!GROK_EXECUTION_WORK_TYPES.has(options.workType)) {
+        throw new Error(`unsupported Grok work_type: ${options.workType}`);
+      }
+      if (options.workType === "review" && !options.assignmentId) {
+        throw new Error("Grok work_type=review requires assignment-bound reviewer identity");
+      }
+    }
     const identity = [options.assignmentId, options.taskId, options.agentId, options.sessionId];
     const bound = identity.some(Boolean);
     if (bound && identity.some((value) => !value)) {
@@ -1267,6 +1280,83 @@ export function buildGrokReviewArgs(model, promptFile, reasoningEffort) {
     "--verbatim",
     "--reasoning-effort", reasoningEffort,
   ];
+}
+
+function reviewPacketError(message) {
+  return new ExternalAgentExecutionError(`review_policy_invalid: ${message}`, {
+    failureClass: "review_policy_invalid",
+    retrySafe: false,
+    resultUnknown: false,
+    reviewStatus: "REVIEW_OUTPUT_INVALID",
+  });
+}
+
+function requiredPacketStringArray(packet, field, { allowEmpty = false } = {}) {
+  const value = packet[field];
+  if (!Array.isArray(value) || (!allowEmpty && value.length === 0)) {
+    throw reviewPacketError(`${field} must be ${allowEmpty ? "a string array" : "a non-empty string array"}`);
+  }
+  if (value.some((item) => typeof item !== "string" || !item.trim())) {
+    throw reviewPacketError(`${field} must contain non-empty strings only`);
+  }
+  return value.map((item) => item.trim());
+}
+
+export function parseGrokReviewPacket(rawPrompt, { candidateRevision, reviewPhase } = {}) {
+  let packet;
+  try {
+    packet = JSON.parse(rawPrompt);
+  } catch {
+    throw reviewPacketError("stdin must be one complete structured JSON review packet");
+  }
+  if (!packet || typeof packet !== "object" || Array.isArray(packet)) {
+    throw reviewPacketError("stdin must be one complete structured JSON review packet");
+  }
+  if (packet.schema_version !== 1) throw reviewPacketError("schema_version must equal 1");
+  if (packet.work_type !== "review") throw reviewPacketError("work_type must equal review");
+  if (packet.role !== "reviewer") throw reviewPacketError("role must equal reviewer");
+  const expectedPhase = String(reviewPhase || "").trim().toLowerCase();
+  if (!new Set(["full", "synthesis"]).has(expectedPhase) || packet.review_phase !== expectedPhase) {
+    throw reviewPacketError("review_phase must exactly match Assignment full|synthesis phase");
+  }
+  const expectedCandidate = String(candidateRevision || "").trim();
+  if (!/^[0-9a-f]{40}$/i.test(expectedCandidate) || packet.candidate_revision !== expectedCandidate) {
+    throw reviewPacketError("candidate_revision must exactly match the immutable Assignment candidate SHA");
+  }
+  const scope = requiredPacketStringArray(packet, "scope");
+  const diffs = requiredPacketStringArray(packet, "diffs", { allowEmpty: true });
+  const sourceArtifacts = requiredPacketStringArray(packet, "source_artifacts", { allowEmpty: true });
+  if (diffs.length === 0 && sourceArtifacts.length === 0) {
+    throw reviewPacketError("diffs or source_artifacts must contain at least one entry");
+  }
+  const testEvidence = requiredPacketStringArray(packet, "test_evidence");
+  const acceptanceCriteria = requiredPacketStringArray(packet, "acceptance_criteria");
+  return {
+    ...packet,
+    scope,
+    diffs,
+    source_artifacts: sourceArtifacts,
+    test_evidence: testEvidence,
+    acceptance_criteria: acceptanceCriteria,
+  };
+}
+
+function validateGrokAssignmentExecutionContract(options) {
+  if (options.engine !== "grok-build") return;
+  const workType = String(options.workType || "").trim().toLowerCase();
+  const role = String(options.assignmentRole || "").trim().toLowerCase();
+  if (!GROK_EXECUTION_WORK_TYPES.has(workType)) {
+    throw reviewPacketError(`unsupported Grok work_type: ${workType || "missing"}`);
+  }
+  if (role === "reviewer" && workType !== "review") {
+    throw reviewPacketError("reviewer role requires work_type=review");
+  }
+  if (workType === "review") {
+    if (role !== "reviewer") throw reviewPacketError("work_type=review requires reviewer role");
+    if (options.sideEffect === true || options.idempotencyKey) {
+      throw reviewPacketError("work_type=review must be read-only: side_effect and idempotency_key are forbidden");
+    }
+  }
 }
 
 function reviewOutputError(message, details = {}) {
@@ -1933,18 +2023,39 @@ async function executeExternalAgent({
   assertDirectory(cwd);
   const rawPrompt = await readStdin();
   if (!rawPrompt) throw new Error("A bounded routing contract prompt is required on stdin");
-  const prompt = sideEffect && idempotencyKey
-    ? `[Adaptive Agent Runtime side-effect contract] Any external side effect in this execution MUST use the exact idempotency key: ${idempotencyKey}. Do not perform the side effect without applying this key through the provider/API mechanism.\n\n${rawPrompt}`
-    : rawPrompt;
   const normalizedWorkType = String(workType || "").trim().toLowerCase();
   const normalizedRole = String(assignmentRole || "").trim().toLowerCase();
   const normalizedReviewPhase = String(reviewPhase || "").trim().toLowerCase();
   const purePacketReview = engine === "grok-build" && normalizedWorkType === "review";
-  if (purePacketReview && (normalizedRole !== "reviewer" || !new Set(["full", "synthesis"]).has(normalizedReviewPhase))) {
-    throw new ExternalAgentExecutionError("review_policy_invalid: work_type=review requires reviewer role and full|synthesis review_phase", {
-      failureClass: "review_policy_invalid", retrySafe: false, reviewStatus: "REVIEW_OUTPUT_INVALID",
-    });
+  if (engine === "grok-build" && !normalizedWorkType) {
+    throw reviewPacketError("Grok Build execution requires explicit work_type");
   }
+  if (engine === "grok-build" && !GROK_EXECUTION_WORK_TYPES.has(normalizedWorkType)) {
+    throw reviewPacketError(`unsupported Grok work_type: ${normalizedWorkType}`);
+  }
+  if (engine === "grok-build" && normalizedRole === "reviewer" && normalizedWorkType !== "review") {
+    throw reviewPacketError("reviewer role requires work_type=review");
+  }
+  if (purePacketReview && !assignmentRole) {
+    throw reviewPacketError("work_type=review requires an assignment-bound reviewer");
+  }
+  if (purePacketReview && normalizedRole !== "reviewer") {
+    throw reviewPacketError("work_type=review requires reviewer role");
+  }
+  if (purePacketReview && !new Set(["full", "synthesis"]).has(normalizedReviewPhase)) {
+    throw reviewPacketError("work_type=review requires full|synthesis review_phase");
+  }
+  if (purePacketReview && (sideEffect === true || idempotencyKey)) {
+    throw reviewPacketError("work_type=review must be read-only: side_effect and idempotency_key are forbidden");
+  }
+  const reviewPacket = purePacketReview
+    ? parseGrokReviewPacket(rawPrompt, { candidateRevision, reviewPhase: normalizedReviewPhase })
+    : null;
+  const prompt = purePacketReview
+    ? JSON.stringify(reviewPacket)
+    : sideEffect && idempotencyKey
+      ? `[Adaptive Agent Runtime side-effect contract] Any external side effect in this execution MUST use the exact idempotency key: ${idempotencyKey}. Do not perform the side effect without applying this key through the provider/API mechanism.\n\n${rawPrompt}`
+      : rawPrompt;
 
   const executable = resolveExecutable(routes[engine]);
   let args;
@@ -2103,6 +2214,7 @@ async function main() {
         : [];
       options.executionLineage = deriveExecutionLineage(options, assignment);
     }
+    validateGrokAssignmentExecutionContract(options);
     validateRuleHandshake(options);
     let eventSeq = 1;
     let previousSnapshot = runtimeGitSnapshot(options.cwd);

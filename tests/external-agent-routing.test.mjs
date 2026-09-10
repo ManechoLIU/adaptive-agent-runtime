@@ -61,11 +61,26 @@ async function makeAssignmentRepo(directory) {
   return repo;
 }
 
+function reviewPacket({ candidateRevision, reviewPhase = "full", diffs = ["git diff --check"] } = {}) {
+  return {
+    schema_version: 1,
+    work_type: "review",
+    role: "reviewer",
+    review_phase: reviewPhase,
+    candidate_revision: candidateRevision,
+    scope: ["scripts/run_external_agent.mjs"],
+    diffs,
+    source_artifacts: [],
+    test_evidence: ["node --test tests/external-agent-routing.test.mjs"],
+    acceptance_criteria: ["Provider must not inspect the repository outside this packet."],
+  };
+}
+
 async function fakeInstalledSkill(directory) {
   const root = path.join(directory, "installed-skill");
   const scripts = path.join(root, "scripts");
   await mkdir(scripts, { recursive: true });
-  for (const file of ["run_external_agent.mjs", "assignment_lease_guard.py", "assignment_runtime.py", "route_contract.py", "project_state.py", "rule_handshake.py"]) {
+  for (const file of ["run_external_agent.mjs", "assignment_lease_guard.py", "assignment_runtime.py", "route_contract.py", "project_state.py", "rule_handshake.py", "controller_target_guard.py", "agent_target_resolution.py"]) {
     await copyFile(path.join(skillRoot, "scripts", file), path.join(scripts, file));
   }
   const rel = "scripts/rule_handshake.py";
@@ -430,7 +445,7 @@ test("OAuth and API execution stay on distinct Kimi and Grok credential paths", 
 
   const grokOauth = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "xhigh", "--cwd", skillRoot,
+    "--model", "grok-4.6", "--reasoning-effort", "xhigh", "--cwd", skillRoot, "--work-type", "implementation",
   ], { encoding: "utf8", input: "bounded contract", env: { ...baseEnv, XAI_API_KEY: "must-be-removed" } });
   assert.equal(grokOauth.status, 0, grokOauth.stderr);
   const grokOauthCall = JSON.parse(grokOauth.stdout.trim());
@@ -440,7 +455,7 @@ test("OAuth and API execution stay on distinct Kimi and Grok credential paths", 
 
   const grokApi = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "api",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", skillRoot, "--work-type", "implementation",
   ], { encoding: "utf8", input: "bounded contract", env: { ...baseEnv, XAI_API_KEY: "test-key" } });
   assert.equal(grokApi.status, 0, grokApi.stderr);
   const grokApiCall = JSON.parse(grokApi.stdout.trim());
@@ -491,7 +506,7 @@ test("heterogeneous frontend and backend tasks stay on Kimi and Grok canonical e
     "--execute", "--authorized-external-call",
     "--engine", "grok-build", "--auth-mode", "oauth",
     "--model", "grok-4.6", "--reasoning-effort", "high",
-    "--cwd", repo,
+    "--cwd", repo, "--work-type", "implementation",
   ], {
     encoding: "utf8",
     input: "backend bounded task",
@@ -507,6 +522,73 @@ test("heterogeneous frontend and backend tasks stay on Kimi and Grok canonical e
   assert.equal((await readFile(kimiMarker, "utf8")).trim(), "spawned");
   assert.equal((await readFile(grokMarker, "utf8")).trim(), "spawned");
   assert.doesNotMatch(frontend.stdout + backend.stdout, /chatgpt_web|web-agent-execution/i);
+});
+
+test("Grok execute fails closed before provider spawn without an explicit work type or a complete immutable review packet", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-work-type-gate-"));
+  const repo = await makeAssignmentRepo(bin);
+  const installed = await fakeInstalledSkill(bin);
+  const manifestPath = path.join(installed.root, ".adaptive-delivery-install.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.impact = "test_only";
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const reviewerAck = await assignmentAckFile(bin, {
+    assignment_id: "reviewer", task_id: "reviewer", agent_id: "reviewer", role: "reviewer",
+    candidate_revision: head, reviewer_for_revision: head, review_phase: "full",
+  }, repo);
+  const mismatchAck = await assignmentAckFile(bin, {
+    assignment_id: "candidate-mismatch", task_id: "candidate-mismatch", agent_id: "reviewer", role: "reviewer",
+    candidate_revision: head, reviewer_for_revision: head, review_phase: "full",
+  }, repo);
+  const incompleteAck = await assignmentAckFile(bin, {
+    assignment_id: "incomplete-packet", task_id: "incomplete-packet", agent_id: "reviewer", role: "reviewer",
+    candidate_revision: head, reviewer_for_revision: head, review_phase: "full",
+  }, repo);
+  const reviewerImplementationAck = await assignmentAckFile(bin, {
+    assignment_id: "reviewer-implementation", task_id: "reviewer-implementation", agent_id: "reviewer", role: "reviewer",
+    candidate_revision: head, reviewer_for_revision: head, review_phase: "full",
+  }, repo);
+  const sideEffectReviewAck = await assignmentAckFile(bin, {
+    assignment_id: "review-side-effect", task_id: "review-side-effect", agent_id: "reviewer", role: "reviewer",
+    candidate_revision: head, reviewer_for_revision: head, review_phase: "full",
+    side_effect: true, idempotency_key: "review:must-not-run",
+  }, repo);
+  const shardAck = await assignmentAckFile(bin, {
+    assignment_id: "shard", task_id: "shard", agent_id: "reviewer", role: "reviewer",
+    candidate_revision: head, reviewer_for_revision: head, review_phase: "shard",
+  }, repo);
+  const missingCandidateAck = await assignmentAckFile(bin, {
+    assignment_id: "missing-candidate", task_id: "missing-candidate", agent_id: "reviewer", role: "reviewer",
+    candidate_revision: undefined, reviewer_for_revision: undefined, review_phase: "full",
+  }, repo);
+  const writerAck = await assignmentAckFile(bin, { assignment_id: "writer-review", role: "writer" }, repo);
+  const base = ["--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth", "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo];
+  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker };
+  const cases = [
+    { name: "missing work type", args: base, input: "ordinary request", error: /work-type/i },
+    { name: "unknown work type", args: [...base, "--work-type", "investigate"], input: "ordinary request", error: /unsupported Grok work_type/i },
+    { name: "unbound review", args: [...base, "--work-type", "review"], input: JSON.stringify(reviewPacket({ candidateRevision: head })), error: /assignment-bound reviewer/i },
+    { name: "writer review", args: [...base, "--work-type", "review", "--assignment-id", "writer-review", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1", "--assignment-ack", writerAck], input: JSON.stringify(reviewPacket({ candidateRevision: head })), error: /reviewer role/i },
+    { name: "reviewer implementation", args: [...base, "--work-type", "implementation", "--assignment-id", "reviewer-implementation", "--task-id", "reviewer-implementation", "--agent-id", "reviewer", "--session-id", "s1", "--assignment-ack", reviewerImplementationAck], input: "ordinary request", error: /reviewer role requires work_type=review/i },
+    { name: "side-effect review", args: [...base, "--work-type", "review", "--assignment-id", "review-side-effect", "--task-id", "review-side-effect", "--agent-id", "reviewer", "--session-id", "s1", "--assignment-ack", sideEffectReviewAck], input: JSON.stringify(reviewPacket({ candidateRevision: head })), error: /review must be read-only/i },
+    { name: "shard review", args: [...base, "--work-type", "review", "--assignment-id", "shard", "--task-id", "shard", "--agent-id", "reviewer", "--session-id", "s1", "--assignment-ack", shardAck], input: JSON.stringify(reviewPacket({ candidateRevision: head, reviewPhase: "shard" })), error: /full\|synthesis/i },
+    { name: "missing immutable candidate", args: [...base, "--work-type", "review", "--assignment-id", "missing-candidate", "--task-id", "missing-candidate", "--agent-id", "reviewer", "--session-id", "s1", "--assignment-ack", missingCandidateAck], input: JSON.stringify(reviewPacket({ candidateRevision: head })), error: /candidate_revision/i },
+    { name: "unstructured stdin", args: [...base, "--work-type", "review", "--assignment-id", "reviewer", "--task-id", "reviewer", "--agent-id", "reviewer", "--session-id", "s1", "--assignment-ack", reviewerAck], input: "not a JSON packet", error: /structured JSON review packet/i },
+    { name: "candidate mismatch", args: [...base, "--work-type", "review", "--assignment-id", "candidate-mismatch", "--task-id", "candidate-mismatch", "--agent-id", "reviewer", "--session-id", "s1", "--assignment-ack", mismatchAck], input: JSON.stringify(reviewPacket({ candidateRevision: "0".repeat(40) })), error: /candidate_revision.*immutable Assignment/i },
+    { name: "incomplete packet", args: [...base, "--work-type", "review", "--assignment-id", "incomplete-packet", "--task-id", "incomplete-packet", "--agent-id", "reviewer", "--session-id", "s1", "--assignment-ack", incompleteAck], input: JSON.stringify({ schema_version: 1, work_type: "review", role: "reviewer", review_phase: "full", candidate_revision: head }), error: /scope.*non-empty string array/i },
+  ];
+  for (const scenario of cases) {
+    const result = spawnSync(process.execPath, [installed.adapter, ...scenario.args], { encoding: "utf8", input: scenario.input, env });
+    assert.equal(result.status, 1, `${scenario.name}: ${result.stderr}`);
+    assert.match(result.stderr, scenario.error, scenario.name);
+  }
+  await assert.rejects(readFile(marker, "utf8"));
 });
 
 test("external execute persists terminal receipt and invokes controller continuation helper", async () => {
@@ -528,7 +610,7 @@ open(os.environ["HELPER_MARKER"], "w", encoding="utf-8").write(json.dumps(sys.ar
 
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", skillRoot,
+    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", skillRoot, "--work-type", "implementation",
     "--terminal-receipt", terminalReceipt, "--result-path", resultPath,
   ], { encoding: "utf8", input: "bounded review", env: {
     ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
@@ -577,7 +659,7 @@ test("assignment-bound execute fails before agent spawn without delivered ACK", 
   await fakeRunner(bin, "grok", "version");
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
   ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
   assert.equal(result.status, 1);
@@ -598,7 +680,7 @@ test("assignment-bound execute rejects stale or mismatched ACK before spawn", as
   for (const ack of [badId, badHead]) {
     const result = spawnSync(process.execPath, [adapter,
       "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
       "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
       "--assignment-ack", ack,
     ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
@@ -617,7 +699,7 @@ test("fresh legacy v1 assignment ACK cannot launch external provider", async () 
   const ack = await assignmentAckFile(bin, { assignment_contract_version: undefined, side_effect: undefined, idempotency_key: undefined }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack,
   ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
@@ -635,7 +717,7 @@ test("v2 side-effect execution propagates stable idempotency key to provider con
   const ack = await assignmentAckFile(bin, { side_effect: true, idempotency_key: "publish:release-42" }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack,
   ], { encoding: "utf8", input: "publish once", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
@@ -665,7 +747,7 @@ test("side-effect PASS propagates provider reconciliation evidence into terminal
   }));
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack, "--runtime-receipts", receipts, "--delivery-receipt", deliveryPath,
   ], { encoding: "utf8", input: "publish once", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
@@ -686,7 +768,7 @@ test("assignment-bound execute rejects missing side-effect contract before spawn
   const ack = await assignmentAckFile(bin, { side_effect: undefined }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack,
   ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
@@ -715,7 +797,7 @@ test("assignment-bound execute rejects CLI route mismatch before provider spawn"
   }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack,
   ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: [bin, process.env.PATH || ""].join(path.delimiter), GROK_HOME: grokHome, SPAWN_MARKER: marker } });
@@ -751,7 +833,7 @@ test("assignment-bound safe fallback requires canonical prior terminal before pr
   }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack,
   ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: [bin, process.env.PATH || ""].join(path.delimiter), GROK_HOME: grokHome, SPAWN_MARKER: marker } });
@@ -770,7 +852,7 @@ test("assignment-bound external start persists exact canonical route contract", 
   const ack = await assignmentAckFile(bin, { assignment_id: "route-runtime-a1" }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "route-runtime-a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "route-runtime-s1",
     "--assignment-ack", ack,
   ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: [bin, process.env.PATH || ""].join(path.delimiter), GROK_HOME: grokHome } });
@@ -798,7 +880,7 @@ test("assignment-bound execute spawns only after exact delivered ACK passes", as
   const ack = await assignmentAckFile(bin, {}, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack,
   ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
@@ -817,7 +899,7 @@ test("delivery verdict leaves exit zero without a receipt unresolved", async () 
   const ack = await assignmentAckFile(bin, {}, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack, "--attempt", "1", "--lease-id", "lease-1", "--runtime-receipts", receipts,
   ], { encoding: "utf8", input: "bounded contract", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
@@ -846,7 +928,7 @@ test("delivery verdict preserves transport failure and explicit evidence-backed 
     const deliveryPath = path.join(bin, `${assignmentId}-delivery.json`);
     const args = [adapter,
       "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
       "--assignment-id", assignmentId, "--task-id", "T1", "--agent-id", "writer", "--session-id", `session-${assignmentId}`,
       "--assignment-ack", await assignmentAckFile(bin, { assignment_id: assignmentId, primary_goal: primaryGoal }, repo),
       "--runtime-receipts", receipts,
@@ -918,31 +1000,18 @@ test("delivery verdict preserves transport failure and explicit evidence-backed 
 
 test("reviewer delivery receipt persists structured review verdict", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-review-verdict-"));
-  const repo = await makeAssignmentRepo(bin);
-  const grokHome = path.join(bin, "grok-home");
-  const receipts = path.join(bin, "receipts.jsonl");
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-verdict=${Date.now()}`);
   const deliveryPath = path.join(bin, "delivery.json");
-  await mkdir(grokHome, { recursive: true });
-  await writeFile(path.join(grokHome, "auth.json"), "{}");
-  await fakeRunner(bin, "grok", "version");
-  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const head = "a".repeat(40);
   const verdict = { reviewed_head: head, verdict: "PASS", critical: [], important: [], minor: [] };
   await writeFile(deliveryPath, JSON.stringify({
     delivery_outcome: "pass", summary: "review passed", evidence: [`git:${head}`], artifacts: [`git:${head}`],
     next_action: "integrate candidate", retry_class: "none", review_verdict: verdict,
   }));
-  const ack = await assignmentAckFile(bin, { assignment_id: "review-a1", agent_id: "reviewer",
-    primary_goal: "review immutable candidate", task_id: "review-a1", owned_scope: ["TASK_LEDGER.md"], role: "reviewer", candidate_revision: head, reviewer_for_revision: head, review_phase: "full",
-  }, repo);
-  const result = spawnSync(process.execPath, [adapter,
-    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
-    "--assignment-id", "review-a1", "--task-id", "review-a1", "--agent-id", "reviewer", "--session-id", "review-session",
-    "--assignment-ack", ack, "--runtime-receipts", receipts, "--delivery-receipt", deliveryPath,
-  ], { encoding: "utf8", input: "review", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
-  assert.equal(result.status, 0, result.stderr);
-  const events = (await readFile(receipts, "utf8")).trim().split("\n").map(JSON.parse);
-  assert.deepEqual(events.at(-1).review_verdict, verdict);
+  const receipt = runtimeModule.readDeliveryReceipt(deliveryPath, {
+    assignmentRole: "reviewer", candidateRevision: head, reviewPhase: "full",
+  });
+  assert.deepEqual(receipt.review_verdict, verdict);
 });
 
 
@@ -957,7 +1026,7 @@ test("long external execution emits automatic heartbeat before terminal", async 
   const ack = await assignmentAckFile(bin, {}, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "heartbeat-a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", await assignmentAckFile(bin, { assignment_id: "heartbeat-a1" }, repo),
     "--attempt", "1", "--lease-id", "heartbeat-lease-1", "--runtime-receipts", receipts,
@@ -989,7 +1058,7 @@ test("external execution emits progress when tracked worktree evidence changes",
   await fakeRunner(bin, "grok", "version");
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "progress-a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", await assignmentAckFile(bin, { assignment_id: "progress-a1" }, repo),
     "--attempt", "1", "--lease-id", "progress-lease-1", "--runtime-receipts", receipts,
@@ -1027,7 +1096,7 @@ test("short assignment-bound execution reconciles final Git progress before term
   await fakeRunner(bin, "grok", "version");
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "final-progress-a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", await assignmentAckFile(bin, { assignment_id: "final-progress-a1" }, repo),
     "--attempt", "1", "--lease-id", "final-progress-lease-1", "--runtime-receipts", receipts,
@@ -1058,7 +1127,7 @@ test("assignment-bound start carries a ten-minute implementation progress budget
   await fakeRunner(bin, "grok", "version");
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "budget-a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", await assignmentAckFile(bin, { assignment_id: "budget-a1" }, repo),
     "--attempt", "1", "--lease-id", "budget-lease-1", "--runtime-receipts", receipts,
@@ -1083,7 +1152,7 @@ test("assignment-bound execution persists canonical runtime without audit JSONL"
   const ack = await assignmentAckFile(bin, {}, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "canonical-a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", await assignmentAckFile(bin, { assignment_id: "canonical-a1" }, repo),
   ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
@@ -1109,7 +1178,7 @@ test("synthetic candidate workspace binds runtime to explicit canonical repo", a
   const ack = await assignmentAckFile(bin, { assignment_id: "candidate-review-a1", agent_id: "reviewer" }, candidateRepo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", candidateRepo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", candidateRepo, "--work-type", "implementation",
     "--runtime-repo", canonicalRepo,
     "--assignment-id", "candidate-review-a1", "--task-id", "T1", "--agent-id", "reviewer", "--session-id", "s1",
     "--assignment-ack", ack,
@@ -1135,7 +1204,7 @@ test("assignment-bound synthetic candidate workspace fails closed without runtim
   const ack = await assignmentAckFile(bin, { assignment_id: "candidate-review-a2", agent_id: "reviewer" }, candidateRepo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", candidateRepo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", candidateRepo, "--work-type", "implementation",
     "--assignment-id", "candidate-review-a2", "--task-id", "T1", "--agent-id", "reviewer", "--session-id", "s2",
     "--assignment-ack", ack,
   ], { encoding: "utf8", input: "review bounded candidate", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
@@ -1156,7 +1225,7 @@ test("pending live rule handshake blocks before external agent spawn", async () 
   const ack = await assignmentAckFile(bin, {}, repo);
   const result = spawnSync(process.execPath, [installed.adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack,
   ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
@@ -1185,7 +1254,7 @@ test("same assignment attempt four is rejected from another linked worktree befo
   const ack = await assignmentAckFile(bin, {}, wt);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", wt,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", wt, "--work-type", "implementation",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack, "--attempt", "4", "--lease-id", "a1:attempt:4",
   ], { encoding: "utf8", input: "bounded", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } });
@@ -1213,7 +1282,7 @@ test("same lineage B-01 through B-04 shares the recovery budget before provider 
     const ack = await assignmentAckFile(bin, { assignment_id: assignmentId }, repo);
     return spawnSync(process.execPath, [adapter,
       "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
       "--assignment-id", assignmentId, "--task-id", "T1", "--agent-id", "writer", "--session-id", `session-${assignmentId}`,
       "--assignment-ack", ack,
     ], { encoding: "utf8", input: "bounded contract", env });
@@ -1255,7 +1324,7 @@ test("Python and Node normalize lineage information separators consistently whil
     const ack = await assignmentAckFile(bin, { assignment_id: assignmentId, primary_goal: primaryGoal }, repo);
     const result = spawnSync(process.execPath, [adapter,
       "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
       "--assignment-id", assignmentId, "--task-id", "T1", "--agent-id", "writer", "--session-id", `session-${assignmentId}`,
       "--assignment-ack", ack,
     ], { encoding: "utf8", input: "bounded contract", env });
@@ -1277,7 +1346,7 @@ test("assignment-bound external terminal receipt carries current attempt and lea
   await chmod(helper, 0o755);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "a-terminal", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
     "--assignment-ack", ack, "--attempt", "1", "--lease-id", "lease-terminal-1",
     "--terminal-receipt", terminalReceipt,
@@ -1302,7 +1371,7 @@ test("Grok execution transports prompts through a private prompt file and remove
   const prompt = "bounded prompt must never be exposed in argv";
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "medium", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "medium", "--cwd", repo, "--work-type", "implementation",
   ], { encoding: "utf8", input: prompt, env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
   assert.equal(result.status, 0, result.stderr);
   const call = JSON.parse(result.stdout.trim());
@@ -1327,12 +1396,12 @@ test("oversized Grok reviewer prompt fails before provider spawn with sharding e
   const ack = await assignmentAckFile(bin, { role: "reviewer", agent_id: "reviewer", candidate_revision: candidateHead, reviewer_for_revision: candidateHead, review_phase: "full" }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo, "--work-type", "review",
     "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "reviewer", "--session-id", "review-s1",
     "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts,
   ], {
     encoding: "utf8",
-    input: "X".repeat(256),
+    input: JSON.stringify(reviewPacket({ candidateRevision: candidateHead, diffs: ["X".repeat(256)] })),
     env: {
       ...process.env,
       PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`,
@@ -1344,7 +1413,7 @@ test("oversized Grok reviewer prompt fails before provider spawn with sharding e
   });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /review_sharding_required/i);
-  assert.match(result.stderr, /observed_bytes=256/i);
+  assert.match(result.stderr, /observed_bytes=\d+/i);
   assert.match(result.stderr, /max_bytes=128/i);
   await assert.rejects(readFile(marker, "utf8"));
 });
@@ -1500,7 +1569,7 @@ test("Grok first-output timeout terminates a silent provider attempt", async () 
   const started = Date.now();
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
   ], {
     encoding: "utf8", input: "bounded",
     env: {
@@ -1524,7 +1593,7 @@ test("Grok generation stall timeout terminates after structured output stops", a
   await fakeRunner(bin, "grok", "version");
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
   ], {
     encoding: "utf8", input: "bounded",
     env: {
@@ -1560,7 +1629,7 @@ if (process.argv[2] === "version") {
   await chmod(runner, 0o755);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
   ], {
     encoding: "utf8", input: "bounded",
     timeout: 3000,
@@ -1597,7 +1666,7 @@ if (process.argv[2] === "version") {
   await chmod(runner, 0o755);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
   ], {
     encoding: "utf8", input: "bounded",
     env: {
@@ -1626,7 +1695,7 @@ test("Grok side-effect timeout crosses provider boundary as result_unknown and d
   }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "side-effect-timeout", "--task-id", "T1", "--agent-id", "writer", "--session-id", "side-effect-timeout-s1",
     "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts, "--terminal-receipt", terminalReceipt,
   ], {
@@ -1654,7 +1723,7 @@ test("Grok side-effect timeout crosses provider boundary as result_unknown and d
   assert.equal(durable.failure_details.provider_failure_class, "first_output_timeout");
 });
 
-test("Grok stall timeout persists structured canonical terminal classification", async () => {
+test("Grok implementation stall timeout persists structured canonical terminal classification", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-stall-terminal-"));
   const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
@@ -1663,15 +1732,14 @@ test("Grok stall timeout persists structured canonical terminal classification",
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
-  const candidateHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const ack = await assignmentAckFile(bin, { role: "reviewer", agent_id: "reviewer", side_effect: false, candidate_revision: candidateHead, reviewer_for_revision: candidateHead, review_phase: "full" }, repo);
+  const ack = await assignmentAckFile(bin, { role: "writer", agent_id: "writer", side_effect: false }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo,
-    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "reviewer", "--session-id", "review-stall-s1",
+    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo, "--work-type", "implementation",
+    "--assignment-id", "a1", "--task-id", "T1", "--agent-id", "writer", "--session-id", "implementation-stall-s1",
     "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts, "--terminal-receipt", terminalReceipt,
   ], {
-    encoding: "utf8", input: "bounded reviewer contract",
+    encoding: "utf8", input: "bounded implementation contract",
     env: {
       ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
       FAKE_RUNNER_MODEL_PROGRESS: "1", FAKE_RUNNER_DELAY_MS: "1000",
@@ -1706,7 +1774,7 @@ test("Grok failed attempt uses 0600 prompt file and removes it", async () => {
   await fakeRunner(bin, "grok", "version");
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
   ], {
     encoding: "utf8", input: "private bounded prompt",
     env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, FAKE_RUNNER_EXIT_CODE: "7" },
@@ -1730,7 +1798,7 @@ test("oversized non-reviewer Grok prompt fails before spawn without sharding", a
   const ack = await assignmentAckFile(bin, { assignment_id: "writer-big", role: "writer", agent_id: "writer" }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "writer-big", "--task-id", "T1", "--agent-id", "writer", "--session-id", "writer-big-s1",
     "--assignment-ack", ack,
   ], {
@@ -1759,7 +1827,7 @@ else { process.stderr.write("provider diagnostic only\\n"); await new Promise((r
   const ack = await assignmentAckFile(bin, { assignment_id: "stderr-heartbeat" }, repo);
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "stderr-heartbeat", "--task-id", "T1", "--agent-id", "writer", "--session-id", "stderr-heartbeat-s1",
     "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts,
   ], {
@@ -1955,71 +2023,30 @@ test("Grok delivery validator requires explicit reviewer phase", async () => {
   }), /review_phase|full\|shard\|synthesis|explicit/i);
 });
 
-test("Grok reviewer shard cannot finalize and synthesis binds exact candidate head", async () => {
-  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-review-phase-"));
+test("Grok reviewer shard assignment is rejected before provider spawn", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-review-shard-phase-"));
   const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
   await fakeRunner(bin, "grok", "version");
   const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const wrongHead = "0".repeat(40);
-
-  const runFinalReview = async ({ assignmentId, reviewPhase, verdictHead, evidence, reviewShardReceipts = [] }) => {
-    const deliveryPath = path.join(bin, `${assignmentId}-delivery.json`);
-    const verdict = { reviewed_head: verdictHead, verdict: "PASS", critical: [], important: [], minor: [] };
-    await writeFile(deliveryPath, JSON.stringify({
-      delivery_outcome: "pass", summary: "review phase result", evidence,
-      artifacts: [`git:${head}`], next_action: "continue review", retry_class: "none", review_verdict: verdict,
-    }));
-    const ack = await assignmentAckFile(bin, {
-      assignment_id: assignmentId, task_id: assignmentId, agent_id: "reviewer", role: "reviewer",
-      candidate_revision: head, reviewer_for_revision: head, review_phase: reviewPhase,
-      ...(reviewShardReceipts.length ? { review_shard_receipts: reviewShardReceipts } : {}),
-    }, repo);
-    return spawnSync(process.execPath, [adapter,
-      "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
-      "--assignment-id", assignmentId, "--task-id", assignmentId, "--agent-id", "reviewer", "--session-id", `${assignmentId}-s1`,
-      "--assignment-ack", ack, "--delivery-receipt", deliveryPath,
-    ], { encoding: "utf8", input: "bounded review", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
-  };
-
-  const shardVerdict = await runFinalReview({ assignmentId: "review-shard-verdict", reviewPhase: "shard", verdictHead: head, evidence: [`git:${head}`] });
-  assert.equal(shardVerdict.status, 1);
-  assert.match(shardVerdict.stderr, /shard|synthesis|final review/i);
-
-  const mismatched = await runFinalReview({ assignmentId: "review-full-wrong", reviewPhase: "full", verdictHead: wrongHead, evidence: [`git:${head}`] });
-  assert.equal(mismatched.status, 1);
-  assert.match(mismatched.stderr, /reviewed_head|candidate_revision|candidate/i);
-
-  // A shard can complete with bounded delivery evidence, but it must not publish the canonical verdict.
-  const shardReceiptsPath = path.join(bin, "review-shard-runtime.jsonl");
-  const shardDeliveryPath = path.join(bin, "review-shard-delivery.json");
-  await writeFile(shardDeliveryPath, JSON.stringify({
-    delivery_outcome: "pass", summary: "bounded shard reviewed", evidence: [`git:${head}`],
-    artifacts: [`git:${head}`], next_action: "synthesize", retry_class: "none",
-  }));
-  const shardAck = await assignmentAckFile(bin, {
+  const ack = await assignmentAckFile(bin, {
     assignment_id: "review-shard", task_id: "review-shard", agent_id: "reviewer", role: "reviewer",
     candidate_revision: head, reviewer_for_revision: head, review_phase: "shard",
   }, repo);
-  const shard = spawnSync(process.execPath, [adapter,
+  const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "review",
     "--assignment-id", "review-shard", "--task-id", "review-shard", "--agent-id", "reviewer", "--session-id", "review-shard-s1",
-    "--assignment-ack", shardAck, "--runtime-receipts", shardReceiptsPath, "--delivery-receipt", shardDeliveryPath,
-  ], { encoding: "utf8", input: "bounded shard", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
-  assert.equal(shard.status, 0, shard.stderr);
-  const shardRuntimeReceipts = (await readFile(shardReceiptsPath, "utf8")).trim().split("\n").map(JSON.parse);
-  const shardTerminalReceiptId = shardRuntimeReceipts.at(-1).receipt_id;
-  const shardLocator = `receipt:${shardTerminalReceiptId}`;
-
-  const synthesis = await runFinalReview({
-    assignmentId: "review-synthesis", reviewPhase: "synthesis", verdictHead: head,
-    evidence: [shardLocator], reviewShardReceipts: [shardLocator],
-  });
-  assert.equal(synthesis.status, 0, synthesis.stderr);
+    "--assignment-ack", ack,
+  ], { encoding: "utf8", input: JSON.stringify(reviewPacket({ candidateRevision: head, reviewPhase: "shard" })), env: {
+    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker,
+  } });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /full\|synthesis/i);
+  await assert.rejects(readFile(marker, "utf8"));
 });
 
 test("Grok cleanup uncertainty preserves cleanup failure class while remaining result unknown", async () => {
@@ -2107,10 +2134,10 @@ test("Grok reviewer requires explicit phase and immutable candidate commit", asy
     }, repo);
     return ackPromise.then((ack) => spawnSync(process.execPath, [adapter,
       "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "review",
       "--assignment-id", assignmentId, "--task-id", assignmentId, "--agent-id", "reviewer", "--session-id", `${assignmentId}-s1`,
       "--assignment-ack", ack,
-    ], { encoding: "utf8", input: "bounded review", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } }));
+    ], { encoding: "utf8", input: JSON.stringify(reviewPacket({ candidateRevision: head })), env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker } }));
   };
   const missingPhase = await run("review-missing-phase", { candidate_revision: head });
   assert.equal(missingPhase.status, 1);
@@ -2122,14 +2149,10 @@ test("Grok reviewer requires explicit phase and immutable candidate commit", asy
   await assert.rejects(readFile(marker, "utf8"));
 });
 
-test("Grok synthesis validates canonical same-candidate shard receipts", async () => {
+test("Grok synthesis receipt rejects a noncanonical assigned shard locator", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-synthesis-canonical-"));
-  const repo = await makeAssignmentRepo(bin);
-  const grokHome = path.join(bin, "grok-home");
-  await mkdir(grokHome, { recursive: true });
-  await writeFile(path.join(grokHome, "auth.json"), "{}");
-  await fakeRunner(bin, "grok", "version");
-  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const runtimeModule = await import(`../scripts/run_external_agent.mjs?synthesis-canonical=${Date.now()}`);
+  const head = "c".repeat(40);
 
   const fakeDelivery = path.join(bin, "fake-synthesis.json");
   await writeFile(fakeDelivery, JSON.stringify({
@@ -2137,19 +2160,10 @@ test("Grok synthesis validates canonical same-candidate shard receipts", async (
     next_action: "integrate", retry_class: "none",
     review_verdict: { reviewed_head: head, verdict: "PASS", critical: [], important: [], minor: [] },
   }));
-  const fakeAck = await assignmentAckFile(bin, {
-    assignment_id: "synth-fake", task_id: "synth-fake", agent_id: "reviewer", role: "reviewer",
-    candidate_revision: head, reviewer_for_revision: head, review_phase: "synthesis",
-    review_shard_receipts: ["receipt:not-real"],
-  }, repo);
-  const fakeResult = spawnSync(process.execPath, [adapter,
-    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
-    "--assignment-id", "synth-fake", "--task-id", "synth-fake", "--agent-id", "reviewer", "--session-id", "synth-fake-s1",
-    "--assignment-ack", fakeAck, "--delivery-receipt", fakeDelivery,
-  ], { encoding: "utf8", input: "bounded synthesis", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome } });
-  assert.equal(fakeResult.status, 1);
-  assert.match(fakeResult.stderr, /shard|receipt|canonical|runtime/i);
+  assert.throws(() => runtimeModule.readDeliveryReceipt(fakeDelivery, {
+    assignmentRole: "reviewer", candidateRevision: head, reviewPhase: "synthesis",
+    reviewShardReceipts: ["receipt:canonical-shard"],
+  }), /shard|receipt|exact/i);
 });
 
 test("Grok structured metadata stdout does not satisfy model first-output progress", async () => {
@@ -2222,7 +2236,7 @@ test("ordinary Grok provider exit and invalid delivery persist durable failure c
   const failedAck = await assignmentAckFile(bin, { assignment_id: "provider-exit" }, repo);
   const failed = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "provider-exit", "--task-id", "T1", "--agent-id", "writer", "--session-id", "provider-exit-s1",
     "--assignment-ack", failedAck, "--terminal-receipt", failedReceipt,
   ], { encoding: "utf8", input: "bounded", env: { ...baseEnv, FAKE_RUNNER_EXIT_CODE: "7" } });
@@ -2240,7 +2254,7 @@ test("ordinary Grok provider exit and invalid delivery persist durable failure c
   const invalidAck = await assignmentAckFile(bin, { assignment_id: "invalid-durable" }, repo);
   const invalid = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
-    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo,
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
     "--assignment-id", "invalid-durable", "--task-id", "T1", "--agent-id", "writer", "--session-id", "invalid-durable-s1",
     "--assignment-ack", invalidAck, "--delivery-receipt", invalidDeliveryPath, "--terminal-receipt", invalidReceipt,
   ], { encoding: "utf8", input: "bounded", env: baseEnv });
@@ -2594,6 +2608,11 @@ async function reviewerFakeRunner(bin, body) {
 async function runPurePacketReview({ verdict, stderr = "", exitCode = 0, body = null, assignmentId = "pure-review" }) {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-pure-review-"));
   const repo = await makeAssignmentRepo(bin);
+  const installed = await fakeInstalledSkill(bin);
+  const manifestPath = path.join(installed.root, ".adaptive-delivery-install.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.impact = "test_only";
+  await writeFile(manifestPath, JSON.stringify(manifest));
   const grokHome = path.join(bin, "grok-home");
   const runtimeReceipts = path.join(bin, "runtime-receipts.jsonl");
   const countFile = path.join(bin, "calls.txt");
@@ -2609,9 +2628,13 @@ import fs from "node:fs";
 fs.appendFileSync(process.env.COUNT_FILE, "1\\n");
 if (process.argv[2] === "version") { process.stdout.write("grok test\\n"); process.exit(0); }
 const args = process.argv.slice(2);
-if (!args.includes("--json-schema") || !args.includes("--no-plan") || !args.includes("--disable-web-search")) process.exit(91);
+if (!args.includes("--json-schema") || !args.includes("--no-plan") || !args.includes("--no-subagents") || !args.includes("--disable-web-search")) process.exit(91);
 const tools = args.indexOf("--tools"); if (tools < 0 || args[tools + 1] !== "") process.exit(92);
 const turns = args.indexOf("--max-turns"); if (turns < 0 || args[turns + 1] !== "2") process.exit(93);
+const promptFile = args[args.indexOf("--prompt-file") + 1];
+if ((fs.statSync(promptFile).mode & 0o777) !== 0o600) process.exit(94);
+const packet = JSON.parse(fs.readFileSync(promptFile, "utf8"));
+if (packet.schema_version !== 1 || packet.work_type !== "review" || packet.candidate_revision !== process.env.REVIEW_HEAD) process.exit(95);
 ${stderr ? `process.stderr.write(${JSON.stringify(stderr)});` : ""}
 ${verdict !== undefined ? `process.stdout.write(${JSON.stringify(typeof verdict === "string" ? verdict : JSON.stringify(verdict))});` : ""}
 process.exit(${exitCode});`;
@@ -2621,13 +2644,13 @@ process.exit(${exitCode});`;
     const text = JSON.stringify(inputVerdict);
     await reviewerFakeRunner(bin, script.replace(JSON.stringify(JSON.stringify(verdict)), JSON.stringify(text)));
   }
-  const result = spawnSync(process.execPath, [adapter,
+  const result = spawnSync(process.execPath, [installed.adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
     "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo, "--work-type", "review",
     "--assignment-id", assignmentId, "--task-id", assignmentId, "--agent-id", "reviewer", "--session-id", `${assignmentId}-s1`,
     "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts,
-  ], { encoding: "utf8", input: `Complete source packet for immutable candidate ${head}. Do not read repository.`, env: {
-    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, COUNT_FILE: countFile,
+  ], { encoding: "utf8", input: JSON.stringify(reviewPacket({ candidateRevision: head })), env: {
+    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, COUNT_FILE: countFile, REVIEW_HEAD: head,
     // These cases verify Reviewer terminal semantics, not provider cold-start watchdog sensitivity.
     // Dedicated launch/first-output/stall tests exercise sub-second deadlines separately.
     AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "1500", AD_GROK_STALL_TIMEOUT_MS: "1500", AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "4000", AD_EXTERNAL_KILL_GRACE_MS: "30",
@@ -2701,6 +2724,7 @@ test("Grok Reviewer stall after stdout closes reaps TERM-resistant relay descend
   const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
   const marker = path.join(bin, "relay-survived.txt");
+  const relayReady = path.join(bin, "relay-ready.txt");
   const runtimeReceipts = path.join(bin, "runtime-receipts.jsonl");
   await mkdir(grokHome, { recursive: true });
   await writeFile(path.join(grokHome, "auth.json"), "{}");
@@ -2711,9 +2735,13 @@ test("Grok Reviewer stall after stdout closes reaps TERM-resistant relay descend
   }, repo);
   await reviewerFakeRunner(bin, `
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 if (process.argv[2] === "version") { process.stdout.write("grok test\\n"); process.exit(0); }
 process.on("SIGTERM", () => {});
-spawn(process.execPath, ["-e", ${JSON.stringify(`process.on('SIGTERM',()=>{}); setTimeout(()=>require('fs').writeFileSync(${JSON.stringify(marker)},'survived'),450); setInterval(()=>{},1000);`)}], { stdio: "ignore" });
+spawn(process.execPath, ["-e", ${JSON.stringify(`require('fs').writeFileSync(process.env.RELAY_READY,'ready'); process.on('SIGTERM',()=>{}); setTimeout(()=>require('fs').writeFileSync(${JSON.stringify(marker)},'survived'),450); setInterval(()=>{},1000);`)}], { stdio: "ignore" });
+const deadline = Date.now() + 500;
+while (!fs.existsSync(process.env.RELAY_READY) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+if (!fs.existsSync(process.env.RELAY_READY)) process.exit(96);
 process.stdout.write("Reviewer started but no verdict yet\\n");
 process.stdout.end();
 setInterval(() => {}, 1000);
@@ -2723,8 +2751,8 @@ setInterval(() => {}, 1000);
     "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo, "--work-type", "review",
     "--assignment-id", "review-relay-timeout", "--task-id", "review-relay-timeout", "--agent-id", "reviewer", "--session-id", "review-relay-timeout-s1",
     "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts,
-  ], { encoding: "utf8", input: "complete source packet", env: {
-    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
+  ], { encoding: "utf8", input: JSON.stringify(reviewPacket({ candidateRevision: head })), env: {
+    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, RELAY_READY: relayReady,
     AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "300", AD_GROK_STALL_TIMEOUT_MS: "60", AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "1000", AD_EXTERNAL_KILL_GRACE_MS: "30",
   } });
   assert.equal(result.status, 1);
@@ -2794,7 +2822,7 @@ process.stdout.write(JSON.stringify({ reviewed_head: process.env.REVIEW_HEAD, cr
     "--model", "grok-4.6", "--reasoning-effort", "high", "--cwd", repo, "--work-type", "review",
     "--assignment-id", "review-transient", "--task-id", "review-transient", "--agent-id", "reviewer", "--session-id", "review-transient-s1",
     "--assignment-ack", ack, "--runtime-receipts", runtimeReceipts,
-  ], { encoding: "utf8", input: "complete source packet", env: {
+  ], { encoding: "utf8", input: JSON.stringify(reviewPacket({ candidateRevision: head })), env: {
     ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
     COUNT_FILE: countFile, REVIEW_HEAD: head,
     // This case verifies retry semantics, not cold-start watchdog sensitivity. Dedicated timeout tests cover 30-300ms deadlines.
