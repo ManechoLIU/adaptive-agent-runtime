@@ -105,6 +105,26 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_verified_execution_target_rejects_wrong_logical_agent_and_stale_fences",
     "tests.test_agent_target_resolution.LogicalAgentTargetResolutionTests."
     "test_resolution_status_model_is_generic_and_requires_verified_target_only_for_verified_state",
+    "tests.test_agent_target_resolution.LogicalAgentExecutionTurnTests."
+    "test_verified_execution_turn_is_generic_and_stable_across_target_generation_rotation",
+    "tests.test_agent_target_resolution.LogicalAgentExecutionTurnTests."
+    "test_verified_execution_turn_rejects_wrong_agent_target_or_invocation",
+    "tests.test_governance.WebMachineTurnLifecycleTests."
+    "test_new_machine_web_turn_resets_old_trace_overflow",
+    "tests.test_governance.WebMachineTurnLifecycleTests."
+    "test_same_machine_web_turn_does_not_reset_existing_trace_or_overflow",
+    "tests.test_governance.WebMachineTurnLifecycleTests."
+    "test_new_machine_web_turn_with_inflight_tool_fails_closed_without_hiding_old_trace",
+    "tests.test_governance.WebMachineTurnLifecycleTests."
+    "test_unverified_web_session_start_cannot_rotate_turn",
+    "tests.test_governance.WebMachineTurnLifecycleTests."
+    "test_verified_web_post_tool_cannot_start_new_turn_without_session_boundary",
+    "tests.test_governance.WebMachineTurnLifecycleTests."
+    "test_verified_web_event_rejects_stale_target_and_ownership_fences",
+    "tests.test_governance.WebMachineTurnLifecycleTests."
+    "test_verified_web_event_rejects_historical_web_target",
+    "tests.test_governance.WebMachineTurnLifecycleTests."
+    "test_multiple_web_turns_under_limit_do_not_accumulate_overflow_but_single_turn_still_does",
     "tests.test_controller_target_guard.ControllerTargetGuardTests."
     "test_verified_logical_agent_target_projects_controller_and_defers_other_agent_ownership",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
@@ -131,6 +151,48 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_session_start_stale_current_entry_generation_fails_closed",
     "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
     "test_session_start_machine_current_successor_rotates_same_controller_only",
+    "tests.test_web_lifecycle_bridge.WebMachineInvocationTurnBridgeTests."
+    "test_current_entry_machine_invocation_builds_generic_verified_execution_turn",
+    "tests.test_web_lifecycle_bridge.WebMachineInvocationTurnBridgeTests."
+    "test_same_host_invocation_has_stable_turn_id_and_next_invocation_changes_it",
+    "tests.test_web_lifecycle_bridge.WebMachineInvocationTurnBridgeTests."
+    "test_session_start_same_machine_invocation_preserves_trace_and_next_invocation_resets",
+    "tests.test_web_lifecycle_bridge.WebMachineInvocationTurnBridgeTests."
+    "test_session_start_without_host_invocation_id_recovers_legacy_overflow_with_runtime_lease",
+    "tests.test_web_lifecycle_bridge.WebMachineInvocationTurnBridgeTests."
+    "test_caller_turn_id_cannot_override_host_machine_turn",
+    "tests.test_web_lifecycle_bridge.WebMachineInvocationTurnBridgeTests."
+    "test_current_entry_rejects_oversized_runtime_invocation_id",
+    "tests.test_governance.RuntimeWebTurnLeaseTests."
+    "test_legacy_overflow_migrates_once_only_without_inflight",
+    "tests.test_governance.RuntimeWebTurnLeaseTests."
+    "test_legacy_overflow_with_inflight_cannot_migrate",
+    "tests.test_governance.RuntimeWebTurnLeaseTests."
+    "test_active_lease_repeated_session_start_is_idempotent",
+    "tests.test_governance.RuntimeWebTurnLeaseTests."
+    "test_active_lease_cannot_rotate_without_machine_end",
+    "tests.test_governance.RuntimeWebTurnLeaseTests."
+    "test_ended_lease_allows_next_generation_and_clears_overflow",
+    "tests.test_governance.RuntimeWebTurnLeaseTests."
+    "test_forged_ended_status_without_machine_end_evidence_cannot_rotate",
+    "tests.test_governance.RuntimeWebTurnLeaseTests."
+    "test_stale_watcher_cannot_end_newer_lease",
+    "tests.test_governance.RuntimeWebTurnMachineTraceAcceptanceTests."
+    "test_recovered_web_turn_produces_machine_trace_and_clean_closed_cycle_evidence",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnEdgeWatcherTests."
+    "test_host_unavailable_marks_lease_ended_but_preserves_overflow_until_next_session_start",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnEdgeWatcherTests."
+    "test_active_host_probe_does_not_end_current_runtime_turn",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnEdgeWatcherTests."
+    "test_post_shell_without_host_turn_token_reuses_active_runtime_lease",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnEndClassificationTests."
+    "test_only_explicit_generation_end_errors_count_as_turn_end",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnEndClassificationTests."
+    "test_missed_generation_end_edge_never_false_resets_next_active_generation",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnStaleFenceWatcherTests."
+    "test_foreign_current_entry_does_not_end_or_clear_current_lease",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnStaleFenceWatcherTests."
+    "test_target_generation_change_does_not_end_current_lease",
     "tests.test_install_skill.InstallCapabilityTests."
     "test_identity_capability_report_exposes_runtime_current_entry_host_contract",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
@@ -1244,6 +1306,16 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
         and '"discover_current_entry"' in bridge_text
         and "runtime_host_current_entry_v1" in bridge_text
     )
+    runtime_web_turn_supported = (
+        "def verified_web_execution_turn_from_current_entry(" in bridge_text
+        and "verified_execution_turn" in bridge_text
+    )
+    runtime_web_turn_edge_supported = (
+        "def runtime_web_turn_for_session_start(" in bridge_text
+        and "def watch_runtime_web_turn_end(" in bridge_text
+        and "runtime_web_turn_lease_v1" in bridge_text
+        and "host_current_entry_unavailable" in bridge_text
+    )
     if not script.is_file():
         return {
             "status": "degraded",
@@ -1258,6 +1330,12 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
             "current_entry_discovery_contract": "runtime_host_current_entry_v1" if runtime_current_entry_supported else None,
             "current_entry_host_operation": "discover_current_entry",
             "host_current_entry_required": runtime_current_entry_supported,
+            "runtime_web_turn_identity_supported": runtime_web_turn_supported,
+            "verified_execution_turn_contract": "verified_execution_turn_v1" if runtime_web_turn_supported else None,
+            "host_current_entry_turn_field_optional": "runtime_invocation_id" if runtime_web_turn_supported else None,
+            "runtime_web_turn_edge_fallback_supported": runtime_web_turn_edge_supported,
+            "host_schema_change_required_for_trace_rotation": False,
+            "machine_turn_end_required_for_trace_rotation": runtime_web_turn_supported,
         }
     completed = subprocess.run(
         [sys.executable, str(script), "capabilities"],
@@ -1277,6 +1355,12 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
             "current_entry_discovery_contract": "runtime_host_current_entry_v1" if runtime_current_entry_supported else None,
             "current_entry_host_operation": "discover_current_entry",
             "host_current_entry_required": runtime_current_entry_supported,
+            "runtime_web_turn_identity_supported": runtime_web_turn_supported,
+            "verified_execution_turn_contract": "verified_execution_turn_v1" if runtime_web_turn_supported else None,
+            "host_current_entry_turn_field_optional": "runtime_invocation_id" if runtime_web_turn_supported else None,
+            "runtime_web_turn_edge_fallback_supported": runtime_web_turn_edge_supported,
+            "host_schema_change_required_for_trace_rotation": False,
+            "machine_turn_end_required_for_trace_rotation": runtime_web_turn_supported,
         }
     try:
         contract = json.loads(completed.stdout)
@@ -1354,6 +1438,12 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
         "current_entry_discovery_contract": "runtime_host_current_entry_v1" if runtime_current_entry_supported else None,
         "current_entry_host_operation": "discover_current_entry",
         "host_current_entry_required": runtime_current_entry_supported,
+        "runtime_web_turn_identity_supported": runtime_web_turn_supported,
+        "verified_execution_turn_contract": "verified_execution_turn_v1" if runtime_web_turn_supported else None,
+        "host_current_entry_turn_field_optional": "runtime_invocation_id" if runtime_web_turn_supported else None,
+        "runtime_web_turn_edge_fallback_supported": runtime_web_turn_edge_supported,
+        "host_schema_change_required_for_trace_rotation": False,
+        "machine_turn_end_required_for_trace_rotation": runtime_web_turn_supported,
         "host_verifier_protocol": "runtime_host_verifier_cli_v1" if runtime_current_entry_supported else None,
     }
 

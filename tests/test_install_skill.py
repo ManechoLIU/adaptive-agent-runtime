@@ -431,7 +431,13 @@ class InstallCapabilityTests(unittest.TestCase):
                 "def discover_current_web_entry_for_logical_agent(): pass\n"
                 "logical_agent_identity = {}\n"
                 "HOST_OPERATION = \"discover_current_entry\"\n"
-                "PROVENANCE = \"runtime_host_current_entry_v1\"\n",
+                "PROVENANCE = \"runtime_host_current_entry_v1\"\n"
+                "def verified_web_execution_turn_from_current_entry(): pass\n"
+                "verified_execution_turn = {}\n"
+                "def runtime_web_turn_for_session_start(): pass\n"
+                "def watch_runtime_web_turn_end(): pass\n"
+                "runtime_web_turn_lease_v1 = True\n"
+                "host_current_entry_unavailable = True\n",
                 encoding="utf-8",
             )
             capability = _installed_controller_identity_capability(root)
@@ -439,6 +445,12 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertEqual(capability["current_entry_discovery_contract"], "runtime_host_current_entry_v1")
         self.assertEqual(capability["current_entry_host_operation"], "discover_current_entry")
         self.assertTrue(capability["host_current_entry_required"])
+        self.assertTrue(capability["runtime_web_turn_identity_supported"])
+        self.assertEqual(capability["verified_execution_turn_contract"], "verified_execution_turn_v1")
+        self.assertEqual(capability["host_current_entry_turn_field_optional"], "runtime_invocation_id")
+        self.assertTrue(capability["runtime_web_turn_edge_fallback_supported"])
+        self.assertFalse(capability["host_schema_change_required_for_trace_rotation"])
+        self.assertTrue(capability["machine_turn_end_required_for_trace_rotation"])
         self.assertEqual(capability["host_verifier_protocol"], "runtime_host_verifier_cli_v1")
         self.assertEqual(capability["host_attestation"], "external_current_entry_required")
         self.assertEqual(capability["logical_agent_target_resolution_contract"], "logical_agent_target_resolution_v1")
@@ -1179,7 +1191,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_identity_contract_directly_supports_controller_agent_reviewer_and_runtime_repair_agent(self): self.assertTrue(True)\n"
                 "    def test_verified_execution_target_is_generic_and_carries_double_generation_fence(self): self.assertTrue(True)\n"
                 "    def test_verified_execution_target_rejects_wrong_logical_agent_and_stale_fences(self): self.assertTrue(True)\n"
-                "    def test_resolution_status_model_is_generic_and_requires_verified_target_only_for_verified_state(self): self.assertTrue(True)\n",
+                "    def test_resolution_status_model_is_generic_and_requires_verified_target_only_for_verified_state(self): self.assertTrue(True)\n"
+                "class LogicalAgentExecutionTurnTests(unittest.TestCase):\n"
+                "    def test_verified_execution_turn_is_generic_and_stable_across_target_generation_rotation(self): self.assertTrue(True)\n"
+                "    def test_verified_execution_turn_rejects_wrong_agent_target_or_invocation(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_web_lifecycle_bridge.py").write_text(
@@ -1221,6 +1236,23 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_session_start_stale_current_entry_ownership_generation_fails_closed(self): self.assertTrue(True)\n"
                 "    def test_session_start_stale_current_entry_generation_fails_closed(self): self.assertTrue(True)\n"
                 "    def test_session_start_machine_current_successor_rotates_same_controller_only(self): self.assertTrue(True)\n"
+                "class WebMachineInvocationTurnBridgeTests(unittest.TestCase):\n"
+                "    def test_current_entry_machine_invocation_builds_generic_verified_execution_turn(self): self.assertTrue(True)\n"
+                "    def test_same_host_invocation_has_stable_turn_id_and_next_invocation_changes_it(self): self.assertTrue(True)\n"
+                "    def test_session_start_same_machine_invocation_preserves_trace_and_next_invocation_resets(self): self.assertTrue(True)\n"
+                "    def test_session_start_without_host_invocation_id_recovers_legacy_overflow_with_runtime_lease(self): self.assertTrue(True)\n"
+                "    def test_caller_turn_id_cannot_override_host_machine_turn(self): self.assertTrue(True)\n"
+                "    def test_current_entry_rejects_oversized_runtime_invocation_id(self): self.assertTrue(True)\n"
+                "class RuntimeWebTurnEdgeWatcherTests(unittest.TestCase):\n"
+                "    def test_host_unavailable_marks_lease_ended_but_preserves_overflow_until_next_session_start(self): self.assertTrue(True)\n"
+                "    def test_active_host_probe_does_not_end_current_runtime_turn(self): self.assertTrue(True)\n"
+                "    def test_post_shell_without_host_turn_token_reuses_active_runtime_lease(self): self.assertTrue(True)\n"
+                "class RuntimeWebTurnEndClassificationTests(unittest.TestCase):\n"
+                "    def test_only_explicit_generation_end_errors_count_as_turn_end(self): self.assertTrue(True)\n"
+                "    def test_missed_generation_end_edge_never_false_resets_next_active_generation(self): self.assertTrue(True)\n"
+                "class RuntimeWebTurnStaleFenceWatcherTests(unittest.TestCase):\n"
+                "    def test_foreign_current_entry_does_not_end_or_clear_current_lease(self): self.assertTrue(True)\n"
+                "    def test_target_generation_change_does_not_end_current_lease(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_host_neutral_supervisor_omits_missing_desktop_codex_argument(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
@@ -1370,6 +1402,25 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_continuation_debt_fingerprint_escalates_through_existing_recurrence_rules(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n"
+                "class RuntimeWebTurnLeaseTests(unittest.TestCase):\n"
+                "    def test_legacy_overflow_migrates_once_only_without_inflight(self): self.assertTrue(True)\n"
+                "    def test_legacy_overflow_with_inflight_cannot_migrate(self): self.assertTrue(True)\n"
+                "    def test_active_lease_repeated_session_start_is_idempotent(self): self.assertTrue(True)\n"
+                "    def test_active_lease_cannot_rotate_without_machine_end(self): self.assertTrue(True)\n"
+                "    def test_ended_lease_allows_next_generation_and_clears_overflow(self): self.assertTrue(True)\n"
+                "    def test_forged_ended_status_without_machine_end_evidence_cannot_rotate(self): self.assertTrue(True)\n"
+                "    def test_stale_watcher_cannot_end_newer_lease(self): self.assertTrue(True)\n"
+                "class RuntimeWebTurnMachineTraceAcceptanceTests(unittest.TestCase):\n"
+                "    def test_recovered_web_turn_produces_machine_trace_and_clean_closed_cycle_evidence(self): self.assertTrue(True)\n"
+                "class WebMachineTurnLifecycleTests(unittest.TestCase):\n"
+                "    def test_new_machine_web_turn_resets_old_trace_overflow(self): self.assertTrue(True)\n"
+                "    def test_same_machine_web_turn_does_not_reset_existing_trace_or_overflow(self): self.assertTrue(True)\n"
+                "    def test_new_machine_web_turn_with_inflight_tool_fails_closed_without_hiding_old_trace(self): self.assertTrue(True)\n"
+                "    def test_unverified_web_session_start_cannot_rotate_turn(self): self.assertTrue(True)\n"
+                "    def test_verified_web_post_tool_cannot_start_new_turn_without_session_boundary(self): self.assertTrue(True)\n"
+                "    def test_verified_web_event_rejects_stale_target_and_ownership_fences(self): self.assertTrue(True)\n"
+                "    def test_verified_web_event_rejects_historical_web_target(self): self.assertTrue(True)\n"
+                "    def test_multiple_web_turns_under_limit_do_not_accumulate_overflow_but_single_turn_still_does(self): self.assertTrue(True)\n"
                 "class ControllerActionSourcePromptTests(unittest.TestCase):\n"
                 "    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self): self.assertTrue(True)\n"
                 "    def test_live_e2e_accept_prompt_carries_actual_execution_source(self): self.assertTrue(True)\n"

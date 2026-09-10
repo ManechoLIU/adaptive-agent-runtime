@@ -3,9 +3,13 @@ from __future__ import annotations
 
 from typing import Any
 
+import hashlib
+import json
+
 LOGICAL_AGENT_TARGET_RESOLUTION_SCHEMA = 1
 LOGICAL_AGENT_TARGET_RESOLUTION_CONTRACT = "logical_agent_target_resolution_v1"
 VERIFIED_EXECUTION_TARGET_CONTRACT = "verified_execution_target_v1"
+VERIFIED_EXECUTION_TURN_CONTRACT = "verified_execution_turn_v1"
 LOGICAL_AGENT_TARGET_RESOLUTION_STATES = (
     "VERIFIED", "UNRESOLVED", "STALE", "CONFLICTED",
 )
@@ -18,6 +22,7 @@ SUPPORTED_LOGICAL_AGENT_TYPES = (
 SUPPORTED_EXECUTION_HOSTS = ("web", "desktop_codex")
 MAX_AGENT_ID_LENGTH = 256
 MAX_SESSION_ID_LENGTH = 256
+MAX_RUNTIME_INVOCATION_ID_LENGTH = 512
 
 
 def _bounded_text(value: object, *, label: str, maximum: int) -> str:
@@ -91,6 +96,112 @@ def verified_execution_target(
         "target_mode": _bounded_text(target_mode, label="target mode", maximum=64),
         "provenance": _bounded_text(provenance, label="target provenance", maximum=128),
     }
+
+
+def _execution_turn_id(*, logical_agent: dict[str, Any], host: str, execution_target_session_id: str, runtime_invocation_id: str) -> str:
+    payload = {
+        "contract": VERIFIED_EXECUTION_TURN_CONTRACT,
+        "logical_agent_identity": logical_agent,
+        "host": host,
+        "execution_target_session_id": execution_target_session_id,
+        "runtime_invocation_id": runtime_invocation_id,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return f"{host}-turn:{digest}"
+
+
+def verified_execution_turn(
+    *,
+    verified_target: object,
+    runtime_invocation_id: str,
+    provenance: str,
+) -> dict[str, Any]:
+    target = normalize_verified_execution_target(verified_target)
+    invocation_id = _bounded_text(
+        runtime_invocation_id,
+        label="runtime invocation id",
+        maximum=MAX_RUNTIME_INVOCATION_ID_LENGTH,
+    )
+    turn_id = _execution_turn_id(
+        logical_agent=target["logical_agent_identity"],
+        host=target["host"],
+        execution_target_session_id=target["execution_target_session_id"],
+        runtime_invocation_id=invocation_id,
+    )
+    return {
+        "schema_version": LOGICAL_AGENT_TARGET_RESOLUTION_SCHEMA,
+        "contract": VERIFIED_EXECUTION_TURN_CONTRACT,
+        "state": "VERIFIED",
+        "logical_agent_identity": target["logical_agent_identity"],
+        "host": target["host"],
+        "execution_target_session_id": target["execution_target_session_id"],
+        "target_generation": target["target_generation"],
+        "ownership_generation": target["ownership_generation"],
+        "runtime_invocation_id": invocation_id,
+        "turn_id": turn_id,
+        "provenance": _bounded_text(provenance, label="turn provenance", maximum=128),
+    }
+
+
+def normalize_verified_execution_turn(
+    value: object,
+    *,
+    expected_logical_agent: object | None = None,
+    expected_host: str | None = None,
+    expected_execution_target_session_id: str | None = None,
+    expected_target_generation: int | None = None,
+    expected_ownership_generation: int | None = None,
+    expected_runtime_invocation_id: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise PermissionError("verified execution turn must be an object")
+    if value.get("schema_version") != LOGICAL_AGENT_TARGET_RESOLUTION_SCHEMA:
+        raise PermissionError("verified execution turn schema_version is unsupported")
+    if value.get("contract") != VERIFIED_EXECUTION_TURN_CONTRACT:
+        raise PermissionError("verified execution turn contract is unsupported")
+    if value.get("state") != "VERIFIED":
+        raise PermissionError("execution turn is not VERIFIED")
+    target = {
+        "schema_version": LOGICAL_AGENT_TARGET_RESOLUTION_SCHEMA,
+        "contract": VERIFIED_EXECUTION_TARGET_CONTRACT,
+        "state": "VERIFIED",
+        "logical_agent_identity": value.get("logical_agent_identity"),
+        "host": value.get("host"),
+        "execution_target_session_id": value.get("execution_target_session_id"),
+        "target_generation": value.get("target_generation"),
+        "ownership_generation": value.get("ownership_generation"),
+        "target_mode": "explicit_current",
+        "provenance": "verified_execution_turn_fence",
+    }
+    normalized_target = normalize_verified_execution_target(
+        target,
+        expected_logical_agent=expected_logical_agent,
+        expected_host=expected_host,
+        expected_execution_target_session_id=expected_execution_target_session_id,
+        expected_target_generation=expected_target_generation,
+        expected_ownership_generation=expected_ownership_generation,
+    )
+    try:
+        normalized = verified_execution_turn(
+            verified_target=normalized_target,
+            runtime_invocation_id=value.get("runtime_invocation_id"),
+            provenance=value.get("provenance"),
+        )
+    except ValueError as exc:
+        raise PermissionError(str(exc)) from exc
+    if str(value.get("turn_id") or "").strip() != normalized["turn_id"]:
+        raise PermissionError("verified execution turn_id does not match machine runtime invocation")
+    if expected_runtime_invocation_id is not None:
+        expected = _bounded_text(
+            expected_runtime_invocation_id,
+            label="expected runtime invocation id",
+            maximum=MAX_RUNTIME_INVOCATION_ID_LENGTH,
+        )
+        if normalized["runtime_invocation_id"] != expected:
+            raise PermissionError("verified execution turn runtime invocation mismatch")
+    return normalized
 
 
 def normalize_verified_execution_target(

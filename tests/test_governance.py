@@ -5831,3 +5831,487 @@ def _web_bridge_event_uses_actual_web_conversation_as_controller_action_source(s
 
 
 ControllerActionSourcePromptTests.test_web_bridge_event_uses_actual_web_conversation_as_controller_action_source = _web_bridge_event_uses_actual_web_conversation_as_controller_action_source
+
+class WebMachineTurnLifecycleTests(unittest.TestCase):
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
+            "ready_ids": [], "runnable_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {}, "control_loop_required": False,
+        }
+
+    def web_turn(self, invocation: str, *, target_generation: int = 8, ownership_generation: int = 8) -> dict[str, object]:
+        identity = lifecycle_hook.agent_target.logical_agent_identity(agent_type="controller", agent_id="controller-1")
+        target = lifecycle_hook.agent_target.verified_execution_target(
+            logical_agent=identity, host="web", execution_target_session_id="web-current",
+            target_generation=target_generation, ownership_generation=ownership_generation,
+            provenance="test",
+        )
+        return lifecycle_hook.agent_target.verified_execution_turn(
+            verified_target=target, runtime_invocation_id=invocation,
+            provenance="runtime_host_current_entry_v1",
+        )
+
+    def event(self, invocation: str) -> dict[str, object]:
+        turn = self.web_turn(invocation)
+        return {
+            "hook_event_name": "SessionStart", "session_id": "controller-1",
+            "controller_session_id": "controller-1", "controller_host": "web",
+            "execution_host": "web", "event_source": "web", "source_session_id": "web-current",
+            "web_session_id": "web-current", "turn_id": turn["turn_id"],
+            "verified_execution_turn": turn,
+        }
+
+    def test_new_machine_web_turn_resets_old_trace_overflow(self) -> None:
+        prior = {
+            "active_turn_id": self.web_turn("machine-A")["turn_id"],
+            "tool_trace": [{"turn_id": self.web_turn("machine-A")["turn_id"], "tool_use_id": "old"}],
+            "tool_trace_overflow": True, "inflight_tool_use_ids": [],
+        }
+        _output, state = lifecycle_hook.evaluate_event(self.event("machine-B"), snapshot=self.snapshot(), prior_state=prior)
+        self.assertEqual(state["active_turn_id"], self.web_turn("machine-B")["turn_id"])
+        self.assertEqual(state["tool_trace"], [])
+        self.assertFalse(state["tool_trace_overflow"])
+
+    def test_same_machine_web_turn_does_not_reset_existing_trace_or_overflow(self) -> None:
+        turn_id = self.web_turn("machine-A")["turn_id"]
+        prior = {
+            "active_turn_id": turn_id,
+            "tool_trace": [{"turn_id": turn_id, "tool_use_id": "existing"}],
+            "tool_trace_overflow": True, "inflight_tool_use_ids": [],
+        }
+        _output, state = lifecycle_hook.evaluate_event(self.event("machine-A"), snapshot=self.snapshot(), prior_state=prior)
+        self.assertEqual(state["active_turn_id"], turn_id)
+        self.assertEqual(len(state["tool_trace"]), 1)
+        self.assertTrue(state["tool_trace_overflow"])
+
+    def test_new_machine_web_turn_with_inflight_tool_fails_closed_without_hiding_old_trace(self) -> None:
+        old_turn = self.web_turn("machine-A")["turn_id"]
+        prior = {
+            "active_turn_id": old_turn,
+            "tool_trace": [{"turn_id": old_turn, "tool_use_id": "tool-inflight"}],
+            "tool_trace_overflow": True, "inflight_tool_use_ids": ["tool-inflight"],
+        }
+        output, state = lifecycle_hook.evaluate_event(self.event("machine-B"), snapshot=self.snapshot(), prior_state=prior)
+        self.assertEqual(output.get("decision"), "block")
+        self.assertEqual(state["active_turn_id"], old_turn)
+        self.assertEqual(state["inflight_tool_use_ids"], ["tool-inflight"])
+        self.assertTrue(state["tool_trace_overflow"])
+        self.assertEqual(state["adapter_fault"]["code"], "inflight_tool_turn_boundary")
+
+    def test_unverified_web_session_start_cannot_rotate_turn(self) -> None:
+        old_turn = self.web_turn("machine-A")["turn_id"]
+        prior = {"active_turn_id": old_turn, "tool_trace": [], "tool_trace_overflow": False, "inflight_tool_use_ids": []}
+        fake = dict(self.event("machine-B"))
+        fake.pop("verified_execution_turn")
+        output, state = lifecycle_hook.evaluate_event(fake, snapshot=self.snapshot(), prior_state=prior)
+        self.assertEqual(output.get("decision"), "block")
+        self.assertEqual(state["active_turn_id"], old_turn)
+        self.assertEqual(state["adapter_fault"]["code"], "unverified_web_turn")
+
+    def test_web_post_tool_cannot_start_next_turn_without_session_boundary(self) -> None:
+        _, state = lifecycle_hook.evaluate_event(
+            self.event("machine-A"), snapshot=self.snapshot(), prior_state=None
+        )
+        old_turn = state["active_turn_id"]
+        next_turn = self.web_turn("machine-B")
+        event = {
+            "hook_event_name": "PostToolUse", "session_id": "controller-1",
+            "controller_session_id": "controller-1", "controller_host": "web",
+            "execution_host": "web", "event_source": "web", "source_session_id": "web-current",
+            "web_session_id": "web-current", "turn_id": next_turn["turn_id"],
+            "verified_execution_turn": next_turn,
+            "tool_use_id": "late-post", "tool_name": "Shell",
+            "tool_input": {"command": "true"}, "tool_response": {"exit_code": 0},
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            event, snapshot=self.snapshot(), prior_state=state
+        )
+        self.assertEqual(output.get("decision"), "block")
+        self.assertEqual(state["active_turn_id"], old_turn)
+        self.assertEqual(state["adapter_fault"]["code"], "web_turn_start_required")
+
+    def test_verified_web_event_rejects_stale_target_and_ownership_fences(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            controller = "controller-1"; web = "web-current"
+            registry = root / "controllers.json"
+            payload = {
+                controller: str(repo.resolve()),
+                "__controller_sessions__": {controller: {"web": [web]}},
+                "__controller_targets__": {controller: {"web": {
+                    "status": "active", "session_id": web, "generation": 5,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+                }}},
+                "__controller_execution_ownership__": {controller: {
+                    "active_host": "web", "execution_target_session_id": web,
+                    "generation": 9, "provenance": "web_entry",
+                }},
+            }
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            identity = lifecycle_hook.agent_target.logical_agent_identity(
+                agent_type="controller", agent_id=controller
+            )
+            stale_target = lifecycle_hook.agent_target.verified_execution_target(
+                logical_agent=identity, host="web", execution_target_session_id=web,
+                target_generation=4, ownership_generation=9, provenance="stale-test",
+            )
+            stale_turn = lifecycle_hook.agent_target.verified_execution_turn(
+                verified_target=stale_target, runtime_invocation_id="machine-A",
+                provenance="runtime_host_current_entry_v1",
+            )
+            event = {
+                "hook_event_name": "SessionStart", "controller_host": "web",
+                "execution_host": "web", "event_source": "web",
+                "controller_id": controller, "controller_session_id": controller,
+                "session_id": controller, "web_session_id": web,
+                "source_session_id": web, "cwd": str(repo),
+                "turn_id": stale_turn["turn_id"], "verified_execution_turn": stale_turn,
+            }
+            snapshot = {**self.snapshot(), "root": str(repo.resolve())}
+            with patch.object(lifecycle_hook, "project_snapshot", return_value=snapshot):
+                with self.assertRaisesRegex(PermissionError, "generation is stale"):
+                    lifecycle_hook.process_verified_web_event(
+                        event, registry_path=registry, lifecycle_path=root / "state.json"
+                    )
+
+            stale_ownership = lifecycle_hook.agent_target.verified_execution_target(
+                logical_agent=identity, host="web", execution_target_session_id=web,
+                target_generation=5, ownership_generation=8, provenance="stale-test",
+            )
+            stale_turn = lifecycle_hook.agent_target.verified_execution_turn(
+                verified_target=stale_ownership, runtime_invocation_id="machine-A",
+                provenance="runtime_host_current_entry_v1",
+            )
+            event["turn_id"] = stale_turn["turn_id"]
+            event["verified_execution_turn"] = stale_turn
+            with patch.object(lifecycle_hook, "project_snapshot", return_value=snapshot):
+                with self.assertRaisesRegex(PermissionError, "ownership generation is stale"):
+                    lifecycle_hook.process_verified_web_event(
+                        event, registry_path=registry, lifecycle_path=root / "state.json"
+                    )
+
+    def test_verified_web_event_rejects_historical_web_target(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            controller = "controller-1"; old_web = "web-old"; current_web = "web-current"
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                controller: str(repo.resolve()),
+                "__controller_sessions__": {controller: {"web": [old_web, current_web]}},
+                "__controller_targets__": {controller: {"web": {
+                    "status": "active", "session_id": current_web, "generation": 5,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+                }}},
+                "__controller_execution_ownership__": {controller: {
+                    "active_host": "web", "execution_target_session_id": current_web,
+                    "generation": 9, "provenance": "web_entry",
+                }},
+            }), encoding="utf-8")
+            identity = lifecycle_hook.agent_target.logical_agent_identity(
+                agent_type="controller", agent_id=controller
+            )
+            old_target = lifecycle_hook.agent_target.verified_execution_target(
+                logical_agent=identity, host="web", execution_target_session_id=old_web,
+                target_generation=4, ownership_generation=8, provenance="historical-test",
+            )
+            turn = lifecycle_hook.agent_target.verified_execution_turn(
+                verified_target=old_target, runtime_invocation_id="machine-old",
+                provenance="runtime_host_current_entry_v1",
+            )
+            event = {
+                "hook_event_name": "SessionStart", "controller_host": "web",
+                "execution_host": "web", "event_source": "web",
+                "controller_id": controller, "controller_session_id": controller,
+                "session_id": controller, "web_session_id": old_web,
+                "source_session_id": old_web, "cwd": str(repo),
+                "turn_id": turn["turn_id"], "verified_execution_turn": turn,
+            }
+            snapshot = {**self.snapshot(), "root": str(repo.resolve())}
+            with patch.object(lifecycle_hook, "project_snapshot", return_value=snapshot):
+                with self.assertRaisesRegex(PermissionError, "not the current Web execution target"):
+                    lifecycle_hook.process_verified_web_event(
+                        event, registry_path=registry, lifecycle_path=root / "state.json"
+                    )
+
+    def test_multiple_web_turns_under_limit_do_not_accumulate_overflow_but_single_turn_still_does(self) -> None:
+        _, state = lifecycle_hook.evaluate_event(self.event("machine-A"), snapshot=self.snapshot(), prior_state=None)
+        turn_a = state["active_turn_id"]
+        for index in range(100):
+            event = {"hook_event_name": "PostToolUse", "session_id": "controller-1", "controller_session_id": "controller-1", "controller_host": "web", "execution_host": "web", "event_source": "web",
+                     "source_session_id": "web-current", "web_session_id": "web-current",
+                     "turn_id": turn_a, "verified_execution_turn": self.web_turn("machine-A"),
+                     "tool_use_id": f"a-{index}", "tool_name": "Shell", "tool_input": {"command": "true"}, "tool_response": {"exit_code": 0}}
+            _, state = lifecycle_hook.evaluate_event(event, snapshot=self.snapshot(), prior_state=state)
+        self.assertFalse(state["tool_trace_overflow"])
+        _, state = lifecycle_hook.evaluate_event(self.event("machine-B"), snapshot=self.snapshot(), prior_state=state)
+        turn_b = state["active_turn_id"]
+        for index in range(100):
+            event = {"hook_event_name": "PostToolUse", "session_id": "controller-1", "controller_session_id": "controller-1", "controller_host": "web", "execution_host": "web", "event_source": "web",
+                     "source_session_id": "web-current", "web_session_id": "web-current",
+                     "turn_id": turn_b, "verified_execution_turn": self.web_turn("machine-B"),
+                     "tool_use_id": f"b-{index}", "tool_name": "Shell", "tool_input": {"command": "true"}, "tool_response": {"exit_code": 0}}
+            _, state = lifecycle_hook.evaluate_event(event, snapshot=self.snapshot(), prior_state=state)
+        self.assertFalse(state["tool_trace_overflow"])
+        for index in range(29):
+            event = {"hook_event_name": "PostToolUse", "session_id": "controller-1", "controller_session_id": "controller-1", "controller_host": "web", "execution_host": "web", "event_source": "web",
+                     "source_session_id": "web-current", "web_session_id": "web-current",
+                     "turn_id": turn_b, "verified_execution_turn": self.web_turn("machine-B"),
+                     "tool_use_id": f"b-over-{index}", "tool_name": "Shell", "tool_input": {"command": "true"}, "tool_response": {"exit_code": 0}}
+            _, state = lifecycle_hook.evaluate_event(event, snapshot=self.snapshot(), prior_state=state)
+        self.assertTrue(state["tool_trace_overflow"])
+
+class RuntimeWebTurnLeaseTests(unittest.TestCase):
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
+            "ready_ids": [], "runnable_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {}, "control_loop_required": False,
+        }
+
+    def lease_event(self, *, generation: int, invocation: str, status: str = "active") -> dict[str, object]:
+        identity = lifecycle_hook.agent_target.logical_agent_identity(agent_type="controller", agent_id="controller-1")
+        target = lifecycle_hook.agent_target.verified_execution_target(
+            logical_agent=identity, host="web", execution_target_session_id="web-current",
+            target_generation=8, ownership_generation=8, provenance="test",
+        )
+        turn = lifecycle_hook.agent_target.verified_execution_turn(
+            verified_target=target, runtime_invocation_id=invocation,
+            provenance="runtime_current_entry_edge_v1",
+        )
+        lease = {
+            "contract": lifecycle_hook.RUNTIME_WEB_TURN_LEASE_CONTRACT,
+            "status": status, "generation": generation,
+            "turn_id": turn["turn_id"], "runtime_invocation_id": invocation,
+            "execution_target_session_id": "web-current",
+            "target_generation": 8, "ownership_generation": 8,
+            "watcher_nonce": f"watch-{generation}",
+        }
+        return {
+            "hook_event_name": "SessionStart", "session_id": "controller-1",
+            "controller_session_id": "controller-1", "controller_host": "web",
+            "execution_host": "web", "event_source": "web", "source_session_id": "web-current",
+            "web_session_id": "web-current", "turn_id": turn["turn_id"],
+            "verified_execution_turn": turn, "web_turn_lease": lease,
+            "controller_target_generation": 8, "controller_ownership_generation": 8,
+        }
+
+    def test_legacy_overflow_migrates_once_only_without_inflight(self) -> None:
+        prior = {
+            "active_turn_id": "web-ai-bridge", "tool_trace_overflow": True,
+            "tool_trace": [{"turn_id":"web-ai-bridge","tool_use_id":"old"}], "inflight_tool_use_ids": [],
+        }
+        out, state = lifecycle_hook.evaluate_event(self.lease_event(generation=1, invocation="rtw-a"), snapshot=self.snapshot(), prior_state=prior)
+        self.assertNotEqual(out.get("decision"), "block")
+        self.assertNotEqual(state["active_turn_id"], "web-ai-bridge")
+        self.assertFalse(state["tool_trace_overflow"])
+        self.assertEqual(state["web_turn_lease"]["generation"], 1)
+
+    def test_legacy_overflow_with_inflight_cannot_migrate(self) -> None:
+        prior = {
+            "active_turn_id": "web-ai-bridge", "tool_trace_overflow": True,
+            "tool_trace": [{"turn_id":"web-ai-bridge","tool_use_id":"old"}],
+            "inflight_tool_use_ids": ["old"],
+        }
+        out, state = lifecycle_hook.evaluate_event(self.lease_event(generation=1, invocation="rtw-a"), snapshot=self.snapshot(), prior_state=prior)
+        self.assertEqual(out.get("decision"), "block")
+        self.assertEqual(state["active_turn_id"], "web-ai-bridge")
+        self.assertTrue(state["tool_trace_overflow"])
+
+    def test_active_lease_repeated_session_start_is_idempotent(self) -> None:
+        event = self.lease_event(generation=1, invocation="rtw-a")
+        _, state = lifecycle_hook.evaluate_event(event, snapshot=self.snapshot(), prior_state=None)
+        state["tool_trace"] = [{"turn_id": state["active_turn_id"], "tool_use_id":"existing"}]
+        state["tool_trace_overflow"] = True
+        _, again = lifecycle_hook.evaluate_event(event, snapshot=self.snapshot(), prior_state=state)
+        self.assertEqual(again["active_turn_id"], state["active_turn_id"])
+        self.assertEqual(len(again["tool_trace"]), 1)
+        self.assertTrue(again["tool_trace_overflow"])
+
+    def test_active_lease_cannot_rotate_without_machine_end(self) -> None:
+        first = self.lease_event(generation=1, invocation="rtw-a")
+        _, state = lifecycle_hook.evaluate_event(first, snapshot=self.snapshot(), prior_state=None)
+        out, after = lifecycle_hook.evaluate_event(self.lease_event(generation=2, invocation="rtw-b"), snapshot=self.snapshot(), prior_state=state)
+        self.assertEqual(out.get("decision"), "block")
+        self.assertEqual(after["active_turn_id"], state["active_turn_id"])
+
+    def test_ended_lease_allows_next_generation_and_clears_overflow(self) -> None:
+        first = self.lease_event(generation=1, invocation="rtw-a")
+        _, state = lifecycle_hook.evaluate_event(first, snapshot=self.snapshot(), prior_state=None)
+        state["tool_trace"] = [{"turn_id": state["active_turn_id"], "tool_use_id":"existing"}]
+        state["tool_trace_overflow"] = True
+        state["web_turn_lease"] = {
+            **state["web_turn_lease"], "status":"ended",
+            "ended_at":"2026-09-10T00:00:00+00:00",
+            "end_reason":"host_current_entry_unavailable",
+            "end_evidence_sha256":"a" * 64,
+        }
+        out, after = lifecycle_hook.evaluate_event(self.lease_event(generation=2, invocation="rtw-b"), snapshot=self.snapshot(), prior_state=state)
+        self.assertNotEqual(out.get("decision"), "block")
+        self.assertNotEqual(after["active_turn_id"], state["active_turn_id"])
+        self.assertFalse(after["tool_trace_overflow"])
+        self.assertEqual(after["tool_trace"], [])
+        self.assertEqual(after["web_turn_lease"]["generation"], 2)
+
+    def test_forged_ended_status_without_machine_end_evidence_cannot_rotate(self) -> None:
+        first = self.lease_event(generation=1, invocation="rtw-a")
+        _, state = lifecycle_hook.evaluate_event(first, snapshot=self.snapshot(), prior_state=None)
+        state["tool_trace_overflow"] = True
+        state["web_turn_lease"] = {**state["web_turn_lease"], "status":"ended"}
+        out, after = lifecycle_hook.evaluate_event(
+            self.lease_event(generation=2, invocation="rtw-b"),
+            snapshot=self.snapshot(), prior_state=state,
+        )
+        self.assertEqual(out.get("decision"), "block")
+        self.assertTrue(after["tool_trace_overflow"])
+        self.assertEqual(after["active_turn_id"], state["active_turn_id"])
+
+    def test_stale_watcher_cannot_end_newer_lease(self) -> None:
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/"state.json"
+            event = self.lease_event(generation=1, invocation="rtw-b")
+            _, state = lifecycle_hook.evaluate_event(event, snapshot=self.snapshot(), prior_state=None)
+            path.write_text(json.dumps(state), encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "stale"):
+                lifecycle_hook.mark_runtime_web_turn_ended(
+                    controller_id="controller-1", expected_turn_id="web-turn:stale",
+                    watcher_nonce="watch-1", end_reason="host_unavailable",
+                    end_evidence_sha256="a"*64, lifecycle_path=path,
+                )
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved["web_turn_lease"]["status"], "active")
+
+class RuntimeWebTurnMachineTraceAcceptanceTests(unittest.TestCase):
+    def complete_event_receipt(self) -> dict[str, object]:
+        return {
+            "event_contract": {
+                "event_id": "control-event-1", "event_type": "dispatch",
+                "primary_task": "CONTROL-WAVE-1", "candidate_revision": "ledger-abc123",
+                "allowed_actions": ["ledger_sync"], "allowed_files": [],
+                "terminal_receipt": "control event synchronized",
+            },
+            "event_actions": [{
+                "action": "ledger_sync", "primary_task": "CONTROL-WAVE-1",
+                "candidate_revision": "ledger-abc123", "files": [],
+                "required_to_close_current_state": True,
+            }],
+            "terminal_receipt_issued": True,
+        }
+
+    def test_recovered_web_turn_produces_machine_trace_and_clean_closed_cycle_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+            (root / "TASK_LEDGER.md").write_text("# ledger\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "TASK_LEDGER.md"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "base"], check=True)
+            revision = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True, text=True, capture_output=True,
+            ).stdout.strip()
+
+            identity = lifecycle_hook.agent_target.logical_agent_identity(
+                agent_type="controller", agent_id="controller-1"
+            )
+            target = lifecycle_hook.agent_target.verified_execution_target(
+                logical_agent=identity, host="web", execution_target_session_id="web-current",
+                target_generation=8, ownership_generation=8, provenance="test",
+            )
+            turn = lifecycle_hook.agent_target.verified_execution_turn(
+                verified_target=target, runtime_invocation_id="runtime-turn-1",
+                provenance="runtime_host_current_entry_edge_v1",
+            )
+            lease = {
+                "contract": lifecycle_hook.RUNTIME_WEB_TURN_LEASE_CONTRACT,
+                "status": "active", "generation": 1,
+                "turn_id": turn["turn_id"], "runtime_invocation_id": "runtime-turn-1",
+                "execution_target_session_id": "web-current",
+                "target_generation": 8, "ownership_generation": 8,
+                "watcher_nonce": "watch-1",
+            }
+            snapshot = {
+                "root": str(root.resolve()), "head": revision,
+                "ledger_sha256": "ledger", "worktree_status_sha256": "status",
+                "ready_ids": [], "runnable_ids": [], "candidate_revisions": [],
+                "ledger_errors": [], "assignment_liveness": {},
+                "control_loop_required": False,
+            }
+            session_start = {
+                "hook_event_name": "SessionStart", "session_id": "controller-1",
+                "controller_session_id": "controller-1", "controller_host": "web",
+                "execution_host": "web", "event_source": "web",
+                "source_session_id": "web-current", "web_session_id": "web-current",
+                "turn_id": turn["turn_id"], "verified_execution_turn": turn,
+                "web_turn_lease": lease,
+                "controller_target_generation": 8, "controller_ownership_generation": 8,
+                "cwd": str(root),
+            }
+            legacy = {
+                "active_turn_id": "web-ai-bridge",
+                "tool_trace": [
+                    {"turn_id": "web-ai-bridge", "tool_use_id": f"legacy-{i}"}
+                    for i in range(lifecycle_hook.MAX_TOOL_TRACE_ENTRIES)
+                ],
+                "tool_trace_overflow": True,
+                "inflight_tool_use_ids": [],
+            }
+            output, state = lifecycle_hook.evaluate_event(
+                session_start, snapshot=snapshot, prior_state=legacy
+            )
+            self.assertNotEqual(output.get("decision"), "block")
+            self.assertFalse(state["tool_trace_overflow"])
+
+            post = {
+                **session_start,
+                "hook_event_name": "PostToolUse",
+                "tool_use_id": "fresh-tool-1",
+                "tool_name": "AI-Bridge.shell_command",
+                "tool_input": {"command": "git status --short"},
+                "tool_response": {"exit_code": 0},
+            }
+            _output, state = lifecycle_hook.evaluate_event(
+                post, snapshot=snapshot, prior_state=state
+            )
+            state_root = root / "lifecycle-state"
+            state_root.mkdir()
+            (state_root / "controller-1.json").write_text(
+                json.dumps(state), encoding="utf-8"
+            )
+            trace = control_event_guard.observed_machine_trace(
+                "controller-1", state_root=state_root
+            )
+            self.assertEqual(trace["turn_id"], turn["turn_id"])
+            self.assertEqual(trace["tool_use_ids"], ["fresh-tool-1"])
+            self.assertTrue(trace["trace_sha256"])
+
+            control_snapshot = {
+                **self.complete_event_receipt(),
+                "event_contract": {
+                    **self.complete_event_receipt()["event_contract"],
+                    "event_id": "web-turn-recovered-cycle",
+                    "primary_task": "LAB-HOST-01",
+                    "candidate_revision": revision,
+                    "terminal_receipt": "fresh Web turn machine trace closed",
+                },
+                "machine_trace": trace,
+            }
+            evidence, evidence_path = control_event_guard.persist_controller_cycle_evidence(
+                root, control_snapshot, controller_id="controller-1",
+                ledger_sha256="ledger-sha", main_revision=revision,
+                terminal_status="CLOSED", validation_errors=[],
+            )
+            self.assertEqual(evidence["terminal_status"], "CLOSED")
+            self.assertEqual(evidence["controller_id"], "controller-1")
+            self.assertTrue(evidence_path.is_file())

@@ -40,6 +40,10 @@ try:
 except ModuleNotFoundError:
     from scripts import controller_target_guard as target_guard
 try:
+    import agent_target_resolution as agent_target
+except ModuleNotFoundError:
+    from scripts import agent_target_resolution as agent_target
+try:
     import goal_display_sync
 except ModuleNotFoundError:
     from scripts import goal_display_sync
@@ -63,6 +67,8 @@ CONTROLLER_SESSIONS_KEY = "__controller_sessions__"
 CONTROLLER_TARGETS_KEY = "__controller_targets__"
 DESKTOP_SESSION_HOST = "desktop_codex"
 MAX_TOOL_TRACE_ENTRIES = 128
+RUNTIME_WEB_TURN_LEASE_CONTRACT = "runtime_web_turn_lease_v1"
+LEGACY_WEB_TURN_IDS = {"web-ai-bridge"}
 DESKTOP_CANARY_PATH = Path(
     os.environ.get(
         "AD_DESKTOP_CANARY_PATH",
@@ -161,18 +167,252 @@ def _desktop_turn_start(event: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
-def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> None:
+def _runtime_web_turn_lease(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    if value.get("contract") != RUNTIME_WEB_TURN_LEASE_CONTRACT:
+        return None
+    status = value.get("status")
+    if status not in {"active", "ended"}:
+        return None
+    generation = value.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        return None
+    turn_id = str(value.get("turn_id") or "").strip()
+    invocation_id = str(value.get("runtime_invocation_id") or "").strip()
+    session_id = str(value.get("execution_target_session_id") or "").strip()
+    target_generation = value.get("target_generation")
+    ownership_generation = value.get("ownership_generation")
+    if (
+        not turn_id or not invocation_id or not session_id
+        or isinstance(target_generation, bool) or not isinstance(target_generation, int) or target_generation < 1
+        or isinstance(ownership_generation, bool) or not isinstance(ownership_generation, int) or ownership_generation < 1
+    ):
+        return None
+    if status == "ended":
+        ended_at = str(value.get("ended_at") or "").strip()
+        end_reason = str(value.get("end_reason") or "").strip()
+        evidence = str(value.get("end_evidence_sha256") or "").strip().lower()
+        if (
+            not ended_at or not end_reason or len(evidence) != 64
+            or any(ch not in "0123456789abcdef" for ch in evidence)
+        ):
+            return None
+    return dict(value)
+
+
+def _runtime_web_turn_lease_matches_event(lease: dict[str, Any], event: dict[str, Any]) -> bool:
+    return (
+        str(lease.get("turn_id") or "").strip() == _event_turn_id(event)
+        and str(lease.get("execution_target_session_id") or "").strip()
+        == str(event.get("web_session_id") or event.get("source_session_id") or "").strip()
+        and lease.get("target_generation") == event.get("controller_target_generation")
+        and lease.get("ownership_generation") == event.get("controller_ownership_generation")
+    )
+
+
+def _validate_runtime_web_turn_lease_transition(
+    state: dict[str, Any], event: dict[str, Any], incoming: dict[str, Any]
+) -> str | None:
+    if incoming.get("status") != "active":
+        return "incoming Runtime Web turn lease must be active"
+    if not _runtime_web_turn_lease_matches_event(incoming, event):
+        return "incoming Runtime Web turn lease does not match verified Web event fences"
+    prior = _runtime_web_turn_lease(state.get("web_turn_lease"))
+    current_turn_id = str(state.get("active_turn_id") or "").strip()
+    inflight = [str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)]
+    if prior is None:
+        if incoming.get("generation") != 1:
+            return "first Runtime Web turn lease generation must be 1"
+        if current_turn_id and current_turn_id not in LEGACY_WEB_TURN_IDS:
+            return "existing non-legacy turn cannot be replaced without a verified Runtime Web turn lease"
+        if current_turn_id in LEGACY_WEB_TURN_IDS and inflight:
+            return "legacy Web turn cannot migrate while tool evidence is inflight"
+        return None
+    if prior.get("status") == "active":
+        if (
+            prior.get("generation") != incoming.get("generation")
+            or str(prior.get("turn_id") or "") != str(incoming.get("turn_id") or "")
+            or str(prior.get("runtime_invocation_id") or "") != str(incoming.get("runtime_invocation_id") or "")
+        ):
+            return "active Runtime Web turn lease cannot be rotated before machine turn-end evidence"
+        if not _runtime_web_turn_lease_matches_event(prior, event):
+            return "active Runtime Web turn lease target or ownership fence is stale"
+        return None
+    if prior.get("status") == "ended":
+        if incoming.get("generation") != int(prior["generation"]) + 1:
+            return "Runtime Web turn lease generation is not the next monotonic generation"
+        if str(prior.get("turn_id") or "") == str(incoming.get("turn_id") or ""):
+            return "ended Runtime Web turn lease cannot be reused as the next turn"
+        if inflight:
+            return "ended Web turn still has inflight tool evidence"
+        return None
+    return "Runtime Web turn lease state is invalid"
+
+
+def mark_runtime_web_turn_ended(
+    *,
+    controller_id: str,
+    expected_turn_id: str,
+    watcher_nonce: str,
+    expected_session_id: str | None = None,
+    expected_target_generation: int | None = None,
+    expected_ownership_generation: int | None = None,
+    end_reason: str,
+    end_evidence_sha256: str,
+    lifecycle_path: Path | None = None,
+) -> dict[str, Any]:
+    path = lifecycle_path or state_path(controller_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_json(path)
+            lease = _runtime_web_turn_lease(state.get("web_turn_lease"))
+            if lease is None:
+                raise PermissionError("Runtime Web turn lease is unavailable")
+            if lease.get("status") == "ended":
+                return lease
+            if (
+                str(lease.get("turn_id") or "") != str(expected_turn_id or "").strip()
+                or str(lease.get("watcher_nonce") or "") != str(watcher_nonce or "").strip()
+                or str(state.get("active_turn_id") or "").strip() != str(expected_turn_id or "").strip()
+                or (expected_session_id is not None and str(lease.get("execution_target_session_id") or "") != str(expected_session_id))
+                or (expected_target_generation is not None and lease.get("target_generation") != expected_target_generation)
+                or (expected_ownership_generation is not None and lease.get("ownership_generation") != expected_ownership_generation)
+            ):
+                raise PermissionError("stale Runtime Web turn-end watcher cannot mutate the current turn")
+            lease["status"] = "ended"
+            lease["ended_at"] = datetime.now(timezone.utc).isoformat()
+            lease["end_reason"] = str(end_reason or "").strip()[:128]
+            lease["end_evidence_sha256"] = str(end_evidence_sha256 or "").strip()[:128]
+            state["web_turn_lease"] = lease
+            write_json(path, state)
+            return lease
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def record_runtime_web_turn_watcher_started(
+    *, controller_id: str, expected_turn_id: str, watcher_nonce: str, pid: int,
+    lifecycle_path: Path | None = None,
+) -> dict[str, Any]:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
+        raise ValueError("Runtime Web turn watcher pid must be positive")
+    path = lifecycle_path or state_path(controller_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_json(path)
+            lease = _runtime_web_turn_lease(state.get("web_turn_lease"))
+            if lease is None or lease.get("status") != "active":
+                raise PermissionError("Runtime Web turn lease is not active")
+            if (
+                str(lease.get("turn_id") or "") != str(expected_turn_id or "").strip()
+                or str(lease.get("watcher_nonce") or "") != str(watcher_nonce or "").strip()
+            ):
+                raise PermissionError("stale Runtime Web turn watcher cannot claim the current turn")
+            lease["watcher_pid"] = pid
+            lease["watcher_started_at"] = datetime.now(timezone.utc).isoformat()
+            state["web_turn_lease"] = lease
+            write_json(path, state)
+            return lease
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _verified_web_turn_evidence(event: dict[str, Any]) -> dict[str, Any]:
+    controller_id = str(
+        event.get("controller_session_id") or event.get("controller_id") or event.get("session_id") or ""
+    ).strip()
+    source_session_id = str(
+        event.get("web_session_id") or event.get("source_session_id") or ""
+    ).strip()
+    if not controller_id or not source_session_id:
+        raise PermissionError("verified Web turn requires exact Controller and Web source session")
+    identity = agent_target.logical_agent_identity(agent_type="controller", agent_id=controller_id)
+    return agent_target.normalize_verified_execution_turn(
+        event.get("verified_execution_turn"),
+        expected_logical_agent=identity,
+        expected_host="web",
+        expected_execution_target_session_id=source_session_id,
+        expected_target_generation=event.get("controller_target_generation"),
+        expected_ownership_generation=event.get("controller_ownership_generation"),
+    )
+
+
+def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
     turn_id = _event_turn_id(event)
     if not turn_id:
-        return
+        return None
+    web_turn: dict[str, Any] | None = None
+    is_web_machine_event = (
+        str(event.get("controller_host") or "").strip() == "web"
+        and str(event.get("execution_host") or "").strip() == "web"
+        and str(event.get("event_source") or "").strip() == "web"
+    )
+    if is_web_machine_event:
+        try:
+            web_turn = _verified_web_turn_evidence(event)
+        except (PermissionError, ValueError) as exc:
+            state["adapter_fault"] = {
+                "code": "unverified_web_turn",
+                "turn_id": turn_id,
+                "active_turn_id": str(state.get("active_turn_id", "")),
+                "reason": str(exc),
+            }
+            return "Web turn boundary rejected: Host-verified execution turn evidence is required."
+        if web_turn["turn_id"] != turn_id:
+            state["adapter_fault"] = {
+                "code": "unverified_web_turn",
+                "turn_id": turn_id,
+                "active_turn_id": str(state.get("active_turn_id", "")),
+                "reason": "event turn_id does not match verified execution turn",
+            }
+            return "Web turn boundary rejected: event turn_id does not match Host-verified execution turn."
+    incoming_lease = _runtime_web_turn_lease(event.get("web_turn_lease")) if web_turn is not None else None
+    if incoming_lease is not None:
+        lease_error = _validate_runtime_web_turn_lease_transition(state, event, incoming_lease)
+        if lease_error:
+            state["adapter_fault"] = {
+                "code": "runtime_web_turn_lease_rejected",
+                "turn_id": turn_id,
+                "active_turn_id": str(state.get("active_turn_id", "")),
+                "reason": lease_error,
+            }
+            return "Web turn boundary rejected: " + lease_error
     current_turn_id = str(state.get("active_turn_id", ""))
     if current_turn_id == turn_id:
-        return
+        if web_turn is not None:
+            state["turn_start_evidence"] = dict(web_turn)
+        if incoming_lease is not None:
+            state["web_turn_lease"] = incoming_lease
+        return None
+    if web_turn is not None and event.get("hook_event_name") not in {"SessionStart", "UserPromptSubmit"}:
+        state["adapter_fault"] = {
+            "code": "web_turn_start_required",
+            "turn_id": turn_id,
+            "active_turn_id": current_turn_id,
+            "reason": "verified Web PostToolUse cannot create a new turn without SessionStart/UserPromptSubmit",
+        }
+        return "Web turn boundary rejected: SessionStart/UserPromptSubmit is required before Web tool evidence."
+    if web_turn is not None and current_turn_id and state.get("inflight_tool_use_ids"):
+        inflight = [str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)]
+        state["adapter_fault"] = {
+            "code": "inflight_tool_turn_boundary",
+            "turn_id": turn_id,
+            "active_turn_id": current_turn_id,
+            "inflight_tool_use_ids": inflight,
+        }
+        return "Turn boundary rejected: prior Web turn still has inflight tool evidence."
     proof = None
     if current_turn_id and event.get("hook_event_name") not in {"SessionStart", "UserPromptSubmit"}:
         proof = _desktop_turn_start(event)
-        if proof is None:
-            return
+        if proof is None and web_turn is None:
+            return None
     state["active_turn_id"] = turn_id
     state["must_yield"] = False
     state["tool_trace"] = []
@@ -184,9 +424,12 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> None:
     state.pop("goal_block_inflight", None)
     state.pop("receipt_turn_id", None)
     state.pop("adapter_fault", None)
-    state["turn_start_evidence"] = proof or {
+    state["turn_start_evidence"] = dict(web_turn) if web_turn is not None else (proof or {
         "source": str(event.get("hook_event_name", "")), "turn_id": turn_id,
-    }
+    })
+    if incoming_lease is not None:
+        state["web_turn_lease"] = incoming_lease
+    return None
 
 
 def _turn_fault(state: dict[str, Any], event: dict[str, Any]) -> str | None:
@@ -2036,7 +2279,9 @@ def evaluate_event(
     event_host = str(event.get("controller_host", "")).strip()
     state["controller_host"] = event_host if event_host in {"web", "desktop_codex"} else "desktop_codex"
     event_name = event.get("hook_event_name")
-    _begin_turn(state, event)
+    turn_boundary_fault = _begin_turn(state, event)
+    if turn_boundary_fault:
+        return {"decision": "block", "reason": turn_boundary_fault}, state
     if "must_yield" not in state:
         state["must_yield"] = False
     if "tool_trace" not in state:
@@ -2994,7 +3239,7 @@ def persist_event_state(
                 archived = {key: previous[key] for key in (
                     "active_turn_id", "source_session_id", "tool_trace", "tool_trace_overflow",
                     "inflight_tool_use_ids", "control_receipt_inflight", "must_yield",
-                    "receipt_turn_id", "adapter_fault",
+                    "receipt_turn_id", "adapter_fault", "web_turn_lease",
                 ) if key in previous}
                 archived["replaced_by"] = next_state.get("turn_start_evidence")
                 try:
@@ -3009,6 +3254,90 @@ def persist_event_state(
             return output, next_state
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+
+def process_verified_web_event(
+    event: dict[str, Any],
+    *,
+    registry_path: Path = REGISTRY_PATH,
+    lifecycle_path: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Persist one Host-attested Web event through the canonical lifecycle state machine.
+
+    This is the Web security boundary. It re-derives current Controller/target/ownership
+    facts from the authoritative registry before allowing the pure lifecycle transition.
+    """
+    if not isinstance(event, dict):
+        raise PermissionError("verified Web lifecycle event must be an object")
+    if str(event.get("controller_host") or "").strip() != "web":
+        raise PermissionError("verified Web lifecycle event requires controller_host=web")
+    if str(event.get("execution_host") or "").strip() != "web":
+        raise PermissionError("verified Web lifecycle event requires execution_host=web")
+    if str(event.get("event_source") or "").strip() != "web":
+        raise PermissionError("verified Web lifecycle event requires event_source=web")
+    controller_id = str(
+        event.get("controller_session_id") or event.get("controller_id") or event.get("session_id") or ""
+    ).strip()
+    source_session_id = str(event.get("web_session_id") or event.get("source_session_id") or "").strip()
+    if not controller_id or not source_session_id:
+        raise PermissionError("verified Web lifecycle event requires exact Controller and Web source session")
+    cwd = Path(str(event.get("cwd") or ".")).expanduser().resolve()
+    snapshot = project_snapshot(cwd)
+    if snapshot is None:
+        raise PermissionError("verified Web lifecycle event is outside a governed project")
+    expected_root = Path(str(snapshot["root"])).expanduser().resolve()
+    registry_path = Path(registry_path).expanduser()
+    normalized_event = dict(event)
+    normalized_event["controller_id"] = controller_id
+    normalized_event["controller_session_id"] = controller_id
+    normalized_event["session_id"] = controller_id
+    normalized_event["source_session_id"] = source_session_id
+    normalized_event["web_session_id"] = source_session_id
+    normalized_event["controller_host"] = "web"
+    normalized_event["execution_host"] = "web"
+    normalized_event["event_source"] = "web"
+    normalized_event["cwd"] = str(expected_root)
+    normalized_event["controller_registry_path"] = str(registry_path.expanduser().resolve())
+
+    with target_guard.locked_registry(registry_path) as registry:
+        unique_controller_id = target_guard.unique_controller_id_for_repo_in_registry(
+            expected_root, registry
+        )
+        if unique_controller_id != controller_id:
+            raise PermissionError("verified Web lifecycle event does not belong to the unique project Controller")
+        if not registry_controller_root_matches(
+            registry, controller_id=controller_id, expected_root=expected_root
+        ):
+            raise PermissionError("verified Web lifecycle event repository does not match Controller root")
+        if target_guard.active_source_controller_id(
+            registry, source_session_id=source_session_id, host="web"
+        ) != controller_id:
+            raise PermissionError("verified Web lifecycle event source is not the current Web execution target")
+        target_record = target_guard.target_record(
+            registry, controller_id=controller_id, host="web"
+        )
+        if target_record is None:
+            raise PermissionError("verified Web lifecycle event requires an explicit current Web target")
+        target_status, target_session_id, target_generation = target_guard.validate_target_record(
+            target_record, host="web"
+        )
+        if target_status != "active" or target_session_id != source_session_id:
+            raise PermissionError("verified Web lifecycle event target is stale or mismatched")
+        ownership = target_guard.execution_ownership_record(registry, controller_id=controller_id)
+        if ownership is None:
+            raise PermissionError("verified Web lifecycle event requires current execution ownership")
+        ownership_host, ownership_session_id, ownership_generation = (
+            target_guard.validate_execution_ownership_record(ownership)
+        )
+        if ownership_host != "web" or ownership_session_id != source_session_id:
+            raise PermissionError("verified Web lifecycle event ownership is stale or mismatched")
+        normalized_event["controller_target_generation"] = target_generation
+        normalized_event["controller_ownership_generation"] = ownership_generation
+        # Validate the signed/derived turn against authoritative current fences before state mutation.
+        _verified_web_turn_evidence(normalized_event)
+        path = lifecycle_path or state_path(controller_id)
+        return persist_event_state(path, normalized_event, snapshot)
 
 
 def run_hook() -> int:

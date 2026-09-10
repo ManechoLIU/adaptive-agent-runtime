@@ -88,3 +88,51 @@ class LogicalAgentTargetResolutionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class LogicalAgentExecutionTurnTests(unittest.TestCase):
+    def test_verified_execution_turn_is_generic_and_stable_across_target_generation_rotation(self) -> None:
+        for agent_type in ("controller", "agent", "reviewer", "runtime_repair_agent"):
+            identity = resolution.logical_agent_identity(agent_type=agent_type, agent_id=f"{agent_type}-turn")
+            before = resolution.verified_execution_target(
+                logical_agent=identity, host="web", execution_target_session_id="web-current",
+                target_generation=7, ownership_generation=7, provenance="test",
+            )
+            after = resolution.verified_execution_target(
+                logical_agent=identity, host="web", execution_target_session_id="web-current",
+                target_generation=8, ownership_generation=8, provenance="test",
+            )
+            turn_a = resolution.verified_execution_turn(
+                verified_target=before, runtime_invocation_id="machine-generation-A",
+                provenance="runtime_host_current_entry_v1",
+            )
+            turn_b = resolution.verified_execution_turn(
+                verified_target=after, runtime_invocation_id="machine-generation-A",
+                provenance="runtime_host_current_entry_v1",
+            )
+            self.assertEqual(turn_a["contract"], "verified_execution_turn_v1")
+            self.assertEqual(turn_a["turn_id"], turn_b["turn_id"])
+            self.assertEqual(turn_b["target_generation"], 8)
+            self.assertEqual(turn_b["ownership_generation"], 8)
+            next_turn = resolution.verified_execution_turn(
+                verified_target=after, runtime_invocation_id="machine-generation-B",
+                provenance="runtime_host_current_entry_v1",
+            )
+            self.assertNotEqual(turn_a["turn_id"], next_turn["turn_id"])
+
+    def test_verified_execution_turn_rejects_wrong_agent_target_or_invocation(self) -> None:
+        controller = resolution.logical_agent_identity(agent_type="controller", agent_id="controller-1")
+        reviewer = resolution.logical_agent_identity(agent_type="reviewer", agent_id="reviewer-1")
+        target = resolution.verified_execution_target(
+            logical_agent=controller, host="web", execution_target_session_id="web-current",
+            target_generation=8, ownership_generation=8, provenance="test",
+        )
+        turn = resolution.verified_execution_turn(
+            verified_target=target, runtime_invocation_id="machine-generation-A",
+            provenance="runtime_host_current_entry_v1",
+        )
+        with self.assertRaisesRegex(PermissionError, "different logical Agent"):
+            resolution.normalize_verified_execution_turn(turn, expected_logical_agent=reviewer)
+        with self.assertRaisesRegex(PermissionError, "target generation is stale"):
+            resolution.normalize_verified_execution_turn(turn, expected_target_generation=7)
+        with self.assertRaisesRegex(PermissionError, "runtime invocation"):
+            resolution.normalize_verified_execution_turn(turn, expected_runtime_invocation_id="machine-generation-B")
