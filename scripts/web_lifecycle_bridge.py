@@ -5855,26 +5855,37 @@ def spawn_runtime_web_turn_end_watcher(
     launcher_log = state_file.with_suffix(state_file.suffix + ".web-turn-watcher.log")
     rotate_launcher_log(launcher_log)
     launcher_log.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = launcher_log.open("ab", buffering=0)
+    devnull_fd = os.open(os.devnull, os.O_RDONLY)
+    log_fd = os.open(str(launcher_log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    file_actions = [
+        (os.POSIX_SPAWN_DUP2, devnull_fd, 0),
+        (os.POSIX_SPAWN_DUP2, log_fd, 1),
+        (os.POSIX_SPAWN_DUP2, log_fd, 2),
+    ]
+    if devnull_fd > 2:
+        file_actions.append((os.POSIX_SPAWN_CLOSE, devnull_fd))
+    if log_fd > 2:
+        file_actions.append((os.POSIX_SPAWN_CLOSE, log_fd))
     try:
-        child = subprocess.Popen(
-            command, stdin=subprocess.DEVNULL, stdout=log_handle, stderr=log_handle,
-            close_fds=True, start_new_session=True,
+        pid = os.posix_spawn(
+            sys.executable, command, os.environ.copy(),
+            file_actions=file_actions, setsid=True,
         )
     finally:
-        log_handle.close()
+        os.close(devnull_fd)
+        os.close(log_fd)
     try:
         lifecycle.record_runtime_web_turn_watcher_started(
             controller_id=controller_id, expected_turn_id=str(lease["turn_id"]),
-            watcher_nonce=str(lease["watcher_nonce"]), pid=int(child.pid),
+            watcher_nonce=str(lease["watcher_nonce"]), pid=int(pid),
         )
     except (OSError, ValueError, PermissionError):
         try:
-            child.terminate()
+            os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
         return None
-    return int(child.pid)
+    return int(pid)
 
 
 def dispatch_pending_lifecycle_wake(

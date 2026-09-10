@@ -12037,3 +12037,27 @@ class RuntimeWebTurnStaleFenceWatcherTests(RuntimeWebTurnEdgeWatcherTests):
             self.assertEqual(result["state"], "STALE")
             saved = json.loads(state_path.read_text())
             self.assertEqual(saved["web_turn_lease"]["status"], "active")
+
+class RuntimeWebTurnWatcherSpawnTests(unittest.TestCase):
+    def test_detached_web_turn_watcher_does_not_use_unreaped_popen(self) -> None:
+        from unittest.mock import patch
+        lease = {
+            "turn_id": "web-turn:test", "watcher_nonce": "nonce-test",
+            "execution_target_session_id": "web-current",
+            "target_generation": 8, "ownership_generation": 8,
+        }
+        lifecycle = type("Lifecycle", (), {
+            "state_path": staticmethod(lambda _cid: Path("/tmp/runtime-web-turn-test-state.json")),
+            "record_runtime_web_turn_watcher_started": staticmethod(lambda **_kwargs: lease),
+        })
+        calls = []
+        with patch.object(web_bridge, "_lifecycle_module", return_value=lifecycle), \
+             patch.object(web_bridge, "_explicit_lifecycle_state_path", return_value=Path("/tmp/runtime-web-turn-test-state.json")), \
+             patch.object(web_bridge.subprocess, "Popen", side_effect=AssertionError("detached watcher must not use Popen")), \
+             patch.object(web_bridge.os, "posix_spawn", side_effect=lambda *args, **kwargs: calls.append((args, kwargs)) or 4242):
+            pid = web_bridge.spawn_runtime_web_turn_end_watcher(
+                repo=Path("/tmp/repo"), controller_id="controller-1",
+                lease=lease, registry_path=Path("/tmp/registry.json"),
+            )
+        self.assertEqual(pid, 4242)
+        self.assertEqual(len(calls), 1)

@@ -1273,6 +1273,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class RuntimeWebTurnStaleFenceWatcherTests(unittest.TestCase):\n"
                 "    def test_foreign_current_entry_does_not_end_or_clear_current_lease(self): self.assertTrue(True)\n"
                 "    def test_target_generation_change_does_not_end_current_lease(self): self.assertTrue(True)\n"
+                "class RuntimeWebTurnWatcherSpawnTests(unittest.TestCase):\n"
+                "    def test_detached_web_turn_watcher_does_not_use_unreaped_popen(self): self.assertTrue(True)\n"
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_host_neutral_supervisor_omits_missing_desktop_codex_argument(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"

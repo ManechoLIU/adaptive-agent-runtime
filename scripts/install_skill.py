@@ -207,6 +207,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_foreign_current_entry_does_not_end_or_clear_current_lease",
     "tests.test_web_lifecycle_bridge.RuntimeWebTurnStaleFenceWatcherTests."
     "test_target_generation_change_does_not_end_current_lease",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnWatcherSpawnTests."
+    "test_detached_web_turn_watcher_does_not_use_unreaped_popen",
     "tests.test_install_skill.InstallCapabilityTests."
     "test_identity_capability_report_exposes_runtime_current_entry_host_contract",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
