@@ -3608,6 +3608,12 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 (worktree / f"{branch}.txt").write_text(branch + "\n", encoding="utf-8")
                 subprocess.run(["git", "add", f"{branch}.txt"], cwd=worktree, check=True)
                 subprocess.run(["git", "commit", "-m", branch], cwd=worktree, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "merge", "--no-ff", "first", "-m", "merge first"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
 
             original_run_git = control_event_guard.run_git
             with patch.object(
@@ -3615,10 +3621,25 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             ) as run_git:
                 inventory = control_event_guard.worktree_candidate_inventory(root)
 
-        self.assertEqual(set(inventory["live"]), {str(first.resolve()), str(second.resolve())})
-        commands = [call.args[1:] for call in run_git.call_args_list]
-        self.assertEqual(sum(args[:1] == ("rev-list",) for args in commands), 1)
-        self.assertFalse(any(args[:1] == ("merge-base",) for args in commands))
+            self.assertEqual(set(inventory["live"]), {str(second.resolve())})
+            commands = [call.args[1:] for call in run_git.call_args_list]
+            self.assertEqual(sum(args[:1] == ("rev-list",) for args in commands), 1)
+            self.assertFalse(any(args[:1] == ("merge-base",) for args in commands))
+
+            def fail_ancestry(repo: Path, *args: str, **kwargs: object):
+                if args[:1] == ("rev-list",):
+                    return subprocess.CompletedProcess(
+                        ["git", "-C", str(repo), *args], 1, "", "synthetic failure"
+                    )
+                return original_run_git(repo, *args, **kwargs)
+
+            with patch.object(control_event_guard, "run_git", side_effect=fail_ancestry):
+                failed_inventory = control_event_guard.worktree_candidate_inventory(root)
+
+        self.assertEqual(
+            set(failed_inventory["live"]),
+            {str(first.resolve()), str(second.resolve())},
+        )
 
     def test_control_event_guard_cli_persists_retained_candidate_state(self) -> None:
         import json
