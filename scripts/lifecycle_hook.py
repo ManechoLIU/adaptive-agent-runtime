@@ -796,16 +796,9 @@ def _verified_rollout_control_receipt(
         return False
     root = Path(str(snapshot.get("root") or "")).expanduser()
     proposal_root = Path(str(proposal.get("repo_path") or "")).expanduser()
-    snapshot_path = Path(str(proposal.get("snapshot_path") or "")).expanduser()
     try:
         root = root.resolve(strict=True)
         if proposal_root.resolve(strict=True) != root:
-            return False
-        raw = snapshot_path.read_bytes()
-        if sha256_bytes(raw) != str(proposal.get("snapshot_sha256") or ""):
-            return False
-        cycle_snapshot = json.loads(raw)
-        if _json_sha256(cycle_snapshot) != str(proposal.get("cycle_snapshot_sha256") or ""):
             return False
         try:
             from control_event_guard import controller_cycle_evidence_path

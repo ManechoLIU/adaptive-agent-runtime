@@ -656,6 +656,35 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         self.assertEqual(state["receipt_turn_id"], "new")
         self.assertFalse(state["pending_control_event"])
 
+    def test_rollout_guard_recovery_uses_durable_evidence_after_input_is_consumed(self):
+        repo, guard_snapshot, command, snapshot, pre_event = self.make_guard_case()
+        _pre_output, pre_state = lifecycle_hook.evaluate_event(
+            pre_event,
+            snapshot=snapshot,
+            prior_state={
+                "active_turn_id": "new",
+                "pending_control_event": True,
+                "triggers": ["ledger_changed"],
+            },
+        )
+        self.append_command_completion(
+            tool_use_id="guard-call", command=command, output="control-event: allowed",
+        )
+        self.write_closed_evidence(repo, guard_snapshot, snapshot)
+        Path(pre_state["control_receipt_proposal"]["snapshot_path"]).unlink()
+        stop = self.event("Stop")
+        stop["cwd"] = str(repo)
+
+        output, state = lifecycle_hook.evaluate_event(
+            stop, snapshot=snapshot, prior_state=pre_state,
+        )
+
+        self.assertEqual(output, {})
+        self.assertEqual(state["inflight_tool_use_ids"], [])
+        self.assertTrue(state["must_yield"])
+        self.assertEqual(state["receipt_turn_id"], "new")
+        self.assertFalse(state["pending_control_event"])
+
     def test_rollout_guard_stdout_without_closed_evidence_cannot_close_receipt(self):
         repo, _guard_snapshot, command, snapshot, pre_event = self.make_guard_case()
         _pre_output, pre_state = lifecycle_hook.evaluate_event(
