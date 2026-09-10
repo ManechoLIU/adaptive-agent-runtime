@@ -1453,7 +1453,7 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
 
         self.assertFalse(managed)
 
-    def test_controller_event_management_reuses_the_current_hook_snapshot(self) -> None:
+    def test_run_hook_reuses_one_project_snapshot_for_management_fence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = self.make_repo(root)
@@ -1475,20 +1475,21 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             lifecycle_hook.REGISTRY_PATH = registry
             try:
                 with patch.object(
-                    lifecycle_hook,
-                    "project_snapshot",
-                    side_effect=AssertionError("must not recompute an existing hook snapshot"),
+                    lifecycle_hook, "project_snapshot", return_value=snapshot
+                ) as project_snapshot, patch.object(
+                    lifecycle_hook, "persist_event_state", return_value=({}, {})
                 ):
-                    managed = lifecycle_hook.controller_event_is_managed(
-                        {"session_id": "desktop-current"},
-                        repo,
-                        repo,
-                        snapshot=snapshot,
-                    )
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "SessionStart",
+                        "session_id": "desktop-current",
+                        "cwd": str(repo),
+                    })
             finally:
                 lifecycle_hook.REGISTRY_PATH = old_registry
 
-        self.assertTrue(managed)
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+        project_snapshot.assert_called_once_with(repo.resolve())
 
     def test_matching_post_tool_keeps_its_lease_until_lifecycle_state_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -587,6 +587,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_controller_without_explicit_surface_uses_its_registered_canonical_repo",
     "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests."
     "test_explicit_controller_surface_rejects_another_checkout",
+    "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests."
+    "test_run_hook_reuses_one_project_snapshot_for_management_fence",
     "tests.test_goal_display_sync.GoalDisplaySyncTests."
     "test_rolled_happy_path_records_exact_host_sequence_and_binding",
     "tests.test_goal_display_sync.GoalDisplaySyncTests."
