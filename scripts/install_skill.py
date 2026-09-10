@@ -472,7 +472,7 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
     "test_reconcile_pending_rejects_lifecycle_change_before_publish",
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
-    "test_reconcile_pending_rejects_target_generation_change_before_publish",
+    "test_reconcile_pending_accepts_independent_desktop_target_and_ownership_generations",
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
     "test_reconcile_pending_hashes_same_bytes_it_parses",
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."

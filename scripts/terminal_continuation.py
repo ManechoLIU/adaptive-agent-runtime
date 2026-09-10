@@ -231,10 +231,6 @@ def _terminal_reconcile_execution_fence_locked(
     if target_receipt.get("host") != ownership_host:
         raise PermissionError("canonical execution ownership host does not match terminal reconciliation target")
     target_generation = int(target_receipt.get("generation", 0) or 0)
-    if target_generation != ownership_generation:
-        raise PermissionError(
-            "canonical target generation does not match execution ownership generation"
-        )
     return {
         "execution_host": ownership_host,
         "execution_target_session_id": ownership_target,

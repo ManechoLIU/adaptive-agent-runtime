@@ -810,6 +810,20 @@ class InstallMigrationContractTests(unittest.TestCase):
             RUNTIME_RELEASE_REGRESSION_TESTS,
         )
 
+    def test_runtime_release_gate_tracks_independent_terminal_reconcile_generations(self):
+        from scripts.install_skill import RUNTIME_RELEASE_REGRESSION_TESTS
+
+        self.assertIn(
+            "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+            "test_reconcile_pending_accepts_independent_desktop_target_and_ownership_generations",
+            RUNTIME_RELEASE_REGRESSION_TESTS,
+        )
+        self.assertNotIn(
+            "tests.test_terminal_continuation.PendingTerminalReconcileTests."
+            "test_reconcile_pending_rejects_target_generation_change_before_publish",
+            RUNTIME_RELEASE_REGRESSION_TESTS,
+        )
+
     def test_runtime_release_gate_includes_host_ownership_and_yield_enforcement_regressions(self):
         from scripts.install_skill import RUNTIME_RELEASE_REGRESSION_TESTS, RUNTIME_RELEASE_REQUIRED_FILES
 
@@ -1116,7 +1130,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_reconcile_pending_cli_has_no_receipt_argument_and_never_self_spawns(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_rejects_lifecycle_change_before_publish(self): self.assertTrue(True)\n"
-                "    def test_reconcile_pending_rejects_target_generation_change_before_publish(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_accepts_independent_desktop_target_and_ownership_generations(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_hashes_same_bytes_it_parses(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_holds_lifecycle_and_registry_fences_through_audit(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_holds_runtime_assignment_fence_through_audit(self): self.assertTrue(True)\n"
@@ -1642,7 +1656,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_reconcile_pending_cli_has_no_receipt_argument_and_never_self_spawns(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_rejects_lifecycle_change_before_publish(self): self.assertTrue(True)\n"
-                "    def test_reconcile_pending_rejects_target_generation_change_before_publish(self): self.assertTrue(True)\n"
+                "    def test_reconcile_pending_accepts_independent_desktop_target_and_ownership_generations(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_hashes_same_bytes_it_parses(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_holds_lifecycle_and_registry_fences_through_audit(self): self.assertTrue(True)\n"
                 "    def test_reconcile_pending_holds_runtime_assignment_fence_through_audit(self): self.assertTrue(True)\n"

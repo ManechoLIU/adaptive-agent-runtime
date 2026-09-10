@@ -379,6 +379,45 @@ class PendingTerminalReconcileTests(unittest.TestCase):
             self.assertEqual(result["receipts"][0]["agent_id"], "reviewer-1")
             self.assertTrue(result["receipts"][0]["sha256"])
 
+    def test_reconcile_pending_accepts_independent_desktop_target_and_ownership_generations(self) -> None:
+        module = self._module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            receipt = root / "terminal.json"
+            receipt.write_text(json.dumps({
+                "schema_version": 1, "event_type": "external_agent_terminal", "repo": str(repo.resolve()),
+                "agent_id": "reviewer-1", "summary": "done", "delivery_outcome": "pass",
+            }), encoding="utf-8")
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 5,
+                }}},
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-current"]}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                    "provenance": "desktop_entry",
+                }},
+            }), encoding="utf-8")
+            lifecycle_state = {
+                "pending_control_event": True,
+                "pending_terminal_receipts": [str(receipt.resolve())],
+                "controller_host": "desktop_codex",
+            }
+            with patch.object(module.lifecycle, "load_json", return_value=lifecycle_state), patch.object(
+                module.lifecycle, "state_path", return_value=root / "controller.json"
+            ):
+                result = module.reconcile_pending_terminal_receipts(repo=repo, registry_path=registry)
+            self.assertEqual(result["controller_id"], "controller-1")
+            self.assertEqual(result["execution_host"], "desktop_codex")
+            self.assertEqual(result["execution_target_session_id"], "desktop-current")
+            self.assertEqual(result["target_generation"], 5)
+            self.assertEqual(result["ownership_generation"], 7)
+
     def test_reconcile_pending_is_idempotent_and_does_not_mutate_lifecycle_or_dispatch_wake(self) -> None:
         module = self._module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -518,21 +557,6 @@ def _pending_reconcile_rejects_lifecycle_change_before_publish(self):
         self.assertEqual(observed,['blocked'])
 
 
-def _pending_reconcile_rejects_target_generation_change_before_publish(self):
-    module=self._module()
-    with tempfile.TemporaryDirectory() as tmp:
-        root=Path(tmp); repo=root/'repo'; repo.mkdir(); subprocess.run(['git','init','-q','-b','main',str(repo)],check=True)
-        registry=root/'controllers.json'
-        value=_ownership_registry(repo,generation=1)
-        value['__controller_targets__']['controller-1']['web']['generation']=2
-        registry.write_text(json.dumps(value),encoding='utf-8')
-        receipt=root/'terminal.json'; receipt.write_text(json.dumps({'event_type':'external_agent_terminal','repo':str(repo.resolve()),'summary':'done'}),encoding='utf-8')
-        state_path=root/'controller.json'; state_path.write_text(json.dumps({'pending_terminal_receipts':[str(receipt)]}),encoding='utf-8')
-        with patch.object(module.lifecycle,'state_path',return_value=state_path):
-            with self.assertRaisesRegex(PermissionError,'target generation does not match execution ownership generation'):
-                module.reconcile_pending_terminal_receipts(repo=repo,registry_path=registry)
-
-
 def _pending_reconcile_hashes_same_bytes_it_parses(self):
     module=self._module()
     with tempfile.TemporaryDirectory() as tmp:
@@ -565,7 +589,6 @@ def _pending_reconcile_hashes_same_bytes_it_parses(self):
         self.assertEqual(result['receipts'][0]['sha256'],hashlib.sha256(payload).hexdigest())
 
 PendingTerminalReconcileTests.test_reconcile_pending_rejects_lifecycle_change_before_publish = _pending_reconcile_rejects_lifecycle_change_before_publish
-PendingTerminalReconcileTests.test_reconcile_pending_rejects_target_generation_change_before_publish = _pending_reconcile_rejects_target_generation_change_before_publish
 PendingTerminalReconcileTests.test_reconcile_pending_hashes_same_bytes_it_parses = _pending_reconcile_hashes_same_bytes_it_parses
 
 def _pending_reconcile_holds_fences_through_audit(self):
