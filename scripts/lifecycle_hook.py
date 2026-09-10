@@ -228,12 +228,13 @@ def _desktop_rollout_completed_items(
             if not isinstance(item, dict):
                 continue
             item_type = str(item.get("type") or "").strip()
-            terminal = str(item.get("status") or "").strip().lower()
-            if (
-                item_type not in {"CommandExecution", "FileChange"}
-                or terminal not in {"completed", "failed"}
-                or not str(item.get("id") or "").strip()
-            ):
+            if not str(item.get("id") or "").strip():
+                continue
+            if item_type == "CommandExecution":
+                terminal = str(item.get("status") or "").strip().lower()
+                if terminal not in {"completed", "failed"}:
+                    continue
+            elif item_type != "FileChange":
                 continue
             completed.append(dict(item))
         return completed if started else []

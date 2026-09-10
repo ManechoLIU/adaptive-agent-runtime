@@ -94,17 +94,16 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         *,
         tool_use_id="new-call",
         turn="new",
-        status="completed",
+        event_type="item_completed",
     ):
         row = {
             "type": "event_msg",
             "payload": {
-                "type": "item_completed",
+                "type": event_type,
                 "turn_id": turn,
                 "item": {
                     "type": "FileChange",
                     "id": tool_use_id,
-                    "status": status,
                     "changes": [],
                 },
             },
@@ -393,16 +392,18 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         self.assertEqual(completed["response_status"], 7)
 
     def test_rollout_file_change_completion_clears_only_exact_current_apply_patch(self):
-        for case in ("exact", "wrong_turn", "wrong_id", "nonterminal", "wrong_tool"):
+        for case in (
+            "exact", "wrong_turn", "wrong_id", "not_completed", "wrong_tool",
+            "missing_record",
+        ):
             with self.subTest(case=case):
                 self.write_transcript()
                 completion_turn = "new" if case != "wrong_turn" else "old"
                 completion_id = "new-call" if case != "wrong_id" else "other-call"
-                status = "completed" if case != "nonterminal" else "running"
                 self.append_file_change_completion(
                     tool_use_id=completion_id,
                     turn=completion_turn,
-                    status=status,
+                    event_type="item_started" if case == "not_completed" else "item_completed",
                 )
                 prior = {
                     **self.prior,
@@ -410,7 +411,7 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
                     "tool_trace_overflow": False,
                     "tool_trace": [],
                     "inflight_tool_use_ids": ["new-call", "still-running"],
-                    "inflight_tool_records": {
+                    "inflight_tool_records": {} if case == "missing_record" else {
                         "new-call": {
                             "turn_id": "new",
                             "tool_name": "Bash" if case == "wrong_tool" else "apply_patch",
