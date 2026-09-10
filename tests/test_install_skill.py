@@ -841,6 +841,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_controller_without_explicit_surface_uses_its_registered_canonical_repo",
             "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_explicit_controller_surface_rejects_another_checkout",
             "tests.test_desktop_lifecycle_adapter.DesktopOutboundLeaseHookTests.test_run_hook_reuses_one_project_snapshot_for_management_fence",
+            "tests.test_governance.GovernanceTests.test_candidate_inventory_batches_ancestry_for_multiple_worktrees",
             "tests.test_controller_target_guard.ControllerTargetGuardTests.test_claim_controller_host_desktop_after_web_increments_one_cross_host_generation",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_direct_wake_rejects_confirmed_web_result_after_desktop_handoff",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_desktop_result_cannot_persist_or_rearm_after_web_handoff",
@@ -1427,6 +1428,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_continuation_debt_fingerprint_escalates_through_existing_recurrence_rules(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n"
+                "    def test_candidate_inventory_batches_ancestry_for_multiple_worktrees(self): self.assertTrue(True)\n"
                 "class RuntimeWebTurnLeaseTests(unittest.TestCase):\n"
                 "    def test_legacy_overflow_migrates_once_only_without_inflight(self): self.assertTrue(True)\n"
                 "    def test_legacy_overflow_with_inflight_cannot_migrate(self): self.assertTrue(True)\n"
@@ -1844,6 +1846,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_continuation_debt_fingerprint_escalates_through_existing_recurrence_rules(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n"
+                "    def test_candidate_inventory_batches_ancestry_for_multiple_worktrees(self): self.assertTrue(True)\n"
                 "class ControllerActionSourcePromptTests(unittest.TestCase):\n"
                 "    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self): self.assertTrue(True)\n"
                 "    def test_live_e2e_accept_prompt_carries_actual_execution_source(self): self.assertTrue(True)\n"

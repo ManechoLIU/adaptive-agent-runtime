@@ -571,6 +571,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_event_scope_guard_allows_project_wide_dispatch_across_business_lines",
     "tests.test_governance.GovernanceTests."
     "test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof",
+    "tests.test_governance.GovernanceTests."
+    "test_candidate_inventory_batches_ancestry_for_multiple_worktrees",
     "tests.test_desktop_lifecycle_adapter.DesktopLifecycleTurnGateTests."
     "test_successful_receipt_is_invalidated_when_same_turn_continuation_executes",
     "tests.test_desktop_lifecycle_adapter.DesktopLifecycleTurnGateTests."

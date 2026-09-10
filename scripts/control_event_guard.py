@@ -1006,6 +1006,7 @@ def worktree_candidate_inventory(
     porcelain = run_git(canonical, "worktree", "list", "--porcelain").stdout
     live: dict[str, Any] = {}
     retained: dict[str, Any] = {}
+    worktree_heads: list[tuple[Path, str]] = []
     path: Path | None = None
     revision = ""
     for line in porcelain.splitlines() + [""]:
@@ -1016,27 +1017,38 @@ def worktree_candidate_inventory(
             revision = line.removeprefix("HEAD ").strip()
         elif not line and path is not None and revision:
             if path != canonical:
-                merged = bool(main_revision) and run_git(
-                    canonical,
-                    "merge-base",
-                    "--is-ancestor",
-                    revision,
-                    main_revision,
-                    check=False,
-                ).returncode == 0
-                if not merged:
-                    key = str(path)
-                    record = retained_records.get(key)
-                    if (
-                        isinstance(record, dict)
-                        and record.get("revision") == revision
-                        and record.get("state") in RETAINED_CANDIDATE_DECISIONS
-                    ):
-                        retained[key] = dict(record)
-                    else:
-                        live[key] = revision
+                worktree_heads.append((path, revision))
             path = None
             revision = ""
+    revisions = sorted({revision for _, revision in worktree_heads})
+    if main_revision and revisions:
+        ancestry = run_git(
+            canonical,
+            "rev-list",
+            *revisions,
+            f"^{main_revision}",
+            check=False,
+        )
+        unmerged_revisions = (
+            set(ancestry.stdout.splitlines())
+            if ancestry.returncode == 0
+            else set(revisions)
+        )
+    else:
+        unmerged_revisions = set(revisions)
+    for worktree_path, worktree_revision in worktree_heads:
+        if worktree_revision not in unmerged_revisions:
+            continue
+        key = str(worktree_path)
+        record = retained_records.get(key)
+        if (
+            isinstance(record, dict)
+            and record.get("revision") == worktree_revision
+            and record.get("state") in RETAINED_CANDIDATE_DECISIONS
+        ):
+            retained[key] = dict(record)
+        else:
+            live[key] = worktree_revision
     return {"live": live, "retained": retained}
 
 

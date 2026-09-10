@@ -3583,6 +3583,43 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 {str(worktree.resolve()): new_revision},
             )
 
+    def test_candidate_inventory_batches_ancestry_for_multiple_worktrees(self) -> None:
+        import subprocess
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            first = Path(directory) / "first"
+            second = Path(directory) / "second"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "base.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "base.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            for branch, worktree in (("first", first), ("second", second)):
+                subprocess.run(
+                    ["git", "worktree", "add", "-b", branch, str(worktree)],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                )
+                (worktree / f"{branch}.txt").write_text(branch + "\n", encoding="utf-8")
+                subprocess.run(["git", "add", f"{branch}.txt"], cwd=worktree, check=True)
+                subprocess.run(["git", "commit", "-m", branch], cwd=worktree, check=True, capture_output=True)
+
+            original_run_git = control_event_guard.run_git
+            with patch.object(
+                control_event_guard, "run_git", wraps=original_run_git
+            ) as run_git:
+                inventory = control_event_guard.worktree_candidate_inventory(root)
+
+        self.assertEqual(set(inventory["live"]), {str(first.resolve()), str(second.resolve())})
+        commands = [call.args[1:] for call in run_git.call_args_list]
+        self.assertEqual(sum(args[:1] == ("rev-list",) for args in commands), 1)
+        self.assertFalse(any(args[:1] == ("merge-base",) for args in commands))
+
     def test_control_event_guard_cli_persists_retained_candidate_state(self) -> None:
         import json
         import subprocess
