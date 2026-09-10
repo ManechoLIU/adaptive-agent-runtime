@@ -167,10 +167,10 @@ def _desktop_turn_start(event: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
-def _desktop_rollout_completed_commands(
+def _desktop_rollout_completed_items(
     event: dict[str, Any], state: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Return only current-turn terminal CommandExecution items from a trusted rollout."""
+    """Return only current-turn terminal recoverable items from a trusted rollout."""
     if event.get("controller_host") != DESKTOP_SESSION_HOST:
         return []
     if event.get("hook_event_name") not in {"PreToolUse", "Stop"}:
@@ -225,11 +225,13 @@ def _desktop_rollout_completed_commands(
             if kind != "item_completed":
                 continue
             item = payload.get("item")
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").strip()
+            terminal = str(item.get("status") or "").strip().lower()
             if (
-                not isinstance(item, dict)
-                or item.get("type") != "CommandExecution"
-                or str(item.get("status") or "").strip().lower()
-                not in {"completed", "failed"}
+                item_type not in {"CommandExecution", "FileChange"}
+                or terminal not in {"completed", "failed"}
                 or not str(item.get("id") or "").strip()
             ):
                 continue
@@ -2220,23 +2222,32 @@ def _reconcile_desktop_rollout(
         return state
     records = state.get("inflight_tool_records")
     records = records if isinstance(records, dict) else {}
-    for item in _desktop_rollout_completed_commands(event, state):
+    for item in _desktop_rollout_completed_items(event, state):
         tool_use_id = str(item.get("id") or "").strip()
         if tool_use_id not in inflight:
-            continue
-        command = _rollout_command_text(item)
-        if command is None:
             continue
         record = records.get(tool_use_id)
         if not isinstance(record, dict):
             continue
         if str(record.get("turn_id") or "").strip() != _event_turn_id(event):
             continue
-        expected_command_sha256 = str(record.get("command_sha256") or "").strip()
-        if (
-            not expected_command_sha256
-            or sha256_bytes(command.encode("utf-8")) != expected_command_sha256
-        ):
+        item_type = str(item.get("type") or "").strip()
+        if item_type == "CommandExecution":
+            command = _rollout_command_text(item)
+            if command is None:
+                continue
+            expected_command_sha256 = str(record.get("command_sha256") or "").strip()
+            if (
+                not expected_command_sha256
+                or sha256_bytes(command.encode("utf-8")) != expected_command_sha256
+            ):
+                continue
+            recovered_input = {"command": command}
+        elif item_type == "FileChange":
+            if str(record.get("tool_name") or "").strip() != "apply_patch":
+                continue
+            recovered_input = {}
+        else:
             continue
         proposal = state.get("control_receipt_proposal")
         is_control_receipt = (
@@ -2256,7 +2267,7 @@ def _reconcile_desktop_rollout(
             "turn_id": _event_turn_id(event),
             "tool_name": str(record.get("tool_name") or "Bash"),
             "tool_use_id": tool_use_id,
-            "tool_input": {"command": command},
+            "tool_input": recovered_input,
             "tool_response": _rollout_tool_response(item),
             "rollout_recovery": {
                 "source": "codex_rollout_item_completed",

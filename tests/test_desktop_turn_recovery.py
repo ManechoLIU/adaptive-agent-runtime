@@ -89,6 +89,29 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         with self.transcript.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(row) + "\n")
 
+    def append_file_change_completion(
+        self,
+        *,
+        tool_use_id="new-call",
+        turn="new",
+        status="completed",
+    ):
+        row = {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "turn_id": turn,
+                "item": {
+                    "type": "FileChange",
+                    "id": tool_use_id,
+                    "status": status,
+                    "changes": [],
+                },
+            },
+        }
+        with self.transcript.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row) + "\n")
+
     def make_guard_case(self):
         repo = Path(tempfile.mkdtemp(dir=self.root, prefix="repo-"))
         subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
@@ -368,6 +391,48 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
             if item["tool_use_id"] == "new-call"
         )
         self.assertEqual(completed["response_status"], 7)
+
+    def test_rollout_file_change_completion_clears_only_exact_current_apply_patch(self):
+        for case in ("exact", "wrong_turn", "wrong_id", "nonterminal", "wrong_tool"):
+            with self.subTest(case=case):
+                self.write_transcript()
+                completion_turn = "new" if case != "wrong_turn" else "old"
+                completion_id = "new-call" if case != "wrong_id" else "other-call"
+                status = "completed" if case != "nonterminal" else "running"
+                self.append_file_change_completion(
+                    tool_use_id=completion_id,
+                    turn=completion_turn,
+                    status=status,
+                )
+                prior = {
+                    **self.prior,
+                    "active_turn_id": "new",
+                    "tool_trace_overflow": False,
+                    "tool_trace": [],
+                    "inflight_tool_use_ids": ["new-call", "still-running"],
+                    "inflight_tool_records": {
+                        "new-call": {
+                            "turn_id": "new",
+                            "tool_name": "Bash" if case == "wrong_tool" else "apply_patch",
+                            "input_sha256": "a" * 64,
+                        },
+                    },
+                }
+                event = self.event()
+                event["tool_use_id"] = "next-call"
+                _output, state = lifecycle_hook.evaluate_event(
+                    event, snapshot=self.snapshot, prior_state=prior,
+                )
+                if case == "exact":
+                    self.assertEqual(
+                        state["inflight_tool_use_ids"],
+                        ["still-running", "next-call"],
+                    )
+                else:
+                    self.assertEqual(
+                        state["inflight_tool_use_ids"],
+                        ["new-call", "still-running", "next-call"],
+                    )
 
     def test_rollout_completion_requires_exact_record_turn_and_command_hash(self):
         for case in ("wrong_turn", "missing_hash", "wrong_hash"):
