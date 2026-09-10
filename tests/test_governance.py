@@ -1081,6 +1081,39 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertEqual(state["triggers"], ["rule_update_pending:rev-new"])
         self.assertEqual(state["rule_wake_policy"], "after_event")
 
+    def test_after_event_control_receipt_clears_old_event_but_keeps_live_e2e_wake_pending(self) -> None:
+        snapshot = {
+            "head": "abc", "ledger_sha256": "l", "worktree_status_sha256": "s",
+            "ready_ids": [], "runnable_ids": [], "candidate_revisions": [], "ledger_errors": [],
+            "assignment_liveness": {},
+            "rule_handshake": {
+                "state": "pending_live_e2e", "blocking": True,
+                "installed_revision": "rev-live", "impact": "live_assignments",
+                "changed_files": ["scripts/web_lifecycle_bridge.py"],
+            },
+        }
+        event = {
+            "hook_event_name": "PostToolUse", "session_id": "controller-1",
+            "tool_input": {"command": f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} event.json --ledger TASK_LEDGER.md --repo ."},
+            "tool_response": {"exit_code": 0, "output": "control-event: allowed"},
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            event, snapshot=snapshot,
+            prior_state={
+                "snapshot": snapshot, "pending_control_event": True,
+                "triggers": [
+                    "terminal_receipt_pending",
+                    "rule_live_e2e_pending:rev-old",
+                    "rule_live_e2e_pending:rev-live",
+                ],
+                "stop_continuations": 1,
+            },
+        )
+        self.assertEqual(output, {})
+        self.assertTrue(state["pending_control_event"])
+        self.assertEqual(state["triggers"], ["rule_live_e2e_pending:rev-live"])
+        self.assertEqual(state["rule_wake_policy"], "after_event")
+
     def test_lifecycle_rule_install_integrity_error_is_blocking(self) -> None:
         snapshot = {
             "head": "abc", "ledger_sha256": "l", "worktree_status_sha256": "s",

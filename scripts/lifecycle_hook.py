@@ -2384,7 +2384,12 @@ def pending_wake_request(state: dict[str, Any]) -> dict[str, Any] | None:
 def _non_rule_triggers(triggers: list[str] | set[str]) -> set[str]:
     return {
         str(item) for item in triggers
-        if not str(item).startswith(("rule_update_pending:", "rule_ledger_stale:", "rule_install_integrity_error:"))
+        if not str(item).startswith((
+            "rule_update_pending:",
+            "rule_ledger_stale:",
+            "rule_live_e2e_pending:",
+            "rule_install_integrity_error:",
+        ))
     }
 
 
@@ -2954,8 +2959,17 @@ def evaluate_event(
                     ),
                 }
             }, state
-        if wake_policy == "after_event" and str(handshake.get("state", "")) == "pending_ack":
-            rule_triggers = [item for item in lifecycle_triggers(snapshot, None) if item.startswith("rule_update_pending:")]
+        handshake_state = str(handshake.get("state", ""))
+        if wake_policy == "after_event" and handshake_state in {"pending_ack", "pending_live_e2e"}:
+            rule_prefix = (
+                "rule_update_pending:"
+                if handshake_state == "pending_ack"
+                else "rule_live_e2e_pending:"
+            )
+            rule_triggers = [
+                item for item in lifecycle_triggers(snapshot, None)
+                if item.startswith(rule_prefix)
+            ]
             state.update({
                 "pending_control_event": bool(rule_triggers),
                 "triggers": rule_triggers,
@@ -2983,7 +2997,8 @@ def evaluate_event(
     detected = lifecycle_triggers(snapshot, prior_state)
     prior_triggers = {str(item) for item in state.get("triggers", [])}
     transient_prefixes = (
-        "rule_update_pending:", "rule_ledger_stale:", "rule_install_integrity_error:",
+        "rule_update_pending:", "rule_ledger_stale:", "rule_live_e2e_pending:",
+        "rule_install_integrity_error:",
         "active_lease_expired:", "assignment_became_unhealthy:", "agent_session_terminal:",
         "active_without_progress:", "recovery_stalled:", "recovery_budget_exhausted:",
     )

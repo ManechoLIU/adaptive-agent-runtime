@@ -6322,7 +6322,12 @@ def rule_wake_schedule_decision(lifecycle_state: dict[str, Any]) -> str:
     triggers = {str(item) for item in lifecycle_state.get("triggers", [])}
     non_rule = {
         item for item in triggers
-        if not item.startswith(("rule_update_pending:", "rule_ledger_stale:", "rule_install_integrity_error:"))
+        if not item.startswith((
+            "rule_update_pending:",
+            "rule_ledger_stale:",
+            "rule_live_e2e_pending:",
+            "rule_install_integrity_error:",
+        ))
     }
     return "wait_for_event" if non_rule else "schedule_now"
 
@@ -6337,7 +6342,7 @@ def _rule_revision_from_state(lifecycle_state: dict[str, Any]) -> str | None:
                 return revision
     for trigger in lifecycle_state.get("triggers", []):
         text = str(trigger)
-        if text.startswith("rule_update_pending:"):
+        if text.startswith(("rule_update_pending:", "rule_live_e2e_pending:")):
             revision = text.split(":", 1)[1].strip()
             if revision:
                 return revision
@@ -6350,6 +6355,11 @@ def _lifecycle_delivery_key(
     base = ""
     for trigger in lifecycle_state.get("triggers", []):
         text = str(trigger)
+        if text.startswith("rule_live_e2e_pending:"):
+            revision = text.split(":", 1)[1].strip()
+            if revision:
+                base = f"rule-live-e2e:{revision}"
+                break
         if text.startswith("rule_update_pending:"):
             revision = text.split(":", 1)[1].strip()
             if revision:
@@ -6438,7 +6448,9 @@ def maybe_schedule_rule_wake(
     revision = _rule_revision_from_state(lifecycle_state)
     if not revision:
         return "none"
-    receipt_id = f"rule-update:{revision}"
+    receipt_id = _delivery_key_base(_lifecycle_delivery_key(lifecycle_state))
+    if not receipt_id.startswith(("rule-update:", "rule-live-e2e:")):
+        receipt_id = f"rule-update:{revision}"
     existing = load_json(state_path)
     if existing.get("receipt_id") == receipt_id and existing.get("state") in {
         "RESUME_PENDING",
@@ -6458,7 +6470,31 @@ def maybe_schedule_rule_wake(
     return "scheduled" if scheduled else "already_scheduled"
 
 
-def refresh_rule_wake_state(*, session_id: str, repo: Path) -> dict[str, Any]:
+def rule_wake_refresh_event(
+    *, controller_id: str, repo: Path, target: dict[str, Any]
+) -> dict[str, Any]:
+    host = str(target.get("host") or "").strip()
+    source_session_id = str(target.get("execution_target_session_id") or "").strip()
+    if host not in {"web", "desktop_codex"} or not source_session_id:
+        raise PermissionError("rule wake refresh requires an exact canonical execution target")
+    return {
+        "hook_event_name": "RuntimeRuleWakeCheck",
+        "controller_host": host,
+        "execution_host": host,
+        "event_source": "runtime",
+        "controller_id": controller_id,
+        "controller_session_id": controller_id,
+        "session_id": controller_id,
+        "source_session_id": source_session_id,
+        "cwd": str(repo),
+        "controller_target_generation": target.get("generation"),
+        "controller_ownership_generation": target.get("ownership_generation"),
+    }
+
+
+def refresh_rule_wake_state(
+    *, session_id: str, repo: Path, registry: Path = DEFAULT_REGISTRY
+) -> dict[str, Any]:
     try:
         import lifecycle_hook as lifecycle
     except ModuleNotFoundError:
@@ -6468,8 +6504,16 @@ def refresh_rule_wake_state(*, session_id: str, repo: Path) -> dict[str, Any]:
         return {}
     path = lifecycle.state_path(session_id)
     prior = lifecycle.load_json(path)
-    event = post_tool_event(
-        session_id=session_id, repo=repo, command="adaptive-delivery rule wake check", exit_code=0
+    target = canonical_rule_wake_target(
+        lifecycle_state=prior,
+        session_id=session_id,
+        repo=repo,
+        registry=Path(registry).expanduser(),
+    )
+    event = rule_wake_refresh_event(
+        controller_id=session_id,
+        repo=repo,
+        target=target,
     )
     _, next_state = lifecycle.evaluate_event(event, snapshot=snapshot, prior_state=prior)
     lifecycle.write_json(path, next_state)
@@ -6699,7 +6743,7 @@ def continuation_supervisor_needs_bootstrap(
                 return False
     legacy_receipt = str(supervisor_state.get("receipt_id") or "").strip()
     if (
-        delivery_key.startswith("rule-update:")
+        delivery_key.startswith(("rule-update:", "rule-live-e2e:"))
         and legacy_receipt == delivery_key
         and str(supervisor_state.get("state") or "") in {
             "WAITING_FOR_CONTROLLER_PROGRESS",
@@ -8596,7 +8640,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _set_audit_receipt_status(cursor_path, receipt, "handled")
                 _advance_audit_cursor(cursor_path, audit_inode, next_offset)
             if receipts and args.auto_native_stop:
-                lifecycle_state = refresh_rule_wake_state(session_id=args.session_id, repo=repo)
+                lifecycle_state = refresh_rule_wake_state(
+                    session_id=args.session_id,
+                    repo=repo,
+                    registry=Path(args.registry).expanduser(),
+                )
                 state_path = (
                     Path(args.auto_stop_state).expanduser()
                     if args.auto_stop_state

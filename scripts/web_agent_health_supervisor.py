@@ -138,7 +138,7 @@ def reconcile_registered_controller_rule_update_once(
     *, repo: Path, registry: Path, controller_id: str, codex: str | None = None
 ) -> dict[str, Any]:
     lifecycle_state = web_lifecycle_bridge.refresh_rule_wake_state(
-        session_id=controller_id, repo=repo
+        session_id=controller_id, repo=repo, registry=registry
     )
     result = web_lifecycle_bridge.schedule_guarded_rule_wake(
         lifecycle_state=lifecycle_state,

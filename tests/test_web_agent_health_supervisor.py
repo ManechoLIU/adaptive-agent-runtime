@@ -656,7 +656,11 @@ class WebAgentHealthSupervisorTests(unittest.TestCase):
         ):
             results = reconcile_all_web_agent_health_once(registry_path=self.registry, now=T0)
 
-        refresh.assert_called_once_with(session_id="controller-1", repo=self.repo.resolve())
+        refresh.assert_called_once_with(
+            session_id="controller-1",
+            repo=self.repo.resolve(),
+            registry=self.registry.resolve(),
+        )
         target.assert_called_once()
         schedule.assert_called_once()
         self.assertEqual(results[0]["rule_wake"]["schedule"], "scheduled")

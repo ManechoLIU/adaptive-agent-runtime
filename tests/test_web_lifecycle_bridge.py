@@ -5324,6 +5324,66 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
 
 
 class WebContinuationSupervisorBootstrapTests(unittest.TestCase):
+    def test_live_e2e_rule_wake_uses_a_distinct_delivery_receipt(self) -> None:
+        from unittest.mock import patch
+
+        lifecycle = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "rule_wake_policy": "after_event",
+            "wake_generation": 9,
+            "triggers": ["rule_live_e2e_pending:rev-live"],
+            "snapshot": {
+                "rule_handshake": {
+                    "state": "pending_live_e2e",
+                    "installed_revision": "rev-live",
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            registry = root / "registry.json"
+            registry.write_text("{}", encoding="utf-8")
+            state = root / "auto-stop.json"
+            state.write_text(json.dumps({
+                "receipt_id": "bootstrap:9",
+                "state": "RESUME_STALLED_NO_PROGRESS",
+                "last_lifecycle_fingerprint": web_bridge._wake_event_fingerprint(lifecycle),
+            }), encoding="utf-8")
+            with patch.object(web_bridge, "schedule_auto_native_stop", return_value=True) as schedule:
+                result = web_bridge.maybe_schedule_rule_wake(
+                    lifecycle_state=lifecycle,
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex=None,
+                    delay_seconds=0,
+                    state_path=state,
+                )
+        self.assertEqual(result, "scheduled")
+        self.assertEqual(
+            schedule.call_args.kwargs["receipt_id"],
+            "rule-live-e2e:rev-live",
+        )
+
+    def test_rule_wake_refresh_event_preserves_canonical_desktop_target(self) -> None:
+        event = web_bridge.rule_wake_refresh_event(
+            controller_id="controller-1",
+            repo=Path("/repo"),
+            target={
+                "host": "desktop_codex",
+                "execution_target_session_id": "desktop-current",
+                "generation": 6,
+                "ownership_generation": 8,
+            },
+        )
+        self.assertEqual(event["hook_event_name"], "RuntimeRuleWakeCheck")
+        self.assertEqual(event["controller_host"], "desktop_codex")
+        self.assertEqual(event["source_session_id"], "desktop-current")
+        self.assertEqual(event["event_source"], "runtime")
+
     def test_identity_blocked_same_event_and_registry_are_not_bootstrapped_again(self) -> None:
         lifecycle = {
             "pending_control_event": True,
