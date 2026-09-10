@@ -11753,6 +11753,174 @@ class RuntimeWebTurnEdgeWatcherTests(WebMachineInvocationTurnBridgeTests):
             self.assertEqual(event["turn_id"],turn)
             self.assertEqual(event["web_turn_lease"]["generation"],1)
 
+    def test_host_invocation_token_does_not_orphan_active_fallback_lease(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            no_token = self.no_token_verifier()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=no_token), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                self.assertEqual(web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)]), 0)
+            state_path = Path(os.environ["AD_LIFECYCLE_STATE_DIR"]) / "controller-1.json"
+            state = json.loads(state_path.read_text())
+            fallback_turn = state["active_turn_id"]
+            fallback_invocation = state["web_turn_lease"]["runtime_invocation_id"]
+            state["tool_trace"] = [{"turn_id": fallback_turn, "tool_use_id": "kept"}]
+            state["tool_trace_overflow"] = True
+            state["inflight_tool_use_ids"] = []
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            direct, _ = self.verifier_with_turn("host-machine-same-generation")
+            out, err = StringIO(), StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=direct), redirect_stdout(out), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 0, err.getvalue())
+            saved = json.loads(state_path.read_text())
+            self.assertEqual(saved["active_turn_id"], fallback_turn)
+            self.assertEqual(saved["tool_trace"], [{"turn_id": fallback_turn, "tool_use_id": "kept"}])
+            self.assertTrue(saved["tool_trace_overflow"])
+            self.assertEqual(saved["web_turn_lease"]["status"], "active")
+            self.assertEqual(saved["web_turn_lease"]["runtime_invocation_id"], fallback_invocation)
+            self.assertEqual(saved["web_turn_lease"]["turn_id"], fallback_turn)
+
+    def test_direct_host_turn_after_ended_fallback_never_leaves_stale_lease(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            no_token = self.no_token_verifier()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=no_token), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                self.assertEqual(web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)]), 0)
+            state_path = Path(os.environ["AD_LIFECYCLE_STATE_DIR"]) / "controller-1.json"
+            state = json.loads(state_path.read_text())
+            lease = state["web_turn_lease"]
+            lifecycle = web_bridge._lifecycle_module()
+            lifecycle.mark_runtime_web_turn_ended(
+                controller_id="controller-1",
+                expected_turn_id=lease["turn_id"],
+                watcher_nonce=lease["watcher_nonce"],
+                expected_session_id="web-current",
+                expected_target_generation=4,
+                expected_ownership_generation=7,
+                end_reason="host_current_entry_unavailable",
+                end_evidence_sha256="a" * 64,
+                lifecycle_path=state_path,
+            )
+            direct, _ = self.verifier_with_turn("host-machine-next-generation")
+            out, err = StringIO(), StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=direct), redirect_stdout(out), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 0, err.getvalue())
+            saved = json.loads(state_path.read_text())
+            active_turn = saved["active_turn_id"]
+            stale = saved.get("web_turn_lease")
+            self.assertTrue(stale is None or (stale.get("status") == "active" and stale.get("turn_id") == active_turn))
+
+    def test_verified_same_controller_successor_rotates_active_fallback_lease_without_watcher_end(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            first = self.no_token_verifier()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=first), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                self.assertEqual(web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)]), 0)
+            state_path = Path(os.environ["AD_LIFECYCLE_STATE_DIR"]) / "controller-1.json"
+            archive_path = state_path.with_suffix(".turns.jsonl")
+            state = json.loads(state_path.read_text())
+            old_turn = state["active_turn_id"]
+            state["tool_trace"] = [{"turn_id": old_turn, "tool_use_id": "old-overflow"}]
+            state["tool_trace_overflow"] = True
+            state["inflight_tool_use_ids"] = []
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            successor, _ = self.verifier_with_current_entry("web-new", runtime_invocation_id=None)
+            out, err = StringIO(), StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=successor), redirect_stdout(out), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 0, err.getvalue())
+            saved = json.loads(state_path.read_text())
+            self.assertNotEqual(saved["active_turn_id"], old_turn)
+            self.assertEqual(saved["tool_trace"], [])
+            self.assertFalse(saved["tool_trace_overflow"])
+            self.assertEqual(saved["web_turn_lease"]["status"], "active")
+            self.assertEqual(saved["web_turn_lease"]["generation"], 2)
+            self.assertEqual(saved["web_turn_lease"]["execution_target_session_id"], "web-new")
+            self.assertEqual(saved["web_turn_lease"]["target_generation"], 5)
+            self.assertEqual(saved["web_turn_lease"]["ownership_generation"], 8)
+            archived = [json.loads(line) for line in archive_path.read_text().splitlines() if line.strip()]
+            self.assertTrue(archived)
+            self.assertEqual(archived[-1]["active_turn_id"], old_turn)
+            self.assertTrue(archived[-1]["tool_trace_overflow"])
+            self.assertEqual(archived[-1]["tool_trace"][0]["tool_use_id"], "old-overflow")
+
+    def test_successor_rechecks_inflight_under_registry_fence_before_target_rotation(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            first = self.no_token_verifier()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=first), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                self.assertEqual(web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)]), 0)
+            state_path = Path(os.environ["AD_LIFECYCLE_STATE_DIR"]) / "controller-1.json"
+            before = json.loads(state_path.read_text())
+            old_turn = before["active_turn_id"]
+
+            def inject_inflight_after_outer_preflight(**_kwargs):
+                raced = json.loads(state_path.read_text())
+                raced["tool_trace"] = [{"turn_id": old_turn, "tool_use_id": "raced-inflight"}]
+                raced["tool_trace_overflow"] = True
+                raced["inflight_tool_use_ids"] = ["raced-inflight"]
+                state_path.write_text(json.dumps(raced), encoding="utf-8")
+
+            successor, _ = self.verifier_with_current_entry("web-new", runtime_invocation_id=None)
+            err = StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=successor), \
+                 patch.object(web_bridge, "_guard_runtime_web_successor_before_recovery", side_effect=inject_inflight_after_outer_preflight), \
+                 redirect_stdout(StringIO()), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 78)
+            saved_registry = json.loads(registry.read_text())
+            self.assertEqual(saved_registry["__controller_targets__"]["controller-1"]["web"]["session_id"], "web-current")
+            self.assertEqual(saved_registry["__controller_targets__"]["controller-1"]["web"]["generation"], 4)
+            self.assertEqual(saved_registry["__controller_execution_ownership__"]["controller-1"]["generation"], 7)
+            saved_state = json.loads(state_path.read_text())
+            self.assertEqual(saved_state["active_turn_id"], old_turn)
+            self.assertEqual(saved_state["inflight_tool_use_ids"], ["raced-inflight"])
+            self.assertTrue(saved_state["tool_trace_overflow"])
+            self.assertEqual(saved_state["web_turn_lease"]["status"], "active")
+
+    def test_verified_same_controller_successor_with_inflight_fallback_tool_fails_closed(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            first = self.no_token_verifier()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=first), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                self.assertEqual(web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)]), 0)
+            state_path = Path(os.environ["AD_LIFECYCLE_STATE_DIR"]) / "controller-1.json"
+            state = json.loads(state_path.read_text())
+            old_turn = state["active_turn_id"]
+            state["tool_trace"] = [{"turn_id": old_turn, "tool_use_id": "still-inflight"}]
+            state["tool_trace_overflow"] = True
+            state["inflight_tool_use_ids"] = ["still-inflight"]
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            successor, _ = self.verifier_with_current_entry("web-new", runtime_invocation_id=None)
+            err = StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=successor), redirect_stdout(StringIO()), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 78)
+            saved = json.loads(state_path.read_text())
+            self.assertEqual(saved["active_turn_id"], old_turn)
+            self.assertTrue(saved["tool_trace_overflow"])
+            self.assertEqual(saved["inflight_tool_use_ids"], ["still-inflight"])
+            self.assertEqual(saved["web_turn_lease"]["status"], "active")
+
 class RuntimeWebTurnEndClassificationTests(WebCurrentEntryDiscoveryTests):
     def test_only_explicit_generation_end_errors_count_as_turn_end(self) -> None:
         self.assertTrue(web_bridge._runtime_web_turn_end_error(

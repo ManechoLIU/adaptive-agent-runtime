@@ -5,6 +5,7 @@ import argparse
 from collections import deque
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 import queue
@@ -1618,6 +1619,38 @@ def recover_same_controller_web_session(
                     "strong successor recovery requires the same current Web owner"
                 )
 
+            runtime_turn_prior: dict[str, Any] | None = None
+            if strong_successor_rotation:
+                # Recheck the turn-local fence while the registry lock is held. Verified Web
+                # lifecycle mutations acquire this same registry lock before the lifecycle lock,
+                # so no new inflight evidence can race past this point.
+                candidate_lease = _runtime_web_turn_lease(controller_id)
+                if isinstance(candidate_lease, dict) and candidate_lease.get("status") == "active":
+                    source_target = agent_target.verified_execution_target(
+                        logical_agent=agent_target.logical_agent_identity(
+                            agent_type="controller", agent_id=controller_id
+                        ),
+                        host="web",
+                        execution_target_session_id=current_target_session,
+                        target_generation=current_generation,
+                        ownership_generation=current_ownership_generation,
+                        provenance="same_controller_successor_source",
+                    )
+                    _verified_turn_from_runtime_web_lease(
+                        controller_id=controller_id, verified_target=source_target, lease=candidate_lease
+                    )
+                    lifecycle_state = _load_lifecycle_state(controller_id)
+                    if str(lifecycle_state.get("active_turn_id") or "") != str(candidate_lease.get("turn_id") or ""):
+                        raise PermissionError("Runtime Web turn lease is not the active machine turn")
+                    inflight = [
+                        str(item) for item in lifecycle_state.get("inflight_tool_use_ids", []) if str(item)
+                    ]
+                    if inflight:
+                        raise PermissionError(
+                            "WEB_TURN_BOUNDARY_INFLIGHT: verified Web successor cannot rotate while tool evidence is inflight"
+                        )
+                    runtime_turn_prior = dict(candidate_lease)
+
             if strong_successor_rotation:
                 if not _is_strong_web_target_record(current_record):
                     raise PermissionError(
@@ -1739,6 +1772,38 @@ def recover_same_controller_web_session(
                     registry, controller_id=controller_id
                 )
             _write_json_atomic_file(registry_path, registry)
+            if runtime_turn_prior is not None:
+                successor_target = agent_target.verified_execution_target(
+                    logical_agent=agent_target.logical_agent_identity(
+                        agent_type="controller", agent_id=controller_id
+                    ),
+                    host="web",
+                    execution_target_session_id=web_session_id,
+                    target_generation=generation,
+                    ownership_generation=ownership_claim["generation"],
+                    provenance="host_attested_same_controller_recovery",
+                )
+                transition_recovery = {
+                    "result": "RECOVERED",
+                    "state": "VERIFIED",
+                    "controller_id": controller_id,
+                    "execution_target_session_id": web_session_id,
+                    "target_generation": generation,
+                    "ownership_generation": ownership_claim["generation"],
+                    "strong_successor_rotation": True,
+                    "source_host_receipt_sha256": hashlib.sha256(
+                        source_identity_evidence["host_receipt_id"].encode("utf-8")
+                    ).hexdigest(),
+                    "successor_host_receipt_sha256": hashlib.sha256(
+                        successor_identity_evidence["host_receipt_id"].encode("utf-8")
+                    ).hexdigest(),
+                }
+                _retire_runtime_web_turn_for_verified_successor(
+                    controller_id=controller_id,
+                    prior=runtime_turn_prior,
+                    verified_target=successor_target,
+                    recovery=transition_recovery,
+                )
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -5403,6 +5468,120 @@ def _verified_turn_from_runtime_web_lease(
     return turn
 
 
+def _runtime_web_turn_lease_matches_target(lease: dict[str, Any], target: dict[str, Any]) -> bool:
+    return (
+        lease.get("status") == "active"
+        and str(lease.get("execution_target_session_id") or "") == target["execution_target_session_id"]
+        and lease.get("target_generation") == target["target_generation"]
+        and lease.get("ownership_generation") == target["ownership_generation"]
+    )
+
+
+def _valid_sha256(value: Any) -> bool:
+    token = str(value or "").strip().lower()
+    return len(token) == 64 and all(ch in "0123456789abcdef" for ch in token)
+
+
+def _verified_successor_recovery_evidence(
+    *, controller_id: str, prior: dict[str, Any], verified_target: dict[str, Any], recovery: object
+) -> dict[str, Any]:
+    if not isinstance(recovery, dict):
+        raise PermissionError("Runtime Web turn target fence changed without verified SAME-Controller recovery")
+    if (
+        recovery.get("result") != "RECOVERED"
+        or recovery.get("state") != "VERIFIED"
+        or recovery.get("strong_successor_rotation") is not True
+        or str(recovery.get("controller_id") or "") != controller_id
+        or str(recovery.get("execution_target_session_id") or "") != verified_target["execution_target_session_id"]
+        or recovery.get("target_generation") != verified_target["target_generation"]
+        or recovery.get("ownership_generation") != verified_target["ownership_generation"]
+    ):
+        raise PermissionError("Runtime Web turn target fence changed without exact verified SAME-Controller successor evidence")
+    if (
+        str(prior.get("execution_target_session_id") or "") == verified_target["execution_target_session_id"]
+        or verified_target["target_generation"] != int(prior["target_generation"]) + 1
+        or verified_target["ownership_generation"] != int(prior["ownership_generation"]) + 1
+    ):
+        raise PermissionError("Runtime Web turn successor generations are not the next exact target/ownership epoch")
+    source_hash = str(recovery.get("source_host_receipt_sha256") or "").strip().lower()
+    successor_hash = str(recovery.get("successor_host_receipt_sha256") or "").strip().lower()
+    if not _valid_sha256(source_hash) or not _valid_sha256(successor_hash):
+        raise PermissionError("Runtime Web turn successor recovery is missing Host receipt evidence")
+    return {
+        "contract": "runtime_web_turn_successor_transition_v1",
+        "controller_id": controller_id,
+        "source_session_id": str(prior["execution_target_session_id"]),
+        "source_target_generation": int(prior["target_generation"]),
+        "source_ownership_generation": int(prior["ownership_generation"]),
+        "successor_session_id": verified_target["execution_target_session_id"],
+        "successor_target_generation": verified_target["target_generation"],
+        "successor_ownership_generation": verified_target["ownership_generation"],
+        "source_host_receipt_sha256": source_hash,
+        "successor_host_receipt_sha256": successor_hash,
+    }
+
+
+def _guard_runtime_web_successor_before_recovery(
+    *, controller_id: str, repo: Path, registry_path: Path, current_entry: dict[str, Any]
+) -> None:
+    lease = _runtime_web_turn_lease(controller_id)
+    if not isinstance(lease, dict) or lease.get("status") != "active":
+        return
+    current_target = target_guard.resolve_verified_logical_agent_execution_target(
+        repo=repo,
+        host="web",
+        logical_agent_identity=agent_target.logical_agent_identity(
+            agent_type="controller", agent_id=controller_id
+        ),
+        registry_path=registry_path,
+    )
+    # Validate that the active fallback lease still belongs to the exact canonical source target.
+    _verified_turn_from_runtime_web_lease(
+        controller_id=controller_id, verified_target=current_target, lease=lease
+    )
+    discovered_session = str(current_entry.get("conversation_id") or "").strip()
+    if discovered_session == current_target["execution_target_session_id"]:
+        return
+    state = _load_lifecycle_state(controller_id)
+    if str(state.get("active_turn_id") or "") != str(lease.get("turn_id") or ""):
+        raise PermissionError("Runtime Web turn lease is not the active machine turn")
+    inflight = [str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)]
+    if inflight:
+        raise PermissionError(
+            "WEB_TURN_BOUNDARY_INFLIGHT: verified Web successor cannot rotate while tool evidence is inflight"
+        )
+
+
+def _retire_runtime_web_turn_for_verified_successor(
+    *, controller_id: str, prior: dict[str, Any], verified_target: dict[str, Any], recovery: object
+) -> dict[str, Any]:
+    evidence = _verified_successor_recovery_evidence(
+        controller_id=controller_id, prior=prior, verified_target=verified_target, recovery=recovery
+    )
+    state = _load_lifecycle_state(controller_id)
+    if str(state.get("active_turn_id") or "") != str(prior.get("turn_id") or ""):
+        raise PermissionError("Runtime Web turn successor cannot retire a non-current lease")
+    inflight = [str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)]
+    if inflight:
+        raise PermissionError(
+            "WEB_TURN_BOUNDARY_INFLIGHT: verified Web successor cannot rotate while tool evidence is inflight"
+        )
+    digest = hashlib.sha256(
+        json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    lifecycle = _lifecycle_module()
+    return lifecycle.mark_runtime_web_turn_ended(
+        controller_id=controller_id,
+        expected_turn_id=str(prior["turn_id"]),
+        watcher_nonce=str(prior["watcher_nonce"]),
+        expected_session_id=str(prior["execution_target_session_id"]),
+        expected_target_generation=int(prior["target_generation"]),
+        expected_ownership_generation=int(prior["ownership_generation"]),
+        end_reason="verified_same_controller_target_successor",
+        end_evidence_sha256=digest,
+    )
+
+
 def _new_runtime_web_turn_lease(
     *, controller_id: str, verified_target: object, generation: int, current_entry: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -5440,26 +5619,49 @@ def _new_runtime_web_turn_lease(
 
 
 def runtime_web_turn_for_session_start(
-    *, controller_id: str, current_entry: dict[str, Any], verified_target: object
+    *, controller_id: str, current_entry: dict[str, Any], verified_target: object,
+    session_recovery: object | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+    target = agent_target.normalize_verified_execution_target(
+        verified_target,
+        expected_logical_agent=agent_target.logical_agent_identity(
+            agent_type="controller", agent_id=controller_id
+        ),
+        expected_host="web",
+    )
+    state = _load_lifecycle_state(controller_id)
+    lifecycle = _lifecycle_module()
+    prior = getattr(lifecycle, "_runtime_web_turn_lease")(state.get("web_turn_lease"))
+
+    # A Runtime fallback lease remains authoritative for the whole machine turn even
+    # if a Host invocation token becomes available later in the same generation.
+    if isinstance(prior, dict) and prior.get("status") == "active":
+        if _runtime_web_turn_lease_matches_target(prior, target):
+            return (
+                _verified_turn_from_runtime_web_lease(
+                    controller_id=controller_id, verified_target=target, lease=prior
+                ),
+                dict(prior),
+                False,
+            )
+        _retire_runtime_web_turn_for_verified_successor(
+            controller_id=controller_id,
+            prior=prior,
+            verified_target=target,
+            recovery=session_recovery,
+        )
+        state = _load_lifecycle_state(controller_id)
+        prior = getattr(lifecycle, "_runtime_web_turn_lease")(state.get("web_turn_lease"))
+        if not isinstance(prior, dict) or prior.get("status") != "ended":
+            raise PermissionError("Runtime Web turn successor retirement was not durably recorded")
+
     direct_invocation = str(current_entry.get("runtime_invocation_id") or "").strip()
     if direct_invocation:
         return (
             verified_web_execution_turn_from_current_entry(
-                current_entry=current_entry, verified_current_target=verified_target
+                current_entry=current_entry, verified_current_target=target
             ),
             None,
-            False,
-        )
-    state = _load_lifecycle_state(controller_id)
-    lifecycle = _lifecycle_module()
-    prior = getattr(lifecycle, "_runtime_web_turn_lease")(state.get("web_turn_lease"))
-    if isinstance(prior, dict) and prior.get("status") == "active":
-        return (
-            _verified_turn_from_runtime_web_lease(
-                controller_id=controller_id, verified_target=verified_target, lease=prior
-            ),
-            dict(prior),
             False,
         )
     if isinstance(prior, dict) and prior.get("status") == "ended":
@@ -5478,7 +5680,7 @@ def runtime_web_turn_for_session_start(
         generation = 1
     turn, lease = _new_runtime_web_turn_lease(
         controller_id=controller_id,
-        verified_target=verified_target,
+        verified_target=target,
         generation=generation,
         current_entry=current_entry,
     )
@@ -5488,21 +5690,33 @@ def runtime_web_turn_for_session_start(
 def runtime_web_turn_for_post_tool(
     *, controller_id: str, current_entry: dict[str, Any], verified_target: object
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    target = agent_target.normalize_verified_execution_target(
+        verified_target,
+        expected_logical_agent=agent_target.logical_agent_identity(
+            agent_type="controller", agent_id=controller_id
+        ),
+        expected_host="web",
+    )
+    lease = _runtime_web_turn_lease(controller_id)
+    if isinstance(lease, dict):
+        if lease.get("status") == "active":
+            # Never abandon a fallback lease merely because a Host token appears mid-turn.
+            return (
+                _verified_turn_from_runtime_web_lease(
+                    controller_id=controller_id, verified_target=target, lease=lease
+                ),
+                lease,
+            )
+        raise PermissionError(
+            "WEB_TURN_SESSION_START_REQUIRED: ended Runtime Web turn lease requires a new Host-attested SessionStart"
+        )
     direct_invocation = str(current_entry.get("runtime_invocation_id") or "").strip()
     if direct_invocation:
         return (
             verified_web_execution_turn_from_current_entry(
-                current_entry=current_entry, verified_current_target=verified_target
+                current_entry=current_entry, verified_current_target=target
             ),
             None,
-        )
-    lease = _runtime_web_turn_lease(controller_id)
-    if isinstance(lease, dict) and lease.get("status") == "active":
-        return (
-            _verified_turn_from_runtime_web_lease(
-                controller_id=controller_id, verified_target=verified_target, lease=lease
-            ),
-            lease,
         )
     raise PermissionError(
         "WEB_TURN_SESSION_START_REQUIRED: Host-attested session-start must establish the Runtime Web turn before tool evidence"
@@ -8009,6 +8223,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise PermissionError(
                     "caller-supplied Web session ID does not match Host machine current-entry identity"
                 )
+            _guard_runtime_web_successor_before_recovery(
+                controller_id=controller_id, repo=repo, registry_path=registry_path,
+                current_entry=current_entry,
+            )
             recovery = recover_same_controller_web_session(
                 repo=repo,
                 web_session_id=web_session_id,
@@ -8052,6 +8270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 controller_id=controller_id,
                 current_entry=current_entry,
                 verified_target=verified_target,
+                session_recovery=recovery,
             )
             turn_event = web_session_start_event(
                 session_id=controller_id, repo=repo, web_session_id=web_session_id,

@@ -120,6 +120,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_governance.WebMachineTurnLifecycleTests."
     "test_web_post_tool_cannot_start_next_turn_without_session_boundary",
     "tests.test_governance.WebMachineTurnLifecycleTests."
+    "test_direct_host_turn_cannot_abandon_active_runtime_fallback_lease",
+    "tests.test_governance.WebMachineTurnLifecycleTests."
     "test_verified_web_event_rejects_stale_target_and_ownership_fences",
     "tests.test_governance.WebMachineTurnLifecycleTests."
     "test_verified_web_event_rejects_historical_web_target",
@@ -185,6 +187,16 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_active_host_probe_does_not_end_current_runtime_turn",
     "tests.test_web_lifecycle_bridge.RuntimeWebTurnEdgeWatcherTests."
     "test_post_shell_without_host_turn_token_reuses_active_runtime_lease",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnEdgeWatcherTests."
+    "test_host_invocation_token_does_not_orphan_active_fallback_lease",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnEdgeWatcherTests."
+    "test_direct_host_turn_after_ended_fallback_never_leaves_stale_lease",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnEdgeWatcherTests."
+    "test_verified_same_controller_successor_rotates_active_fallback_lease_without_watcher_end",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnEdgeWatcherTests."
+    "test_verified_same_controller_successor_with_inflight_fallback_tool_fails_closed",
+    "tests.test_web_lifecycle_bridge.RuntimeWebTurnEdgeWatcherTests."
+    "test_successor_rechecks_inflight_under_registry_fence_before_target_rotation",
     "tests.test_web_lifecycle_bridge.RuntimeWebTurnEndClassificationTests."
     "test_only_explicit_generation_end_errors_count_as_turn_end",
     "tests.test_web_lifecycle_bridge.RuntimeWebTurnEndClassificationTests."

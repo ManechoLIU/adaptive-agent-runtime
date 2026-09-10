@@ -373,6 +373,7 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
                 "reason": "event turn_id does not match verified execution turn",
             }
             return "Web turn boundary rejected: event turn_id does not match Host-verified execution turn."
+    prior_lease = _runtime_web_turn_lease(state.get("web_turn_lease")) if web_turn is not None else None
     incoming_lease = _runtime_web_turn_lease(event.get("web_turn_lease")) if web_turn is not None else None
     if incoming_lease is not None:
         lease_error = _validate_runtime_web_turn_lease_transition(state, event, incoming_lease)
@@ -391,6 +392,19 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
         if incoming_lease is not None:
             state["web_turn_lease"] = incoming_lease
         return None
+    if (
+        web_turn is not None
+        and prior_lease is not None
+        and prior_lease.get("status") == "active"
+        and incoming_lease is None
+    ):
+        state["adapter_fault"] = {
+            "code": "runtime_web_turn_lease_abandonment",
+            "turn_id": turn_id,
+            "active_turn_id": current_turn_id,
+            "reason": "active Runtime Web turn lease cannot be abandoned by a direct Host turn",
+        }
+        return "Web turn boundary rejected: active Runtime Web turn lease requires machine end or verified successor transition."
     if web_turn is not None and event.get("hook_event_name") not in {"SessionStart", "UserPromptSubmit"}:
         state["adapter_fault"] = {
             "code": "web_turn_start_required",
@@ -429,6 +443,8 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
     })
     if incoming_lease is not None:
         state["web_turn_lease"] = incoming_lease
+    elif web_turn is not None and prior_lease is not None and prior_lease.get("status") == "ended":
+        state.pop("web_turn_lease", None)
     return None
 
 

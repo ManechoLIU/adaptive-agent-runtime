@@ -5909,6 +5909,35 @@ class WebMachineTurnLifecycleTests(unittest.TestCase):
         self.assertEqual(state["active_turn_id"], old_turn)
         self.assertEqual(state["adapter_fault"]["code"], "unverified_web_turn")
 
+    def test_direct_host_turn_cannot_abandon_active_runtime_fallback_lease(self) -> None:
+        fallback = self.web_turn("runtime-fallback-A")
+        lease = {
+            "contract": lifecycle_hook.RUNTIME_WEB_TURN_LEASE_CONTRACT,
+            "status": "active", "generation": 1,
+            "turn_id": fallback["turn_id"],
+            "runtime_invocation_id": "runtime-fallback-A",
+            "execution_target_session_id": "web-current",
+            "target_generation": 4, "ownership_generation": 7,
+            "watcher_nonce": "watcher-a",
+        }
+        prior = {
+            "active_turn_id": fallback["turn_id"],
+            "tool_trace": [{"turn_id": fallback["turn_id"], "tool_use_id": "kept"}],
+            "tool_trace_overflow": True,
+            "inflight_tool_use_ids": [],
+            "web_turn_lease": lease,
+        }
+        direct = self.event("host-direct-B")
+        output, state = lifecycle_hook.evaluate_event(
+            direct, snapshot=self.snapshot(), prior_state=prior
+        )
+        self.assertEqual(output.get("decision"), "block")
+        self.assertEqual(state["active_turn_id"], fallback["turn_id"])
+        self.assertTrue(state["tool_trace_overflow"])
+        self.assertEqual(state["tool_trace"][0]["tool_use_id"], "kept")
+        self.assertEqual(state["web_turn_lease"]["turn_id"], fallback["turn_id"])
+        self.assertEqual(state["adapter_fault"]["code"], "runtime_web_turn_lease_abandonment")
+
     def test_web_post_tool_cannot_start_next_turn_without_session_boundary(self) -> None:
         _, state = lifecycle_hook.evaluate_event(
             self.event("machine-A"), snapshot=self.snapshot(), prior_state=None
