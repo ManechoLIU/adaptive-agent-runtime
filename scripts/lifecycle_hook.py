@@ -167,6 +167,100 @@ def _desktop_turn_start(event: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
+def _desktop_rollout_completed_commands(
+    event: dict[str, Any], state: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return only current-turn terminal CommandExecution items from a trusted rollout."""
+    if event.get("controller_host") != DESKTOP_SESSION_HOST:
+        return []
+    if event.get("hook_event_name") not in {"PreToolUse", "Stop"}:
+        return []
+    turn_id = _event_turn_id(event)
+    if not turn_id or turn_id != str(state.get("active_turn_id", "")).strip():
+        return []
+    source_id = str(event.get("source_session_id") or "").strip()
+    transcript = str(event.get("transcript_path") or "").strip()
+    if not source_id or not transcript:
+        return []
+    sessions = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
+    try:
+        path = Path(transcript).resolve(strict=True)
+        if not path.is_relative_to(sessions.resolve()):
+            return []
+        with path.open("rb") as stream:
+            header = json.loads(stream.readline(65536))
+            if (
+                header.get("type") != "session_meta"
+                or header.get("payload", {}).get("id") != source_id
+            ):
+                return []
+            size = stream.seek(0, os.SEEK_END)
+            offset = max(0, size - 8 * 1024 * 1024)
+            stream.seek(offset)
+            if offset:
+                stream.readline()
+            raw = stream.read()
+        started = False
+        completed: list[dict[str, Any]] = []
+        for line in raw.splitlines():
+            row = json.loads(line)
+            if row.get("type") != "event_msg":
+                continue
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            kind = payload.get("type")
+            payload_turn_id = str(payload.get("turn_id") or "").strip()
+            if kind == "task_started":
+                if started and payload_turn_id != turn_id:
+                    return []
+                if payload_turn_id == turn_id:
+                    started = True
+                    completed = []
+                continue
+            if not started or payload_turn_id != turn_id:
+                continue
+            if kind in {"turn_aborted", "task_complete"}:
+                return []
+            if kind != "item_completed":
+                continue
+            item = payload.get("item")
+            if (
+                not isinstance(item, dict)
+                or item.get("type") != "CommandExecution"
+                or str(item.get("status") or "").strip().lower()
+                not in {"completed", "failed"}
+                or not str(item.get("id") or "").strip()
+            ):
+                continue
+            completed.append(dict(item))
+        return completed if started else []
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+
+
+def _rollout_command_text(item: dict[str, Any]) -> str | None:
+    command = item.get("command")
+    if not isinstance(command, list) or len(command) != 3:
+        return None
+    shell = Path(str(command[0])).name
+    if shell not in {"bash", "sh", "zsh"} or command[1] not in {"-c", "-lc"}:
+        return None
+    value = command[2]
+    return value if isinstance(value, str) and value else None
+
+
+def _rollout_tool_response(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: item[key]
+        for key in (
+            "status", "stdout", "stderr", "aggregated_output", "formatted_output",
+            "exit_code", "duration",
+        )
+        if key in item
+    }
+
+
 def _runtime_web_turn_lease(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -432,6 +526,7 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
     state["tool_trace"] = []
     state["tool_trace_overflow"] = False
     state["inflight_tool_use_ids"] = []
+    state["inflight_tool_records"] = {}
     state.pop("control_receipt_inflight", None)
     state.pop("control_receipt_proposal", None)
     state.pop("goal_block_authorization", None)
@@ -552,14 +647,31 @@ def _control_guard_proposal(command: str, *, cwd: str | Path | None) -> dict[str
         snapshot = json.loads(raw)
     except (OSError, json.JSONDecodeError):
         return None
-    rollover = snapshot.get("goal_rollover") if isinstance(snapshot, dict) else None
-    if not isinstance(rollover, dict):
+    if not isinstance(snapshot, dict):
         return None
+    event_contract = snapshot.get("event_contract")
+    event_id = (
+        str(event_contract.get("event_id") or "").strip()
+        if isinstance(event_contract, dict)
+        else ""
+    )
+    rollover = snapshot.get("goal_rollover") if isinstance(snapshot, dict) else None
+    rollover = rollover if isinstance(rollover, dict) else {}
     proposal: dict[str, Any] = {
         "snapshot_path": str(snapshot_path),
         "snapshot_sha256": sha256_bytes(raw),
+        "cycle_snapshot_sha256": _json_sha256(snapshot),
+        "event_id": event_id,
         "goal_rollover_status": str(rollover.get("status", "")).strip().lower(),
     }
+    try:
+        repo_index = tokens.index("--repo")
+        repo_path = Path(tokens[repo_index + 1]).expanduser()
+        if not repo_path.is_absolute():
+            repo_path = (Path(cwd or ".").expanduser().resolve() / repo_path).resolve()
+        proposal["repo_path"] = str(repo_path)
+    except (ValueError, IndexError):
+        pass
     if proposal["goal_rollover_status"] != "rolled":
         return proposal
     try:
@@ -645,10 +757,73 @@ def _tool_use_id(event: dict[str, Any]) -> str:
     return str(event.get("tool_use_id", "")).strip()
 
 
+def _verified_rollout_control_receipt(
+    event: dict[str, Any], snapshot: dict[str, Any] | None
+) -> bool:
+    recovery = event.get("rollout_recovery")
+    proposal = event.get("rollout_control_receipt_proposal")
+    if not isinstance(recovery, dict) or not isinstance(proposal, dict):
+        return False
+    response = event.get("tool_response")
+    if not isinstance(response, dict) or response.get("exit_code") != 0:
+        return False
+    if "control-event: allowed" not in str(response.get("stdout") or ""):
+        return False
+    tool_use_id = _tool_use_id(event)
+    event_id = str(proposal.get("event_id") or "").strip()
+    if (
+        not tool_use_id
+        or str(proposal.get("tool_use_id") or "").strip() != tool_use_id
+        or str(recovery.get("tool_use_id") or "").strip() != tool_use_id
+        or not event_id
+        or not isinstance(snapshot, dict)
+    ):
+        return False
+    root = Path(str(snapshot.get("root") or "")).expanduser()
+    proposal_root = Path(str(proposal.get("repo_path") or "")).expanduser()
+    snapshot_path = Path(str(proposal.get("snapshot_path") or "")).expanduser()
+    try:
+        root = root.resolve(strict=True)
+        if proposal_root.resolve(strict=True) != root:
+            return False
+        raw = snapshot_path.read_bytes()
+        if sha256_bytes(raw) != str(proposal.get("snapshot_sha256") or ""):
+            return False
+        cycle_snapshot = json.loads(raw)
+        if _json_sha256(cycle_snapshot) != str(proposal.get("cycle_snapshot_sha256") or ""):
+            return False
+        try:
+            from control_event_guard import controller_cycle_evidence_path
+        except ModuleNotFoundError:
+            from scripts.control_event_guard import controller_cycle_evidence_path
+        evidence = json.loads(
+            controller_cycle_evidence_path(root, event_id).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    controller_id = str(event.get("controller_session_id") or "").strip()
+    return (
+        isinstance(evidence, dict)
+        and evidence.get("record_kind") == "controller_cycle_evidence"
+        and str(evidence.get("evidence_id") or "").strip() == event_id
+        and str(evidence.get("cycle_id") or "").strip() == event_id
+        and str(evidence.get("controller_id") or "").strip() == controller_id
+        and str(evidence.get("terminal_status") or "").strip().upper() == "CLOSED"
+        and str(evidence.get("snapshot_sha256") or "").strip()
+        == str(proposal.get("cycle_snapshot_sha256") or "")
+        and str(evidence.get("main_revision") or "").strip()
+        == str(snapshot.get("head") or "").strip()
+        and str(evidence.get("ledger_sha256") or "").strip()
+        == str(snapshot.get("ledger_sha256") or "").strip()
+    )
+
+
 def _record_tool_trace(state: dict[str, Any], event: dict[str, Any]) -> None:
     if event.get("hook_event_name") != "PostToolUse":
         return
     tool_name = str(event.get("tool_name", "")).strip()
+    if event.get("controller_host") == DESKTOP_SESSION_HOST and not _tool_use_id(event):
+        return
     tool_input = event.get("tool_input")
     if not tool_name and not isinstance(tool_input, dict):
         return
@@ -673,7 +848,9 @@ def _record_tool_trace(state: dict[str, Any], event: dict[str, Any]) -> None:
             ):
                 return
     turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
-    input_sha256 = _json_sha256(tool_input)
+    input_sha256 = str(event.get("recovered_input_sha256") or "").strip()
+    if not input_sha256:
+        input_sha256 = _json_sha256(tool_input)
     tool_use_id = str(event.get("tool_use_id", "")).strip()
     if not tool_use_id:
         tool_use_id = f"derived:{turn_id}:{tool_name}:{input_sha256[:12]}"
@@ -689,6 +866,21 @@ def _record_tool_trace(state: dict[str, Any], event: dict[str, Any]) -> None:
         "response_status": response_status,
     }
     trace = [item for item in state.get("tool_trace", []) if isinstance(item, dict)]
+    for index in range(len(trace) - 1, -1, -1):
+        existing = trace[index]
+        if (
+            str(existing.get("turn_id") or "") == turn_id
+            and str(existing.get("tool_use_id") or "") == tool_use_id
+        ):
+            updated = dict(existing)
+            updated["response_status"] = response_status
+            if not str(updated.get("tool_name") or ""):
+                updated["tool_name"] = entry["tool_name"]
+            if not str(updated.get("input_sha256") or ""):
+                updated["input_sha256"] = entry["input_sha256"]
+            trace[index] = updated
+            state["tool_trace"] = trace
+            return
     trace.append(entry)
     if len(trace) > MAX_TOOL_TRACE_ENTRIES:
         state["tool_trace_overflow"] = True
@@ -1980,6 +2172,8 @@ def successful_control_receipt(
             return False
     if event.get("hook_event_name") != "PostToolUse":
         return False
+    if event.get("controller_host") == DESKTOP_SESSION_HOST and not _tool_use_id(event):
+        return False
     tool_input = event.get("tool_input")
     if not isinstance(tool_input, dict):
         return False
@@ -1997,7 +2191,82 @@ def successful_control_receipt(
     if not isinstance(response, dict) or response.get("exit_code") not in (None, 0):
         return False
     output = json.dumps(response, ensure_ascii=False)
-    return "control-event: allowed" in output
+    if "control-event: allowed" not in output:
+        return False
+    if event.get("rollout_recovery") is not None:
+        return _verified_rollout_control_receipt(event, snapshot)
+    return True
+
+
+def _reconcile_desktop_rollout(
+    state: dict[str, Any], event: dict[str, Any], snapshot: dict[str, Any]
+) -> dict[str, Any]:
+    inflight = {
+        str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)
+    }
+    if not inflight:
+        return state
+    records = state.get("inflight_tool_records")
+    records = records if isinstance(records, dict) else {}
+    for item in _desktop_rollout_completed_commands(event, state):
+        tool_use_id = str(item.get("id") or "").strip()
+        if tool_use_id not in inflight:
+            continue
+        command = _rollout_command_text(item)
+        if command is None:
+            continue
+        record = records.get(tool_use_id)
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("turn_id") or "").strip() != _event_turn_id(event):
+            continue
+        expected_command_sha256 = str(record.get("command_sha256") or "").strip()
+        if (
+            not expected_command_sha256
+            or sha256_bytes(command.encode("utf-8")) != expected_command_sha256
+        ):
+            continue
+        proposal = state.get("control_receipt_proposal")
+        is_control_receipt = (
+            str(state.get("control_receipt_inflight") or "").strip() == tool_use_id
+        )
+        recovered = {
+            key: event[key]
+            for key in (
+                "session_id", "controller_session_id", "source_session_id",
+                "controller_host", "controller_target_generation",
+                "controller_ownership_generation", "transcript_path", "cwd",
+            )
+            if key in event
+        }
+        recovered.update({
+            "hook_event_name": "PostToolUse",
+            "turn_id": _event_turn_id(event),
+            "tool_name": str(record.get("tool_name") or "Bash"),
+            "tool_use_id": tool_use_id,
+            "tool_input": {"command": command},
+            "tool_response": _rollout_tool_response(item),
+            "rollout_recovery": {
+                "source": "codex_rollout_item_completed",
+                "tool_use_id": tool_use_id,
+            },
+        })
+        input_sha256 = str(record.get("input_sha256") or "").strip()
+        if input_sha256:
+            recovered["recovered_input_sha256"] = input_sha256
+        if is_control_receipt and isinstance(proposal, dict):
+            recovered["rollout_control_receipt_proposal"] = dict(proposal)
+        _output, state = evaluate_event(
+            recovered, snapshot=snapshot, prior_state=state
+        )
+        inflight = {
+            str(value)
+            for value in state.get("inflight_tool_use_ids", [])
+            if str(value)
+        }
+        if is_control_receipt and state.get("must_yield") is not True:
+            state.pop("control_receipt_proposal", None)
+    return state
 
 
 def lifecycle_triggers(
@@ -2302,6 +2571,8 @@ def evaluate_event(
         state["must_yield"] = False
     if "tool_trace" not in state:
         state["tool_trace"] = []
+    if event_name in {"PreToolUse", "Stop"}:
+        state = _reconcile_desktop_rollout(state, event, snapshot)
     if _is_observation_status_query(event):
         state["observation_query_only"] = True
         state["observation_query_turn_id"] = _event_turn_id(event)
@@ -2439,6 +2710,18 @@ def evaluate_event(
         if tool_use_id and tool_use_id not in inflight:
             inflight.append(tool_use_id)
         state["inflight_tool_use_ids"] = inflight
+        if tool_use_id:
+            records = state.get("inflight_tool_records")
+            records = dict(records) if isinstance(records, dict) else {}
+            record: dict[str, Any] = {
+                "turn_id": _event_turn_id(event),
+                "tool_name": str(event.get("tool_name") or ""),
+                "input_sha256": _json_sha256(tool_input),
+            }
+            if command:
+                record["command_sha256"] = sha256_bytes(command.encode("utf-8"))
+            records[tool_use_id] = record
+            state["inflight_tool_records"] = records
         if is_guard:
             state["control_receipt_inflight"] = tool_use_id or "unknown"
             proposal = _control_guard_proposal(command, cwd=event.get("cwd"))
@@ -2459,6 +2742,12 @@ def evaluate_event(
         ]
         if str(state.get("control_receipt_inflight", "")) == tool_use_id:
             state.pop("control_receipt_inflight", None)
+        if tool_use_id:
+            records = state.get("inflight_tool_records")
+            if isinstance(records, dict):
+                records = dict(records)
+                records.pop(tool_use_id, None)
+                state["inflight_tool_records"] = records
         pending_display_sync = state.get("goal_display_sync")
         if (
             isinstance(pending_display_sync, dict)
@@ -3261,7 +3550,7 @@ def persist_event_state(
                 # projection. An archive failure must not silently discard it.
                 archived = {key: previous[key] for key in (
                     "active_turn_id", "source_session_id", "tool_trace", "tool_trace_overflow",
-                    "inflight_tool_use_ids", "control_receipt_inflight", "must_yield",
+                    "inflight_tool_use_ids", "inflight_tool_records", "control_receipt_inflight", "must_yield",
                     "receipt_turn_id", "adapter_fault", "web_turn_lease",
                 ) if key in previous}
                 archived["replaced_by"] = next_state.get("turn_start_evidence")
