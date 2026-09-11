@@ -483,6 +483,50 @@ class InstallCapabilityTests(unittest.TestCase):
 
 
 class InstallMigrationContractTests(unittest.TestCase):
+    def test_canonical_release_source_requires_published_main(self):
+        import subprocess
+
+        from scripts.install_skill import verify_canonical_release_source
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = self.make_source(root)
+
+            proof = verify_canonical_release_source(source)
+            revision = subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+            ).strip()
+            self.assertEqual(proof["status"], "verified")
+            self.assertEqual(proof["branch"], "main")
+            self.assertEqual(proof["upstream"], "origin/main")
+            self.assertEqual(proof["revision"], revision)
+            self.assertEqual(proof["upstream_revision"], revision)
+
+            subprocess.run(
+                ["git", "-C", str(source), "checkout", "-b", "feature/not-a-release"],
+                check=True,
+                capture_output=True,
+            )
+            with self.assertRaisesRegex(ValueError, "canonical main branch"):
+                verify_canonical_release_source(source)
+
+            subprocess.run(
+                ["git", "-C", str(source), "checkout", "main"],
+                check=True,
+                capture_output=True,
+            )
+            (source / "SKILL.md").write_text(
+                "---\nname: adaptive-agent-runtime\n---\n# unpublished\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "-C", str(source), "add", "SKILL.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(source), "commit", "-m", "unpublished"],
+                check=True,
+                capture_output=True,
+            )
+            with self.assertRaisesRegex(ValueError, "must equal published upstream"):
+                verify_canonical_release_source(source)
+
     def test_cli_reports_default_target_conflict_without_traceback(self):
         import contextlib
         import io
@@ -582,6 +626,14 @@ class InstallMigrationContractTests(unittest.TestCase):
             script.chmod(0o755)
         subprocess.run(["git", "-C", str(source), "add", "."], check=True)
         subprocess.run(["git", "-C", str(source), "commit", "-m", "initial"], check=True, capture_output=True)
+        remote = root / "source-origin.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(source), "remote", "add", "origin", str(remote)], check=True)
+        subprocess.run(
+            ["git", "-C", str(source), "push", "-u", "origin", "main"],
+            check=True,
+            capture_output=True,
+        )
         return source
 
     def test_existing_legacy_manifest_upgrades_in_place_with_new_product_metadata(self):

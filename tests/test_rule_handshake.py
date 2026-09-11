@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from scripts.install_skill import install_skill
+from scripts.install_skill import install_skill, verify_canonical_release_source
 import scripts.rule_handshake as rule_handshake_module
 from scripts.rule_handshake import (
     acknowledge_rule_revision,
@@ -132,6 +132,45 @@ def acknowledge_rule_revision(repo, controller_session_id, revision, **kwargs):
 
 
 class RuleHandshakeTests(unittest.TestCase):
+    def test_formal_install_ack_rejects_missing_canonical_release_proof(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, revision = make_source(base)
+            remote = base / "origin.git"
+            git(base, "init", "--bare", str(remote))
+            git(source, "remote", "add", "origin", str(remote))
+            git(source, "push", "-u", "origin", "main")
+            target = base / "installed"
+            manifest = install_skill(
+                source,
+                target,
+                summary="formal release",
+                impact="live_assignments",
+                stop_condition="canonical ACK only",
+                now=NOW,
+                canonical_release_source=verify_canonical_release_source(source),
+            )
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(manifest["canonical_release_source"]["status"], "verified")
+
+            manifest.pop("canonical_release_source")
+            (target / ".adaptive-delivery-install.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            repo = make_project(base)
+            registry = base / "controllers.json"
+            write_current_controller_registry(registry, repo)
+
+            with self.assertRaisesRegex(ValueError, "canonical release proof"):
+                acknowledge_rule_revision(
+                    repo,
+                    "controller-1",
+                    revision,
+                    skill_root=target,
+                    registry_path=registry,
+                    now=NOW,
+                )
+
     def test_install_manifest_records_exact_revision_and_hashes(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)

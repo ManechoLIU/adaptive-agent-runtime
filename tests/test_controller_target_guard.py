@@ -33,6 +33,48 @@ class ControllerTargetGuardTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
         return repo
 
+    def test_desktop_target_rotation_carries_current_goal_rebind_contract(self) -> None:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import lifecycle_hook
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            (repo / "TASK_LEDGER.md").write_text(
+                "# Ledger\n\n- 当前 Goal：`M1-F5-B / OUTLINE GENERATION AND EDITING`。\n",
+                encoding="utf-8",
+            )
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {
+                    "controller-1": {"desktop_codex": ["desktop-current"]}
+                },
+                "__controller_targets__": {
+                    "controller-1": {"desktop_codex": {
+                        "status": "active", "session_id": "desktop-current", "generation": 4,
+                    }}
+                },
+            }), encoding="utf-8")
+
+            receipt = lifecycle_hook.replace_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-next",
+                repo=repo,
+                expected_generation=4,
+                registry_path=registry,
+            )
+
+            contract = receipt["goal_rebind"]
+            self.assertEqual(contract["objective"], "M1-F5-B / OUTLINE GENERATION AND EDITING")
+            self.assertEqual(contract["target_generation"], 5)
+            self.assertEqual(contract["execution_target_session_id"], "desktop-next")
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["desktop_codex"]["goal_rebind"],
+                contract,
+            )
+
     def test_claim_controller_host_web_initializes_cross_host_ownership(self) -> None:
         guard = load_guard()
         with tempfile.TemporaryDirectory() as tmp:

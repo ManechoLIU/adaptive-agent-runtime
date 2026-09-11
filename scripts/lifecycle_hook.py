@@ -2638,6 +2638,59 @@ def evaluate_event(
     )
     event_host = str(event.get("controller_host", "")).strip()
     state["controller_host"] = event_host if event_host in {"web", "desktop_codex"} else "desktop_codex"
+    goal_rebind_contract = event.get("goal_rebind_contract")
+    if isinstance(goal_rebind_contract, dict):
+        try:
+            target_generation = event.get("controller_target_generation")
+            if (
+                str(goal_rebind_contract.get("controller_id") or "").strip()
+                != str(event.get("controller_session_id") or "").strip()
+                or str(goal_rebind_contract.get("execution_target_session_id") or "").strip()
+                != state["source_session_id"]
+                or str(goal_rebind_contract.get("host") or "").strip()
+                != state["controller_host"]
+                or goal_rebind_contract.get("target_generation") != target_generation
+            ):
+                raise ValueError("target Goal rebind binding changed")
+            rebound = goal_display_sync.start_target_goal_rebind(
+                state.get("goal_display_sync")
+                if isinstance(state.get("goal_display_sync"), dict)
+                else None,
+                goal_rebind_contract,
+                controller_id=str(event.get("controller_session_id") or "").strip(),
+                source_session_id=state["source_session_id"],
+                host=state["controller_host"],
+                target_generation=target_generation,
+                turn_id=_event_turn_id(event),
+                host_capabilities=None,
+            )
+            completed_rebinds = {
+                str(item)
+                for item in state.get("goal_rebind_completed_fingerprints", [])
+                if str(item).strip()
+            }
+            if (
+                isinstance(rebound, dict)
+                and str(rebound.get("fingerprint") or "") in completed_rebinds
+            ):
+                rebound = None
+        except ValueError as error:
+            rebound = {
+                "schema_version": 2,
+                "sync_kind": "target_goal_rebind",
+                "status": "degraded",
+                "reason": "TARGET_GOAL_REBIND_CONTRACT_INVALID",
+                "detail": str(error),
+            }
+        if rebound is not None:
+            state["goal_display_sync"] = rebound
+            if rebound.get("status") != "completed":
+                state["pending_control_event"] = True
+                triggers = {
+                    str(item) for item in state.get("triggers", []) if str(item).strip()
+                }
+                triggers.add("target_goal_rebind:" + str(rebound.get("status") or "unknown"))
+                state["triggers"] = sorted(triggers)
     event_name = event.get("hook_event_name")
     turn_boundary_fault = _begin_turn(state, event)
     if turn_boundary_fault:
@@ -2828,9 +2881,23 @@ def evaluate_event(
             isinstance(pending_display_sync, dict)
             and pending_display_sync.get("status") not in {None, "completed", "degraded"}
         ):
-            state["goal_display_sync"] = goal_display_sync.observe_goal_display_sync_result(
+            observed_sync = goal_display_sync.observe_goal_display_sync_result(
                 pending_display_sync, event
             )
+            state["goal_display_sync"] = observed_sync
+            if (
+                observed_sync.get("status") == "completed"
+                and observed_sync.get("sync_kind") == "target_goal_rebind"
+            ):
+                completed = {
+                    str(item)
+                    for item in state.get("goal_rebind_completed_fingerprints", [])
+                    if str(item).strip()
+                }
+                fingerprint = str(observed_sync.get("fingerprint") or "").strip()
+                if fingerprint:
+                    completed.add(fingerprint)
+                state["goal_rebind_completed_fingerprints"] = sorted(completed)[-32:]
     _record_tool_trace(state, event)
     event_next_action = str(event.get("next_action") or "").strip()
     event_requires_user = event.get("requires_user")
@@ -3439,6 +3506,30 @@ def _reject_cross_controller_desktop_owner(
             )
 
 
+def _current_goal_rebind_contract(repo: Path) -> dict[str, Any] | None:
+    ledger = repo / "TASK_LEDGER.md"
+    try:
+        raw = ledger.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    match = re.search(r"^- 当前 Goal：\s*(.+?)\s*$", text, re.MULTILINE)
+    if match is None:
+        return None
+    objective = match.group(1).strip().removesuffix("。").strip()
+    if objective.startswith("`") and objective.endswith("`") and len(objective) > 1:
+        objective = objective[1:-1].strip()
+    if not objective or objective.lower() in {"none", "null", "无", "无当前 goal"}:
+        return None
+    return {
+        "schema_version": 1,
+        "ledger_path": str(ledger.resolve()),
+        "ledger_sha256": sha256_bytes(raw),
+        "objective": objective,
+        "project_name": repo.name,
+    }
+
+
 def replace_desktop_session(
     *, controller_id: str, desktop_session_id: str, repo: Path, expected_generation: int,
     expected_ownership_generation: int | None = None,
@@ -3516,6 +3607,15 @@ def replace_desktop_session(
                 "session_id": desktop_session_id,
                 "generation": generation,
             }
+            goal_rebind = _current_goal_rebind_contract(canonical_root)
+            if goal_rebind is not None:
+                goal_rebind.update({
+                    "controller_id": controller_id,
+                    "execution_target_session_id": desktop_session_id,
+                    "host": DESKTOP_SESSION_HOST,
+                    "target_generation": generation,
+                })
+                target["goal_rebind"] = goal_rebind
             controller_targets[DESKTOP_SESSION_HOST] = target
             targets[controller_id] = controller_targets
             registry[CONTROLLER_TARGETS_KEY] = targets
@@ -3537,6 +3637,7 @@ def replace_desktop_session(
                 "host": DESKTOP_SESSION_HOST,
                 "repo": str(canonical_root.resolve()),
                 **target,
+                **({"goal_rebind": goal_rebind} if goal_rebind is not None else {}),
                 **({"ownership_generation": ownership_claim["generation"]} if ownership_claim else {}),
             }
         finally:
@@ -3843,6 +3944,9 @@ def process_verified_web_event(
         )
         if target_status != "active" or target_session_id != source_session_id:
             raise PermissionError("verified Web lifecycle event target is stale or mismatched")
+        goal_rebind_contract = target_record.get("goal_rebind")
+        if isinstance(goal_rebind_contract, dict):
+            normalized_event["goal_rebind_contract"] = goal_rebind_contract
         ownership = target_guard.execution_ownership_record(registry, controller_id=controller_id)
         if ownership is None:
             raise PermissionError("verified Web lifecycle event requires current execution ownership")
@@ -4021,6 +4125,9 @@ def run_hook() -> int:
             if target_status != "active" or target_session_id != source_session_id:
                 return 0
             normalized_event["controller_target_generation"] = target_generation
+            goal_rebind_contract = target_record.get("goal_rebind")
+            if isinstance(goal_rebind_contract, dict):
+                normalized_event["goal_rebind_contract"] = goal_rebind_contract
         ownership_record = target_guard.execution_ownership_record(
             registry, controller_id=controller_id
         )

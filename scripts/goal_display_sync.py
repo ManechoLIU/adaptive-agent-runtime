@@ -17,6 +17,7 @@ REQUIRED_HOST_CAPABILITIES = {
     "update_goal", "create_goal", "set_thread_title", "get_goal", "list_threads"
 }
 STEP_BY_STATUS = {
+    "pending_existing_goal_readback": "existing_goal_readback",
     "pending_update_goal": "update_goal_complete",
     "pending_create_goal": "create_goal",
     "pending_thread_title": "set_thread_title",
@@ -81,6 +82,20 @@ def _structured_payloads(response: Any) -> list[dict[str, Any]]:
 
 def _goal_readback_matches(response: Any, objective: str) -> bool:
     return any(payload.get("objective") == objective for payload in _structured_payloads(response))
+
+
+def _explicit_goal_snapshot(response: Any) -> tuple[bool, dict[str, Any] | None]:
+    """Return only an explicit Host Goal envelope; absence is not guessed."""
+    for payload in _structured_payloads(response):
+        if "goal" in payload:
+            goal = payload.get("goal")
+            if goal is None:
+                return True, None
+            if isinstance(goal, dict):
+                return True, goal
+        if "objective" in payload and "status" in payload:
+            return True, payload
+    return False, None
 
 
 def _title_readback_matches(response: Any, session_id: str, title: str) -> bool:
@@ -187,6 +202,64 @@ def start_goal_display_sync(
     return receipt
 
 
+def start_target_goal_rebind(
+    existing: dict[str, Any] | None,
+    contract: dict[str, Any],
+    *,
+    controller_id: str,
+    source_session_id: str,
+    host: str,
+    target_generation: int | None,
+    turn_id: str,
+    host_capabilities: set[str] | None,
+) -> dict[str, Any] | None:
+    """Fence a replacement target until it restores the same current Goal."""
+    ledger_sha256 = str(contract.get("ledger_sha256") or "").strip()
+    objective = str(contract.get("objective") or "").strip()
+    project_name = str(contract.get("project_name") or "").strip()
+    generation = _positive_generation(target_generation)
+    if not all((ledger_sha256, objective, project_name, controller_id, source_session_id, host)):
+        raise ValueError("target Goal rebind contract is incomplete")
+    fingerprint = _json_sha256({
+        "kind": "target_goal_rebind",
+        "controller_id": controller_id,
+        "execution_target_session_id": source_session_id,
+        "host": host,
+        "target_generation": generation,
+        "ledger_sha256": ledger_sha256,
+        "objective": objective,
+        "project_name": project_name,
+    })
+    if isinstance(existing, dict) and existing.get("fingerprint") == fingerprint:
+        return existing
+    receipt: dict[str, Any] = {
+        "schema_version": 2,
+        "sync_kind": "target_goal_rebind",
+        "receipt_id": "target-goal-rebind:" + fingerprint[:24],
+        "fingerprint": fingerprint,
+        "status": "pending_existing_goal_readback",
+        "controller_id": controller_id,
+        "execution_target_session_id": source_session_id,
+        "host": host,
+        "target_generation": generation,
+        "ledger_sha256": ledger_sha256,
+        "objective": objective,
+        "thread_title": f"{project_name} 总控｜{objective}",
+        "rollover_turn_id": turn_id,
+        "steps": [],
+    }
+    required = {"create_goal", "set_thread_title", "get_goal", "list_threads"}
+    if generation is None:
+        receipt.update({"status": "degraded", "reason": "CURRENT_TARGET_GENERATION_UNAVAILABLE"})
+    elif host_capabilities is not None and not required.issubset(host_capabilities):
+        receipt.update({"status": "degraded", "reason": "HOST_GOAL_DISPLAY_CAPABILITY_UNAVAILABLE"})
+    elif host_capabilities is None:
+        receipt["host_capability_state"] = "configured_unverified"
+    else:
+        receipt["host_capability_state"] = "declared_available_pending_live_receipt"
+    return receipt
+
+
 def _expected_tool_error(receipt: dict[str, Any], event: dict[str, Any]) -> str | None:
     status = str(receipt.get("status", ""))
     expected_step = STEP_BY_STATUS.get(status)
@@ -198,7 +271,10 @@ def _expected_tool_error(receipt: dict[str, Any], event: dict[str, Any]) -> str 
     tool_input = event.get("tool_input")
     if not isinstance(tool_input, dict):
         return f"Goal display sync requires {expected_step} next."
-    if expected_step == "update_goal_complete":
+    if expected_step == "existing_goal_readback":
+        valid = kind == "get_goal"
+        expected_name = "get_goal initial target readback"
+    elif expected_step == "update_goal_complete":
         valid = kind == "update_goal" and str(tool_input.get("status", "")).lower() == "complete"
         expected_name = "update_goal(status=complete)"
     elif expected_step == "create_goal":
@@ -272,7 +348,28 @@ def observe_goal_display_sync_result(
         response, ensure_ascii=False, sort_keys=True, default=str
     ).lower()
     step_name = str(inflight.get("step", ""))
-    if success and step_name == "get_goal_readback":
+    if success and step_name == "existing_goal_readback":
+        explicit, goal = _explicit_goal_snapshot(response)
+        if not explicit:
+            success = False
+        elif goal is None:
+            next_receipt["status"] = "pending_create_goal"
+        else:
+            objective = str(goal.get("objective") or "").strip()
+            status = str(goal.get("status") or "").strip().lower()
+            if objective != str(next_receipt.get("objective") or "").strip():
+                next_receipt.update({
+                    "status": "degraded",
+                    "reason": "HOST_GOAL_CONFLICT",
+                })
+                success = False
+            elif status == "active":
+                next_receipt["status"] = "pending_thread_title"
+            elif status in {"blocked", "complete", "completed"}:
+                next_receipt["status"] = "pending_create_goal"
+            else:
+                success = False
+    elif success and step_name == "get_goal_readback":
         success = _goal_readback_matches(
             response, str(next_receipt.get("objective", ""))
         )
@@ -300,7 +397,7 @@ def observe_goal_display_sync_result(
             if capability_unavailable
             else (
                 "HOST_READBACK_MISMATCH"
-                if step_name in {"get_goal_readback", "thread_title_readback"}
+                if step_name in {"existing_goal_readback", "get_goal_readback", "thread_title_readback"}
                 else "HOST_TOOL_FAILED"
             )
         )
@@ -321,7 +418,8 @@ def observe_goal_display_sync_result(
     if not any(item.get("tool_use_id") == tool_use_id for item in steps):
         steps.append(step)
     next_receipt["steps"] = steps
-    next_receipt["status"] = NEXT_STATUS[str(step["step"])]
+    if step_name != "existing_goal_readback":
+        next_receipt["status"] = NEXT_STATUS[str(step["step"])]
     next_receipt.pop("last_failure", None)
     if next_receipt["status"] == "completed":
         next_receipt["completed_turn_id"] = str(event.get("turn_id", "")).strip()

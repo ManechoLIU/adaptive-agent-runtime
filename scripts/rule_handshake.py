@@ -125,6 +125,30 @@ def installation_integrity_errors(skill_root: str | Path | None, manifest: dict[
     if not isinstance(files, dict) or not files:
         return ["install manifest files map is missing"]
     errors: list[str] = []
+    schema_version = manifest.get("schema_version")
+    if isinstance(schema_version, int) and not isinstance(schema_version, bool) and schema_version >= 2:
+        installed_revision = str(manifest.get("revision") or "").strip()
+        release = manifest.get("canonical_release_source")
+        if not isinstance(release, dict):
+            errors.append("canonical release proof is missing")
+        else:
+            expected = {
+                "status": "verified",
+                "branch": "main",
+                "upstream": "origin/main",
+                "remote_ref": "refs/heads/main",
+                "revision": installed_revision,
+                "upstream_revision": installed_revision,
+                "remote_revision": installed_revision,
+            }
+            mismatches = [
+                key for key, value in expected.items() if str(release.get(key) or "").strip() != value
+            ]
+            if mismatches:
+                errors.append(
+                    "canonical release proof does not bind installed revision: "
+                    + ", ".join(mismatches)
+                )
     for relative, expected in sorted(files.items()):
         path = root / str(relative)
         if not path.is_file():

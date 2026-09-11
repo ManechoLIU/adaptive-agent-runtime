@@ -1997,6 +1997,61 @@ def _verify_upgrade_lineage(source: Path, previous_revision: str | None, revisio
     }
 
 
+def verify_canonical_release_source(source: str | Path) -> dict[str, Any]:
+    """Prove that a formal Runtime release is the clean, published canonical main."""
+    source_path = Path(source).expanduser().resolve()
+    if _git(source_path, "status", "--porcelain=v1"):
+        raise ValueError("canonical Runtime release source must be completely clean")
+
+    branch = _git(source_path, "branch", "--show-current")
+    if branch != "main":
+        raise ValueError(
+            f"formal Runtime installation requires the canonical main branch; found {branch or 'detached HEAD'}"
+        )
+
+    revision = _git(source_path, "rev-parse", "HEAD")
+    main_revision = _git(source_path, "rev-parse", "refs/heads/main")
+    if revision != main_revision:
+        raise ValueError("canonical Runtime release HEAD must equal refs/heads/main")
+
+    try:
+        upstream_ref = _git(source_path, "rev-parse", "--symbolic-full-name", "@{upstream}")
+    except subprocess.CalledProcessError as error:
+        raise ValueError("canonical Runtime main must track origin/main") from error
+    if upstream_ref != "refs/remotes/origin/main":
+        raise ValueError(
+            "canonical Runtime main must track origin/main; "
+            f"found {upstream_ref or 'no upstream'}"
+        )
+
+    upstream_revision = _git(source_path, "rev-parse", upstream_ref)
+    remote_result = subprocess.run(
+        ["git", "-C", str(source_path), "ls-remote", "--exit-code", "origin", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    remote_fields = remote_result.stdout.strip().split()
+    if len(remote_fields) != 2 or remote_fields[1] != "refs/heads/main":
+        raise ValueError("canonical Runtime origin/main remote proof is malformed")
+    remote_revision = remote_fields[0]
+    if revision != upstream_revision or revision != remote_revision:
+        raise ValueError(
+            "canonical Runtime main must equal published upstream before formal installation: "
+            f"HEAD={revision}, origin/main={upstream_revision}, remote={remote_revision}"
+        )
+
+    return {
+        "status": "verified",
+        "branch": branch,
+        "upstream": "origin/main",
+        "remote_ref": "refs/heads/main",
+        "revision": revision,
+        "upstream_revision": upstream_revision,
+        "remote_revision": remote_revision,
+    }
+
+
 def _changed_files(source: Path, previous_revision: str | None, revision: str, tracked: list[str]) -> list[str]:
     if not previous_revision:
         return tracked
@@ -2162,6 +2217,7 @@ def install_skill(
     previous_revision: str | None = None,
     now: datetime | None = None,
     controller_registry: str | Path = DEFAULT_CONTROLLER_REGISTRY,
+    canonical_release_source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     source_path = Path(source).expanduser().resolve()
     target_path = Path(target).expanduser().resolve()
@@ -2176,6 +2232,10 @@ def install_skill(
         raise ValueError("source repository must be tracked-clean before installation")
 
     revision = _git(source_path, "rev-parse", "HEAD")
+    if canonical_release_source is not None:
+        fresh_release_source = verify_canonical_release_source(source_path)
+        if fresh_release_source != canonical_release_source or revision != fresh_release_source["revision"]:
+            raise ValueError("canonical Runtime release source changed before installation")
     target_path.parent.mkdir(parents=True, exist_ok=True)
     prior_manifest = _read_manifest(target_path / MANIFEST_NAME)
     prior_files = prior_manifest.get("files", {}) if isinstance(prior_manifest.get("files"), dict) else {}
@@ -2214,7 +2274,7 @@ def install_skill(
         )
         staged_capabilities["controller_identity"] = _installed_controller_identity_capability(stage)
         manifest: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2 if canonical_release_source is not None else 1,
             "product_name": PRODUCT_NAME,
             "skill_id": SKILL_ID,
             "product_slug": PRODUCT_SLUG,
@@ -2225,6 +2285,7 @@ def install_skill(
             "release_regressions": release_regressions,
             "installed_at": installed_at,
             "source_root": str(source_path),
+            "canonical_release_source": canonical_release_source,
             "summary": summary.strip(),
             "impact": impact,
             "stop_condition": stop_condition.strip(),
@@ -2236,6 +2297,10 @@ def install_skill(
         for relative, expected in hashes.items():
             if _sha256(stage / relative) != expected:
                 raise ValueError(f"staged file hash mismatch: {relative}")
+        if canonical_release_source is not None:
+            final_release_source = verify_canonical_release_source(source_path)
+            if final_release_source != canonical_release_source:
+                raise ValueError("canonical Runtime release source changed before promotion")
         _promote_staged_install(stage, target_path)
     finally:
         if stage.exists():
@@ -2390,12 +2455,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         except BlockingIOError:
             print(f"adaptive-agent-runtime-install: blocked: another installer is active for shared install resources: {target_path}")
             return 1
+        try:
+            canonical_release_source = verify_canonical_release_source(args.source)
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            print(f"adaptive-agent-runtime-install: blocked: {error}")
+            return 1
         if args.no_configure_host_adapters and args.no_configure_runtime_services:
             try:
                 manifest = install_skill(
                     args.source, target_path, summary=args.summary, impact=args.impact,
                     stop_condition=args.stop_condition, previous_revision=args.previous_revision,
                     controller_registry=args.controller_registry,
+                    canonical_release_source=canonical_release_source,
                 )
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
                 print(f"adaptive-agent-runtime-install: blocked: {error}")
@@ -2403,7 +2474,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
             return 0
         return _run_install_transaction(
-            args, target_path, hooks_path, zshenv_path, health_service_path
+            args, target_path, hooks_path, zshenv_path, health_service_path,
+            canonical_release_source=canonical_release_source,
         )
     finally:
         if 'install_locks' in locals():
@@ -2416,6 +2488,8 @@ def _run_install_transaction(
     hooks_path: Path,
     zshenv_path: Path,
     health_service_path: Path,
+    *,
+    canonical_release_source: dict[str, Any],
 ) -> int:
     with tempfile.TemporaryDirectory(prefix="adaptive-agent-runtime-install-rollback-") as backup_dir:
         backup_root = Path(backup_dir)
@@ -2436,6 +2510,7 @@ def _run_install_transaction(
                 args.source, target_path, summary=args.summary, impact=args.impact,
                 stop_condition=args.stop_condition, previous_revision=args.previous_revision,
                 controller_registry=args.controller_registry,
+                canonical_release_source=canonical_release_source,
             )
             if not args.no_configure_runtime_services:
                 service = configure_runtime_services(

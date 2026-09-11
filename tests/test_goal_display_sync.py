@@ -9,6 +9,149 @@ from scripts import lifecycle_hook
 
 
 class GoalDisplaySyncTests(unittest.TestCase):
+    def start_rebind(self) -> dict[str, object]:
+        receipt = goal_display_sync.start_target_goal_rebind(
+            None,
+            {
+                "ledger_sha256": "ledger-rebind",
+                "objective": "M1-F5-B / OUTLINE GENERATION AND EDITING",
+                "project_name": "SelfAlone",
+            },
+            controller_id="controller-1",
+            source_session_id="desktop-next",
+            host="desktop_codex",
+            target_generation=5,
+            turn_id="turn-rebind",
+            host_capabilities={
+                "create_goal", "set_thread_title", "get_goal", "list_threads"
+            },
+        )
+        self.assertIsNotNone(receipt)
+        return receipt  # type: ignore[return-value]
+
+    def rebind_event(
+        self, kind: str, tool_use_id: str, tool_input: dict[str, object]
+    ) -> dict[str, object]:
+        return {
+            "tool_name": kind,
+            "tool_use_id": tool_use_id,
+            "tool_input": tool_input,
+            "turn_id": "turn-rebind",
+            "controller_session_id": "controller-1",
+            "source_session_id": "desktop-next",
+            "controller_host": "desktop_codex",
+            "controller_target_generation": 5,
+        }
+
+    def test_target_rebind_restores_missing_goal_before_controller_work(self) -> None:
+        receipt = self.start_rebind()
+        self.assertEqual(receipt["status"], "pending_existing_goal_readback")
+
+        readback = self.rebind_event("get_goal", "goal-existing", {})
+        receipt = self.complete_step(
+            receipt, readback, response={"goal": None, "isError": False}
+        )
+        self.assertEqual(receipt["status"], "pending_create_goal")
+
+        create = self.rebind_event(
+            "create_goal",
+            "goal-create",
+            {"objective": "M1-F5-B / OUTLINE GENERATION AND EDITING"},
+        )
+        receipt = self.complete_step(receipt, create)
+        self.assertEqual(receipt["status"], "pending_thread_title")
+
+    def test_target_rebind_preserves_matching_active_goal_without_recreating_it(self) -> None:
+        receipt = self.start_rebind()
+        readback = self.rebind_event("get_goal", "goal-existing", {})
+        receipt = self.complete_step(
+            receipt,
+            readback,
+            response={
+                "goal": {
+                    "objective": "M1-F5-B / OUTLINE GENERATION AND EDITING",
+                    "status": "active",
+                },
+                "isError": False,
+            },
+        )
+        self.assertEqual(receipt["status"], "pending_thread_title")
+
+    def test_lifecycle_hydrates_target_rebind_and_blocks_business_tool_first(self) -> None:
+        event = {
+            **self.rebind_event("exec_command", "business-1", {"cmd": "git status"}),
+            "hook_event_name": "PreToolUse",
+            "session_id": "controller-1",
+            "goal_rebind_contract": {
+                "ledger_sha256": "ledger-rebind",
+                "objective": "M1-F5-B / OUTLINE GENERATION AND EDITING",
+                "project_name": "SelfAlone",
+                "controller_id": "controller-1",
+                "execution_target_session_id": "desktop-next",
+                "host": "desktop_codex",
+                "target_generation": 5,
+            },
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            event,
+            snapshot={"control_loop_required": False, "rule_handshake": {}},
+            prior_state={},
+        )
+
+        self.assertEqual(
+            output["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+        self.assertIn("get_goal", output["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(
+            state["goal_display_sync"]["status"], "pending_existing_goal_readback"
+        )
+        self.assertTrue(state["pending_control_event"])
+
+    def test_completed_target_rebind_cannot_overwrite_a_later_goal_rollover(self) -> None:
+        completed_rebind = self.start_rebind()
+        completed_rebind["status"] = "completed"
+        later_rollover = goal_display_sync.start_goal_display_sync(
+            None,
+            self.contract(),
+            controller_id="controller-1",
+            source_session_id="desktop-next",
+            host="desktop_codex",
+            target_generation=5,
+            turn_id="turn-rollover",
+            host_capabilities={
+                "update_goal", "create_goal", "set_thread_title", "get_goal", "list_threads"
+            },
+        )
+        self.assertIsNotNone(later_rollover)
+        contract = {
+            "ledger_sha256": "ledger-rebind",
+            "objective": "M1-F5-B / OUTLINE GENERATION AND EDITING",
+            "project_name": "SelfAlone",
+            "controller_id": "controller-1",
+            "execution_target_session_id": "desktop-next",
+            "host": "desktop_codex",
+            "target_generation": 5,
+        }
+        event = {
+            **self.rebind_event("get_goal", "goal-new", {}),
+            "hook_event_name": "PreToolUse",
+            "session_id": "controller-1",
+            "goal_rebind_contract": contract,
+        }
+
+        output, state = lifecycle_hook.evaluate_event(
+            event,
+            snapshot={"control_loop_required": False, "rule_handshake": {}},
+            prior_state={
+                "goal_display_sync": later_rollover,
+                "goal_rebind_completed_fingerprints": [completed_rebind["fingerprint"]],
+                "pending_control_event": True,
+            },
+        )
+
+        self.assertEqual(state["goal_display_sync"]["fingerprint"], later_rollover["fingerprint"])
+        self.assertIn("update_goal", output["hookSpecificOutput"]["permissionDecisionReason"])
+
     def contract(self, *, status: str = "rolled") -> dict[str, object]:
         return {
             "status": status,
