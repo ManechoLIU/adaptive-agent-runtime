@@ -41,27 +41,31 @@ STATE_ROOT = Path(
 
 _CONTROLLER_TERMS = re.compile(r"(?:总控|项目总控|controller|orchestrator)", re.IGNORECASE)
 _SCORE_VALUE = r"(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)"
+# A score assertion connects its label directly to a value, not through prose
+# about a rule, a file name, or a different paragraph. Keep one-line wrapping.
+_SCORE_SEPARATOR = r"(?:[ \t\r:*_：=为是\[\]-]|\n(?![ \t\r]*\n)){0,20}"
+_CONTROLLER_OUTPUT_TERM = r"(?:项目总控|总控|(?<![\w/-])(?:controller|orchestrator)(?![\w/-]))"
 _CYCLE_REQUEST = re.compile(r"(?:单回合|闭环回合|最佳(?:闭环)?回合|最差(?:闭环)?回合|最佳闭环|最差闭环|能力上限|能力下限|single[ -]?cycle|best[ -]?(?:closed[ -]?loop[ -]?)?cycle|worst[ -]?(?:closed[ -]?loop[ -]?)?cycle)", re.IGNORECASE)
-_CYCLE_OUTPUT_SCORE = re.compile(r"(?:单回合诊断评分|单回合评分|single[ -]?cycle(?: diagnostic)? score).{0,20}?(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)", re.IGNORECASE | re.DOTALL)
+_CYCLE_OUTPUT_SCORE = re.compile(rf"(?:单回合诊断评分|单回合评分|single[ -]?cycle(?: diagnostic)? score){_SCORE_SEPARATOR}{_SCORE_VALUE}", re.IGNORECASE)
 _CYCLE_EXTREMA_OUTPUT = re.compile(
-    rf"(?:最佳(?:闭环)?回合|最差(?:闭环)?回合|能力上限|能力下限|best[ -]?(?:closed[ -]?loop[ -]?)?cycle|worst[ -]?(?:closed[ -]?loop[ -]?)?cycle).{{0,20}}?{_SCORE_VALUE}",
-    re.IGNORECASE | re.DOTALL,
+    rf"(?:最佳(?:闭环)?回合|最差(?:闭环)?回合|能力上限|能力下限|best[ -]?(?:closed[ -]?loop[ -]?)?cycle|worst[ -]?(?:closed[ -]?loop[ -]?)?cycle){_SCORE_SEPARATOR}{_SCORE_VALUE}",
+    re.IGNORECASE,
 )
 _OUTPUT_SCORE = re.compile(
-    rf"(?:总控|项目总控|controller|orchestrator).{{0,80}}?(?:评分|得分|score|performance).{{0,40}}?{_SCORE_VALUE}",
-    re.IGNORECASE | re.DOTALL,
+    rf"{_CONTROLLER_OUTPUT_TERM}[^\n。！？!?;；]{{0,80}}?(?:评分|得分|performance score|score|performance){_SCORE_SEPARATOR}{_SCORE_VALUE}",
+    re.IGNORECASE,
 )
 _FORMAL_SCORE_LABEL = re.compile(
-    rf"(?:正式(?:总控)?(?:履职)?评分|履职评分|formal(?: controller)? score|controller performance score).{{0,20}}?{_SCORE_VALUE}",
-    re.IGNORECASE | re.DOTALL,
+    rf"(?:正式(?:总控)?(?:履职)?评分|履职评分|formal(?: controller)? score|controller performance score){_SCORE_SEPARATOR}{_SCORE_VALUE}",
+    re.IGNORECASE,
 )
 _PERFORMANCE_SCORE_LABEL = re.compile(
-    rf"(?:近期履职能力|recent performance score).{{0,20}}?{_SCORE_VALUE}",
-    re.IGNORECASE | re.DOTALL,
+    rf"(?:近期履职能力|recent performance score){_SCORE_SEPARATOR}{_SCORE_VALUE}",
+    re.IGNORECASE,
 )
 _RISK_CONSTRAINED_SCORE_LABEL = re.compile(
-    rf"(?:风险约束分|risk-constrained score).{{0,20}}?{_SCORE_VALUE}",
-    re.IGNORECASE | re.DOTALL,
+    rf"(?:风险约束分|risk-constrained score){_SCORE_SEPARATOR}{_SCORE_VALUE}",
+    re.IGNORECASE,
 )
 _ANY_SCORE_SHAPE = re.compile(
     r"(?:100|[1-9]?\d)(?:\.\d+)?(?:\s*/\s*100|\s*分)",
@@ -116,8 +120,18 @@ def _scoring_mode(prompt: str) -> str:
     return "formal"
 
 
+def _score_output_text(message: str) -> str:
+    # Link destinations are metadata; retain visible labels (including scores).
+    # Do not discard quotes/code blocks: wrapping a claim must not bypass the gate.
+    return re.sub(
+        r"\[([^\]\n]*)\]\((?:<[^>\n]*>|[^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)",
+        r"\1",
+        str(message or ""),
+    )
+
+
 def looks_like_controller_score_output(message: str) -> bool:
-    text = str(message or "")
+    text = _score_output_text(message)
     return bool(
         _OUTPUT_SCORE.search(text)
         or _FORMAL_SCORE_LABEL.search(text)
@@ -129,7 +143,7 @@ def looks_like_controller_score_output(message: str) -> bool:
 
 
 def _extract_score_value(message: str) -> float | None:
-    text = str(message or "")
+    text = _score_output_text(message)
     match = _RISK_CONSTRAINED_SCORE_LABEL.search(text) or _OUTPUT_SCORE.search(text) or _FORMAL_SCORE_LABEL.search(text)
     if not match:
         return None
@@ -138,7 +152,7 @@ def _extract_score_value(message: str) -> float | None:
 
 
 def _extract_cycle_score_value(message: str) -> float | None:
-    match = _CYCLE_OUTPUT_SCORE.search(str(message or ""))
+    match = _CYCLE_OUTPUT_SCORE.search(_score_output_text(message))
     if not match:
         return None
     value = re.search(r"(?:100|[1-9]?\d)(?:\.\d+)?", match.group(0))
@@ -146,7 +160,7 @@ def _extract_cycle_score_value(message: str) -> float | None:
 
 
 def _has_distinct_formal_score_output(message: str) -> bool:
-    text = str(message or "")
+    text = _score_output_text(message)
     cycle_spans = [match.span() for match in _CYCLE_OUTPUT_SCORE.finditer(text)]
     formal_matches = (
         list(_OUTPUT_SCORE.finditer(text))

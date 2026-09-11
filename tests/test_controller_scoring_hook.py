@@ -476,6 +476,48 @@ class ControllerScoringHookTests(unittest.TestCase):
 
 
 class ControllerScoringOutputGateTests(unittest.TestCase):
+    def test_explanation_links_and_cap_rules_do_not_become_new_scores(self):
+        hook = load_module()
+        messages = [
+            "这正是[现行归因规则](/runtime/references/controller-performance-scoring.md:54)要求的。\n\n### 49分什么时候解除？",
+            "参见[规则](https://example.test/controller-performance-scoring)。上限为49分。",
+            "参见 `controller-performance-scoring.md`，上限为49分。",
+            "总控仍应遵循评分规则。\n\n### 49分什么时候解除？",
+            "总控评分的上限为49分，不代表本次给出了评分。",
+            "风险约束分的上限是49分；证据齐全后解除。",
+            "正式履职评分的上限是49分。",
+        ]
+        for message in messages:
+            with self.subTest(message=message):
+                output, state = hook.evaluate_event(
+                    {"hook_event_name": "Stop", "session_id": "explanation", "last_assistant_message": message},
+                    skill_root=ROOT, prior_state={},
+                )
+                self.assertEqual({}, output)
+                self.assertFalse(state.get("pending_scoring", False))
+                self.assertIsNone(hook._extract_score_value(message))
+
+    def test_visible_score_claims_cannot_hide_in_markdown_or_multiline_labels(self):
+        hook = load_module()
+        messages = [
+            "[总控评分：82/100](https://example.test/report)",
+            "总控评分：[82/100](https://example.test/report)",
+            "**近期履职能力：**\n82/100",
+            "风险约束分：\n49/100",
+            "`总控评分：82/100`",
+            "> 总控评分：82/100",
+            "```text\n总控评分：82/100\n```",
+            "Controller performance score: 82/100.",
+            "单回合诊断评分：91/100",
+        ]
+        for message in messages:
+            with self.subTest(message=message):
+                output, _ = hook.evaluate_event(
+                    {"hook_event_name": "Stop", "session_id": "unloaded", "last_assistant_message": message},
+                    skill_root=ROOT, prior_state={},
+                )
+                self.assertEqual("block", output.get("decision"))
+
     def test_output_detector_requires_scoring_semantics(self):
         hook = load_module()
         self.assertFalse(hook.looks_like_controller_score_output("总分：82/100。"))
