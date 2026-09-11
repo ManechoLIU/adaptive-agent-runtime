@@ -4241,8 +4241,12 @@ def _rejecting_peer_attestation_verifier(message: str) -> Callable[..., Any]:
     return reject
 
 
-def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
-    config_path = Path(DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG).expanduser()
+def _external_peer_attestation_verifier(
+    host: str, *, config_path: Path | None = None
+) -> Callable[..., Any] | None:
+    config_path = Path(
+        DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG if config_path is None else config_path
+    ).expanduser()
     if not config_path.exists():
         return None
     try:
@@ -4264,7 +4268,10 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
             return None
         if not isinstance(record, dict):
             raise PermissionError("registered Host verifier record is invalid")
-        if record.get("protocol") != "runtime_host_verifier_cli_v1":
+        verifier_protocol = record.get("protocol")
+        if verifier_protocol not in {
+            "runtime_host_verifier_cli_v1", "runtime_host_verifier_cli_v2",
+        }:
             raise PermissionError("registered Host verifier protocol is unsupported")
         executable_raw = record.get("executable")
         digest = record.get("sha256")
@@ -4394,6 +4401,79 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
                 + (f": {error_detail}" if error_detail else "")
             )
         return payload
+
+    def run_tool_receipt(
+        *, phase: str, receipt: object,
+        expected_target_generation: int, expected_ownership_generation: int,
+        expected_pre_chain: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if verifier_protocol != "runtime_host_verifier_cli_v2":
+            raise PermissionError("registered Host verifier v2 receipt capability is unavailable")
+        if not isinstance(receipt, dict):
+            raise PermissionError(f"Host tool {phase} receipt must be an object")
+        expected_provenance = f"lab_host_tool_{phase}_receipt_v1"
+        if receipt.get("schema_version") != 1 or receipt.get("provenance") != expected_provenance:
+            raise PermissionError(f"Host tool {phase} receipt provenance is invalid")
+        for value, name in (
+            (expected_target_generation, "target generation"),
+            (expected_ownership_generation, "ownership generation"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise PermissionError(f"registered Host verifier requires positive {name}")
+        receipt_bytes = json.dumps(
+            receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if len(receipt_bytes) > target_guard.MAX_HOST_TOOL_RECEIPT_BYTES:
+            raise PermissionError(f"Host tool {phase} receipt exceeds limit")
+        receipt_sha256 = hashlib.sha256(receipt_bytes).hexdigest()
+        request_digests: dict[str, str] = {}
+        for name in (
+            "outer_request_sha256", "forwarded_request_sha256",
+            "normalized_request_sha256", "retry_outer_request_sha256",
+        ):
+            value = str(receipt.get(name) or "").strip().lower()
+            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise PermissionError(f"Host tool receipt {name} is invalid")
+            request_digests[name] = value
+        operation = f"verify_tool_{phase}"
+        request: dict[str, Any] = {
+            "protocol": "runtime_host_verifier_cli_v2",
+            "operation": operation,
+            "receipt_sha256": receipt_sha256,
+            "receipt": receipt,
+            "expected_target_generation": expected_target_generation,
+            "expected_ownership_generation": expected_ownership_generation,
+            "expected_request_digests": request_digests,
+        }
+        if phase == "terminal":
+            if not isinstance(expected_pre_chain, dict):
+                raise PermissionError("Host terminal verifier requires the prepared pre chain")
+            request["expected_pre_chain"] = expected_pre_chain
+        payload = run_cli(request)
+        expected_receipt_id = receipt.get(f"{phase}_receipt_id")
+        if (
+            payload.get("protocol") != "runtime_host_verifier_cli_v2"
+            or payload.get("operation") != operation
+            or payload.get("receipt_sha256") != receipt_sha256
+            or payload.get("receipt_id") != expected_receipt_id
+            or payload.get("capability_id") != receipt.get("capability_id")
+            or payload.get("host_tool_execution_id") != receipt.get("host_tool_execution_id")
+        ):
+            raise PermissionError("registered Host verifier returned mismatched tool receipt")
+        current_entry = _validated_current_web_entry_evidence(
+            payload.get("current_entry"),
+            expected_target_generation=expected_target_generation,
+            expected_ownership_generation=expected_ownership_generation,
+        )
+        if current_entry.get("conversation_id") != receipt.get("conversation_id"):
+            raise PermissionError("registered Host verifier current entry does not match tool receipt")
+        if phase == "terminal":
+            if payload.get("pre_chain") != {
+                "pre_receipt_id": expected_pre_chain.get("pre_receipt_id"),
+                "pre_receipt_sha256": expected_pre_chain.get("pre_receipt_sha256"),
+            }:
+                raise PermissionError("registered Host verifier returned mismatched pre chain")
+        return {**payload, "current_entry": current_entry}
 
     def verify(**kwargs: Any) -> Any:
         expected_host = str(kwargs.get("host") or "").strip()
@@ -4577,6 +4657,15 @@ def _external_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
     setattr(verify, "discover_current_entry", discover_current_entry)
     setattr(verify, "submit_reentry", submit_reentry)
     setattr(verify, "delivery_fingerprint", delivery_fingerprint)
+    if verifier_protocol == "runtime_host_verifier_cli_v2":
+        setattr(
+            verify, "verify_tool_pre",
+            lambda **kwargs: run_tool_receipt(phase="pre", **kwargs),
+        )
+        setattr(
+            verify, "verify_tool_terminal",
+            lambda **kwargs: run_tool_receipt(phase="terminal", **kwargs),
+        )
     return verify
 
 
@@ -8511,6 +8600,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     return 3
                 if status == "wake_pending":
+                    # Older Runtime revisions could promote translated AI-Bridge
+                    # shell output into wake_pending.  The Host-receipt contract
+                    # makes that source diagnostic-only, including persisted
+                    # upgrade state; never let it bypass the current verifier/CAS
+                    # boundary by entering the wake retry fast path.
+                    if translate_receipt(
+                        receipt,
+                        session_id=args.session_id,
+                        repo=repo,
+                        web_session_id=web_session_id,
+                    ) is not None:
+                        _set_audit_receipt_status(cursor_path, receipt, "diagnostic")
+                        _advance_audit_cursor(cursor_path, audit_inode, next_offset)
+                        continue
                     expected_wake_fingerprint = _audit_receipt_wake_fingerprint(cursor_path, receipt)
                     try:
                         lifecycle_state = _load_lifecycle_state(args.session_id)

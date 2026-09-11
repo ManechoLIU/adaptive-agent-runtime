@@ -14,7 +14,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 try:
     from lint_governance import task_records, task_rows
@@ -558,6 +558,7 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
     state.pop("goal_block_authorization", None)
     state.pop("goal_block_inflight", None)
     state.pop("receipt_turn_id", None)
+    state.pop("receipt_tool_use_id", None)
     state.pop("adapter_fault", None)
     state["turn_start_evidence"] = dict(web_turn) if web_turn is not None else (proof or {
         "source": str(event.get("hook_event_name", "")), "turn_id": turn_id,
@@ -2222,7 +2223,8 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
 
 
 def successful_control_receipt(
-    event: dict[str, Any], snapshot: dict[str, Any] | None = None
+    event: dict[str, Any], snapshot: dict[str, Any] | None = None,
+    *, trusted_host_terminal_commit: dict[str, Any] | None = None,
 ) -> bool:
     handshake = snapshot.get("rule_handshake", {}) if isinstance(snapshot, dict) else {}
     if isinstance(handshake, dict) and handshake.get("blocking") is True:
@@ -2233,6 +2235,28 @@ def successful_control_receipt(
             return False
     if event.get("hook_event_name") != "PostToolUse":
         return False
+    if event.get("controller_host") == "web":
+        commit = trusted_host_terminal_commit
+        tuple_value = commit.get("tuple") if isinstance(commit, dict) else None
+        return bool(
+            isinstance(commit, dict)
+            and commit.get("schema_version") == 1
+            and commit.get("provenance") == "host_tool_terminal_commit_v1"
+            and isinstance(tuple_value, dict)
+            and tuple_value.get("controller_id")
+            == str(event.get("controller_session_id") or "").strip()
+            and tuple_value.get("host") == "web"
+            and tuple_value.get("execution_target_session_id")
+            == str(event.get("source_session_id") or "").strip()
+            and tuple_value.get("turn_id") == _event_turn_id(event)
+            and tuple_value.get("target_generation")
+            == event.get("controller_target_generation")
+            and tuple_value.get("ownership_generation")
+            == event.get("controller_ownership_generation")
+            and tuple_value.get("host_tool_execution_id") == _tool_use_id(event)
+            and commit.get("terminal_receipt_sha256")
+            and commit.get("guard_contract_sha256")
+        )
     if event.get("controller_host") == DESKTOP_SESSION_HOST and not _tool_use_id(event):
         return False
     tool_input = event.get("tool_input")
@@ -2622,6 +2646,7 @@ def evaluate_event(
     *,
     snapshot: dict[str, Any] | None,
     prior_state: dict[str, Any] | None,
+    trusted_host_terminal_commit: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if snapshot is None:
         return {}, {}
@@ -2723,6 +2748,7 @@ def evaluate_event(
     if _assistant_declares_executable_next_action(event, snapshot):
         state["must_yield"] = False
         state.pop("receipt_turn_id", None)
+        state.pop("receipt_tool_use_id", None)
         state["pending_control_event"] = True
         current_triggers = {
             str(item) for item in state.get("triggers", []) if str(item).strip()
@@ -2807,6 +2833,7 @@ def evaluate_event(
                 ), state
             state["must_yield"] = False
             state.pop("receipt_turn_id", None)
+            state.pop("receipt_tool_use_id", None)
             state.pop("goal_block_authorization", None)
             state["pending_control_event"] = True
             current_triggers = {
@@ -2999,7 +3026,10 @@ def evaluate_event(
             state["wake_generation"] = prior_generation + 1
         return {}, state
 
-    if successful_control_receipt(event, snapshot):
+    if successful_control_receipt(
+        event, snapshot,
+        trusted_host_terminal_commit=trusted_host_terminal_commit,
+    ):
         receipt_turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
         control_receipt_proposal = state.get("control_receipt_proposal")
         project_block_authorized = _verified_project_block_proposal(
@@ -3008,6 +3038,10 @@ def evaluate_event(
         state.pop("control_receipt_proposal", None)
         state["must_yield"] = True
         state["receipt_turn_id"] = receipt_turn_id
+        if event.get("controller_host") == "web":
+            state["receipt_tool_use_id"] = _tool_use_id(event)
+        else:
+            state.pop("receipt_tool_use_id", None)
         if project_block_authorized:
             state["goal_block_authorization"] = {
                 "turn_id": receipt_turn_id,
@@ -3765,7 +3799,9 @@ def state_path(session_id: str) -> Path:
 
 
 def persist_event_state(
-    path: Path, event: dict[str, Any], snapshot: dict[str, Any], *, preserve_controller_host: bool = False
+    path: Path, event: dict[str, Any], snapshot: dict[str, Any], *,
+    preserve_controller_host: bool = False,
+    prior_state_validator: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(path.suffix + ".lock")
@@ -3773,6 +3809,8 @@ def persist_event_state(
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             previous = load_json(path)
+            if prior_state_validator is not None:
+                prior_state_validator(previous)
             persisted_event = dict(event)
             if preserve_controller_host:
                 prior_host = str(previous.get("controller_host") or "desktop_codex").strip()
@@ -3890,6 +3928,16 @@ def process_verified_web_event(
     """
     if not isinstance(event, dict):
         raise PermissionError("verified Web lifecycle event must be an object")
+    forbidden_internal_fields = {
+        "_runtime_host_terminal_commit", "host_tool_terminal_commit",
+        "verified_host_tool_receipt", "internal_trust", "trusted_internal_event",
+    }
+    supplied_internal = forbidden_internal_fields.intersection(event)
+    if supplied_internal:
+        raise PermissionError(
+            "generic Web lifecycle event cannot supply internal Host trust fields: "
+            + ", ".join(sorted(supplied_internal))
+        )
     if str(event.get("controller_host") or "").strip() != "web":
         raise PermissionError("verified Web lifecycle event requires controller_host=web")
     if str(event.get("execution_host") or "").strip() != "web":
@@ -3960,7 +4008,104 @@ def process_verified_web_event(
         # Validate the signed/derived turn against authoritative current fences before state mutation.
         _verified_web_turn_evidence(normalized_event)
         path = lifecycle_path or state_path(controller_id)
-        return persist_event_state(path, normalized_event, snapshot)
+        def validate_web_stop(current_state: dict[str, Any]) -> None:
+            if normalized_event.get("hook_event_name") == "Stop":
+                if current_state.get("must_yield") is not True:
+                    return
+                commits = current_state.get("host_tool_terminal_commits")
+                receipts = registry.get(target_guard.CONTROLLER_HOST_TOOL_RECEIPTS_KEY)
+                controller_receipts = (
+                    receipts.get(controller_id) if isinstance(receipts, dict) else None
+                )
+                web_receipts = (
+                    controller_receipts.get("web")
+                    if isinstance(controller_receipts, dict) else None
+                )
+                matching_closed = False
+                if isinstance(commits, dict) and isinstance(web_receipts, dict):
+                    execution_id = str(current_state.get("receipt_tool_use_id") or "").strip()
+                    commit = commits.get(execution_id)
+                    if execution_id:
+                        tuple_value = commit.get("tuple") if isinstance(commit, dict) else None
+                        record = web_receipts.get(execution_id)
+                        if (
+                            isinstance(tuple_value, dict)
+                            and tuple_value.get("controller_id") == controller_id
+                            and tuple_value.get("execution_target_session_id") == source_session_id
+                            and tuple_value.get("turn_id") == current_state.get("receipt_turn_id")
+                            and tuple_value.get("target_generation") == target_generation
+                            and tuple_value.get("ownership_generation") == ownership_generation
+                            and isinstance(record, dict)
+                            and record.get("state") == "CLOSED"
+                            and record.get("tuple") == tuple_value
+                            and record.get("guard_evidence_sha256")
+                            == commit.get("guard_contract_sha256")
+                        ):
+                            matching_closed = True
+                if not matching_closed:
+                    raise PermissionError(
+                        "Web Stop requires the matching Host tool receipt CAS to be CLOSED"
+                    )
+        return persist_event_state(
+            path, normalized_event, snapshot,
+            prior_state_validator=validate_web_stop,
+        )
+
+
+def process_verified_host_tool_terminal(
+    *, repo: Path, controller_id: str, verified_turn: dict[str, Any],
+    host_terminal_receipt: dict[str, Any], guard_evidence: dict[str, Any],
+    guard_evidence_id: str, guard_evidence_file_sha256: str,
+    snapshot_path: Path, command: str, lifecycle_path: Path,
+    registry_path: Path = REGISTRY_PATH,
+) -> dict[str, Any]:
+    """Apply one Host-authenticated terminal through the atomic private boundary."""
+    repo = Path(repo).expanduser().resolve()
+    lifecycle_path = Path(lifecycle_path).expanduser()
+    normalized_turn = agent_target.normalize_verified_execution_turn(
+        verified_turn,
+        expected_logical_agent=agent_target.logical_agent_identity(
+            agent_type="controller", agent_id=controller_id
+        ),
+        expected_host="web",
+    )
+
+    def transition(
+        prior_state: dict[str, Any], terminal_commit: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        snapshot = project_snapshot(repo)
+        if snapshot is None or Path(str(snapshot.get("root") or "")).resolve() != repo:
+            raise PermissionError("Host terminal project snapshot is unavailable or mismatched")
+        event = {
+            "hook_event_name": "PostToolUse",
+            "session_id": controller_id,
+            "controller_id": controller_id,
+            "controller_session_id": controller_id,
+            "source_session_id": normalized_turn["execution_target_session_id"],
+            "web_session_id": normalized_turn["execution_target_session_id"],
+            "controller_host": "web", "execution_host": "web", "event_source": "web",
+            "controller_target_generation": normalized_turn["target_generation"],
+            "controller_ownership_generation": normalized_turn["ownership_generation"],
+            "verified_execution_turn": normalized_turn,
+            "turn_id": normalized_turn["turn_id"],
+            "cwd": str(repo), "tool_name": "run_command",
+            "tool_use_id": terminal_commit["tuple"]["host_tool_execution_id"],
+            "tool_input": {"command": command, "cwd": str(repo)},
+            "tool_response": {"state": "CLOSED"},
+        }
+        return evaluate_event(
+            event, snapshot=snapshot, prior_state=prior_state,
+            trusted_host_terminal_commit=terminal_commit,
+        )
+
+    return target_guard.commit_host_tool_execution(
+        repo=repo, controller_id=controller_id, verified_turn=normalized_turn,
+        host_terminal_receipt=host_terminal_receipt, guard_evidence=guard_evidence,
+        guard_evidence_id=guard_evidence_id,
+        guard_evidence_file_sha256=guard_evidence_file_sha256,
+        snapshot_path=Path(snapshot_path), lifecycle_path=lifecycle_path,
+        lifecycle_transition=transition, registry_path=Path(registry_path),
+    )
 
 
 def run_hook() -> int:

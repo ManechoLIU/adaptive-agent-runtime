@@ -10,7 +10,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 try:
     import agent_target_resolution as agent_target
@@ -1357,7 +1357,12 @@ def prepare_host_tool_execution(
         _assert_new_pre_receipt(records, tuple_value=tuple_value, digests=digests)
         if len(records) >= MAX_HOST_TOOL_RECEIPTS_PER_HOST:
             raise PermissionError("Host tool receipt limit reached for web")
-        record = {"state": "PREPARED", "tuple": tuple_value, **digests}
+        record = {
+            "state": "PREPARED", "tuple": tuple_value, **digests,
+            "capability_id_sha256": _receipt_value_sha256(
+                host_pre_receipt.get("capability_id"), label="Host capability id"
+            ),
+        }
         _persist_host_tool_record(
             registry, controller_id=tuple_value["controller_id"],
             execution_id=tuple_value["host_tool_execution_id"], record=record,
@@ -1392,6 +1397,9 @@ def terminalize_host_tool_execution(
         if (
             record.get("pre_receipt_id_sha256") != digests["referenced_pre_receipt_id_sha256"]
             or record.get("pre_receipt_sha256") != digests["referenced_pre_receipt_sha256"]
+            or record.get("capability_id_sha256") != _receipt_value_sha256(
+                host_terminal_receipt.get("capability_id"), label="Host capability id"
+            )
         ):
             raise PermissionError("Host terminal pre receipt does not match the prepared execution")
         existing = record.get("terminal_receipt_sha256")
@@ -1488,6 +1496,116 @@ def close_host_tool_execution(
         )
         _write_registry(registry_path, registry)
         return _receipt_record_response(record)
+
+
+def commit_host_tool_execution(
+    *, repo: Path, controller_id: str, verified_turn: dict[str, Any],
+    host_terminal_receipt: dict[str, Any], guard_evidence: dict[str, Any],
+    guard_evidence_id: str, guard_evidence_file_sha256: str,
+    snapshot_path: Path, lifecycle_path: Path,
+    lifecycle_transition: Callable[
+        [dict[str, Any], dict[str, Any]],
+        tuple[dict[str, Any], dict[str, Any]],
+    ],
+    registry_path: Path = DEFAULT_REGISTRY,
+) -> dict[str, Any]:
+    """Commit lifecycle evidence before the matching registry CAS becomes CLOSED.
+
+    The registry->lifecycle lock order is shared with prepare/terminalize.  An
+    already-written exact lifecycle commit is the retry marker after a registry
+    close failure, so the reducer and trace are never applied twice.
+    """
+    repo = repo.expanduser().resolve()
+    registry_path = registry_path.expanduser()
+    lifecycle_path = lifecycle_path.expanduser()
+    evidence_id = _bounded_string(
+        guard_evidence_id, label="Host tool guard evidence id",
+        maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH,
+    )
+    evidence_file_sha256 = _sha256_field(
+        guard_evidence_file_sha256, label="Host tool guard evidence file sha256"
+    )
+    with _locked_host_tool_receipt_mutation(
+        registry_path=registry_path, lifecycle_path=lifecycle_path
+    ) as (registry, lifecycle_state):
+        tuple_base = _current_host_tool_tuple(
+            registry=registry, repo=repo, controller_id=controller_id,
+            verified_turn=verified_turn, snapshot_path=snapshot_path,
+            lifecycle_state=lifecycle_state,
+        )
+        tuple_value, terminal_digests = _host_receipt_tuple(
+            host_terminal_receipt, tuple_base=tuple_base, phase="terminal"
+        )
+        record = _stored_host_tool_record(
+            registry, controller_id=tuple_value["controller_id"],
+            execution_id=tuple_value["host_tool_execution_id"],
+        )
+        _assert_exact_record_tuple(record, tuple_value)
+        if (
+            record.get("pre_receipt_id_sha256")
+            != terminal_digests["referenced_pre_receipt_id_sha256"]
+            or record.get("pre_receipt_sha256")
+            != terminal_digests["referenced_pre_receipt_sha256"]
+            or record.get("capability_id_sha256")
+            != _receipt_value_sha256(
+                host_terminal_receipt.get("capability_id"), label="Host capability id"
+            )
+        ):
+            raise PermissionError("Host terminal pre receipt does not match the prepared execution")
+        if record.get("terminal_receipt_sha256") != terminal_digests["terminal_receipt_sha256"]:
+            raise PermissionError("Host terminal receipt does not match the pending execution")
+        guard_contract_sha256 = _assert_exact_guard_evidence(
+            guard_evidence, tuple_value=tuple_value,
+            terminal_receipt_sha256=terminal_digests["terminal_receipt_sha256"],
+        )
+        commit = {
+            "schema_version": 1,
+            "provenance": "host_tool_terminal_commit_v1",
+            "tuple": tuple_value,
+            "terminal_receipt_sha256": terminal_digests["terminal_receipt_sha256"],
+            "guard_evidence_id": evidence_id,
+            "guard_evidence_sha256": evidence_file_sha256,
+            "guard_contract_sha256": guard_contract_sha256,
+        }
+        commits = lifecycle_state.get("host_tool_terminal_commits")
+        if commits is None:
+            commits = {}
+        if not isinstance(commits, dict):
+            raise ValueError("Host tool terminal commit registry is invalid")
+        execution_id = tuple_value["host_tool_execution_id"]
+        existing_commit = commits.get(execution_id)
+        lifecycle_output: dict[str, Any] = {}
+        if existing_commit is not None:
+            if existing_commit != commit:
+                raise PermissionError("Host tool terminal commit does not match exact retry")
+        else:
+            if record.get("state") != "TERMINAL_PENDING":
+                raise PermissionError("Host tool execution is not terminal pending")
+            lifecycle_output, next_state = lifecycle_transition(lifecycle_state, commit)
+            if not isinstance(lifecycle_output, dict) or not isinstance(next_state, dict):
+                raise ValueError("Host tool lifecycle transition returned invalid state")
+            next_commits = dict(
+                next_state.get("host_tool_terminal_commits")
+                if isinstance(next_state.get("host_tool_terminal_commits"), dict)
+                else {}
+            )
+            next_commits[execution_id] = commit
+            next_state["host_tool_terminal_commits"] = next_commits
+            _write_registry(lifecycle_path, next_state)
+        if record.get("state") == "CLOSED":
+            if record.get("guard_evidence_sha256") != guard_contract_sha256:
+                raise PermissionError("Host tool guard evidence does not match the closed execution")
+            return {**_receipt_record_response(record), "lifecycle_output": lifecycle_output}
+        if record.get("state") != "TERMINAL_PENDING":
+            raise PermissionError("Host tool execution is not terminal pending")
+        record["guard_evidence_sha256"] = guard_contract_sha256
+        record["state"] = "CLOSED"
+        _persist_host_tool_record(
+            registry, controller_id=tuple_value["controller_id"],
+            execution_id=execution_id, record=record,
+        )
+        _write_registry(registry_path, registry)
+        return {**_receipt_record_response(record), "lifecycle_output": lifecycle_output}
 
 
 def acquire_outbound_lease(

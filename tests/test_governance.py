@@ -4806,6 +4806,29 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertTrue(state["must_yield"])
         self.assertEqual(state["receipt_turn_id"], "turn-1")
 
+    def test_web_stdout_marker_never_closes_without_private_terminal_commit(self) -> None:
+        snapshot = {
+            "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
+            "ready_ids": [], "runnable_ids": ["PENDING-RUNNABLE"], "candidate_revisions": [],
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        event = {
+            "hook_event_name": "PostToolUse", "session_id": "controller-1",
+            "controller_session_id": "controller-1", "source_session_id": "web-current",
+            "controller_host": "web", "turn_id": "turn-1", "tool_use_id": "caller-tool",
+            "tool_input": {"command": f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} receipt --ledger TASK_LEDGER.md --controller-session controller-1"},
+            "tool_response": {"exit_code": 0, "stdout": "control-event: allowed"},
+        }
+        _, state = lifecycle_hook.evaluate_event(
+            event, snapshot=snapshot,
+            prior_state={
+                "active_turn_id": "turn-1", "pending_control_event": True,
+                "triggers": ["RUNNABLE:PENDING-RUNNABLE"], "snapshot": snapshot,
+            },
+        )
+        self.assertTrue(state["pending_control_event"])
+        self.assertFalse(state["must_yield"])
+
     def test_reviewer_pass_integration_has_mandatory_verify_converge_recompute_successors(self) -> None:
         snapshot = {
             "candidate_packages": [{
