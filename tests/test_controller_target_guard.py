@@ -255,8 +255,8 @@ class ControllerTargetGuardTests(unittest.TestCase):
                 ["hte-1"],
             )
 
-    def test_host_tool_terminal_retry_is_exact_and_close_requires_exact_guard_evidence(self) -> None:
-        """Would fail if changed terminal data overwrote pending state or guard evidence could close another tuple."""
+    def test_host_tool_terminal_retry_is_exact_and_direct_close_is_disabled(self) -> None:
+        """Would fail if changed terminal data overwrote pending state or a public API made a bare CLOSED."""
         guard = load_guard()
         self.assertTrue(hasattr(guard, "prepare_host_tool_execution"), "prepare_host_tool_execution is missing")
         self.assertTrue(hasattr(guard, "terminalize_host_tool_execution"), "terminalize_host_tool_execution is missing")
@@ -311,19 +311,16 @@ class ControllerTargetGuardTests(unittest.TestCase):
                 snapshot_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
                 turn=turn,
             )
-            closed = guard.close_host_tool_execution(
-                repo=repo, controller_id="controller-1", verified_turn=turn,
-                host_terminal_receipt=terminal, guard_evidence=evidence,
-                snapshot_path=snapshot, registry_path=registry, lifecycle_path=lifecycle,
-            )
-            self.assertEqual(closed["state"], "CLOSED")
-            bad_evidence = evidence | {"host_tool_execution_id": "hte-other"}
-            with self.assertRaisesRegex(PermissionError, "guard evidence"):
+            with self.assertRaisesRegex(PermissionError, "commit_host_tool_execution"):
                 guard.close_host_tool_execution(
                     repo=repo, controller_id="controller-1", verified_turn=turn,
-                    host_terminal_receipt=terminal, guard_evidence=bad_evidence,
+                    host_terminal_receipt=terminal, guard_evidence=evidence,
                     snapshot_path=snapshot, registry_path=registry, lifecycle_path=lifecycle,
                 )
+            saved = guard.load_json(registry)
+            record = saved["__controller_host_tool_receipts__"]["controller-1"]["web"]["hte-1"]
+            self.assertEqual(record["state"], "TERMINAL_PENDING")
+            self.assertNotIn("host_tool_terminal_commits", guard.load_json(lifecycle))
 
     def test_host_tool_cas_has_one_concurrent_winner_and_fails_closed_on_tuple_drift_and_capacity(self) -> None:
         """Would fail if races, stale canonical bindings, or a full ledger admitted another execution."""

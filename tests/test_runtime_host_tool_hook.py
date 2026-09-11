@@ -520,16 +520,41 @@ class RuntimeHostToolHookTests(unittest.TestCase):
         record = json.loads(self.registry.read_text())["__controller_host_tool_receipts__"][self.controller_id]["web"]["hte_1"]
         self.assertEqual(record["state"], "TERMINAL_PENDING")
 
+    def test_pre_rejects_writable_snapshot_and_ledger_files(self) -> None:
+        self.snapshot.chmod(0o664)
+        with self.assertRaisesRegex(PermissionError, "snapshot.*permissions"):
+            self.call(self.request("pre"))
+
+        self.snapshot.chmod(0o600)
+        (self.repo / "TASK_LEDGER.md").chmod(0o664)
+        with self.assertRaisesRegex(PermissionError, "TASK_LEDGER.*permissions"):
+            self.call(self.request("pre"))
+
+    def test_pre_rejects_oversized_snapshot_before_parsing(self) -> None:
+        self.snapshot.write_bytes(b"x" * (runtime_hook.MAX_SNAPSHOT_BYTES + 1))
+        with self.assertRaisesRegex(PermissionError, "snapshot.*exceeds.*limit"):
+            self.call(self.request("pre"))
+
+    def test_terminal_rejects_writable_guard_evidence_and_stays_pending(self) -> None:
+        self.call(self.request("pre"))
+        evidence_path = self.write_guard_evidence()
+        evidence_path.chmod(0o664)
+        request, _terminal = self.terminal_payload()
+        with self.assertRaisesRegex(PermissionError, "evidence.*permissions"):
+            self.call(request)
+        record = json.loads(self.registry.read_text())["__controller_host_tool_receipts__"][self.controller_id]["web"]["hte_1"]
+        self.assertEqual(record["state"], "TERMINAL_PENDING")
+
     def test_terminal_failure_stays_pending_and_identical_retry_does_not_duplicate_trace(self) -> None:
         self.call(self.request("pre"))
         self.write_guard_evidence()
         request, _terminal = self.terminal_payload()
         original_write = target_guard._write_registry
 
-        def fail_lifecycle(path, value):
+        def fail_lifecycle(path, value, **kwargs):
             if Path(path) == self.lifecycle:
                 raise OSError("lifecycle write failed")
-            return original_write(path, value)
+            return original_write(path, value, **kwargs)
 
         with patch.object(target_guard, "_write_registry", side_effect=fail_lifecycle):
             with self.assertRaisesRegex(OSError, "lifecycle write failed"):
@@ -546,12 +571,20 @@ class RuntimeHostToolHookTests(unittest.TestCase):
 
         failed_once = False
 
-        def fail_registry_once(path, value):
+        def fail_registry_once(path, value, **kwargs):
             nonlocal failed_once
-            if Path(path) == self.registry and not failed_once:
+            records = (
+                value.get("__controller_host_tool_receipts__", {})
+                .get(self.controller_id, {}).get("web", {})
+                if isinstance(value, dict) else {}
+            )
+            if (
+                Path(path) == self.registry and not failed_once
+                and records.get("hte_1", {}).get("state") == "CLOSED"
+            ):
                 failed_once = True
                 raise OSError("registry close failed")
-            return original_write(path, value)
+            return original_write(path, value, **kwargs)
 
         with patch.object(target_guard, "_write_registry", side_effect=fail_registry_once):
             with self.assertRaisesRegex(OSError, "registry close failed"):
@@ -610,12 +643,20 @@ class RuntimeHostToolHookTests(unittest.TestCase):
             "stop_event": stop,
         }, daemon=True)
         thread.start()
-        for _ in range(100):
-            if socket_path.exists():
-                break
+        ready_deadline = time.monotonic() + 2
+        while True:
+            if socket_path.exists() and (socket_path.lstat().st_mode & 0o777) == 0o600:
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                        probe.settimeout(0.1)
+                        probe.connect(str(socket_path))
+                except (ConnectionRefusedError, FileNotFoundError):
+                    pass
+                else:
+                    break
+            if time.monotonic() >= ready_deadline:
+                self.fail("Runtime Host hook socket did not become private and connectable")
             time.sleep(0.01)
-        self.assertTrue(socket_path.exists())
-        self.assertEqual(socket_path.lstat().st_mode & 0o777, 0o600)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(2)
             for _ in range(100):
@@ -638,6 +679,59 @@ class RuntimeHostToolHookTests(unittest.TestCase):
         thread.join(3)
         self.assertFalse(thread.is_alive())
         self.assertFalse(socket_path.exists())
+
+    def test_unix_server_contains_invalid_request_ids_and_keeps_accepting(self) -> None:
+        parent = self.root / "socket-parent"
+        parent.mkdir(mode=0o700)
+        socket_path = parent / "runtime.sock"
+        stop = threading.Event()
+        thread = threading.Thread(target=runtime_hook.serve_unix_socket, kwargs={
+            "socket_path": socket_path, "registry_path": self.registry,
+            "lifecycle_path": self.lifecycle, "verifier": self.verifier,
+            "stop_event": stop,
+        }, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (stop.set(), thread.join(3)))
+
+        def exchange(frame: bytes) -> tuple[bytes, dict[str, object]]:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(2)
+                client.connect(str(socket_path))
+                client.sendall(frame + b"\n")
+                response = b""
+                while not response.endswith(b"\n"):
+                    response += client.recv(65536)
+            self.assertTrue(response.isascii(), response)
+            return response, json.loads(response)
+
+        deadline = time.monotonic() + 2
+        while True:
+            if socket_path.exists() and (socket_path.lstat().st_mode & 0o777) == 0o600:
+                try:
+                    _response, payload = exchange(canonical_json({"request_id": "probe"}))
+                except (ConnectionRefusedError, FileNotFoundError):
+                    pass
+                else:
+                    self.assertFalse(payload["ok"])
+                    break
+            if time.monotonic() >= deadline:
+                self.fail("Runtime Host hook socket did not become private and connectable")
+            time.sleep(0.01)
+
+        invalid_frames = (
+            json.dumps({"request_id": "bad\ud800"}).encode(),
+            b'{"request_id":"\xed\xa0\x80"}',
+            canonical_json({"request_id": "你" * 90}),
+        )
+        for frame in invalid_frames:
+            with self.subTest(frame=frame[:32]):
+                _response, payload = exchange(frame)
+                self.assertFalse(payload["ok"])
+                self.assertIsNone(payload["request_id"])
+
+        _response, payload = exchange(canonical_json(self.request("pre")))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["request_id"], "request-pre")
 
     def test_unix_server_rejects_unsafe_paths_and_bad_frames(self) -> None:
         non_private = self.root / "non-private"

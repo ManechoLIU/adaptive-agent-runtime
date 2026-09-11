@@ -32,6 +32,9 @@ HOOK_PROTOCOL = "runtime_host_tool_hook_v1"
 MAX_FRAME_BYTES = 64 * 1024
 IO_TIMEOUT_SECONDS = 5.0
 MAX_REQUEST_ID_BYTES = 256
+MAX_SNAPSHOT_BYTES = 64 * 1024
+MAX_EVIDENCE_BYTES = 64 * 1024
+MAX_LEDGER_BYTES = 128 * 1024
 INTENT_KEYS = {
     "schema_version", "provenance", "request_digest_profile", "normalized_request_utf8",
 }
@@ -64,6 +67,94 @@ def _bounded_text(value: object, *, label: str, maximum: int = 256) -> str:
     return value
 
 
+def _safe_request_id(value: object) -> str:
+    """Accept only bounded printable Unicode scalar values for response correlation."""
+    request_id = _bounded_text(
+        value, label="Runtime Host hook request_id", maximum=MAX_REQUEST_ID_BYTES
+    )
+    try:
+        request_id.encode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise ValueError("Runtime Host hook request_id is not valid UTF-8 scalar text") from exc
+    if any(ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in request_id):
+        raise ValueError("Runtime Host hook request_id contains unsafe control characters")
+    return request_id
+
+
+def _safe_request_id_or_none(value: object) -> str | None:
+    try:
+        return _safe_request_id(value)
+    except (ValueError, UnicodeError):
+        return None
+
+
+def _safe_error_text(error: BaseException | object) -> str:
+    """Return a bounded printable-ASCII error without reflecting malformed text."""
+    text = str(error).replace("\n", " ").replace("\r", " ")
+    return "".join(character if 0x20 <= ord(character) <= 0x7E else "?" for character in text)[:2048]
+
+
+def _safe_response_bytes(response: dict[str, Any]) -> bytes:
+    """Serialize protocol responses as ASCII so malformed request text cannot poison a listener."""
+    return json.dumps(
+        response, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("ascii") + b"\n"
+
+
+def _remaining_seconds(deadline_monotonic: float | None) -> float | None:
+    if deadline_monotonic is None:
+        return None
+    remaining = deadline_monotonic - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Runtime Host hook request exceeded deadline")
+    return remaining
+
+
+def _read_trusted_regular_file(
+    path: Path, *, label: str, maximum: int,
+    deadline_monotonic: float | None = None,
+) -> bytes:
+    """Read a private regular file through one O_NOFOLLOW descriptor and bounded bytes."""
+    _remaining_seconds(deadline_monotonic)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except PermissionError:
+        raise
+    except OSError as exc:
+        raise PermissionError(f"{label} is unavailable") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise PermissionError(f"{label} must be an owned regular file")
+        if hasattr(os, "geteuid") and before.st_uid != os.geteuid():
+            raise PermissionError(f"{label} must be an owned regular file")
+        if stat.S_IMODE(before.st_mode) & 0o022:
+            raise PermissionError(f"{label} permissions must not allow group or other writes")
+        if before.st_size > maximum:
+            raise PermissionError(f"{label} exceeds byte limit")
+        data = bytearray()
+        while len(data) <= maximum:
+            _remaining_seconds(deadline_monotonic)
+            chunk = os.read(descriptor, min(8192, maximum + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > maximum:
+            raise PermissionError(f"{label} exceeds byte limit")
+        after = os.fstat(descriptor)
+        _remaining_seconds(deadline_monotonic)
+        if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size):
+            raise PermissionError(f"{label} changed while being read")
+        return bytes(data)
+    except PermissionError:
+        raise
+    except OSError as exc:
+        raise PermissionError(f"{label} is unavailable") from exc
+    finally:
+        os.close(descriptor)
+
+
 def _sha256_field(value: object, *, label: str) -> str:
     text = _bounded_text(value, label=label, maximum=64).lower()
     if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
@@ -91,12 +182,15 @@ def _strict_json(text: str, *, label: str) -> Any:
 
 def _runtime_context(
     receipt: dict[str, Any], *, registry_path: Path, lifecycle_path: Path | None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     conversation_id = _bounded_text(
         receipt.get("conversation_id"), label="Host receipt conversation id"
     )
     registry_path = Path(registry_path).expanduser()
-    with target_guard.locked_registry(registry_path) as registry:
+    with target_guard.locked_registry(
+        registry_path, deadline_monotonic=deadline_monotonic
+    ) as registry:
         controller_id = target_guard.active_source_controller_id(
             registry, source_session_id=conversation_id, host="web"
         )
@@ -129,7 +223,9 @@ def _runtime_context(
             Path(lifecycle_path).expanduser()
             if lifecycle_path is not None else lifecycle.state_path(controller_id)
         )
+        _remaining_seconds(deadline_monotonic)
         lifecycle_state = lifecycle.load_json(resolved_lifecycle)
+        _remaining_seconds(deadline_monotonic)
         lease = lifecycle_state.get("web_turn_lease")
         if not isinstance(lease, dict) or lease.get("contract") != "runtime_web_turn_lease_v1" or lease.get("status") != "active":
             raise PermissionError("active Runtime Web turn lease is unavailable")
@@ -158,8 +254,10 @@ def _runtime_context(
         if verified_turn["turn_id"] != lease.get("turn_id"):
             raise PermissionError("Runtime Web turn identity is invalid")
     ledger = repo / "TASK_LEDGER.md"
-    if not ledger.is_file() or ledger.is_symlink():
-        raise PermissionError("canonical TASK_LEDGER.md is unavailable")
+    _read_trusted_regular_file(
+        ledger, label="canonical TASK_LEDGER.md", maximum=MAX_LEDGER_BYTES,
+        deadline_monotonic=deadline_monotonic,
+    )
     return {
         "controller_id": controller_id, "repo": repo, "ledger": ledger.resolve(),
         "target_generation": target_generation,
@@ -170,6 +268,7 @@ def _runtime_context(
 
 def _verified_intent(
     value: object, *, receipt: dict[str, Any], context: dict[str, Any],
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != INTENT_KEYS:
         raise PermissionError("Runtime Host tool intent envelope is invalid")
@@ -232,17 +331,10 @@ def _verified_intent(
     ]
     if argv[3:] != expected_tail:
         raise PermissionError("Runtime Host control guard ledger/repo/Controller argv is not canonical")
-    try:
-        snapshot_stat = snapshot_path.lstat()
-        if (
-            snapshot_path.is_symlink() or not stat.S_ISREG(snapshot_stat.st_mode)
-            or (hasattr(os, "geteuid") and snapshot_stat.st_uid != os.geteuid())
-        ):
-            raise PermissionError("Runtime Host control snapshot must be an owned regular file")
-        snapshot_path = snapshot_path.resolve(strict=True)
-        snapshot_raw = snapshot_path.read_bytes()
-    except OSError as exc:
-        raise PermissionError("Runtime Host control snapshot is unavailable") from exc
+    snapshot_raw = _read_trusted_regular_file(
+        snapshot_path, label="Runtime Host control snapshot", maximum=MAX_SNAPSHOT_BYTES,
+        deadline_monotonic=deadline_monotonic,
+    )
     snapshot = _strict_json(snapshot_raw.decode("utf-8"), label="Runtime Host control snapshot")
     if not isinstance(snapshot, dict):
         raise PermissionError("Runtime Host control snapshot is invalid")
@@ -338,14 +430,20 @@ def _verified_backend(
 
 def _guard_evidence(
     *, context: dict[str, Any], intent: dict[str, Any], terminal: dict[str, Any],
-    pending: dict[str, Any],
+    pending: dict[str, Any], deadline_monotonic: float | None = None,
 ) -> tuple[dict[str, Any], str]:
     snapshot = intent["snapshot"]
-    ledger_sha = _sha256_hex(context["ledger"].read_bytes())
+    _remaining_seconds(deadline_monotonic)
+    ledger_raw = _read_trusted_regular_file(
+        context["ledger"], label="canonical TASK_LEDGER.md", maximum=MAX_LEDGER_BYTES,
+        deadline_monotonic=deadline_monotonic,
+    )
+    ledger_sha = _sha256_hex(ledger_raw)
     try:
+        remaining = _remaining_seconds(deadline_monotonic)
         head = subprocess.run(
             ["git", "-C", str(context["repo"]), "rev-parse", "HEAD"],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, text=True, timeout=remaining,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError) as exc:
         raise PermissionError("Runtime Host repository revision is unavailable") from exc
@@ -356,17 +454,12 @@ def _guard_evidence(
     evidence_path = control_event_guard.controller_cycle_evidence_path(
         context["repo"], intent["event_id"]
     )
-    try:
-        evidence_stat = evidence_path.lstat()
-        if (
-            evidence_path.is_symlink() or not stat.S_ISREG(evidence_stat.st_mode)
-            or (hasattr(os, "geteuid") and evidence_stat.st_uid != os.geteuid())
-        ):
-            raise PermissionError("controller guard evidence must be an owned regular file")
-        evidence_raw = evidence_path.read_bytes()
-        evidence = _strict_json(evidence_raw.decode("utf-8"), label="controller guard evidence")
-    except OSError as exc:
-        raise PermissionError("controller guard evidence is unavailable") from exc
+    _remaining_seconds(deadline_monotonic)
+    evidence_raw = _read_trusted_regular_file(
+        evidence_path, label="controller guard evidence", maximum=MAX_EVIDENCE_BYTES,
+        deadline_monotonic=deadline_monotonic,
+    )
+    evidence = _strict_json(evidence_raw.decode("utf-8"), label="controller guard evidence")
     snapshot_sha = _sha256_hex(intent["snapshot_raw"])
     if (
         not isinstance(evidence, dict)
@@ -397,14 +490,12 @@ def _guard_evidence(
 def handle_request(
     request: object, *, registry_path: Path = target_guard.DEFAULT_REGISTRY,
     lifecycle_path: Path | None = None, verifier: Callable[..., Any] | None = None,
-    verifier_config_path: Path | None = None,
+    verifier_config_path: Path | None = None, deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
+    _remaining_seconds(deadline_monotonic)
     if not isinstance(request, dict):
         raise ValueError("Runtime Host hook request must be an object")
-    request_id = _bounded_text(
-        request.get("request_id"), label="Runtime Host hook request_id",
-        maximum=MAX_REQUEST_ID_BYTES,
-    )
+    request_id = _safe_request_id(request.get("request_id"))
     if request.get("protocol") != HOOK_PROTOCOL:
         raise PermissionError("Runtime Host hook protocol is unsupported")
     op = request.get("op")
@@ -422,10 +513,13 @@ def handle_request(
     if receipt.get("bridge_call_id") != bridge_call_id or receipt.get("host_tool_execution_id") != execution_id:
         raise PermissionError("Runtime Host hook transport tuple does not match Host receipt")
     context = _runtime_context(
-        receipt, registry_path=Path(registry_path), lifecycle_path=lifecycle_path
+        receipt, registry_path=Path(registry_path), lifecycle_path=lifecycle_path,
+        deadline_monotonic=deadline_monotonic,
     )
+    _remaining_seconds(deadline_monotonic)
     registered = verifier or web_bridge._external_peer_attestation_verifier(
-        "web", config_path=verifier_config_path
+        "web", config_path=verifier_config_path,
+        deadline_monotonic=deadline_monotonic,
     )
     method = getattr(registered, f"verify_tool_{op}", None)
     if not callable(method):
@@ -443,20 +537,25 @@ def handle_request(
             "host_tool_execution_id": execution_id,
         }
     verified = _verify_host_result(
-        method(**kwargs), phase=op, receipt=receipt, context=context
+        method(**kwargs, deadline_monotonic=deadline_monotonic),
+        phase=op, receipt=receipt, context=context
     )
     if op == "terminal" and verified.get("pre_chain") != {
         "pre_receipt_id": receipt.get("pre_receipt_id"),
         "pre_receipt_sha256": receipt.get("pre_receipt_sha256"),
     }:
         raise PermissionError("registered Host terminal pre chain is mismatched")
-    intent = _verified_intent(request.get("tool_intent"), receipt=receipt, context=context)
+    intent = _verified_intent(
+        request.get("tool_intent"), receipt=receipt, context=context,
+        deadline_monotonic=deadline_monotonic,
+    )
+    _remaining_seconds(deadline_monotonic)
     if op == "pre":
         prepared = target_guard.prepare_host_tool_execution(
             repo=context["repo"], controller_id=context["controller_id"],
             verified_turn=context["verified_turn"], host_pre_receipt=receipt,
             snapshot_path=intent["snapshot_path"], lifecycle_path=context["lifecycle_path"],
-            registry_path=Path(registry_path),
+            registry_path=Path(registry_path), deadline_monotonic=deadline_monotonic,
         )
         event = {
             "hook_event_name": "PreToolUse", "session_id": context["controller_id"],
@@ -470,7 +569,8 @@ def handle_request(
             "tool_input": {"command": intent["command"], "cwd": intent["cwd"]},
         }
         lifecycle_output, _state = lifecycle.process_verified_web_event(
-            event, registry_path=Path(registry_path), lifecycle_path=context["lifecycle_path"]
+            event, registry_path=Path(registry_path), lifecycle_path=context["lifecycle_path"],
+            deadline_monotonic=deadline_monotonic,
         )
         decision = lifecycle_output.get("hookSpecificOutput", {}).get("permissionDecision")
         if decision == "deny" or lifecycle_output.get("decision") == "block":
@@ -481,14 +581,16 @@ def handle_request(
             "receipt_record_sha256": prepared["receipt_record_sha256"],
         }
     _verified_backend(request, receipt=receipt, intent=intent)
+    _remaining_seconds(deadline_monotonic)
     pending = target_guard.terminalize_host_tool_execution(
         repo=context["repo"], controller_id=context["controller_id"],
         verified_turn=context["verified_turn"], host_terminal_receipt=receipt,
         snapshot_path=intent["snapshot_path"], lifecycle_path=context["lifecycle_path"],
-        registry_path=Path(registry_path),
+        registry_path=Path(registry_path), deadline_monotonic=deadline_monotonic,
     )
     guard, evidence_file_sha256 = _guard_evidence(
-        context=context, intent=intent, terminal=receipt, pending=pending
+        context=context, intent=intent, terminal=receipt, pending=pending,
+        deadline_monotonic=deadline_monotonic,
     )
     closed = lifecycle.process_verified_host_tool_terminal(
         repo=context["repo"], controller_id=context["controller_id"],
@@ -497,6 +599,7 @@ def handle_request(
         guard_evidence_file_sha256=evidence_file_sha256,
         snapshot_path=intent["snapshot_path"], command=intent["command"],
         lifecycle_path=context["lifecycle_path"], registry_path=Path(registry_path),
+        deadline_monotonic=deadline_monotonic,
     )
     return {
         "protocol": HOOK_PROTOCOL, "op": "terminal", "state": "CLOSED",
@@ -521,8 +624,8 @@ def _socket_parent(socket_path: Path) -> Path:
     return parent
 
 
-def _read_frame(connection: socket.socket) -> bytes:
-    deadline = time.monotonic() + IO_TIMEOUT_SECONDS
+def _read_frame(connection: socket.socket, *, deadline_monotonic: float | None = None) -> bytes:
+    deadline = deadline_monotonic if deadline_monotonic is not None else time.monotonic() + IO_TIMEOUT_SECONDS
     data = bytearray()
     while len(data) <= MAX_FRAME_BYTES:
         remaining = deadline - time.monotonic()
@@ -569,29 +672,35 @@ def serve_unix_socket(
             with connection:
                 request_id: str | None = None
                 try:
-                    frame = _read_frame(connection)
+                    deadline_monotonic = time.monotonic() + IO_TIMEOUT_SECONDS
+                    frame = _read_frame(connection, deadline_monotonic=deadline_monotonic)
                     request = _strict_json(frame.decode("utf-8"), label="Runtime Host hook request")
-                    if isinstance(request, dict) and isinstance(request.get("request_id"), str):
-                        request_id = request["request_id"][:MAX_REQUEST_ID_BYTES]
+                    if isinstance(request, dict):
+                        request_id = _safe_request_id_or_none(request.get("request_id"))
                     result = handle_request(
                         request, registry_path=registry_path, lifecycle_path=lifecycle_path,
                         verifier=verifier, verifier_config_path=verifier_config_path,
+                        deadline_monotonic=deadline_monotonic,
                     )
                     response = {"request_id": request_id, "ok": True, "result": result}
-                except (OSError, ValueError, PermissionError, RuntimeError, subprocess.SubprocessError) as exc:
+                except Exception as exc:
                     response = {
                         "request_id": request_id, "ok": False,
-                        "error": str(exc).replace("\n", " ")[:2048],
+                        "error": _safe_error_text(exc),
                     }
-                encoded = _canonical_json_bytes(response) + b"\n"
-                if len(encoded) > MAX_FRAME_BYTES:
-                    encoded = _canonical_json_bytes({
+                try:
+                    encoded = _safe_response_bytes(response)
+                    if len(encoded) > MAX_FRAME_BYTES:
+                        encoded = _safe_response_bytes({
                         "request_id": request_id, "ok": False,
                         "error": "Runtime Host hook response exceeds limit",
-                    }) + b"\n"
+                        })
+                except Exception:
+                    encoded = b'{"error":"Runtime Host hook response serialization failed","ok":false,"request_id":null}\n'
                 try:
+                    connection.settimeout(_remaining_seconds(deadline_monotonic))
                     connection.sendall(encoded)
-                except (OSError, socket.timeout):
+                except Exception:
                     pass
     finally:
         listener.close()
@@ -608,13 +717,16 @@ def serve_unix_socket(
 
 
 def _stdio_once() -> int:
+    request_id: str | None = None
     try:
         request = _strict_json(sys.stdin.read(MAX_FRAME_BYTES + 1).rstrip("\n"), label="Runtime Host hook request")
+        if isinstance(request, dict):
+            request_id = _safe_request_id_or_none(request.get("request_id"))
         result = handle_request(request)
-        response = {"request_id": request.get("request_id"), "ok": True, "result": result}
-    except (OSError, ValueError, PermissionError, RuntimeError, subprocess.SubprocessError) as exc:
-        response = {"request_id": None, "ok": False, "error": str(exc)[:2048]}
-    print(json.dumps(response, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        response = {"request_id": request_id, "ok": True, "result": result}
+    except Exception as exc:
+        response = {"request_id": request_id, "ok": False, "error": _safe_error_text(exc)}
+    sys.stdout.buffer.write(_safe_response_bytes(response))
     return 0 if response["ok"] else 78
 
 

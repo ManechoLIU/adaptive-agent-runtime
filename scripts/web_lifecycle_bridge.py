@@ -12,6 +12,7 @@ import queue
 import secrets
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -51,10 +52,21 @@ DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG = Path.home() / ".codex" / "adaptive-de
 _PEER_HOST_ATTESTATION_VERIFIERS: dict[str, Callable[..., Any]] = {}
 PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS = 15
 PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT = 64 * 1024
+PEER_ATTESTATION_VERIFIER_CONFIG_BYTES_LIMIT = 256 * 1024
+PEER_ATTESTATION_VERIFIER_BUNDLE_MEMBER_BYTES_LIMIT = 8 * 1024 * 1024
+PEER_ATTESTATION_VERIFIER_BUNDLE_BYTES_LIMIT = 32 * 1024 * 1024
+PEER_ATTESTATION_VERIFIER_READ_CHUNK_BYTES = 64 * 1024
+PEER_ATTESTATION_HELPER_AUTH_ENV = "ADAPTIVE_DELIVERY_PINNED_HELPER_AUTH"
+PEER_ATTESTATION_HELPER_TERM_GRACE_SECONDS = 0.01
+PEER_ATTESTATION_HELPER_KILL_GRACE_SECONDS = 0.01
 
 
 class PeerHostTransientUnavailable(RuntimeError):
     """Machine Host boundary exists but is temporarily unable to attest/deliver."""
+
+
+class _PinnedHostVerifierHelperTerminated(RuntimeError):
+    """Private helper termination signal used to unwind and reap its verifier child."""
 
 
 _PEER_HOST_TRANSIENT_ERROR_MARKERS = (
@@ -2654,16 +2666,73 @@ def _audit_receipt_key(receipt: dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _audit_receipt_binding(receipt: dict[str, Any]) -> dict[str, str]:
+    """Bind retry state to the full immutable audit receipt, not its display ID."""
+    canonical = json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    raw_kind = receipt.get("childTool")
+    kind = raw_kind.strip() if isinstance(raw_kind, str) and raw_kind.strip() else "<missing-child-tool>"
+    raw_provenance = receipt.get("provenance")
+    provenance = (
+        raw_provenance.strip()
+        if isinstance(raw_provenance, str) and raw_provenance.strip()
+        else "ai_bridge_audit_log_v1"
+    )
+    return {
+        "receipt_digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "receipt_kind": kind,
+        "receipt_provenance": provenance,
+    }
+
+
+def _audit_receipt_binding_matches(binding: object, receipt: dict[str, Any]) -> bool:
+    if not isinstance(binding, dict):
+        return False
+    expected = _audit_receipt_binding(receipt)
+    return all(
+        isinstance(binding.get(field), str)
+        and secrets.compare_digest(binding[field], value)
+        for field, value in expected.items()
+    )
+
+
 def _audit_receipt_status(cursor_path: Path, receipt: dict[str, Any]) -> str | None:
     data = load_json(_audit_receipt_state_path(cursor_path))
     receipts = data.get("receipts", {}) if isinstance(data, dict) else {}
-    return receipts.get(_audit_receipt_key(receipt)) if isinstance(receipts, dict) else None
+    key = _audit_receipt_key(receipt)
+    status = receipts.get(key) if isinstance(receipts, dict) else None
+    if not isinstance(status, str):
+        return None
+    bindings = data.get("receipt_bindings", {}) if isinstance(data, dict) else {}
+    binding = bindings.get(key) if isinstance(bindings, dict) else None
+    if binding is None:
+        # Historical states did not bind receiptId to immutable receipt material.
+        # They must be revalidated through the ordinary source-specific path.
+        return None
+    if not _audit_receipt_binding_matches(binding, receipt):
+        return "receipt_binding_mismatch"
+    return status
+
+
+def _audit_receipt_unbound_status(cursor_path: Path, receipt: dict[str, Any]) -> str | None:
+    """Return only a legacy status that has no receipt binding to validate."""
+    data = load_json(_audit_receipt_state_path(cursor_path))
+    receipts = data.get("receipts", {}) if isinstance(data, dict) else {}
+    bindings = data.get("receipt_bindings", {}) if isinstance(data, dict) else {}
+    key = _audit_receipt_key(receipt)
+    status = receipts.get(key) if isinstance(receipts, dict) else None
+    binding = bindings.get(key) if isinstance(bindings, dict) else None
+    return status if isinstance(status, str) and binding is None else None
 
 
 def _audit_receipt_wake_fingerprint(cursor_path: Path, receipt: dict[str, Any]) -> str | None:
     data = load_json(_audit_receipt_state_path(cursor_path))
+    key = _audit_receipt_key(receipt)
+    bindings = data.get("receipt_bindings", {}) if isinstance(data, dict) else {}
+    binding = bindings.get(key) if isinstance(bindings, dict) else None
+    if not _audit_receipt_binding_matches(binding, receipt):
+        return None
     fingerprints = data.get("wake_fingerprints", {}) if isinstance(data, dict) else {}
-    value = fingerprints.get(_audit_receipt_key(receipt)) if isinstance(fingerprints, dict) else None
+    value = fingerprints.get(key) if isinstance(fingerprints, dict) else None
     return value if isinstance(value, str) and value else None
 
 
@@ -2674,8 +2743,10 @@ def _set_audit_receipt_status(
     data = load_json(path)
     receipts = data.get("receipts", {}) if isinstance(data.get("receipts"), dict) else {}
     fingerprints = data.get("wake_fingerprints", {}) if isinstance(data.get("wake_fingerprints"), dict) else {}
+    bindings = data.get("receipt_bindings", {}) if isinstance(data.get("receipt_bindings"), dict) else {}
     key = _audit_receipt_key(receipt)
     receipts[key] = status
+    bindings[key] = _audit_receipt_binding(receipt)
     if status == "wake_pending" and wake_fingerprint:
         fingerprints[key] = wake_fingerprint
     elif status != "wake_pending":
@@ -2684,7 +2755,12 @@ def _set_audit_receipt_status(
         keep = set(list(receipts.keys())[-256:])
         receipts = {key: value for key, value in receipts.items() if key in keep}
         fingerprints = {key: value for key, value in fingerprints.items() if key in keep}
-    _write_json_atomic_file(path, {"receipts": receipts, "wake_fingerprints": fingerprints})
+        bindings = {key: value for key, value in bindings.items() if key in keep}
+    _write_json_atomic_file(path, {
+        "receipts": receipts,
+        "wake_fingerprints": fingerprints,
+        "receipt_bindings": bindings,
+    })
 
 
 def _advance_audit_cursor(cursor_path: Path, inode: int, offset: int) -> None:
@@ -4241,23 +4317,116 @@ def _rejecting_peer_attestation_verifier(message: str) -> Callable[..., Any]:
     return reject
 
 
-def _external_peer_attestation_verifier(
-    host: str, *, config_path: Path | None = None
+def _verifier_remaining_seconds(deadline_monotonic: float | None) -> float | None:
+    if deadline_monotonic is None:
+        return None
+    if isinstance(deadline_monotonic, bool) or not isinstance(deadline_monotonic, (int, float)):
+        raise PermissionError("registered Host verifier deadline must be a monotonic timestamp")
+    remaining_seconds = float(deadline_monotonic) - time.monotonic()
+    if not 0.0 < remaining_seconds < float("inf"):
+        raise PermissionError("registered Host verifier request budget exhausted")
+    return remaining_seconds
+
+
+def _read_pinned_verifier_file(
+    path: Path, *, label: str, max_bytes: int, deadline_monotonic: float | None,
+    require_private_mode: bool = False, require_executable: bool = False,
+) -> tuple[bytes, str, tuple[int, int, int, int]]:
+    """Read and hash one pinned verifier file through a single no-follow FD."""
+    _verifier_remaining_seconds(deadline_monotonic)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(nofollow, int) or nofollow == 0:
+        raise PermissionError(f"{label} requires O_NOFOLLOW support")
+    fd = os.open(str(path), os.O_RDONLY | nofollow)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError(f"{label} must be a regular non-symlink file")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise PermissionError(f"{label} owner mismatch")
+        if require_private_mode and metadata.st_mode & 0o077:
+            raise PermissionError(f"{label} permissions must be 0600 or stricter")
+        if require_executable and metadata.st_mode & 0o111 == 0:
+            raise PermissionError(f"{label} is not executable")
+        if (require_executable or label.endswith("bundle member")) and metadata.st_mode & 0o022:
+            raise PermissionError(f"{label} must not be group or other writable")
+        if metadata.st_size < 0 or metadata.st_size > max_bytes:
+            raise PermissionError(f"{label} exceeds size limit")
+        content = bytearray()
+        digest = hashlib.sha256()
+        while True:
+            _verifier_remaining_seconds(deadline_monotonic)
+            chunk = os.read(fd, min(PEER_ATTESTATION_VERIFIER_READ_CHUNK_BYTES, max_bytes - len(content) + 1))
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > max_bytes:
+                raise PermissionError(f"{label} exceeds size limit")
+            digest.update(chunk)
+            _verifier_remaining_seconds(deadline_monotonic)
+        return (
+            bytes(content), digest.hexdigest(),
+            (metadata.st_dev, metadata.st_ino, stat.S_IMODE(metadata.st_mode), metadata.st_uid),
+        )
+    finally:
+        os.close(fd)
+
+
+def _trusted_verifier_parent_chain(path: Path, *, root: Path) -> None:
+    if not path.is_absolute() or not root.is_absolute() or ".." in path.parts or ".." in root.parts:
+        raise PermissionError("registered Host verifier parent path is not canonical")
+    current = path.parent
+    while True:
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise PermissionError("registered Host verifier parent must not be a symlink")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise PermissionError("registered Host verifier parent must be a real directory")
+        if hasattr(os, "getuid") and metadata.st_uid not in {os.getuid(), 0}:
+            raise PermissionError("registered Host verifier parent owner is untrusted")
+        if metadata.st_mode & 0o022:
+            raise PermissionError("registered Host verifier parent is group or other writable")
+        if current == root:
+            return
+        if current.parent == current:
+            raise PermissionError("registered Host verifier bundle root is not an ancestor")
+        current = current.parent
+
+
+def _pinned_verifier_path_identity(path: Path) -> tuple[int, int, int, int]:
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise PermissionError("registered Host verifier path changed from pinned regular file")
+    return metadata.st_dev, metadata.st_ino, stat.S_IMODE(metadata.st_mode), metadata.st_uid
+
+
+def _loaded_external_peer_attestation_verifier(
+    host: str, *, config_path: Path | None = None,
+    deadline_monotonic: float | None = None,
 ) -> Callable[..., Any] | None:
     config_path = Path(
         DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG if config_path is None else config_path
     ).expanduser()
-    if not config_path.exists():
-        return None
+    config_path = Path(os.path.abspath(os.fspath(config_path)))
     try:
-        config_stat = config_path.lstat()
-        if config_path.is_symlink() or not config_path.is_file():
-            raise PermissionError("registered Host verifier config must be a regular non-symlink file")
-        if hasattr(os, "getuid") and config_stat.st_uid != os.getuid():
-            raise PermissionError("registered Host verifier config owner mismatch")
-        if config_stat.st_mode & 0o077:
-            raise PermissionError("registered Host verifier config permissions must be 0600 or stricter")
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        _trusted_verifier_parent_chain(config_path, root=config_path.parent)
+        config_bytes, config_digest, config_identity = _read_pinned_verifier_file(
+            config_path,
+            label="registered Host verifier config",
+            max_bytes=PEER_ATTESTATION_VERIFIER_CONFIG_BYTES_LIMIT,
+            deadline_monotonic=deadline_monotonic,
+            require_private_mode=True,
+        )
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        return _rejecting_peer_attestation_verifier(
+            f"registered Host verifier configuration rejected: {exc}"
+        )
+    try:
+        _verifier_remaining_seconds(deadline_monotonic)
+        config = json.loads(config_bytes.decode("utf-8"))
+        _verifier_remaining_seconds(deadline_monotonic)
         if not isinstance(config, dict) or config.get("schema_version") != 1:
             raise PermissionError("registered Host verifier config schema is invalid")
         verifiers = config.get("verifiers")
@@ -4280,14 +4449,13 @@ def _external_peer_attestation_verifier(
         executable = Path(executable_raw).expanduser()
         if not executable.is_absolute():
             raise PermissionError("registered Host verifier executable must be absolute")
-        executable_stat = executable.lstat()
-        if executable.is_symlink() or not executable.is_file():
-            raise PermissionError("registered Host verifier executable must be a regular non-symlink file")
-        if hasattr(os, "getuid") and executable_stat.st_uid != os.getuid():
-            raise PermissionError("registered Host verifier executable owner mismatch")
-        if executable_stat.st_mode & 0o111 == 0:
-            raise PermissionError("registered Host verifier executable is not executable")
-        actual_digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+        _, actual_digest, _ = _read_pinned_verifier_file(
+            executable,
+            label="registered Host verifier executable",
+            max_bytes=PEER_ATTESTATION_VERIFIER_BUNDLE_MEMBER_BYTES_LIMIT,
+            deadline_monotonic=deadline_monotonic,
+            require_executable=True,
+        )
         if not isinstance(digest, str) or len(digest) != 64 or not secrets.compare_digest(actual_digest, digest.lower()):
             raise PermissionError("registered Host verifier executable hash mismatch")
         bundle = record.get("bundle_sha256")
@@ -4295,18 +4463,32 @@ def _external_peer_attestation_verifier(
             raise PermissionError("registered Host verifier bundle hash manifest is incomplete")
         if len(bundle) > 64:
             raise PermissionError("registered Host verifier bundle hash manifest is too large")
+        bundle_paths = [
+            Path(os.path.abspath(os.fspath(Path(value).expanduser()))) for value in bundle
+        ]
+        bundle_root = Path(os.path.commonpath([str(path.parent) for path in bundle_paths]))
+        if not bundle_root.is_absolute():
+            raise PermissionError("registered Host verifier bundle root must be absolute")
+        pinned_identities: dict[str, tuple[int, int, int, int]] = {}
+        bundle_total_bytes = 0
         for bundle_path_raw, bundle_digest in bundle.items():
+            _verifier_remaining_seconds(deadline_monotonic)
             if not isinstance(bundle_path_raw, str) or not bundle_path_raw.strip():
                 raise PermissionError("registered Host verifier bundle path is invalid")
-            bundle_path = Path(bundle_path_raw).expanduser()
+            bundle_path = Path(os.path.abspath(os.fspath(Path(bundle_path_raw).expanduser())))
             if not bundle_path.is_absolute():
                 raise PermissionError("registered Host verifier bundle path must be absolute")
-            bundle_stat = bundle_path.lstat()
-            if bundle_path.is_symlink() or not bundle_path.is_file():
-                raise PermissionError("registered Host verifier bundle member must be a regular non-symlink file")
-            if hasattr(os, "getuid") and bundle_stat.st_uid != os.getuid():
-                raise PermissionError("registered Host verifier bundle member owner mismatch")
-            actual_bundle_digest = __import__("hashlib").sha256(bundle_path.read_bytes()).hexdigest()
+            _trusted_verifier_parent_chain(bundle_path, root=bundle_root)
+            bundle_bytes, actual_bundle_digest, identity = _read_pinned_verifier_file(
+                bundle_path,
+                label="registered Host verifier bundle member",
+                max_bytes=PEER_ATTESTATION_VERIFIER_BUNDLE_MEMBER_BYTES_LIMIT,
+                deadline_monotonic=deadline_monotonic,
+            )
+            bundle_total_bytes += len(bundle_bytes)
+            pinned_identities[str(bundle_path)] = identity
+            if bundle_total_bytes > PEER_ATTESTATION_VERIFIER_BUNDLE_BYTES_LIMIT:
+                raise PermissionError("registered Host verifier bundle exceeds total size limit")
             if (
                 not isinstance(bundle_digest, str)
                 or len(bundle_digest) != 64
@@ -4318,6 +4500,7 @@ def _external_peer_attestation_verifier(
             f"registered Host verifier configuration rejected: {exc}"
         )
 
+    _verifier_remaining_seconds(deadline_monotonic)
     delivery_fingerprint_payload = {
         "host": host,
         "protocol": record.get("protocol"),
@@ -4336,6 +4519,17 @@ def _external_peer_attestation_verifier(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    manifest_identity = hashlib.sha256(json.dumps(
+        {
+            "config_path": str(config_path),
+            "config_sha256": config_digest,
+            "config_identity": list(config_identity),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    _verifier_remaining_seconds(deadline_monotonic)
 
     safe_env = {
         "HOME": str(Path.home()),
@@ -4343,20 +4537,53 @@ def _external_peer_attestation_verifier(
         "LANG": "C.UTF-8",
     }
 
-    def validate_pinned_bundle() -> None:
+    def validate_pinned_bundle(*, deadline_monotonic: float | None = None) -> None:
+        _trusted_verifier_parent_chain(config_path, root=config_path.parent)
+        _, current_config_digest, current_config_identity = _read_pinned_verifier_file(
+            config_path,
+            label="registered Host verifier config",
+            max_bytes=PEER_ATTESTATION_VERIFIER_CONFIG_BYTES_LIMIT,
+            deadline_monotonic=deadline_monotonic,
+            require_private_mode=True,
+        )
+        if current_config_identity != config_identity or not secrets.compare_digest(
+            current_config_digest, config_digest
+        ):
+            raise PermissionError("registered Host verifier config identity changed")
+        bundle_total_bytes = 0
         for bundle_path_raw, bundle_digest in bundle.items():
-            bundle_path = Path(bundle_path_raw).expanduser()
-            bundle_stat = bundle_path.lstat()
-            if bundle_path.is_symlink() or not bundle_path.is_file():
-                raise PermissionError("registered Host verifier bundle member must remain a regular non-symlink file")
-            if hasattr(os, "getuid") and bundle_stat.st_uid != os.getuid():
-                raise PermissionError("registered Host verifier bundle member owner mismatch")
-            actual_bundle_digest = __import__("hashlib").sha256(bundle_path.read_bytes()).hexdigest()
+            _verifier_remaining_seconds(deadline_monotonic)
+            bundle_path = Path(os.path.abspath(os.fspath(Path(bundle_path_raw).expanduser())))
+            _trusted_verifier_parent_chain(bundle_path, root=bundle_root)
+            bundle_bytes, actual_bundle_digest, identity = _read_pinned_verifier_file(
+                bundle_path,
+                label="registered Host verifier bundle member",
+                max_bytes=PEER_ATTESTATION_VERIFIER_BUNDLE_MEMBER_BYTES_LIMIT,
+                deadline_monotonic=deadline_monotonic,
+            )
+            bundle_total_bytes += len(bundle_bytes)
+            if pinned_identities.get(str(bundle_path)) != identity:
+                raise PermissionError("registered Host verifier bundle member identity changed")
+            if bundle_total_bytes > PEER_ATTESTATION_VERIFIER_BUNDLE_BYTES_LIMIT:
+                raise PermissionError("registered Host verifier bundle exceeds total size limit")
             if not secrets.compare_digest(actual_bundle_digest, str(bundle_digest).lower()):
                 raise PermissionError("registered Host verifier bundle member hash mismatch")
 
-    def run_cli(request: dict[str, Any]) -> dict[str, Any]:
-        validate_pinned_bundle()
+    def run_cli(
+        request: dict[str, Any], *, deadline_monotonic: float | None = None
+    ) -> dict[str, Any]:
+        _verifier_remaining_seconds(deadline_monotonic)
+        validate_pinned_bundle(deadline_monotonic=deadline_monotonic)
+        for bundle_path_raw in bundle:
+            bundle_path = Path(os.path.abspath(os.fspath(Path(bundle_path_raw).expanduser())))
+            if pinned_identities.get(str(bundle_path)) != _pinned_verifier_path_identity(bundle_path):
+                raise PermissionError("registered Host verifier bundle path changed before execution")
+        remaining_seconds = _verifier_remaining_seconds(deadline_monotonic)
+        timeout_seconds = (
+            PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS
+            if remaining_seconds is None
+            else min(PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS, remaining_seconds)
+        )
         try:
             completed = subprocess.run(
                 [str(executable)],
@@ -4364,7 +4591,7 @@ def _external_peer_attestation_verifier(
                 text=True,
                 capture_output=True,
                 check=False,
-                timeout=PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
                 env=safe_env,
             )
         except subprocess.TimeoutExpired as exc:
@@ -4406,6 +4633,7 @@ def _external_peer_attestation_verifier(
         *, phase: str, receipt: object,
         expected_target_generation: int, expected_ownership_generation: int,
         expected_pre_chain: dict[str, Any] | None = None,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, Any]:
         if verifier_protocol != "runtime_host_verifier_cli_v2":
             raise PermissionError("registered Host verifier v2 receipt capability is unavailable")
@@ -4449,7 +4677,7 @@ def _external_peer_attestation_verifier(
             if not isinstance(expected_pre_chain, dict):
                 raise PermissionError("Host terminal verifier requires the prepared pre chain")
             request["expected_pre_chain"] = expected_pre_chain
-        payload = run_cli(request)
+        payload = run_cli(request, deadline_monotonic=deadline_monotonic)
         expected_receipt_id = receipt.get(f"{phase}_receipt_id")
         if (
             payload.get("protocol") != "runtime_host_verifier_cli_v2"
@@ -4492,7 +4720,7 @@ def _external_peer_attestation_verifier(
             "conversation_id": conversation_id,
             "target_generation": target_generation,
             "ownership_generation": ownership_generation,
-        })
+        }, deadline_monotonic=kwargs.get("deadline_monotonic"))
         verified = payload.get("verified_target")
         receipt = payload.get("host_receipt_id")
         if (
@@ -4542,7 +4770,7 @@ def _external_peer_attestation_verifier(
             "operation": "discover_current_entry",
             "target_generation": target_generation,
             "ownership_generation": ownership_generation,
-        })
+        }, deadline_monotonic=kwargs.get("deadline_monotonic"))
         if payload.get("operation") != "discover_current_entry":
             raise PermissionError("registered Host current-entry discovery returned wrong operation")
         current_entry = payload.get("current_entry")
@@ -4597,7 +4825,7 @@ def _external_peer_attestation_verifier(
             "wake_id": wake_id,
             "wake_nonce": secrets.token_urlsafe(24),
             "continuation_payload": continuation_payload,
-        })
+        }, deadline_monotonic=kwargs.get("deadline_monotonic"))
         receipt = payload.get("reentry_receipt")
         if (
             not isinstance(receipt, dict)
@@ -4657,6 +4885,13 @@ def _external_peer_attestation_verifier(
     setattr(verify, "discover_current_entry", discover_current_entry)
     setattr(verify, "submit_reentry", submit_reentry)
     setattr(verify, "delivery_fingerprint", delivery_fingerprint)
+    setattr(verify, "manifest_identity", manifest_identity)
+    setattr(verify, "verifier_protocol", verifier_protocol)
+    setattr(
+        verify,
+        "_execute_pinned_cli_request",
+        lambda request: run_cli(request, deadline_monotonic=None),
+    )
     if verifier_protocol == "runtime_host_verifier_cli_v2":
         setattr(
             verify, "verify_tool_pre",
@@ -4666,6 +4901,245 @@ def _external_peer_attestation_verifier(
             verify, "verify_tool_terminal",
             lambda **kwargs: run_tool_receipt(phase="terminal", **kwargs),
         )
+    return verify
+
+
+def _pinned_host_verifier_helper_main(argv: Sequence[str]) -> int:
+    """Private worker: validates pinned files and invokes only configured verifier CLI."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--config", required=True)
+    try:
+        def terminate_helper(_signum: int, _frame: object) -> None:
+            raise _PinnedHostVerifierHelperTerminated()
+
+        signal.signal(signal.SIGTERM, terminate_helper)
+        expected_authorization = os.environ.pop(PEER_ATTESTATION_HELPER_AUTH_ENV, "")
+        args = parser.parse_args(list(argv))
+        raw = sys.stdin.buffer.read(PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT + 1)
+        if len(raw) > PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT:
+            raise PermissionError("registered Host verifier helper request exceeds limit")
+        message = json.loads(raw.decode("utf-8"))
+        if not isinstance(message, dict) or set(message) - {
+            "operation", "method", "kwargs", "helper_authorization",
+            "expected_delivery_fingerprint", "expected_manifest_identity",
+        }:
+            raise PermissionError("registered Host verifier helper request is invalid")
+        supplied_authorization = message.pop("helper_authorization", None)
+        if (
+            len(expected_authorization) < 32
+            or not isinstance(supplied_authorization, str)
+            or not secrets.compare_digest(expected_authorization, supplied_authorization)
+        ):
+            raise PermissionError("registered Host verifier helper authorization is invalid")
+        verifier = _loaded_external_peer_attestation_verifier(
+            str(args.host), config_path=Path(args.config), deadline_monotonic=None
+        )
+        if verifier is None:
+            print(json.dumps({"ok": False, "missing": True, "error": "registered Host verifier config is missing"}))
+            return 0
+        if not callable(verifier):
+            raise PermissionError("registered Host verifier configuration is unavailable")
+        if not getattr(verifier, "delivery_fingerprint", None):
+            verifier()
+            raise PermissionError("registered Host verifier configuration is unavailable")
+        operation = message.get("operation")
+        if operation == "probe":
+            result: object = {
+                "delivery_fingerprint": getattr(verifier, "delivery_fingerprint"),
+                "manifest_identity": getattr(verifier, "manifest_identity", None),
+                "verifier_protocol": getattr(verifier, "verifier_protocol", None),
+            }
+        elif operation == "call":
+            expected_fingerprint = message.get("expected_delivery_fingerprint")
+            expected_manifest_identity = message.get("expected_manifest_identity")
+            if (
+                not isinstance(expected_fingerprint, str)
+                or not secrets.compare_digest(
+                    expected_fingerprint, str(getattr(verifier, "delivery_fingerprint", ""))
+                )
+                or not isinstance(expected_manifest_identity, str)
+                or not secrets.compare_digest(
+                    expected_manifest_identity, str(getattr(verifier, "manifest_identity", ""))
+                )
+            ):
+                raise PermissionError("registered Host verifier changed after factory probe")
+            method_name = message.get("method")
+            kwargs = message.get("kwargs")
+            if not isinstance(method_name, str) or not isinstance(kwargs, dict):
+                raise PermissionError("registered Host verifier helper call is invalid")
+            allowed_methods = {
+                "verify", "discover_current_entry", "submit_reentry",
+                "verify_tool_pre", "verify_tool_terminal",
+            }
+            method = verifier if method_name == "verify" else getattr(verifier, method_name, None)
+            if method_name not in allowed_methods or not callable(method):
+                raise PermissionError("registered Host verifier helper method is unavailable")
+            result = method(**kwargs)
+        else:
+            raise PermissionError("registered Host verifier helper operation is unsupported")
+        print(json.dumps({"ok": True, "result": result}, ensure_ascii=False))
+        return 0
+    except _PinnedHostVerifierHelperTerminated:
+        return 143
+    except PeerHostTransientUnavailable as exc:
+        print(json.dumps({"ok": False, "transient": True, "error": str(exc)}))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"ok": False, "transient": False, "error": str(exc)}))
+        return 0
+
+
+def _terminate_helper_process_group(process: subprocess.Popen[str]) -> None:
+    try:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=PEER_ATTESTATION_HELPER_TERM_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=PEER_ATTESTATION_HELPER_KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=PEER_ATTESTATION_HELPER_KILL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+def _call_pinned_host_verifier_helper(
+    *, host: str, config_path: Path, message: dict[str, Any], deadline_monotonic: float | None,
+) -> object:
+    _verifier_remaining_seconds(deadline_monotonic)
+    command = [
+        sys.executable, str(Path(__file__).resolve()), "__pinned-host-verifier-helper",
+        "--host", host, "--config", str(config_path),
+    ]
+    helper_authorization = secrets.token_urlsafe(32)
+    helper_message = {**message, "helper_authorization": helper_authorization}
+    helper_input = json.dumps(helper_message, ensure_ascii=False, sort_keys=True)
+    helper_env = {
+        "HOME": str(Path.home()),
+        "PATH": DEFAULT_RUNTIME_PATH,
+        "LANG": "C.UTF-8",
+        PEER_ATTESTATION_HELPER_AUTH_ENV: helper_authorization,
+    }
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True, env=helper_env,
+    )
+    try:
+        remaining = _verifier_remaining_seconds(deadline_monotonic)
+        timeout = PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS if remaining is None else min(
+            PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS, remaining
+        )
+        timeout = max(0.001, timeout - (
+            PEER_ATTESTATION_HELPER_TERM_GRACE_SECONDS
+            + PEER_ATTESTATION_HELPER_KILL_GRACE_SECONDS
+            + 0.005
+        ))
+        stdout, _stderr = process.communicate(
+            helper_input, timeout=timeout
+        )
+    except PermissionError as exc:
+        _terminate_helper_process_group(process)
+        raise PeerHostTransientUnavailable(
+            "registered Host verifier execution temporarily unavailable: request budget exhausted"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        _terminate_helper_process_group(process)
+        raise PeerHostTransientUnavailable(
+            "registered Host verifier execution temporarily unavailable: request budget exhausted"
+        ) from exc
+    if process.returncode != 0:
+        raise PermissionError("registered Host verifier helper failed")
+    if len(stdout.encode("utf-8", errors="replace")) > PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT:
+        raise PermissionError("registered Host verifier helper output exceeds limit")
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise PermissionError("registered Host verifier helper returned invalid JSON") from exc
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(payload, dict) and payload.get("missing") is True:
+            raise FileNotFoundError(str(error or "registered Host verifier config is missing"))
+        if isinstance(payload, dict) and payload.get("transient") is True:
+            raise PeerHostTransientUnavailable(str(error or "registered Host verifier unavailable"))
+        raise PermissionError("registered Host verifier rejected machine request" + (f": {error}" if error else ""))
+    return payload.get("result")
+
+
+def _external_peer_attestation_verifier(
+    host: str, *, config_path: Path | None = None,
+    deadline_monotonic: float | None = None,
+) -> Callable[..., Any] | None:
+    config = Path(
+        DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG if config_path is None else config_path
+    ).expanduser()
+    try:
+        probe = _call_pinned_host_verifier_helper(
+            host=host, config_path=config, message={"operation": "probe"},
+            deadline_monotonic=deadline_monotonic,
+        )
+    except FileNotFoundError:
+        return None
+    except PeerHostTransientUnavailable:
+        raise
+    except Exception as exc:
+        return _rejecting_peer_attestation_verifier(
+            f"registered Host verifier configuration rejected: {exc}"
+        )
+    if not isinstance(probe, dict):
+        return _rejecting_peer_attestation_verifier("registered Host verifier probe is invalid")
+    protocol = probe.get("verifier_protocol")
+    fingerprint = probe.get("delivery_fingerprint")
+    manifest_identity = probe.get("manifest_identity")
+    if protocol not in {"runtime_host_verifier_cli_v1", "runtime_host_verifier_cli_v2"}:
+        return _rejecting_peer_attestation_verifier("registered Host verifier protocol is unsupported")
+    if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+        return _rejecting_peer_attestation_verifier("registered Host verifier fingerprint is invalid")
+    if not isinstance(manifest_identity, str) or len(manifest_identity) != 64:
+        return _rejecting_peer_attestation_verifier("registered Host verifier manifest identity is invalid")
+
+    def call(method: str, **kwargs: Any) -> Any:
+        deadline = kwargs.pop("deadline_monotonic", None)
+        return _call_pinned_host_verifier_helper(
+            host=host, config_path=config,
+            message={
+                "operation": "call", "method": method, "kwargs": kwargs,
+                "expected_delivery_fingerprint": fingerprint,
+                "expected_manifest_identity": manifest_identity,
+            },
+            deadline_monotonic=deadline,
+        )
+
+    def verify(**kwargs: Any) -> Any:
+        return call("verify", **kwargs)
+
+    setattr(verify, "discover_current_entry", lambda **kwargs: call("discover_current_entry", **kwargs))
+    setattr(verify, "submit_reentry", lambda **kwargs: call("submit_reentry", **kwargs))
+    setattr(verify, "delivery_fingerprint", fingerprint)
+    setattr(verify, "verifier_protocol", protocol)
+    if protocol == "runtime_host_verifier_cli_v2":
+        setattr(verify, "verify_tool_pre", lambda **kwargs: call("verify_tool_pre", **kwargs))
+        setattr(verify, "verify_tool_terminal", lambda **kwargs: call("verify_tool_terminal", **kwargs))
     return verify
 
 
@@ -4680,12 +5154,14 @@ def _registered_web_host_delivery_fingerprint() -> str | None:
     return _verifier_delivery_fingerprint(_registered_peer_attestation_verifier("web"))
 
 
-def _registered_peer_attestation_verifier(host: str) -> Callable[..., Any] | None:
+def _registered_peer_attestation_verifier(
+    host: str, *, deadline_monotonic: float | None = None
+) -> Callable[..., Any] | None:
     """Return only a verifier registered by this bridge's trusted host boundary."""
     builtin = _PEER_HOST_ATTESTATION_VERIFIERS.get(host)
     if callable(builtin):
         return builtin
-    return _external_peer_attestation_verifier(host)
+    return _external_peer_attestation_verifier(host, deadline_monotonic=deadline_monotonic)
 
 
 def _validated_web_origin_attestation(
@@ -8160,7 +8636,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    values = list(sys.argv[1:] if argv is None else argv)
+    if values and values[0] == "__pinned-host-verifier-helper":
+        if len(os.environ.get(PEER_ATTESTATION_HELPER_AUTH_ENV, "")) < 32:
+            print("private verifier helper authorization required", file=sys.stderr)
+            return 78
+        return _pinned_host_verifier_helper_main(values[1:])
+    args = build_parser().parse_args(values)
     if args.command_name == "translate-receipt":
         repo = Path(args.repo).expanduser().resolve()
         registry_path = Path(args.registry).expanduser()
@@ -8590,6 +9072,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             for receipt, next_offset in records:
                 status = _audit_receipt_status(cursor_path, receipt)
+                legacy_status = _audit_receipt_unbound_status(cursor_path, receipt)
                 if status == "handled":
                     _advance_audit_cursor(cursor_path, audit_inode, next_offset)
                     continue
@@ -8599,6 +9082,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                         file=sys.stderr,
                     )
                     return 3
+                if status == "receipt_binding_mismatch":
+                    # A receiptId is display metadata, not an authorization key.  Do
+                    # not revalidate, consume a lease, or wake for a different raw
+                    # receipt that merely reuses a persisted identifier.
+                    _advance_audit_cursor(cursor_path, audit_inode, next_offset)
+                    continue
+                if legacy_status == "wake_pending":
+                    # A pre-binding wake record cannot attest that this audit
+                    # row is the original computer receipt.  Retire it without
+                    # dispatching, waking, or consuming any present lease.
+                    _set_audit_receipt_status(cursor_path, receipt, "diagnostic")
+                    _advance_audit_cursor(cursor_path, audit_inode, next_offset)
+                    continue
                 if status == "wake_pending":
                     # Older Runtime revisions could promote translated AI-Bridge
                     # shell output into wake_pending.  The Host-receipt contract
@@ -8615,6 +9111,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         _advance_audit_cursor(cursor_path, audit_inode, next_offset)
                         continue
                     expected_wake_fingerprint = _audit_receipt_wake_fingerprint(cursor_path, receipt)
+                    if not expected_wake_fingerprint:
+                        print(
+                            f"web lifecycle wake retry receipt binding missing or invalid for {_audit_receipt_key(receipt)}",
+                            file=sys.stderr,
+                        )
+                        return 78
                     try:
                         lifecycle_state = _load_lifecycle_state(args.session_id)
                         if lifecycle_state.get("pending_control_event") is not True:

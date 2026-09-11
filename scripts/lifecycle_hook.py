@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -2074,19 +2075,52 @@ def record_desktop_canary_observation(
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def run_git(root: Path, *args: str) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(root), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+LOCAL_GIT_TIMEOUT_SECONDS = 2.0
+
+
+def run_git(
+    root: Path, *args: str, deadline_monotonic: float | None = None
+) -> str:
+    timeout: float | None = None
+    if deadline_monotonic is not None:
+        target_guard._require_before_deadline(
+            deadline_monotonic, operation="Runtime snapshot Git"
+        )
+        timeout = min(
+            LOCAL_GIT_TIMEOUT_SECONDS,
+            max(0.001, deadline_monotonic - time.monotonic()),
+        )
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError("Runtime snapshot Git exceeded its deadline/timeout") from exc
     return completed.stdout.strip()
 
 
-def git_common_dir(cwd: Path) -> Path | None:
+def _run_git_with_optional_deadline(
+    root: Path, *args: str, deadline_monotonic: float | None
+) -> str:
+    if deadline_monotonic is None:
+        return run_git(root, *args)
+    return run_git(root, *args, deadline_monotonic=deadline_monotonic)
+
+
+def git_common_dir(
+    cwd: Path, *, deadline_monotonic: float | None = None
+) -> Path | None:
     try:
-        value = run_git(cwd, "rev-parse", "--git-common-dir")
+        value = _run_git_with_optional_deadline(
+            cwd, "rev-parse", "--git-common-dir",
+            deadline_monotonic=deadline_monotonic,
+        )
+    except TimeoutError:
+        raise
     except (OSError, subprocess.CalledProcessError, ValueError):
         return None
     if not value:
@@ -2095,9 +2129,16 @@ def git_common_dir(cwd: Path) -> Path | None:
     return (path if path.is_absolute() else cwd / path).resolve()
 
 
-def canonical_main_root(cwd: Path) -> Path | None:
+def canonical_main_root(
+    cwd: Path, *, deadline_monotonic: float | None = None
+) -> Path | None:
     try:
-        worktrees = run_git(cwd, "worktree", "list", "--porcelain")
+        worktrees = _run_git_with_optional_deadline(
+            cwd, "worktree", "list", "--porcelain",
+            deadline_monotonic=deadline_monotonic,
+        )
+    except TimeoutError:
+        raise
     except (OSError, subprocess.CalledProcessError, ValueError):
         return None
     worktree: Path | None = None
@@ -2109,14 +2150,27 @@ def canonical_main_root(cwd: Path) -> Path | None:
     return None
 
 
-def project_snapshot(cwd: Path) -> dict[str, Any] | None:
+def project_snapshot(
+    cwd: Path, *, deadline_monotonic: float | None = None
+) -> dict[str, Any] | None:
     try:
-        invocation_root = Path(run_git(cwd, "rev-parse", "--show-toplevel")).resolve()
+        invocation_root = Path(_run_git_with_optional_deadline(
+            cwd, "rev-parse", "--show-toplevel",
+            deadline_monotonic=deadline_monotonic,
+        )).resolve()
+    except TimeoutError:
+        raise
     except (OSError, subprocess.CalledProcessError, ValueError):
         return None
-    common_dir = git_common_dir(invocation_root)
-    root = canonical_main_root(invocation_root)
-    if common_dir is None or root is None or git_common_dir(root) != common_dir:
+    common_dir = git_common_dir(
+        invocation_root, deadline_monotonic=deadline_monotonic
+    )
+    root = canonical_main_root(
+        invocation_root, deadline_monotonic=deadline_monotonic
+    )
+    if common_dir is None or root is None or git_common_dir(
+        root, deadline_monotonic=deadline_monotonic
+    ) != common_dir:
         return None
     ledger = next((root / name for name in LEDGER_NAMES if (root / name).is_file()), None)
     if ledger is None:
@@ -2136,13 +2190,22 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
     runnable_projection = derive_runnable_tasks(task_records(text))
     runnable_ids = list(runnable_projection["runnable_task_ids"])
     derived_slices = dict(runnable_projection.get("derived_slices", {}))
-    status = run_git(root, "status", "--porcelain=v1", "--untracked-files=no")
+    status = _run_git_with_optional_deadline(
+        root, "status", "--porcelain=v1", "--untracked-files=no",
+        deadline_monotonic=deadline_monotonic,
+    )
     try:
         from control_event_guard import unmerged_worktree_candidates
     except ModuleNotFoundError:
         from scripts.control_event_guard import unmerged_worktree_candidates
 
+    target_guard._require_before_deadline(
+        deadline_monotonic, operation="Runtime snapshot candidate scan"
+    )
     candidates = unmerged_worktree_candidates(root)
+    target_guard._require_before_deadline(
+        deadline_monotonic, operation="Runtime snapshot candidate scan completion"
+    )
     try:
         from assignment_runtime import evaluate_lease, load_runtime_state, select_current_lease
     except ModuleNotFoundError:
@@ -2198,7 +2261,11 @@ def project_snapshot(cwd: Path) -> dict[str, Any] | None:
             from scripts.control_event_guard import open_controller_corrections
         controller_corrections = open_controller_corrections(root, owners[0])
     try:
-        head = run_git(root, "rev-parse", "HEAD")
+        head = _run_git_with_optional_deadline(
+            root, "rev-parse", "HEAD", deadline_monotonic=deadline_monotonic
+        )
+    except TimeoutError:
+        raise
     except (OSError, subprocess.CalledProcessError, ValueError):
         head = None
     return {
@@ -3802,12 +3869,25 @@ def persist_event_state(
     path: Path, event: dict[str, Any], snapshot: dict[str, Any], *,
     preserve_controller_host: bool = False,
     prior_state_validator: Callable[[dict[str, Any]], None] | None = None,
+    deadline_monotonic: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    target_guard._require_before_deadline(
+        deadline_monotonic, operation="lifecycle state directory creation"
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(path.suffix + ".lock")
+    target_guard._require_before_deadline(
+        deadline_monotonic, operation="lifecycle lock file open"
+    )
     with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        target_guard._acquire_receipt_lock(
+            lock.fileno(), deadline_monotonic=deadline_monotonic,
+            label="lifecycle event lock",
+        )
         try:
+            target_guard._require_before_deadline(
+                deadline_monotonic, operation="lifecycle state load"
+            )
             previous = load_json(path)
             if prior_state_validator is not None:
                 prior_state_validator(previous)
@@ -3830,6 +3910,9 @@ def persist_event_state(
                 ) if key in previous}
                 archived["replaced_by"] = next_state.get("turn_start_evidence")
                 try:
+                    target_guard._require_before_deadline(
+                        deadline_monotonic, operation="lifecycle turn archive"
+                    )
                     with path.with_suffix(".turns.jsonl").open("a", encoding="utf-8") as archive:
                         archive.write(json.dumps(archived, ensure_ascii=False) + "\n")
                         archive.flush()
@@ -3837,7 +3920,9 @@ def persist_event_state(
                 except OSError:
                     output = _adapter_fault_output(previous, event, "turn_archive_unavailable")
                     return output, previous
-            write_json(path, next_state)
+            target_guard._write_registry(
+                path, next_state, deadline_monotonic=deadline_monotonic
+            )
             return output, next_state
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -3920,6 +4005,7 @@ def process_verified_web_event(
     *,
     registry_path: Path = REGISTRY_PATH,
     lifecycle_path: Path | None = None,
+    deadline_monotonic: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Persist one Host-attested Web event through the canonical lifecycle state machine.
 
@@ -3928,6 +4014,9 @@ def process_verified_web_event(
     """
     if not isinstance(event, dict):
         raise PermissionError("verified Web lifecycle event must be an object")
+    target_guard._require_before_deadline(
+        deadline_monotonic, operation="verified Web lifecycle validation"
+    )
     forbidden_internal_fields = {
         "_runtime_host_terminal_commit", "host_tool_terminal_commit",
         "verified_host_tool_receipt", "internal_trust", "trusted_internal_event",
@@ -3951,7 +4040,7 @@ def process_verified_web_event(
     if not controller_id or not source_session_id:
         raise PermissionError("verified Web lifecycle event requires exact Controller and Web source session")
     cwd = Path(str(event.get("cwd") or ".")).expanduser().resolve()
-    snapshot = project_snapshot(cwd)
+    snapshot = project_snapshot(cwd, deadline_monotonic=deadline_monotonic)
     if snapshot is None:
         raise PermissionError("verified Web lifecycle event is outside a governed project")
     expected_root = Path(str(snapshot["root"])).expanduser().resolve()
@@ -3968,7 +4057,12 @@ def process_verified_web_event(
     normalized_event["cwd"] = str(expected_root)
     normalized_event["controller_registry_path"] = str(registry_path.expanduser().resolve())
 
-    with target_guard.locked_registry(registry_path) as registry:
+    target_guard._require_before_deadline(
+        deadline_monotonic, operation="verified Web registry lock"
+    )
+    with target_guard.locked_registry(
+        registry_path, deadline_monotonic=deadline_monotonic
+    ) as registry:
         unique_controller_id = target_guard.unique_controller_id_for_repo_in_registry(
             expected_root, registry
         )
@@ -4049,6 +4143,7 @@ def process_verified_web_event(
         return persist_event_state(
             path, normalized_event, snapshot,
             prior_state_validator=validate_web_stop,
+            deadline_monotonic=deadline_monotonic,
         )
 
 
@@ -4058,10 +4153,14 @@ def process_verified_host_tool_terminal(
     guard_evidence_id: str, guard_evidence_file_sha256: str,
     snapshot_path: Path, command: str, lifecycle_path: Path,
     registry_path: Path = REGISTRY_PATH,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Apply one Host-authenticated terminal through the atomic private boundary."""
     repo = Path(repo).expanduser().resolve()
     lifecycle_path = Path(lifecycle_path).expanduser()
+    target_guard._require_before_deadline(
+        deadline_monotonic, operation="verified Host terminal validation"
+    )
     normalized_turn = agent_target.normalize_verified_execution_turn(
         verified_turn,
         expected_logical_agent=agent_target.logical_agent_identity(
@@ -4073,7 +4172,7 @@ def process_verified_host_tool_terminal(
     def transition(
         prior_state: dict[str, Any], terminal_commit: dict[str, Any]
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        snapshot = project_snapshot(repo)
+        snapshot = project_snapshot(repo, deadline_monotonic=deadline_monotonic)
         if snapshot is None or Path(str(snapshot.get("root") or "")).resolve() != repo:
             raise PermissionError("Host terminal project snapshot is unavailable or mismatched")
         event = {
@@ -4105,6 +4204,7 @@ def process_verified_host_tool_terminal(
         guard_evidence_file_sha256=guard_evidence_file_sha256,
         snapshot_path=Path(snapshot_path), lifecycle_path=lifecycle_path,
         lifecycle_transition=transition, registry_path=Path(registry_path),
+        deadline_monotonic=deadline_monotonic,
     )
 
 

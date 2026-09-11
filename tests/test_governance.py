@@ -4,9 +4,12 @@ import hashlib
 import json
 import importlib.util
 import io
+import os
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -38,6 +41,447 @@ ledger_consistency_guard = load_module(
     "ledger_consistency_guard", "scripts/ledger_consistency_guard.py"
 )
 lifecycle_hook = load_module("lifecycle_hook", "scripts/lifecycle_hook.py")
+
+
+class DurableHostToolReceiptPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.guard = lifecycle_hook.target_guard
+
+    def make_context(self, root: Path) -> dict[str, object]:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps({
+            "controller-1": str(repo.resolve()),
+            "__controller_sessions__": {"controller-1": {"web": ["web-current"]}},
+            "__controller_targets__": {"controller-1": {"web": {
+                "status": "active", "session_id": "web-current", "generation": 4,
+            }}},
+            "__controller_execution_ownership__": {"controller-1": {
+                "active_host": "web", "execution_target_session_id": "web-current",
+                "generation": 9,
+            }},
+        }), encoding="utf-8")
+        identity = self.guard.agent_target.logical_agent_identity(
+            agent_type="controller", agent_id="controller-1"
+        )
+        target = self.guard.agent_target.verified_execution_target(
+            logical_agent=identity, host="web", execution_target_session_id="web-current",
+            target_generation=4, ownership_generation=9, provenance="test_host_entry",
+        )
+        turn = self.guard.agent_target.verified_execution_turn(
+            verified_target=target, runtime_invocation_id="runtime-invocation-1",
+            provenance="test_runtime_web_turn",
+        )
+        lifecycle = root / "lifecycle.json"
+        lifecycle.write_text(json.dumps({
+            "active_turn_id": turn["turn_id"],
+            "web_turn_lease": {
+                "contract": "runtime_web_turn_lease_v1", "status": "active",
+                "generation": 1, "turn_id": turn["turn_id"],
+                "runtime_invocation_id": turn["runtime_invocation_id"],
+                "execution_target_session_id": "web-current",
+                "target_generation": 4, "ownership_generation": 9,
+                "watcher_nonce": "watcher-nonce",
+            },
+            "tool_trace": [],
+        }), encoding="utf-8")
+        snapshot = root / "snapshot.json"
+        snapshot.write_text('{"snapshot":"current"}', encoding="utf-8")
+        return {
+            "repo": repo, "registry": registry, "lifecycle": lifecycle,
+            "snapshot": snapshot, "turn": turn,
+        }
+
+    def pre_receipt(self) -> dict[str, object]:
+        return {
+            "schema_version": 1, "provenance": "lab_host_tool_pre_receipt_v1",
+            "pre_receipt_id": "pre-receipt-1", "capability_id": "hic_1",
+            "host_tool_execution_id": "hte-1", "bridge_call_id": "bridge-1",
+            "bridge_challenge_nonce": "challenge-nonce", "transport_binding_id": "tb_1",
+            "workspace": "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge",
+            "production_release_revision": "1" * 40, "production_endpoint_generation": 1,
+            "bridge_principal_id": "bridge-principal", "bridge_execution_session_id": "bridge-session",
+            "bridge_capability_id": "bridge-capability",
+            "bridge_workspace_id": "local-agent-bridge-production",
+            "tool_name": "run_command", "outer_request_sha256": "c" * 64,
+            "forwarded_request_sha256": "d" * 64, "normalized_request_sha256": "a" * 64,
+            "conversation_id": "web-current", "browser_target_id": "target-1",
+            "top_frame_id": "frame-1", "loader_id": "loader-1",
+            "secure_origin": "https://chatgpt.com", "generation_anchor_sha256": "e" * 64,
+            "extension_binding_sha256": "f" * 64, "extension_instance_id_sha256": "0" * 64,
+            "extension_loaded_at_ms": 1, "pre_nonce": "pre-nonce-1",
+            "issued_at_unix_ms": 2, "host_epoch_binding_sha256": "1" * 64,
+            "host_mac_sha256": "2" * 64,
+        }
+
+    def terminal_receipt(self, pre: dict[str, object]) -> dict[str, object]:
+        return {
+            **{key: value for key, value in pre.items() if key not in {
+                "pre_receipt_id", "pre_nonce", "issued_at_unix_ms", "host_mac_sha256",
+            }},
+            "schema_version": 1, "provenance": "lab_host_tool_terminal_receipt_v1",
+            "terminal_receipt_id": "terminal-receipt-1",
+            "pre_receipt_id": pre["pre_receipt_id"],
+            "pre_receipt_sha256": hashlib.sha256(json.dumps(
+                pre, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest(),
+            "backend_route": "/run-command", "http_status": 200,
+            "response_body_sha256": "b" * 64, "terminal_classification": "completed",
+            "issued_at_unix_ms": 3, "host_epoch_binding_sha256": "1" * 64,
+            "host_mac_sha256": "3" * 64,
+        }
+
+    def guard_evidence(
+        self, context: dict[str, object], terminal_sha256: str
+    ) -> dict[str, object]:
+        turn = context["turn"]
+        snapshot = context["snapshot"]
+        return {
+            "controller_id": "controller-1", "host": "web",
+            "execution_target_session_id": "web-current", "turn_id": turn["turn_id"],
+            "target_generation": 4, "ownership_generation": 9,
+            "bridge_call_id": "bridge-1", "host_tool_execution_id": "hte-1",
+            "normalized_request_sha256": "a" * 64,
+            "snapshot_sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+            "terminal_receipt_sha256": terminal_sha256, "terminal_status": "CLOSED",
+        }
+
+    def prepare(self, context: dict[str, object], pre: dict[str, object], **kwargs):
+        return self.guard.prepare_host_tool_execution(
+            repo=context["repo"], controller_id="controller-1",
+            verified_turn=context["turn"], host_pre_receipt=pre,
+            snapshot_path=context["snapshot"], lifecycle_path=context["lifecycle"],
+            registry_path=context["registry"], **kwargs,
+        )
+
+    def hung_git_path(self, root: Path) -> Path:
+        binary = root / "bin"
+        binary.mkdir()
+        git = binary / "git"
+        git.write_text("#!/bin/sh\n/bin/sleep 1\n", encoding="utf-8")
+        git.chmod(0o700)
+        return binary
+
+    def test_registry_write_uses_unique_private_temp_and_fsyncs_file_then_directory(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = root / "controllers.json"
+            fixed_temp = registry.with_suffix(registry.suffix + ".tmp")
+            fixed_temp.write_text("unrelated-stale-temp", encoding="utf-8")
+            real_open, real_fsync, real_replace = os.open, os.fsync, os.replace
+            open_calls: list[tuple[Path, int, int]] = []
+            events: list[str] = []
+
+            def tracked_open(path, flags, mode=0o777, *, dir_fd=None):
+                open_calls.append((Path(path), flags, mode))
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            def tracked_fsync(fd):
+                events.append("fsync")
+                return real_fsync(fd)
+
+            def tracked_replace(source, destination, *, src_dir_fd=None, dst_dir_fd=None):
+                events.append("replace")
+                return real_replace(
+                    source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd
+                )
+
+            with patch("os.open", side_effect=tracked_open), patch(
+                "os.fsync", side_effect=tracked_fsync
+            ), patch("os.replace", side_effect=tracked_replace):
+                self.guard._write_registry(registry, {"state": "PREPARED"})
+
+            self.assertEqual(json.loads(registry.read_text()), {"state": "PREPARED"})
+            self.assertEqual(stat.S_IMODE(registry.stat().st_mode), 0o600)
+            self.assertEqual(fixed_temp.read_text(), "unrelated-stale-temp")
+            temp_opens = [call for call in open_calls if call[0].parent == root and call[0] != root]
+            self.assertTrue(temp_opens)
+            temp_path, flags, mode = temp_opens[0]
+            self.assertNotEqual(temp_path, fixed_temp)
+            self.assertTrue(flags & os.O_EXCL)
+            self.assertTrue(flags & os.O_NOFOLLOW)
+            self.assertEqual(mode, 0o600)
+            self.assertEqual(events, ["fsync", "replace", "fsync"])
+
+    def test_registry_write_failures_before_replace_preserve_old_state_and_remove_own_temp(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = root / "controllers.json"
+            cases = ("write", "file_fsync", "replace")
+            for phase in cases:
+                with self.subTest(phase=phase):
+                    registry.write_text('{"state":"OLD"}', encoding="utf-8")
+                    real_write, real_fsync, real_replace = os.write, os.fsync, os.replace
+
+                    def injected_write(fd, value):
+                        if phase == "write":
+                            raise OSError("injected temp write failure")
+                        return real_write(fd, value)
+
+                    def injected_fsync(fd):
+                        if phase == "file_fsync":
+                            raise OSError("injected file fsync failure")
+                        return real_fsync(fd)
+
+                    def injected_replace(source, destination, **kwargs):
+                        if phase == "replace":
+                            raise OSError("injected replace failure")
+                        return real_replace(source, destination, **kwargs)
+
+                    with patch("os.write", side_effect=injected_write), patch(
+                        "os.fsync", side_effect=injected_fsync
+                    ), patch("os.replace", side_effect=injected_replace):
+                        with self.assertRaisesRegex(OSError, "injected"):
+                            self.guard._write_registry(registry, {"state": "NEW"})
+                    self.assertEqual(json.loads(registry.read_text()), {"state": "OLD"})
+                    self.assertEqual(
+                        list(root.glob(f".{registry.name}.*.tmp")), [],
+                        "writer must remove only the private temp from its failed attempt",
+                    )
+
+    def test_prepare_does_not_allow_before_directory_fsync_and_persisted_attempt_stays_fenced(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self.make_context(Path(tmp))
+            pre = self.pre_receipt()
+            real_fsync = os.fsync
+            calls = 0
+
+            def fail_directory_fsync(fd):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated directory fsync failure")
+                return real_fsync(fd)
+
+            with patch("os.fsync", side_effect=fail_directory_fsync):
+                with self.assertRaisesRegex(OSError, "directory fsync failure"):
+                    self.prepare(context, pre)
+            saved = self.guard.load_json(context["registry"])
+            self.assertEqual(
+                saved["__controller_host_tool_receipts__"]["controller-1"]["web"]["hte-1"]["state"],
+                "PREPARED",
+            )
+            with self.assertRaisesRegex(PermissionError, "already"):
+                self.prepare(context, pre)
+
+    def test_lifecycle_commit_fsync_failure_keeps_registry_pending_and_exact_retry_is_single_trace(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self.make_context(Path(tmp))
+            pre = self.pre_receipt()
+            self.prepare(context, pre)
+            terminal = self.terminal_receipt(pre)
+            pending = self.guard.terminalize_host_tool_execution(
+                repo=context["repo"], controller_id="controller-1",
+                verified_turn=context["turn"], host_terminal_receipt=terminal,
+                snapshot_path=context["snapshot"], lifecycle_path=context["lifecycle"],
+                registry_path=context["registry"],
+            )
+            evidence = self.guard_evidence(context, pending["terminal_receipt_sha256"])
+            transition_calls = 0
+
+            def transition(state, commit):
+                nonlocal transition_calls
+                transition_calls += 1
+                next_state = json.loads(json.dumps(state))
+                next_state.setdefault("tool_trace", []).append({
+                    "tool_use_id": commit["tuple"]["host_tool_execution_id"]
+                })
+                return {"transition": "applied"}, next_state
+
+            real_fsync = os.fsync
+            calls = 0
+
+            def fail_lifecycle_directory_fsync(fd):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated lifecycle directory fsync failure")
+                return real_fsync(fd)
+
+            arguments = dict(
+                repo=context["repo"], controller_id="controller-1",
+                verified_turn=context["turn"], host_terminal_receipt=terminal,
+                guard_evidence=evidence, guard_evidence_id="evidence-1",
+                guard_evidence_file_sha256="9" * 64,
+                snapshot_path=context["snapshot"], lifecycle_path=context["lifecycle"],
+                lifecycle_transition=transition, registry_path=context["registry"],
+            )
+            with patch("os.fsync", side_effect=fail_lifecycle_directory_fsync):
+                with self.assertRaisesRegex(OSError, "lifecycle directory fsync failure"):
+                    self.guard.commit_host_tool_execution(**arguments)
+            record = self.guard.load_json(context["registry"])[
+                "__controller_host_tool_receipts__"
+            ]["controller-1"]["web"]["hte-1"]
+            self.assertEqual(record["state"], "TERMINAL_PENDING")
+            result = self.guard.commit_host_tool_execution(**arguments)
+            self.assertEqual(result["state"], "CLOSED")
+            state = self.guard.load_json(context["lifecycle"])
+            self.assertEqual(len(state["tool_trace"]), 1)
+            self.assertEqual(transition_calls, 1)
+
+    def test_registry_close_replace_failure_keeps_durable_lifecycle_and_retry_is_single_trace(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self.make_context(Path(tmp))
+            pre = self.pre_receipt()
+            self.prepare(context, pre)
+            terminal = self.terminal_receipt(pre)
+            pending = self.guard.terminalize_host_tool_execution(
+                repo=context["repo"], controller_id="controller-1",
+                verified_turn=context["turn"], host_terminal_receipt=terminal,
+                snapshot_path=context["snapshot"], lifecycle_path=context["lifecycle"],
+                registry_path=context["registry"],
+            )
+            evidence = self.guard_evidence(context, pending["terminal_receipt_sha256"])
+            transition_calls = 0
+
+            def transition(state, commit):
+                nonlocal transition_calls
+                transition_calls += 1
+                next_state = json.loads(json.dumps(state))
+                next_state.setdefault("tool_trace", []).append({
+                    "tool_use_id": commit["tuple"]["host_tool_execution_id"]
+                })
+                return {"transition": "applied"}, next_state
+
+            arguments = dict(
+                repo=context["repo"], controller_id="controller-1",
+                verified_turn=context["turn"], host_terminal_receipt=terminal,
+                guard_evidence=evidence, guard_evidence_id="evidence-1",
+                guard_evidence_file_sha256="9" * 64,
+                snapshot_path=context["snapshot"], lifecycle_path=context["lifecycle"],
+                lifecycle_transition=transition, registry_path=context["registry"],
+            )
+            real_replace = os.replace
+
+            def fail_registry_replace(source, destination, **kwargs):
+                if Path(destination) == context["registry"]:
+                    raise OSError("simulated CLOSED registry replace failure")
+                return real_replace(source, destination, **kwargs)
+
+            with patch("os.replace", side_effect=fail_registry_replace):
+                with self.assertRaisesRegex(OSError, "CLOSED registry replace failure"):
+                    self.guard.commit_host_tool_execution(**arguments)
+            lifecycle_state = self.guard.load_json(context["lifecycle"])
+            self.assertIn("hte-1", lifecycle_state["host_tool_terminal_commits"])
+            record = self.guard.load_json(context["registry"])[
+                "__controller_host_tool_receipts__"
+            ]["controller-1"]["web"]["hte-1"]
+            self.assertEqual(record["state"], "TERMINAL_PENDING")
+            result = self.guard.commit_host_tool_execution(**arguments)
+            self.assertEqual(result["state"], "CLOSED")
+            self.assertEqual(transition_calls, 1)
+            self.assertEqual(len(self.guard.load_json(context["lifecycle"])["tool_trace"]), 1)
+
+    def test_receipt_lock_deadline_fails_closed_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self.make_context(Path(tmp))
+            registry = context["registry"]
+            before = registry.read_bytes()
+            lock_path = self.guard.registry_lock_path(registry)
+            with lock_path.open("a+") as lock_file:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                started = time.monotonic()
+                with self.assertRaisesRegex(TimeoutError, "deadline"):
+                    self.prepare(
+                        context, self.pre_receipt(), deadline_monotonic=started + 0.05
+                    )
+                self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(registry.read_bytes(), before)
+
+    def test_expired_deadline_does_not_create_receipt_lock_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = root / "controllers.json"
+            lifecycle = root / "lifecycle.json"
+            registry.write_text("{}", encoding="utf-8")
+            lifecycle.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(TimeoutError, "deadline"):
+                with self.guard._locked_host_tool_receipt_mutation(
+                    registry_path=registry, lifecycle_path=lifecycle,
+                    deadline_monotonic=time.monotonic() - 1,
+                ):
+                    self.fail("expired receipt mutation must not acquire locks")
+            self.assertFalse(self.guard.registry_lock_path(registry).exists())
+            self.assertFalse(lifecycle.with_suffix(lifecycle.suffix + ".lock").exists())
+
+    def test_verified_web_entry_times_out_hung_snapshot_git_without_state_or_lock(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = self.hung_git_path(root)
+            registry = root / "controllers.json"
+            registry.write_text("{}", encoding="utf-8")
+            lifecycle = root / "state" / "controller-1.json"
+            event = {
+                "hook_event_name": "SessionStart", "controller_host": "web",
+                "execution_host": "web", "event_source": "web",
+                "controller_session_id": "controller-1", "web_session_id": "web-current",
+                "cwd": str(root),
+            }
+            started = time.monotonic()
+            with patch.dict(os.environ, {"PATH": str(fake_bin)}):
+                with self.assertRaisesRegex(TimeoutError, "Git.*timeout|deadline"):
+                    lifecycle_hook.process_verified_web_event(
+                        event, registry_path=registry, lifecycle_path=lifecycle,
+                        deadline_monotonic=started + 0.05,
+                    )
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(registry.read_text(encoding="utf-8"), "{}")
+            self.assertFalse(lifecycle.exists())
+            self.assertFalse(lifecycle.with_suffix(lifecycle.suffix + ".lock").exists())
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
+
+    def test_verified_terminal_times_out_hung_snapshot_git_without_closed_or_trace(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            context = self.make_context(root)
+            pre = self.pre_receipt()
+            self.prepare(context, pre)
+            terminal = self.terminal_receipt(pre)
+            pending = self.guard.terminalize_host_tool_execution(
+                repo=context["repo"], controller_id="controller-1",
+                verified_turn=context["turn"], host_terminal_receipt=terminal,
+                snapshot_path=context["snapshot"], lifecycle_path=context["lifecycle"],
+                registry_path=context["registry"],
+            )
+            evidence = self.guard_evidence(context, pending["terminal_receipt_sha256"])
+            before_registry = context["registry"].read_bytes()
+            before_lifecycle = context["lifecycle"].read_bytes()
+            fake_bin = self.hung_git_path(root)
+            started = time.monotonic()
+            with patch.dict(os.environ, {"PATH": str(fake_bin)}):
+                with self.assertRaisesRegex(TimeoutError, "Git.*timeout|deadline"):
+                    lifecycle_hook.process_verified_host_tool_terminal(
+                        repo=context["repo"], controller_id="controller-1",
+                        verified_turn=context["turn"], host_terminal_receipt=terminal,
+                        guard_evidence=evidence, guard_evidence_id="evidence-1",
+                        guard_evidence_file_sha256="9" * 64,
+                        snapshot_path=context["snapshot"], command="git status --short",
+                        lifecycle_path=context["lifecycle"], registry_path=context["registry"],
+                        deadline_monotonic=started + 0.05,
+                    )
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(context["registry"].read_bytes(), before_registry)
+            self.assertEqual(context["lifecycle"].read_bytes(), before_lifecycle)
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
+
 
 
 class GovernanceTests(unittest.TestCase):

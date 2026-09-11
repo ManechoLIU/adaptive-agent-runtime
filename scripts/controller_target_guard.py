@@ -6,8 +6,11 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import os
+import secrets
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -32,6 +35,7 @@ MAX_ACTIVE_OUTBOUND_LEASES_PER_HOST = 64
 MAX_HOST_TOOL_RECEIPTS_PER_HOST = 64
 MAX_HOST_TOOL_RECEIPT_BYTES = 16384
 HOST_TOOL_RECEIPT_STATES = {"PREPARED", "TERMINAL_PENDING", "CLOSED", "RESULT_UNKNOWN"}
+HOST_TOOL_GIT_TIMEOUT_SECONDS = 2.0
 DESKTOP_SESSION_HOST = "desktop_codex"
 SUPPORTED_HOSTS = (DESKTOP_SESSION_HOST, "web")
 SUPPORTED_ACTIONS = ("native_resume", "message", "navigate")
@@ -49,13 +53,31 @@ def registry_lock_path(registry_path: Path) -> Path:
 
 
 @contextmanager
-def locked_registry(registry_path: Path, *, exclusive: bool = False) -> Iterator[dict[str, Any]]:
+def locked_registry(
+    registry_path: Path, *, exclusive: bool = False,
+    deadline_monotonic: float | None = None,
+) -> Iterator[dict[str, Any]]:
     registry_path = registry_path.expanduser()
     lock_path = registry_lock_path(registry_path)
+    _require_before_deadline(
+        deadline_monotonic, operation="controller registry lock directory creation"
+    )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    _require_before_deadline(
+        deadline_monotonic, operation="controller registry lock file open"
+    )
     with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        if deadline_monotonic is None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        else:
+            _acquire_receipt_lock(
+                lock.fileno(), deadline_monotonic=deadline_monotonic,
+                label="registry lock", shared=not exclusive,
+            )
         try:
+            _require_before_deadline(
+                deadline_monotonic, operation="controller registry load"
+            )
             yield load_json(registry_path)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -136,14 +158,31 @@ def load_json(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _git_common_dir(repo: Path) -> Path:
+def _git_common_dir(
+    repo: Path, *, deadline_monotonic: float | None = None
+) -> Path:
     repo = repo.expanduser().resolve()
-    completed = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    timeout: float | None = None
+    if deadline_monotonic is not None:
+        _require_before_deadline(
+            deadline_monotonic, operation="Host tool repository identity Git"
+        )
+        timeout = min(
+            HOST_TOOL_GIT_TIMEOUT_SECONDS,
+            max(0.001, deadline_monotonic - time.monotonic()),
+        )
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            "Host tool repository identity Git exceeded its deadline/timeout"
+        ) from exc
     if completed.returncode != 0 or not completed.stdout.strip():
         raise ValueError(f"cannot resolve Git common-dir for {repo}")
     common_dir = Path(completed.stdout.strip()).expanduser()
@@ -153,10 +192,13 @@ def _git_common_dir(repo: Path) -> Path:
 
 
 def _matching_controller_ids_for_repo(
-    repo: Path, registry: dict[str, Any]
+    repo: Path, registry: dict[str, Any], *,
+    deadline_monotonic: float | None = None,
 ) -> list[str]:
     repo = repo.expanduser().resolve()
-    requested_common_dir = _git_common_dir(repo)
+    requested_common_dir = _git_common_dir(
+        repo, deadline_monotonic=deadline_monotonic
+    )
     matches: list[str] = []
     for controller_id, registered_repo in registry.items():
         if (
@@ -166,7 +208,9 @@ def _matching_controller_ids_for_repo(
         ):
             continue
         try:
-            if _git_common_dir(Path(registered_repo)) == requested_common_dir:
+            if _git_common_dir(
+                Path(registered_repo), deadline_monotonic=deadline_monotonic
+            ) == requested_common_dir:
                 matches.append(
                     _bounded_string(
                         controller_id,
@@ -1056,12 +1100,75 @@ def _outbound_leases_for_host(
     return dict(host_leases)
 
 
-def _write_registry(registry_path: Path, registry: dict[str, Any]) -> None:
-    temporary = registry_path.with_suffix(registry_path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.replace(registry_path)
+def _require_before_deadline(
+    deadline_monotonic: float | None, *, operation: str
+) -> None:
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        raise TimeoutError(f"Host tool receipt deadline expired before {operation}")
+
+
+def _write_registry(
+    registry_path: Path, registry: dict[str, Any], *,
+    deadline_monotonic: float | None = None,
+) -> None:
+    """Atomically replace one JSON state file with crash-durable bytes and name.
+
+    The temporary file is private and unique to this attempt.  Once replacement
+    begins, the parent directory fsync must finish even if the caller's deadline
+    expires: stopping between rename and directory fsync would weaken the
+    durability fence which the returned receipt relies on.
+    """
+    registry_path = registry_path.expanduser()
+    payload = (json.dumps(registry, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    _require_before_deadline(deadline_monotonic, operation="state file creation")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    temporary: Path | None = None
+    descriptor: int | None = None
+    replaced = False
+    try:
+        for _attempt in range(128):
+            candidate = registry_path.parent / (
+                f".{registry_path.name}.{secrets.token_hex(16)}.tmp"
+            )
+            try:
+                descriptor = os.open(candidate, flags, 0o600)
+            except FileExistsError:
+                continue
+            temporary = candidate
+            break
+        if descriptor is None or temporary is None:
+            raise FileExistsError("cannot allocate unique registry temporary file")
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            _require_before_deadline(deadline_monotonic, operation="state file write")
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
+                raise OSError("short write while persisting controller state")
+            written += count
+        _require_before_deadline(deadline_monotonic, operation="state file fsync")
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        _require_before_deadline(deadline_monotonic, operation="state file replace")
+        os.replace(temporary, registry_path)
+        replaced = True
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_descriptor = os.open(registry_path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None and not replaced:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _json_sha256(value: object, *, label: str) -> str:
@@ -1120,26 +1227,65 @@ def _host_tool_receipts_for_host(
 
 @contextmanager
 def _locked_host_tool_receipt_mutation(
-    *, registry_path: Path, lifecycle_path: Path
+    *, registry_path: Path, lifecycle_path: Path,
+    deadline_monotonic: float | None = None,
 ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
     """Acquire canonical registry then lifecycle locks for one Web receipt mutation."""
     registry_path = registry_path.expanduser()
     lifecycle_path = lifecycle_path.expanduser()
     registry_lock = registry_lock_path(registry_path)
     lifecycle_lock = lifecycle_path.with_suffix(lifecycle_path.suffix + ".lock")
+    _require_before_deadline(
+        deadline_monotonic, operation="Host tool receipt lock directory creation"
+    )
     registry_lock.parent.mkdir(parents=True, exist_ok=True)
     lifecycle_lock.parent.mkdir(parents=True, exist_ok=True)
+    _require_before_deadline(
+        deadline_monotonic, operation="registry lock file open"
+    )
     with registry_lock.open("a+") as registry_file:
-        fcntl.flock(registry_file.fileno(), fcntl.LOCK_EX)
+        _acquire_receipt_lock(
+            registry_file.fileno(), deadline_monotonic=deadline_monotonic,
+            label="registry lock",
+        )
         try:
+            _require_before_deadline(
+                deadline_monotonic, operation="lifecycle lock file open"
+            )
             with lifecycle_lock.open("a+") as lifecycle_file:
-                fcntl.flock(lifecycle_file.fileno(), fcntl.LOCK_EX)
+                _acquire_receipt_lock(
+                    lifecycle_file.fileno(), deadline_monotonic=deadline_monotonic,
+                    label="lifecycle lock",
+                )
                 try:
+                    _require_before_deadline(
+                        deadline_monotonic, operation="Host tool receipt state load"
+                    )
                     yield load_json(registry_path), load_json(lifecycle_path)
                 finally:
                     fcntl.flock(lifecycle_file.fileno(), fcntl.LOCK_UN)
         finally:
             fcntl.flock(registry_file.fileno(), fcntl.LOCK_UN)
+
+
+def _acquire_receipt_lock(
+    descriptor: int, *, deadline_monotonic: float | None, label: str,
+    shared: bool = False,
+) -> None:
+    mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+    if deadline_monotonic is None:
+        fcntl.flock(descriptor, mode)
+        return
+    while True:
+        _require_before_deadline(deadline_monotonic, operation=label)
+        try:
+            fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Host tool receipt deadline expired before {label}")
+            time.sleep(min(0.01, remaining))
 
 
 def _require_active_runtime_web_turn_lease(
@@ -1170,11 +1316,14 @@ def _current_host_tool_tuple(
     verified_turn: object,
     snapshot_path: Path,
     lifecycle_state: dict[str, Any],
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     canonical_controller_id = _bounded_string(
         controller_id, label="controller id", maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH
     )
-    if _matching_controller_ids_for_repo(repo, registry) != [canonical_controller_id]:
+    if _matching_controller_ids_for_repo(
+        repo, registry, deadline_monotonic=deadline_monotonic
+    ) != [canonical_controller_id]:
         raise PermissionError("Host tool receipt requires the existing unique project Controller")
     target = target_record(registry, controller_id=canonical_controller_id, host="web")
     if target is None:
@@ -1336,17 +1485,20 @@ def _persist_host_tool_record(
 def prepare_host_tool_execution(
     *, repo: Path, controller_id: str, verified_turn: dict[str, Any], host_pre_receipt: dict[str, Any],
     snapshot_path: Path, lifecycle_path: Path, registry_path: Path = DEFAULT_REGISTRY,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Durably prepare one Host-bound Web tool execution before dispatch."""
     repo = repo.expanduser().resolve()
     registry_path = registry_path.expanduser()
     with _locked_host_tool_receipt_mutation(
-        registry_path=registry_path, lifecycle_path=lifecycle_path
+        registry_path=registry_path, lifecycle_path=lifecycle_path,
+        deadline_monotonic=deadline_monotonic,
     ) as (registry, lifecycle_state):
         tuple_base = _current_host_tool_tuple(
             registry=registry, repo=repo, controller_id=controller_id,
             verified_turn=verified_turn, snapshot_path=snapshot_path,
             lifecycle_state=lifecycle_state,
+            deadline_monotonic=deadline_monotonic,
         )
         tuple_value, digests = _host_receipt_tuple(
             host_pre_receipt, tuple_base=tuple_base, phase="pre"
@@ -1354,37 +1506,42 @@ def prepare_host_tool_execution(
         records = _host_tool_receipts_for_host(
             registry, controller_id=tuple_value["controller_id"], host="web"
         )
-        _assert_new_pre_receipt(records, tuple_value=tuple_value, digests=digests)
-        if len(records) >= MAX_HOST_TOOL_RECEIPTS_PER_HOST:
-            raise PermissionError("Host tool receipt limit reached for web")
         record = {
             "state": "PREPARED", "tuple": tuple_value, **digests,
             "capability_id_sha256": _receipt_value_sha256(
                 host_pre_receipt.get("capability_id"), label="Host capability id"
             ),
         }
+        _assert_new_pre_receipt(records, tuple_value=tuple_value, digests=digests)
+        if len(records) >= MAX_HOST_TOOL_RECEIPTS_PER_HOST:
+            raise PermissionError("Host tool receipt limit reached for web")
         _persist_host_tool_record(
             registry, controller_id=tuple_value["controller_id"],
             execution_id=tuple_value["host_tool_execution_id"], record=record,
         )
-        _write_registry(registry_path, registry)
+        _write_registry(
+            registry_path, registry, deadline_monotonic=deadline_monotonic
+        )
         return _receipt_record_response(record)
 
 
 def terminalize_host_tool_execution(
     *, repo: Path, controller_id: str, verified_turn: dict[str, Any], host_terminal_receipt: dict[str, Any],
     snapshot_path: Path, lifecycle_path: Path, registry_path: Path = DEFAULT_REGISTRY,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Persist a verified Host terminal receipt without closing lifecycle debt."""
     repo = repo.expanduser().resolve()
     registry_path = registry_path.expanduser()
     with _locked_host_tool_receipt_mutation(
-        registry_path=registry_path, lifecycle_path=lifecycle_path
+        registry_path=registry_path, lifecycle_path=lifecycle_path,
+        deadline_monotonic=deadline_monotonic,
     ) as (registry, lifecycle_state):
         tuple_base = _current_host_tool_tuple(
             registry=registry, repo=repo, controller_id=controller_id,
             verified_turn=verified_turn, snapshot_path=snapshot_path,
             lifecycle_state=lifecycle_state,
+            deadline_monotonic=deadline_monotonic,
         )
         tuple_value, digests = _host_receipt_tuple(
             host_terminal_receipt, tuple_base=tuple_base, phase="terminal"
@@ -1406,6 +1563,9 @@ def terminalize_host_tool_execution(
         if existing is not None:
             if existing != digests["terminal_receipt_sha256"]:
                 raise PermissionError("Host terminal receipt does not match the pending execution")
+            _write_registry(
+                registry_path, registry, deadline_monotonic=deadline_monotonic
+            )
             return _receipt_record_response(record)
         if record.get("state") != "PREPARED":
             raise PermissionError("Host tool execution cannot accept a terminal receipt")
@@ -1426,7 +1586,9 @@ def terminalize_host_tool_execution(
             registry, controller_id=tuple_value["controller_id"],
             execution_id=tuple_value["host_tool_execution_id"], record=record,
         )
-        _write_registry(registry_path, registry)
+        _write_registry(
+            registry_path, registry, deadline_monotonic=deadline_monotonic
+        )
         return _receipt_record_response(record)
 
 
@@ -1449,53 +1611,16 @@ def close_host_tool_execution(
     *, repo: Path, controller_id: str, verified_turn: dict[str, Any], host_terminal_receipt: dict[str, Any],
     guard_evidence: dict[str, Any], snapshot_path: Path, lifecycle_path: Path,
     registry_path: Path = DEFAULT_REGISTRY,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
-    """Close only the terminal receipt whose lifecycle guard evidence matches its full tuple."""
-    repo = repo.expanduser().resolve()
-    registry_path = registry_path.expanduser()
-    with _locked_host_tool_receipt_mutation(
-        registry_path=registry_path, lifecycle_path=lifecycle_path
-    ) as (registry, lifecycle_state):
-        tuple_base = _current_host_tool_tuple(
-            registry=registry, repo=repo, controller_id=controller_id,
-            verified_turn=verified_turn, snapshot_path=snapshot_path,
-            lifecycle_state=lifecycle_state,
-        )
-        tuple_value, terminal_digests = _host_receipt_tuple(
-            host_terminal_receipt, tuple_base=tuple_base, phase="terminal"
-        )
-        record = _stored_host_tool_record(
-            registry, controller_id=tuple_value["controller_id"],
-            execution_id=tuple_value["host_tool_execution_id"],
-        )
-        _assert_exact_record_tuple(record, tuple_value)
-        if (
-            record.get("pre_receipt_id_sha256")
-            != terminal_digests["referenced_pre_receipt_id_sha256"]
-            or record.get("pre_receipt_sha256")
-            != terminal_digests["referenced_pre_receipt_sha256"]
-        ):
-            raise PermissionError("Host terminal pre receipt does not match the prepared execution")
-        if record.get("terminal_receipt_sha256") != terminal_digests["terminal_receipt_sha256"]:
-            raise PermissionError("Host terminal receipt does not match the pending execution")
-        evidence_sha256 = _assert_exact_guard_evidence(
-            guard_evidence, tuple_value=tuple_value,
-            terminal_receipt_sha256=terminal_digests["terminal_receipt_sha256"],
-        )
-        if record.get("state") == "CLOSED":
-            if record.get("guard_evidence_sha256") != evidence_sha256:
-                raise PermissionError("Host tool guard evidence does not match the closed execution")
-            return _receipt_record_response(record)
-        if record.get("state") != "TERMINAL_PENDING":
-            raise PermissionError("Host tool execution is not terminal pending")
-        record["guard_evidence_sha256"] = evidence_sha256
-        record["state"] = "CLOSED"
-        _persist_host_tool_record(
-            registry, controller_id=tuple_value["controller_id"],
-            execution_id=tuple_value["host_tool_execution_id"], record=record,
-        )
-        _write_registry(registry_path, registry)
-        return _receipt_record_response(record)
+    """Deprecated: lifecycle evidence must be committed by the atomic commit API."""
+    del (
+        repo, controller_id, verified_turn, host_terminal_receipt, guard_evidence,
+        snapshot_path, lifecycle_path, registry_path, deadline_monotonic,
+    )
+    raise PermissionError(
+        "Host tool execution requires commit_host_tool_execution; direct CLOSED is disabled"
+    )
 
 
 def commit_host_tool_execution(
@@ -1508,6 +1633,7 @@ def commit_host_tool_execution(
         tuple[dict[str, Any], dict[str, Any]],
     ],
     registry_path: Path = DEFAULT_REGISTRY,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Commit lifecycle evidence before the matching registry CAS becomes CLOSED.
 
@@ -1526,12 +1652,14 @@ def commit_host_tool_execution(
         guard_evidence_file_sha256, label="Host tool guard evidence file sha256"
     )
     with _locked_host_tool_receipt_mutation(
-        registry_path=registry_path, lifecycle_path=lifecycle_path
+        registry_path=registry_path, lifecycle_path=lifecycle_path,
+        deadline_monotonic=deadline_monotonic,
     ) as (registry, lifecycle_state):
         tuple_base = _current_host_tool_tuple(
             registry=registry, repo=repo, controller_id=controller_id,
             verified_turn=verified_turn, snapshot_path=snapshot_path,
             lifecycle_state=lifecycle_state,
+            deadline_monotonic=deadline_monotonic,
         )
         tuple_value, terminal_digests = _host_receipt_tuple(
             host_terminal_receipt, tuple_base=tuple_base, phase="terminal"
@@ -1578,9 +1706,16 @@ def commit_host_tool_execution(
         if existing_commit is not None:
             if existing_commit != commit:
                 raise PermissionError("Host tool terminal commit does not match exact retry")
+            _write_registry(
+                lifecycle_path, lifecycle_state,
+                deadline_monotonic=deadline_monotonic,
+            )
         else:
             if record.get("state") != "TERMINAL_PENDING":
                 raise PermissionError("Host tool execution is not terminal pending")
+            _require_before_deadline(
+                deadline_monotonic, operation="Host tool lifecycle transition"
+            )
             lifecycle_output, next_state = lifecycle_transition(lifecycle_state, commit)
             if not isinstance(lifecycle_output, dict) or not isinstance(next_state, dict):
                 raise ValueError("Host tool lifecycle transition returned invalid state")
@@ -1591,10 +1726,15 @@ def commit_host_tool_execution(
             )
             next_commits[execution_id] = commit
             next_state["host_tool_terminal_commits"] = next_commits
-            _write_registry(lifecycle_path, next_state)
+            _write_registry(
+                lifecycle_path, next_state, deadline_monotonic=deadline_monotonic
+            )
         if record.get("state") == "CLOSED":
             if record.get("guard_evidence_sha256") != guard_contract_sha256:
                 raise PermissionError("Host tool guard evidence does not match the closed execution")
+            _write_registry(
+                registry_path, registry, deadline_monotonic=deadline_monotonic
+            )
             return {**_receipt_record_response(record), "lifecycle_output": lifecycle_output}
         if record.get("state") != "TERMINAL_PENDING":
             raise PermissionError("Host tool execution is not terminal pending")
@@ -1604,7 +1744,9 @@ def commit_host_tool_execution(
             registry, controller_id=tuple_value["controller_id"],
             execution_id=execution_id, record=record,
         )
-        _write_registry(registry_path, registry)
+        _write_registry(
+            registry_path, registry, deadline_monotonic=deadline_monotonic
+        )
         return {**_receipt_record_response(record), "lifecycle_output": lifecycle_output}
 
 
