@@ -85,16 +85,17 @@ git commit -m "feat(runtime): persist Host tool receipt CAS"
 **Files:**
 - Create: `scripts/runtime_host_tool_hook.py`
 - Modify: `scripts/web_lifecycle_bridge.py`
+- Create: `tests/test_runtime_host_tool_hook.py`
 - Modify: `tests/test_web_lifecycle_bridge.py`
 - Modify: `tests/test_agent_target_resolution.py`
 
 **Interfaces:**
 - Consumes: Task 1 CAS functions; registered Host verifier bundle; LAB receipts `lab_host_tool_pre_receipt_v1` and `lab_host_tool_terminal_receipt_v1`; Bridge-transported `runtime_host_tool_intent_v1` canonical normalized-request bytes; terminal `runtime_host_backend_response_v1` exact CatDesk JSON-RPC bytes.
-- Produces: verifier protocol `runtime_host_verifier_cli_v2`; callable verifier methods `verify_tool_pre` and `verify_tool_terminal`; executable stdin/stdout protocol `runtime_host_tool_hook_v1`; verified Web PreToolUse and PostToolUse events sharing `host_tool_execution_id`.
+- Produces: verifier protocol `runtime_host_verifier_cli_v2`; callable verifier methods `verify_tool_pre` and `verify_tool_terminal`; private owned-0600 Unix-socket NDJSON server protocol `runtime_host_tool_hook_v1`; verified Web PreToolUse and PostToolUse events sharing `host_tool_execution_id`.
 
 - [ ] **Step 1: Write failing verifier and hook tests**
 
-Test the real CLI boundary with a controlled executable verifier. Pre requires v2, exact receipt provenance/signature/expiry/tuple, current Host entry, exact control-guard argv/cwd/repo/ledger/snapshot identity, and current Runtime Web turn. It decodes only the exact bounded UTF-8 canonical intent whose SHA-256 equals the authenticated receipt `normalized_request_sha256`; it never executes that command. Terminal requires the matching PREPARED record, the same intent digest, exact backend bytes whose SHA-256 equals the Host terminal receipt, a CatDesk structured result with `success=true`, integer `exitCode=0`, `timedOut=false`, and matching command/cwd, plus exact evidence file ID/hash and current target/ownership/turn.
+Test the real verifier CLI boundary with a controlled executable and the real hook server over a private Unix socket. The server accepts one bounded NDJSON request per connection, requires a bounded transport `request_id`, and replies `{request_id, ok, result|error}` for Bridge correlation. Pre requires v2, exact receipt provenance/signature/expiry/tuple, current Host entry, exact control-guard argv/cwd/repo/ledger/snapshot identity, and current Runtime Web turn. It decodes only the exact bounded UTF-8 canonical intent whose SHA-256 equals the authenticated receipt `normalized_request_sha256`; it never executes that command. Terminal requires the matching PREPARED record, the same intent digest, exact backend bytes whose SHA-256 equals the Host terminal receipt, a CatDesk structured result with `success=true`, integer `exitCode=0`, `timedOut=false`, and matching command/cwd, plus exact evidence file ID/hash and current target/ownership/turn.
 
 ```python
 self.assertEqual(result["protocol"], "runtime_host_tool_hook_v1")
@@ -109,14 +110,14 @@ Add negatives for caller conversation/tool ID injection, v1 verifier, missing ca
 Run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_web_lifecycle_bridge tests.test_agent_target_resolution
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_runtime_host_tool_hook tests.test_web_lifecycle_bridge tests.test_agent_target_resolution
 ```
 
 Expected: new tests fail because v2 receipt methods and the hook executable are absent.
 
 - [ ] **Step 3: Implement the minimal verifier and hook**
 
-Reuse the registered verifier's executable, bundle hash, safe environment, timeout, and output limit. Never accept a caller-provided equivalent receipt. The hook reads one bounded JSON object from stdin and writes one bounded JSON object; it never invokes a shell.
+Reuse the registered verifier's executable, bundle hash, safe environment, timeout, and output limit. Never accept a caller-provided equivalent receipt. `runtime_host_tool_hook.py --serve-unix-socket <absolute path>` refuses a missing, symlinked, foreign-owned, or non-0700 parent and any pre-existing socket path; after bind it chmods the socket to 0600, serves sequential one-request/one-response NDJSON connections with a 64 KiB bound and finite I/O deadline, and on shutdown removes only the same device/inode socket it created. It never invokes a shell. A one-request stdio mode may exist only as a test/debug adapter over the same pure handler; production Bridge uses the Unix socket.
 
 ```python
 {
@@ -136,7 +137,7 @@ Pre dispatches verified `PreToolUse`; terminal first persists TERMINAL_PENDING, 
 Run the Step 2 command plus:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_governance
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_runtime_host_tool_hook tests.test_governance
 ```
 
 Expected: all tests pass and existing Desktop native-hook behavior is unchanged.
@@ -144,7 +145,7 @@ Expected: all tests pass and existing Desktop native-hook behavior is unchanged.
 - [ ] **Step 5: Commit Task 2**
 
 ```bash
-git add scripts/runtime_host_tool_hook.py scripts/web_lifecycle_bridge.py tests/test_web_lifecycle_bridge.py tests/test_agent_target_resolution.py
+git add scripts/runtime_host_tool_hook.py scripts/web_lifecycle_bridge.py tests/test_runtime_host_tool_hook.py tests/test_web_lifecycle_bridge.py tests/test_agent_target_resolution.py
 git commit -m "feat(runtime): consume verified Host tool receipts"
 ```
 
