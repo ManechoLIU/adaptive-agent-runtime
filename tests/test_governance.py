@@ -1606,6 +1606,77 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertIn("CANDIDATE:candidate-123", second_state["triggers"])
         self.assertEqual(second_state["host_turn_handoff"]["state"], "requested")
 
+    def test_resolved_ledger_errors_do_not_remain_as_permanent_lifecycle_triggers(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-fixed",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        _output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "tool_use_id": "ledger-fix",
+                "tool_name": "Bash",
+                "tool_input": {"command": "true"},
+                "tool_response": {"exit_code": 0},
+            },
+            snapshot=snapshot,
+            prior_state={
+                "active_turn_id": "turn-1",
+                "pending_control_event": True,
+                "triggers": [
+                    "LEDGER_INVALID:old undeclared task",
+                    "subagent_stopped:writer-1",
+                ],
+                "snapshot": {**snapshot, "ledger_sha256": "ledger-broken"},
+            },
+        )
+
+        self.assertNotIn("LEDGER_INVALID:old undeclared task", state["triggers"])
+        self.assertIn("subagent_stopped:writer-1", state["triggers"])
+
+    def test_current_ledger_error_replaces_stale_ledger_error(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-new-error",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": ["current checkpoint is invalid"],
+            "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        _output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "tool_use_id": "ledger-edit",
+                "tool_name": "Bash",
+                "tool_input": {"command": "true"},
+                "tool_response": {"exit_code": 0},
+            },
+            snapshot=snapshot,
+            prior_state={
+                "active_turn_id": "turn-1",
+                "pending_control_event": True,
+                "triggers": ["LEDGER_INVALID:old undeclared task"],
+                "snapshot": {**snapshot, "ledger_sha256": "ledger-old-error"},
+            },
+        )
+
+        self.assertNotIn("LEDGER_INVALID:old undeclared task", state["triggers"])
+        self.assertIn("LEDGER_INVALID:current checkpoint is invalid", state["triggers"])
+
     def test_stop_gate_docs_distinguish_host_turn_handoff_from_debt_escape(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         for relative in ("README.md", "references/long-task-governance.md"):

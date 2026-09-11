@@ -3057,6 +3057,7 @@ def evaluate_event(
     transient_prefixes = (
         "rule_update_pending:", "rule_ledger_stale:", "rule_live_e2e_pending:",
         "rule_install_integrity_error:",
+        "LEDGER_INVALID:",
         "active_lease_expired:", "assignment_became_unhealthy:", "agent_session_terminal:",
         "active_without_progress:", "recovery_stalled:", "recovery_budget_exhausted:",
     )
