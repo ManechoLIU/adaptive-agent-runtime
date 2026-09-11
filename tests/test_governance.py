@@ -676,6 +676,49 @@ class GovernanceTests(unittest.TestCase):
         self.assertEqual(saved["source_session_id"], "desktop-entry-2")
         self.assertEqual(saved["controller_host"], "desktop_codex")
 
+    def test_lifecycle_desktop_stop_arms_handoff_before_terminalizing_host_turn(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        state_root = main.parent / "lifecycle-state"
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry), patch.object(
+            lifecycle_hook, "STATE_ROOT", state_root
+        ):
+            lifecycle_hook.register_controller("controller-1", main)
+            lifecycle_hook.replace_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-2",
+                repo=main,
+                expected_generation=0,
+            )
+            event = {
+                "hook_event_name": "Stop",
+                "session_id": "desktop-entry-2",
+                "turn_id": "turn-1",
+                "cwd": str(main),
+            }
+            lifecycle_hook.write_json(lifecycle_hook.state_path("controller-1"), {
+                "active_turn_id": "turn-1",
+                "pending_control_event": True,
+                "triggers": ["CANDIDATE:candidate-1"],
+                "stop_continuations": 1,
+                "stop_continuation_turn_id": "turn-1",
+                "wake_generation": 3,
+            })
+            with patch.object(
+                lifecycle_hook, "arm_host_turn_handoff", return_value={"state": "delegated"}
+            ) as arm, patch("sys.stdin", io.StringIO(json.dumps(event))), patch(
+                "sys.stdout", new_callable=io.StringIO
+            ) as output:
+                self.assertEqual(lifecycle_hook.run_hook(), 0)
+
+            response = json.loads(output.getvalue())
+            self.assertIs(response.get("continue"), False)
+            self.assertNotEqual(response.get("decision"), "block")
+            arm.assert_called_once()
+            self.assertEqual(arm.call_args.kwargs["controller_id"], "controller-1")
+            self.assertEqual(arm.call_args.kwargs["repo"], main.resolve())
+
     def test_lifecycle_pretool_rejects_message_or_navigation_to_retired_task(self) -> None:
         from unittest.mock import patch
 
@@ -1487,7 +1530,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertIn("WEB-READY", output["reason"])
         self.assertTrue(next_state["pending_control_event"])
 
-    def test_lifecycle_hook_repeated_stop_with_ready_stays_blocked_until_dispatch_or_blocked(self) -> None:
+    def test_lifecycle_hook_repeated_stop_with_ready_hands_off_without_clearing_ready(self) -> None:
         snapshot = {
             "head": "abc123",
             "ledger_sha256": "ledger-1",
@@ -1497,9 +1540,11 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             "rule_handshake": {"state": "current", "blocking": False, "installed_revision": "rev-current"},
         }
         prior = {
+            "active_turn_id": "turn-2",
             "pending_control_event": True,
             "triggers": ["READY:SERVER-GATE", "ledger_changed"],
             "stop_continuations": 1,
+            "stop_continuation_turn_id": "turn-2",
             "snapshot": snapshot,
         }
 
@@ -1514,12 +1559,14 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             prior_state=prior,
         )
 
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("SERVER-GATE", output["reason"])
-        self.assertIn("BLOCKED", output["reason"])
+        self.assertIs(output.get("continue"), False)
+        self.assertNotEqual(output.get("decision"), "block")
+        self.assertIn("SERVER-GATE", output["stopReason"])
         self.assertTrue(next_state["pending_control_event"])
+        self.assertIn("READY:SERVER-GATE", next_state["triggers"])
+        self.assertEqual(next_state["host_turn_handoff"]["state"], "requested")
 
-    def test_lifecycle_hook_repeated_stop_without_progress_stays_blocked_while_pending(self) -> None:
+    def test_lifecycle_hook_repeated_stop_without_progress_hands_off_while_pending(self) -> None:
         snapshot = {
             "head": "abc123",
             "ledger_sha256": "ledger-1",
@@ -1551,17 +1598,21 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             prior_state=first_state,
         )
 
-        self.assertEqual(second_output["decision"], "block")
-        self.assertIn("candidate-123", second_output["reason"])
+        self.assertIs(second_output.get("continue"), False)
+        self.assertNotEqual(second_output.get("decision"), "block")
+        self.assertIn("candidate-123", second_output["stopReason"])
         self.assertEqual(second_state["stop_continuations"], 2)
+        self.assertTrue(second_state["pending_control_event"])
+        self.assertIn("CANDIDATE:candidate-123", second_state["triggers"])
+        self.assertEqual(second_state["host_turn_handoff"]["state"], "requested")
 
-    def test_stop_gate_docs_do_not_describe_second_stop_escape(self) -> None:
+    def test_stop_gate_docs_distinguish_host_turn_handoff_from_debt_escape(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         for relative in ("README.md", "references/long-task-governance.md"):
             text = (repo_root / relative).read_text(encoding="utf-8")
-            self.assertNotIn("第二次 Stop", text, relative)
-            self.assertNotIn("首次 Stop 只允许一次受控续作", text, relative)
-            self.assertIn("重复 Stop", text, relative)
+            self.assertIn("宿主回合", text, relative)
+            self.assertIn("Continuation Debt", text, relative)
+            self.assertIn("不得清空", text, relative)
 
     def test_explicit_non_user_next_action_survives_tool_use_and_blocks_stop(self) -> None:
         snapshot = {

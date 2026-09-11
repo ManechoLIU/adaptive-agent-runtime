@@ -302,7 +302,7 @@ python3 scripts/control_event_guard.py \
 - `PreToolUse`：成功控制收据后，同一回合的下一次工具调用在执行前被拒绝；
 - `PostToolUse`：主线、工作区、台账、`READY` 或任一 worktree 未合入候选改变后立即给总控追加控制上下文；
 - `SubagentStop`：把子 Agent 完成登记为待审候选事件；
-- `Stop`：仍有待处理事件且没有通过的控制收据时，每一次原生 `Stop` 都返回 block；重复 Stop 不能成为逃生口，只有既有闭合收据、真正用户依赖或可验证阻塞才能释放 pending。
+- `Stop`：仍有待处理事件且没有通过的控制收据时，首次原生 `Stop` 返回 block；同一宿主回合在没有机器进展后再次 Stop 时，只结束这个物理回合，并先持久化 handoff、唤起同一 logical Controller 的 continuation supervisor。这个受控 handoff 不得清空、关闭或降级任何 Continuation Debt，只有既有闭合收据、真正用户依赖或可验证阻塞才能释放 pending。
 
 先把唯一总控登记到本机状态；临时 Writer / Reviewer 不登记：
 

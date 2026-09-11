@@ -324,14 +324,91 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertTrue(state["must_yield"])
 
-    def test_normal_pending_stop_does_not_gain_a_retry_count_escape(self):
+    def test_normal_pending_stop_terminalizes_host_turn_without_closing_control_debt(self):
         prior = {**self.prior, "tool_trace_overflow": False, "inflight_tool_use_ids": []}
-        for _ in range(3):
-            output, prior = lifecycle_hook.evaluate_event(
-                self.event("Stop", turn="old"), snapshot=self.snapshot, prior_state=prior,
-            )
-            self.assertEqual(output.get("decision"), "block")
-            self.assertTrue(prior["pending_control_event"])
+        first_output, first_state = lifecycle_hook.evaluate_event(
+            self.event("Stop", turn="old"), snapshot=self.snapshot, prior_state=prior,
+        )
+        self.assertEqual(first_output.get("decision"), "block")
+
+        second_output, second_state = lifecycle_hook.evaluate_event(
+            self.event("Stop", turn="old"), snapshot=self.snapshot, prior_state=first_state,
+        )
+
+        self.assertIs(second_output.get("continue"), False)
+        self.assertNotEqual(second_output.get("decision"), "block")
+        self.assertTrue(second_state["pending_control_event"])
+        self.assertEqual(second_state["triggers"], first_state["triggers"])
+        self.assertEqual(second_state["pending_terminal_receipts"], ["/tmp/result.json"])
+        self.assertEqual(second_state["host_turn_handoff"]["state"], "requested")
+        self.assertEqual(second_state["host_turn_handoff"]["turn_id"], "old")
+        self.assertEqual(second_state["host_turn_handoff"]["wake_generation"], 1)
+
+    def test_host_turn_handoff_arms_existing_same_controller_supervisor(self):
+        state_path = self.root / "handoff-state.json"
+        state = {
+            "pending_control_event": True,
+            "requires_user": False,
+            "controller_host": "desktop_codex",
+            "wake_generation": 4,
+            "host_turn_handoff": {
+                "schema_version": 1,
+                "state": "requested",
+                "turn_id": "old",
+                "wake_generation": 4,
+                "debt_fingerprint": "debt-1",
+            },
+        }
+        lifecycle_hook.write_json(state_path, state)
+        calls = []
+
+        result = lifecycle_hook.arm_host_turn_handoff(
+            path=state_path,
+            lifecycle_state=state,
+            controller_id="logical",
+            repo=self.root,
+            registry=self.root / "registry.json",
+            supervisor_ensurer=lambda **kwargs: calls.append(kwargs) or True,
+        )
+
+        self.assertEqual(result["state"], "delegated")
+        self.assertEqual(result["delivery_state"], "supervisor_started")
+        self.assertEqual(calls[0]["session_id"], "logical")
+        saved = lifecycle_hook.load_json(state_path)
+        self.assertTrue(saved["pending_control_event"])
+        self.assertEqual(saved["host_turn_handoff"]["debt_fingerprint"], "debt-1")
+        self.assertEqual(saved["host_turn_handoff"]["state"], "delegated")
+
+    def test_fresh_turn_reenters_handoff_and_resets_only_turn_local_stop_count(self):
+        prior = {
+            **self.prior,
+            "tool_trace_overflow": False,
+            "inflight_tool_use_ids": [],
+            "stop_continuations": 2,
+            "stop_continuation_turn_id": "old",
+            "host_turn_handoff": {
+                "schema_version": 1,
+                "state": "delegated",
+                "turn_id": "old",
+                "wake_generation": 4,
+                "debt_fingerprint": "debt-1",
+            },
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            self.event("UserPromptSubmit", turn="new"),
+            snapshot=self.snapshot,
+            prior_state=prior,
+        )
+
+        self.assertEqual(output, {})
+        self.assertEqual(state["active_turn_id"], "new")
+        self.assertEqual(state["stop_continuations"], 0)
+        self.assertNotIn("stop_continuation_turn_id", state)
+        self.assertNotIn("host_turn_handoff", state)
+        self.assertEqual(state["last_host_turn_handoff"]["state"], "reentered")
+        self.assertEqual(state["last_host_turn_handoff"]["reentry_turn_id"], "new")
+        self.assertTrue(state["pending_control_event"])
+        self.assertEqual(state["pending_terminal_receipts"], ["/tmp/result.json"])
 
     def inflight_record(self, *, command="git status --short", turn="new"):
         tool_input = {"command": command}

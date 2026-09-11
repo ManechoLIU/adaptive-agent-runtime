@@ -67,6 +67,7 @@ CONTROLLER_SESSIONS_KEY = "__controller_sessions__"
 CONTROLLER_TARGETS_KEY = "__controller_targets__"
 DESKTOP_SESSION_HOST = "desktop_codex"
 MAX_TOOL_TRACE_ENTRIES = 128
+MAX_IN_TURN_STOP_CONTINUATIONS = 2
 RUNTIME_WEB_TURN_LEASE_CONTRACT = "runtime_web_turn_lease_v1"
 LEGACY_WEB_TURN_IDS = {"web-ai-bridge"}
 DESKTOP_CANARY_PATH = Path(
@@ -536,6 +537,16 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
         proof = _desktop_turn_start(event)
         if proof is None and web_turn is None:
             return None
+    prior_handoff = state.get("host_turn_handoff")
+    if isinstance(prior_handoff, dict):
+        state["last_host_turn_handoff"] = {
+            **prior_handoff,
+            "state": "reentered",
+            "reentry_turn_id": turn_id,
+        }
+    state.pop("host_turn_handoff", None)
+    state["stop_continuations"] = 0
+    state.pop("stop_continuation_turn_id", None)
     state["active_turn_id"] = turn_id
     state["must_yield"] = False
     state["tool_trace"] = []
@@ -583,6 +594,48 @@ def _adapter_fault_output(state: dict[str, Any], event: dict[str, Any], code: st
     if event.get("hook_event_name") == "PreToolUse":
         return _pre_tool_denial(reason)
     return {"continue": False, "stopReason": reason, "systemMessage": reason}
+
+
+def _pending_stop_output(
+    state: dict[str, Any], event: dict[str, Any], *, reason: str
+) -> dict[str, Any]:
+    """Bound one Host turn without treating durable Controller debt as complete."""
+    turn_id = _event_turn_id(event) or str(state.get("active_turn_id", "")).strip()
+    prior_turn_id = str(state.get("stop_continuation_turn_id", "")).strip()
+    prior_count = int(state.get("stop_continuations", 0) or 0)
+    continuations = prior_count + 1 if turn_id and prior_turn_id == turn_id else 1
+    state["stop_continuations"] = continuations
+    if turn_id:
+        state["stop_continuation_turn_id"] = turn_id
+    if not turn_id or continuations < MAX_IN_TURN_STOP_CONTINUATIONS:
+        return {"decision": "block", "reason": reason}
+
+    debt_fingerprint = _json_sha256({
+        "wake_generation": int(state.get("wake_generation", 0) or 0),
+        "triggers": sorted(str(item) for item in state.get("triggers", []) if str(item)),
+        "next_action": str(state.get("next_action") or ""),
+        "requires_user": state.get("requires_user"),
+        "pending_terminal_receipts": sorted(
+            str(item) for item in state.get("pending_terminal_receipts", []) if str(item)
+        ),
+    })
+    state["host_turn_handoff"] = {
+        "schema_version": 1,
+        "state": "requested",
+        "turn_id": turn_id,
+        "wake_generation": int(state.get("wake_generation", 0) or 0),
+        "debt_fingerprint": debt_fingerprint,
+    }
+    terminal_reason = (
+        reason
+        + " 当前宿主回合已达到受控续作边界；Runtime 保留全部 Continuation Debt，"
+        "结束本回合并交由同一 logical Controller 的 continuation supervisor 接续。"
+    )
+    return {
+        "continue": False,
+        "stopReason": terminal_reason,
+        "systemMessage": terminal_reason,
+    }
 
 
 def _is_control_guard_command(
@@ -2631,7 +2684,7 @@ def evaluate_event(
         _mark_yield_rejected(
             state, event, reason=reason, trigger="KNOWN_NEXT_ACTION_NOT_EXECUTED"
         )
-        return {"decision": "block", "reason": reason}, state
+        return _pending_stop_output(state, event, reason=reason), state
 
     if event_name == "Stop" and snapshot.get("control_loop_required") is True:
         active_turn = str(state.get("active_turn_id", "")).strip()
@@ -2650,7 +2703,7 @@ def evaluate_event(
             _mark_yield_rejected(
                 state, event, reason="control-loop gate rejected: " + reason
             )
-            return {"decision": "block", "reason": reason}, state
+            return _pending_stop_output(state, event, reason=reason), state
     if event_name == "PostToolUse" and _event_turn_id(event) and _event_turn_id(event) != str(state.get("active_turn_id", "")):
         # A delayed result cannot unlock a newer turn or contaminate its trace.
         state["adapter_fault"] = {
@@ -3066,8 +3119,6 @@ def evaluate_event(
         }, state
 
     if event_name == "Stop" and pending:
-        continuations = int(state.get("stop_continuations", 0)) + 1
-        state["stop_continuations"] = continuations
         reason = continuation_reason(
             triggers,
             list(snapshot.get("ready_ids", [])),
@@ -3077,7 +3128,7 @@ def evaluate_event(
             **_controller_action_context(event),
             next_action=pending_next_action if continuation_pending else None,
         )
-        return {"decision": "block", "reason": reason}, state
+        return _pending_stop_output(state, event, reason=reason), state
     return {}, state
 
 
@@ -3652,6 +3703,77 @@ def persist_event_state(
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def arm_host_turn_handoff(
+    *,
+    path: Path,
+    lifecycle_state: dict[str, Any],
+    controller_id: str,
+    repo: Path,
+    registry: Path,
+    supervisor_ensurer: Any = None,
+) -> dict[str, Any]:
+    """Delegate durable debt before the current Host turn is allowed to terminate."""
+    requested = lifecycle_state.get("host_turn_handoff")
+    if not isinstance(requested, dict) or requested.get("state") != "requested":
+        return {}
+    if supervisor_ensurer is None:
+        try:
+            from scripts import web_lifecycle_bridge as bridge
+        except ModuleNotFoundError:
+            import web_lifecycle_bridge as bridge
+        supervisor_ensurer = bridge.ensure_continuation_supervisor
+    try:
+        supervisor_started = bool(supervisor_ensurer(
+            lifecycle_state=lifecycle_state,
+            session_id=controller_id,
+            repo=repo,
+            registry=registry,
+            codex=None,
+            delay_seconds=1.0,
+        ))
+        delivery_state = (
+            "supervisor_started"
+            if supervisor_started
+            else "supervisor_already_managing_or_deferred"
+        )
+        handoff_state = "delegated"
+        failure_class = None
+    except (OSError, ValueError, PermissionError, RuntimeError, subprocess.SubprocessError) as exc:
+        delivery_state = "supervisor_arm_failed"
+        handoff_state = "degraded"
+        failure_class = type(exc).__name__
+
+    expected_turn_id = str(requested.get("turn_id") or "")
+    expected_fingerprint = str(requested.get("debt_fingerprint") or "")
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            current = load_json(path)
+            current_handoff = current.get("host_turn_handoff")
+            if not isinstance(current_handoff, dict) or (
+                str(current_handoff.get("turn_id") or "") != expected_turn_id
+                or str(current_handoff.get("debt_fingerprint") or "")
+                != expected_fingerprint
+            ):
+                return {}
+            recorded = {
+                **current_handoff,
+                "state": handoff_state,
+                "delivery_state": delivery_state,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if failure_class is not None:
+                recorded["failure_class"] = failure_class
+            else:
+                recorded.pop("failure_class", None)
+            current["host_turn_handoff"] = recorded
+            write_json(path, current)
+            return recorded
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 
 def process_verified_web_event(
     event: dict[str, Any],
@@ -3925,6 +4047,18 @@ def run_hook() -> int:
                 # Fail closed: without a durable receipt the release handshake
                 # remains pending, while ordinary lifecycle handling can continue.
                 pass
+    if (
+        output.get("continue") is False
+        and isinstance(next_state.get("host_turn_handoff"), dict)
+        and next_state["host_turn_handoff"].get("state") == "requested"
+    ):
+        arm_host_turn_handoff(
+            path=path,
+            lifecycle_state=next_state,
+            controller_id=controller_id,
+            repo=expected_root,
+            registry=REGISTRY_PATH,
+        )
     if post_outbound_request is not None and _tool_use_id(normalized_event):
         action, target_session_id = post_outbound_request
         try:
