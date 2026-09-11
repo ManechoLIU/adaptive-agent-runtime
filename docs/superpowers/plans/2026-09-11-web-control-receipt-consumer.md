@@ -89,12 +89,12 @@ git commit -m "feat(runtime): persist Host tool receipt CAS"
 - Modify: `tests/test_agent_target_resolution.py`
 
 **Interfaces:**
-- Consumes: Task 1 CAS functions; registered Host verifier bundle; LAB receipts `lab_host_tool_pre_receipt_v1` and `lab_host_tool_terminal_receipt_v1`.
+- Consumes: Task 1 CAS functions; registered Host verifier bundle; LAB receipts `lab_host_tool_pre_receipt_v1` and `lab_host_tool_terminal_receipt_v1`; Bridge-transported `runtime_host_tool_intent_v1` canonical normalized-request bytes; terminal `runtime_host_backend_response_v1` exact CatDesk JSON-RPC bytes.
 - Produces: verifier protocol `runtime_host_verifier_cli_v2`; callable verifier methods `verify_tool_pre` and `verify_tool_terminal`; executable stdin/stdout protocol `runtime_host_tool_hook_v1`; verified Web PreToolUse and PostToolUse events sharing `host_tool_execution_id`.
 
 - [ ] **Step 1: Write failing verifier and hook tests**
 
-Test the real CLI boundary with a controlled executable verifier. Pre requires v2, exact receipt provenance/signature/expiry/tuple, current Host entry, exact control-guard argv/cwd/repo/ledger/snapshot identity, and current Runtime Web turn. Terminal requires the matching PREPARED record, structured exit code and response digest, exact evidence file ID/hash, and current target/ownership/turn.
+Test the real CLI boundary with a controlled executable verifier. Pre requires v2, exact receipt provenance/signature/expiry/tuple, current Host entry, exact control-guard argv/cwd/repo/ledger/snapshot identity, and current Runtime Web turn. It decodes only the exact bounded UTF-8 canonical intent whose SHA-256 equals the authenticated receipt `normalized_request_sha256`; it never executes that command. Terminal requires the matching PREPARED record, the same intent digest, exact backend bytes whose SHA-256 equals the Host terminal receipt, a CatDesk structured result with `success=true`, integer `exitCode=0`, `timedOut=false`, and matching command/cwd, plus exact evidence file ID/hash and current target/ownership/turn.
 
 ```python
 self.assertEqual(result["protocol"], "runtime_host_tool_hook_v1")
@@ -102,7 +102,7 @@ self.assertEqual(result["decision"], "ALLOW")
 self.assertEqual(result["host_tool_execution_id"], "hte_1")
 ```
 
-Add negatives for caller conversation/tool ID injection, v1 verifier, missing capability, wrong target/ownership/turn, stale receipt, command/cwd/snapshot changes, terminal without pre, changed outcome replay, and lifecycle failure leaving TERMINAL_PENDING.
+Add negatives for caller conversation/tool ID injection, v1 verifier, missing capability, wrong target/ownership/turn, stale receipt, intent/receipt hash mismatch, non-canonical or duplicate-key intent, command/cwd/snapshot changes, backend body/hash mismatch, JSON-RPC error, `isError`, nonzero/missing exit code, timeout, terminal without pre, changed outcome replay, and lifecycle failure leaving TERMINAL_PENDING. HTTP 200, stdout markers, AI-Bridge audit, or writable evidence alone never closes the record.
 
 - [ ] **Step 2: Run focused tests and capture RED**
 
@@ -121,14 +121,15 @@ Reuse the registered verifier's executable, bundle hash, safe environment, timeo
 ```python
 {
     "protocol": "runtime_host_tool_hook_v1",
-    "operation": "pre" | "terminal",
-    "decision": "ALLOW" | "CLOSED" | "BLOCK",
+    "op": "pre" | "terminal",
+    "decision": "ALLOW" | "BLOCK",
+    "state": "CLOSED" | "REJECTED",
     "host_tool_execution_id": "hte_<opaque>",
     "receipt_record_sha256": "<64 hex>",
 }
 ```
 
-Pre dispatches verified `PreToolUse`; terminal first persists TERMINAL_PENDING, dispatches verified `PostToolUse` with the same tool ID, validates exact guard evidence, then closes the CAS record.
+Pre dispatches verified `PreToolUse`; terminal first persists TERMINAL_PENDING, dispatches verified `PostToolUse` with the same tool ID and authenticated structured result, validates exact guard evidence, then closes the CAS record. Inputs use Bridge's actual `op`; pre returns `decision: ALLOW`, terminal returns `state: CLOSED`. Runtime re-derives Controller, repository, ledger, target, ownership, turn lease, lifecycle path, snapshot bytes hash, and evidence path under the canonical lock and never accepts those identities from the Bridge envelope.
 
 - [ ] **Step 4: Run focused tests GREEN**
 
