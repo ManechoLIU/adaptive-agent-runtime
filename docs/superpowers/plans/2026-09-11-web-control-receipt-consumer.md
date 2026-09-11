@@ -85,9 +85,12 @@ git commit -m "feat(runtime): persist Host tool receipt CAS"
 **Files:**
 - Create: `scripts/runtime_host_tool_hook.py`
 - Modify: `scripts/web_lifecycle_bridge.py`
+- Modify: `scripts/lifecycle_hook.py`
+- Modify: `scripts/controller_target_guard.py`
 - Create: `tests/test_runtime_host_tool_hook.py`
 - Modify: `tests/test_web_lifecycle_bridge.py`
 - Modify: `tests/test_agent_target_resolution.py`
+- Modify: `tests/test_governance.py`
 
 **Interfaces:**
 - Consumes: Task 1 CAS functions; registered Host verifier bundle; LAB receipts `lab_host_tool_pre_receipt_v1` and `lab_host_tool_terminal_receipt_v1`; Bridge-transported `runtime_host_tool_intent_v1` canonical normalized-request bytes; terminal `runtime_host_backend_response_v1` exact CatDesk JSON-RPC bytes.
@@ -95,7 +98,7 @@ git commit -m "feat(runtime): persist Host tool receipt CAS"
 
 - [ ] **Step 1: Write failing verifier and hook tests**
 
-Test the real verifier CLI boundary with a controlled executable and the real hook server over a private Unix socket. The server accepts one bounded NDJSON request per connection, requires a bounded transport `request_id`, and replies `{request_id, ok, result|error}` for Bridge correlation. Pre requires v2, exact receipt provenance/signature/expiry/tuple, current Host entry, exact control-guard argv/cwd/repo/ledger/snapshot identity, and current Runtime Web turn. It decodes only the exact bounded UTF-8 canonical intent whose SHA-256 equals the authenticated receipt `normalized_request_sha256`; it never executes that command. Terminal requires the matching PREPARED record, the same intent digest, exact backend bytes whose SHA-256 equals the Host terminal receipt, a CatDesk structured result with `success=true`, integer `exitCode=0`, `timedOut=false`, and matching command/cwd, plus exact evidence file ID/hash and current target/ownership/turn.
+Test the real verifier CLI boundary with a controlled executable and the real hook server over a private Unix socket. The server accepts one bounded NDJSON request per connection, requires a bounded transport `request_id`, and replies `{request_id, ok, result|error}` for Bridge correlation. Pre requires v2, exact receipt provenance/signature/expiry/tuple, current Host entry, exact control-guard argv/cwd/repo/ledger/snapshot identity, and current Runtime Web turn. It decodes only the exact bounded UTF-8 canonical intent whose SHA-256 equals the authenticated receipt `normalized_request_sha256`; it never executes that command. Terminal requires the matching PREPARED record, the same intent digest, exact backend bytes whose SHA-256 equals the Host terminal receipt, a CatDesk structured result with `success=true`, integer `exitCode=0`, `timedOut=false`, and matching command/cwd, plus exact evidence file ID/hash and current target/ownership/turn. Add crash-boundary tests: lifecycle write failure leaves `TERMINAL_PENDING`; registry close failure leaves an exact recoverable lifecycle commit but Web Stop remains blocked; an identical retry closes without a duplicate trace; changed terminal/tuple/turn replay remains rejected.
 
 ```python
 self.assertEqual(result["protocol"], "runtime_host_tool_hook_v1")
@@ -130,7 +133,7 @@ Reuse the registered verifier's executable, bundle hash, safe environment, timeo
 }
 ```
 
-Pre dispatches verified `PreToolUse`; terminal first persists TERMINAL_PENDING, dispatches verified `PostToolUse` with the same tool ID and authenticated structured result, validates exact guard evidence, then closes the CAS record. Inputs use Bridge's actual `op`; pre returns `decision: ALLOW`, terminal returns `state: CLOSED`. Runtime re-derives Controller, repository, ledger, target, ownership, turn lease, lifecycle path, snapshot bytes hash, and evidence path under the canonical lock and never accepts those identities from the Bridge envelope.
+Pre dispatches verified `PreToolUse`. Terminal first persists `TERMINAL_PENDING`, then enters a dedicated internal Host-terminal boundary rather than the generic Web `PostToolUse` entry. That boundary takes the canonical registry then lifecycle locks, revalidates the full tuple/pre-chain/terminal/evidence, applies the authenticated Post transition, persists an exact `host_tool_terminal_commit_v1` in lifecycle state, and only then writes the registry record as `CLOSED`. If the lifecycle write fails, CAS stays pending. If the registry close fails, exact retry detects the lifecycle commit, skips the reducer/trace, and completes the close. Generic Web events must reject caller-supplied internal-trust or commit fields. Web Stop/yield must confirm that the matching CAS record is actually `CLOSED`, so the recoverable intermediate state remains fail closed. Inputs use Bridge's actual `op`; pre returns `decision: ALLOW`, terminal returns `state: CLOSED`. Runtime re-derives Controller, repository, ledger, target, ownership, turn lease, lifecycle path, snapshot bytes hash, and evidence path under the canonical lock and never accepts those identities from the Bridge envelope.
 
 - [ ] **Step 4: Run focused tests GREEN**
 
