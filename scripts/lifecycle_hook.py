@@ -2863,19 +2863,29 @@ def evaluate_event(
         return {}, state
     if event_name == "PostToolUse":
         tool_use_id = _tool_use_id(event)
-        state["inflight_tool_use_ids"] = [
-            str(item)
-            for item in state.get("inflight_tool_use_ids", [])
-            if str(item) and str(item) != tool_use_id
-        ]
-        if str(state.get("control_receipt_inflight", "")) == tool_use_id:
-            state.pop("control_receipt_inflight", None)
-        if tool_use_id:
-            records = state.get("inflight_tool_records")
-            if isinstance(records, dict):
-                records = dict(records)
-                records.pop(tool_use_id, None)
-                state["inflight_tool_records"] = records
+        guard_result_missing = (
+            bool(tool_use_id)
+            and str(state.get("control_receipt_inflight", "")) == tool_use_id
+            and not isinstance(event.get("tool_response"), dict)
+        )
+        # Desktop can emit a same-ID PostToolUse callback before attaching a tool
+        # result. Keep an armed control receipt fenced until the native transcript
+        # can recover the completed command on Stop; otherwise that empty callback
+        # would discard the only binding between the command and its proposal.
+        if not guard_result_missing:
+            state["inflight_tool_use_ids"] = [
+                str(item)
+                for item in state.get("inflight_tool_use_ids", [])
+                if str(item) and str(item) != tool_use_id
+            ]
+            if str(state.get("control_receipt_inflight", "")) == tool_use_id:
+                state.pop("control_receipt_inflight", None)
+            if tool_use_id:
+                records = state.get("inflight_tool_records")
+                if isinstance(records, dict):
+                    records = dict(records)
+                    records.pop(tool_use_id, None)
+                    state["inflight_tool_records"] = records
         pending_display_sync = state.get("goal_display_sync")
         if (
             isinstance(pending_display_sync, dict)

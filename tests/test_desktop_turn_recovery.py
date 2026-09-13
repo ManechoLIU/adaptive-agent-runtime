@@ -733,6 +733,45 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         self.assertEqual(state["receipt_turn_id"], "new")
         self.assertFalse(state["pending_control_event"])
 
+    def test_missing_desktop_guard_post_is_recovered_from_native_transcript_on_stop(self):
+        repo, guard_snapshot, command, snapshot, pre_event = self.make_guard_case()
+        _pre_output, pre_state = lifecycle_hook.evaluate_event(
+            pre_event,
+            snapshot=snapshot,
+            prior_state={
+                "active_turn_id": "new",
+                "pending_control_event": True,
+                "triggers": ["ledger_changed"],
+            },
+        )
+        incomplete_post = self.event("PostToolUse")
+        incomplete_post["cwd"] = str(repo)
+        incomplete_post["tool_use_id"] = "guard-call"
+        incomplete_post["tool_input"] = {"command": command}
+        _post_output, post_state = lifecycle_hook.evaluate_event(
+            incomplete_post, snapshot=snapshot, prior_state=pre_state,
+        )
+        self.assertEqual(post_state["inflight_tool_use_ids"], ["guard-call"])
+        self.assertEqual(post_state["control_receipt_inflight"], "guard-call")
+        self.assertEqual(
+            post_state["control_receipt_proposal"]["event_id"],
+            guard_snapshot["event_contract"]["event_id"],
+        )
+
+        self.append_command_completion(
+            tool_use_id="guard-call", command=command, output="control-event: allowed",
+        )
+        self.write_closed_evidence(repo, guard_snapshot, snapshot)
+        stop = self.event("Stop")
+        stop["cwd"] = str(repo)
+        output, state = lifecycle_hook.evaluate_event(
+            stop, snapshot=snapshot, prior_state=post_state,
+        )
+        self.assertEqual(output, {})
+        self.assertTrue(state["must_yield"])
+        self.assertEqual(state["receipt_turn_id"], "new")
+        self.assertEqual(state["inflight_tool_use_ids"], [])
+
     def test_rollout_guard_recovery_uses_durable_evidence_after_input_is_consumed(self):
         repo, guard_snapshot, command, snapshot, pre_event = self.make_guard_case()
         _pre_output, pre_state = lifecycle_hook.evaluate_event(
