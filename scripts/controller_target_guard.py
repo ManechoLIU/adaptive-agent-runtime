@@ -6,11 +6,14 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import os
+import secrets
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 try:
     import agent_target_resolution as agent_target
@@ -24,10 +27,15 @@ CONTROLLER_TARGETS_KEY = "__controller_targets__"
 CONTROLLER_EXECUTION_OWNERSHIP_KEY = "__controller_execution_ownership__"
 CONTROLLER_OUTBOUND_LEASES_KEY = "__controller_outbound_leases__"
 CONTROLLER_OUTBOUND_LEASE_RECONCILIATIONS_KEY = "__controller_outbound_lease_reconciliations__"
+CONTROLLER_HOST_TOOL_RECEIPTS_KEY = "__controller_host_tool_receipts__"
 MAX_OUTBOUND_LEASE_RECONCILIATIONS = 64
 MAX_CONTROLLER_IDENTIFIER_LENGTH = 256
 MAX_RECONCILIATION_TEXT_LENGTH = 1024
 MAX_ACTIVE_OUTBOUND_LEASES_PER_HOST = 64
+MAX_HOST_TOOL_RECEIPTS_PER_HOST = 64
+MAX_HOST_TOOL_RECEIPT_BYTES = 16384
+HOST_TOOL_RECEIPT_STATES = {"PREPARED", "TERMINAL_PENDING", "CLOSED", "RESULT_UNKNOWN"}
+HOST_TOOL_GIT_TIMEOUT_SECONDS = 2.0
 DESKTOP_SESSION_HOST = "desktop_codex"
 SUPPORTED_HOSTS = (DESKTOP_SESSION_HOST, "web")
 SUPPORTED_ACTIONS = ("native_resume", "message", "navigate")
@@ -45,13 +53,31 @@ def registry_lock_path(registry_path: Path) -> Path:
 
 
 @contextmanager
-def locked_registry(registry_path: Path, *, exclusive: bool = False) -> Iterator[dict[str, Any]]:
+def locked_registry(
+    registry_path: Path, *, exclusive: bool = False,
+    deadline_monotonic: float | None = None,
+) -> Iterator[dict[str, Any]]:
     registry_path = registry_path.expanduser()
     lock_path = registry_lock_path(registry_path)
+    _require_before_deadline(
+        deadline_monotonic, operation="controller registry lock directory creation"
+    )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    _require_before_deadline(
+        deadline_monotonic, operation="controller registry lock file open"
+    )
     with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        if deadline_monotonic is None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        else:
+            _acquire_receipt_lock(
+                lock.fileno(), deadline_monotonic=deadline_monotonic,
+                label="registry lock", shared=not exclusive,
+            )
         try:
+            _require_before_deadline(
+                deadline_monotonic, operation="controller registry load"
+            )
             yield load_json(registry_path)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -132,14 +158,31 @@ def load_json(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _git_common_dir(repo: Path) -> Path:
+def _git_common_dir(
+    repo: Path, *, deadline_monotonic: float | None = None
+) -> Path:
     repo = repo.expanduser().resolve()
-    completed = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    timeout: float | None = None
+    if deadline_monotonic is not None:
+        _require_before_deadline(
+            deadline_monotonic, operation="Host tool repository identity Git"
+        )
+        timeout = min(
+            HOST_TOOL_GIT_TIMEOUT_SECONDS,
+            max(0.001, deadline_monotonic - time.monotonic()),
+        )
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            "Host tool repository identity Git exceeded its deadline/timeout"
+        ) from exc
     if completed.returncode != 0 or not completed.stdout.strip():
         raise ValueError(f"cannot resolve Git common-dir for {repo}")
     common_dir = Path(completed.stdout.strip()).expanduser()
@@ -149,10 +192,13 @@ def _git_common_dir(repo: Path) -> Path:
 
 
 def _matching_controller_ids_for_repo(
-    repo: Path, registry: dict[str, Any]
+    repo: Path, registry: dict[str, Any], *,
+    deadline_monotonic: float | None = None,
 ) -> list[str]:
     repo = repo.expanduser().resolve()
-    requested_common_dir = _git_common_dir(repo)
+    requested_common_dir = _git_common_dir(
+        repo, deadline_monotonic=deadline_monotonic
+    )
     matches: list[str] = []
     for controller_id, registered_repo in registry.items():
         if (
@@ -162,7 +208,9 @@ def _matching_controller_ids_for_repo(
         ):
             continue
         try:
-            if _git_common_dir(Path(registered_repo)) == requested_common_dir:
+            if _git_common_dir(
+                Path(registered_repo), deadline_monotonic=deadline_monotonic
+            ) == requested_common_dir:
                 matches.append(
                     _bounded_string(
                         controller_id,
@@ -1052,12 +1100,654 @@ def _outbound_leases_for_host(
     return dict(host_leases)
 
 
-def _write_registry(registry_path: Path, registry: dict[str, Any]) -> None:
-    temporary = registry_path.with_suffix(registry_path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+def _require_before_deadline(
+    deadline_monotonic: float | None, *, operation: str
+) -> None:
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        raise TimeoutError(f"Host tool receipt deadline expired before {operation}")
+
+
+def _write_registry(
+    registry_path: Path, registry: dict[str, Any], *,
+    deadline_monotonic: float | None = None,
+) -> None:
+    """Atomically replace one JSON state file with crash-durable bytes and name.
+
+    The temporary file is private and unique to this attempt.  Once replacement
+    begins, the parent directory fsync must finish even if the caller's deadline
+    expires: stopping between rename and directory fsync would weaken the
+    durability fence which the returned receipt relies on.
+    """
+    registry_path = registry_path.expanduser()
+    payload = (json.dumps(registry, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    _require_before_deadline(deadline_monotonic, operation="state file creation")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    temporary: Path | None = None
+    descriptor: int | None = None
+    replaced = False
+    try:
+        for _attempt in range(128):
+            candidate = registry_path.parent / (
+                f".{registry_path.name}.{secrets.token_hex(16)}.tmp"
+            )
+            try:
+                descriptor = os.open(candidate, flags, 0o600)
+            except FileExistsError:
+                continue
+            temporary = candidate
+            break
+        if descriptor is None or temporary is None:
+            raise FileExistsError("cannot allocate unique registry temporary file")
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            _require_before_deadline(deadline_monotonic, operation="state file write")
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
+                raise OSError("short write while persisting controller state")
+            written += count
+        _require_before_deadline(deadline_monotonic, operation="state file fsync")
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        _require_before_deadline(deadline_monotonic, operation="state file replace")
+        os.replace(temporary, registry_path)
+        replaced = True
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_descriptor = os.open(registry_path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None and not replaced:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _json_sha256(value: object, *, label: str) -> str:
+    try:
+        encoded = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be JSON serializable") from exc
+    if len(encoded) > MAX_HOST_TOOL_RECEIPT_BYTES:
+        raise ValueError(f"{label} is too large")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sha256_field(value: object, *, label: str) -> str:
+    normalized = _bounded_string(value, label=label, maximum=64).lower()
+    if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+        raise ValueError(f"{label} must be a SHA-256 hex digest")
+    return normalized
+
+
+def _receipt_string(value: object, *, label: str) -> str:
+    return _bounded_string(value, label=label, maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH)
+
+
+def _receipt_integer(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise PermissionError(f"{label} is invalid")
+    return value
+
+
+def _receipt_value_sha256(value: object, *, label: str) -> str:
+    return hashlib.sha256(_receipt_string(value, label=label).encode("utf-8")).hexdigest()
+
+
+def _host_tool_receipts_for_host(
+    registry: dict[str, Any], *, controller_id: str, host: str
+) -> dict[str, Any]:
+    receipts = registry.get(CONTROLLER_HOST_TOOL_RECEIPTS_KEY)
+    if receipts is None:
+        return {}
+    if not isinstance(receipts, dict):
+        raise ValueError("controller Host tool receipt registry is invalid")
+    controller_receipts = receipts.get(controller_id)
+    if controller_receipts is None:
+        return {}
+    if not isinstance(controller_receipts, dict):
+        raise ValueError("Controller Host tool receipt map is invalid")
+    host_receipts = controller_receipts.get(host)
+    if host_receipts is None:
+        return {}
+    if not isinstance(host_receipts, dict):
+        raise ValueError("Controller Host tool receipt host map is invalid")
+    return dict(host_receipts)
+
+
+@contextmanager
+def _locked_host_tool_receipt_mutation(
+    *, registry_path: Path, lifecycle_path: Path,
+    deadline_monotonic: float | None = None,
+) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
+    """Acquire canonical registry then lifecycle locks for one Web receipt mutation."""
+    registry_path = registry_path.expanduser()
+    lifecycle_path = lifecycle_path.expanduser()
+    registry_lock = registry_lock_path(registry_path)
+    lifecycle_lock = lifecycle_path.with_suffix(lifecycle_path.suffix + ".lock")
+    _require_before_deadline(
+        deadline_monotonic, operation="Host tool receipt lock directory creation"
     )
-    temporary.replace(registry_path)
+    registry_lock.parent.mkdir(parents=True, exist_ok=True)
+    lifecycle_lock.parent.mkdir(parents=True, exist_ok=True)
+    _require_before_deadline(
+        deadline_monotonic, operation="registry lock file open"
+    )
+    with registry_lock.open("a+") as registry_file:
+        _acquire_receipt_lock(
+            registry_file.fileno(), deadline_monotonic=deadline_monotonic,
+            label="registry lock",
+        )
+        try:
+            _require_before_deadline(
+                deadline_monotonic, operation="lifecycle lock file open"
+            )
+            with lifecycle_lock.open("a+") as lifecycle_file:
+                _acquire_receipt_lock(
+                    lifecycle_file.fileno(), deadline_monotonic=deadline_monotonic,
+                    label="lifecycle lock",
+                )
+                try:
+                    _require_before_deadline(
+                        deadline_monotonic, operation="Host tool receipt state load"
+                    )
+                    yield load_json(registry_path), load_json(lifecycle_path)
+                finally:
+                    fcntl.flock(lifecycle_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            fcntl.flock(registry_file.fileno(), fcntl.LOCK_UN)
+
+
+def _acquire_receipt_lock(
+    descriptor: int, *, deadline_monotonic: float | None, label: str,
+    shared: bool = False,
+) -> None:
+    mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+    if deadline_monotonic is None:
+        fcntl.flock(descriptor, mode)
+        return
+    while True:
+        _require_before_deadline(deadline_monotonic, operation=label)
+        try:
+            fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Host tool receipt deadline expired before {label}")
+            time.sleep(min(0.01, remaining))
+
+
+def _require_active_runtime_web_turn_lease(
+    lifecycle_state: object, *, verified_turn: dict[str, Any]
+) -> None:
+    if not isinstance(lifecycle_state, dict):
+        raise PermissionError("Runtime Web lifecycle state is invalid")
+    lease = lifecycle_state.get("web_turn_lease")
+    if not isinstance(lease, dict):
+        raise PermissionError("Runtime Web turn lease is unavailable")
+    if lease.get("contract") != "runtime_web_turn_lease_v1" or lease.get("status") != "active":
+        raise PermissionError("Runtime Web turn lease is not active")
+    for name in (
+        "turn_id", "runtime_invocation_id", "execution_target_session_id",
+        "target_generation", "ownership_generation",
+    ):
+        if lease.get(name) != verified_turn[name]:
+            raise PermissionError(f"Runtime Web turn lease {name} does not match verified execution turn")
+    if lifecycle_state.get("active_turn_id") != verified_turn["turn_id"]:
+        raise PermissionError("Runtime Web turn lease is not the active lifecycle turn")
+
+
+def _current_host_tool_tuple(
+    *,
+    registry: dict[str, Any],
+    repo: Path,
+    controller_id: object,
+    verified_turn: object,
+    snapshot_path: Path,
+    lifecycle_state: dict[str, Any],
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    canonical_controller_id = _bounded_string(
+        controller_id, label="controller id", maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH
+    )
+    if _matching_controller_ids_for_repo(
+        repo, registry, deadline_monotonic=deadline_monotonic
+    ) != [canonical_controller_id]:
+        raise PermissionError("Host tool receipt requires the existing unique project Controller")
+    target = target_record(registry, controller_id=canonical_controller_id, host="web")
+    if target is None:
+        raise PermissionError("Host tool receipt requires an explicit current web target")
+    target_status, target_session_id, target_generation = validate_target_record(target, host="web")
+    if target_status != "active" or target_session_id is None:
+        raise PermissionError("Host tool receipt requires an active web target")
+    ownership = execution_ownership_record(registry, controller_id=canonical_controller_id)
+    if ownership is None:
+        raise PermissionError("Host tool receipt requires execution ownership")
+    ownership_host, ownership_target, ownership_generation = validate_execution_ownership_record(ownership)
+    if ownership_host != "web" or ownership_target != target_session_id:
+        raise PermissionError("Host tool receipt ownership does not match the current web target")
+    try:
+        turn = agent_target.normalize_verified_execution_turn(
+            verified_turn,
+            expected_logical_agent=agent_target.logical_agent_identity(
+                agent_type="controller", agent_id=canonical_controller_id
+            ),
+            expected_host="web",
+            expected_execution_target_session_id=target_session_id,
+            expected_target_generation=target_generation,
+            expected_ownership_generation=ownership_generation,
+        )
+    except (PermissionError, ValueError) as exc:
+        raise PermissionError(f"verified Web execution turn is invalid: {exc}") from exc
+    _require_active_runtime_web_turn_lease(lifecycle_state, verified_turn=turn)
+    try:
+        snapshot_sha256 = hashlib.sha256(snapshot_path.expanduser().read_bytes()).hexdigest()
+    except OSError as exc:
+        raise PermissionError("Host tool receipt snapshot is unavailable") from exc
+    return {
+        "controller_id": canonical_controller_id,
+        "host": "web",
+        "execution_target_session_id": target_session_id,
+        "turn_id": turn["turn_id"],
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+        "snapshot_sha256": snapshot_sha256,
+    }
+
+
+def _host_receipt_tuple(
+    receipt: object, *, tuple_base: dict[str, Any], phase: str
+) -> tuple[dict[str, Any], dict[str, str]]:
+    if not isinstance(receipt, dict):
+        raise ValueError(f"Host {phase} receipt must be an object")
+    expected_provenance = f"lab_host_tool_{phase}_receipt_v1"
+    if receipt.get("schema_version") != 1 or receipt.get("provenance") != expected_provenance:
+        raise PermissionError(f"Host {phase} receipt provenance is invalid")
+    conversation_id = _receipt_string(
+        receipt.get("conversation_id"), label=f"Host {phase} receipt conversation id"
+    )
+    if conversation_id != tuple_base["execution_target_session_id"]:
+        raise PermissionError(f"Host {phase} receipt conversation does not match current web target")
+    bridge_call_id = _receipt_string(receipt.get("bridge_call_id"), label="Host bridge call id")
+    execution_id = _receipt_string(
+        receipt.get("host_tool_execution_id"), label="Host tool execution id"
+    )
+    normalized_request_sha256 = _sha256_field(
+        receipt.get("normalized_request_sha256"), label="Host normalized request sha256"
+    )
+    tuple_value = {
+        **tuple_base,
+        "bridge_call_id": bridge_call_id,
+        "host_tool_execution_id": execution_id,
+        "normalized_request_sha256": normalized_request_sha256,
+    }
+    receipt_id = _receipt_string(receipt.get(f"{phase}_receipt_id"), label=f"Host {phase} receipt id")
+    digests = {
+        f"{phase}_receipt_sha256": _json_sha256(receipt, label=f"Host {phase} receipt"),
+        f"{phase}_receipt_id_sha256": _receipt_value_sha256(receipt_id, label=f"Host {phase} receipt id"),
+    }
+    if phase == "pre":
+        nonce = _receipt_string(receipt.get("pre_nonce"), label="Host pre nonce")
+        digests["pre_nonce_sha256"] = _receipt_value_sha256(nonce, label="Host pre nonce")
+    elif phase == "terminal":
+        pre_receipt_id = _receipt_string(
+            receipt.get("pre_receipt_id"), label="Host terminal pre receipt id"
+        )
+        digests["referenced_pre_receipt_id_sha256"] = _receipt_value_sha256(
+            pre_receipt_id, label="Host terminal pre receipt id"
+        )
+        digests["referenced_pre_receipt_sha256"] = _sha256_field(
+            receipt.get("pre_receipt_sha256"), label="Host terminal pre receipt sha256"
+        )
+    else:
+        raise ValueError(f"unsupported Host receipt phase: {phase}")
+    return tuple_value, digests
+
+
+def _receipt_record_response(record: dict[str, Any]) -> dict[str, Any]:
+    tuple_value = record.get("tuple")
+    if not isinstance(tuple_value, dict):
+        raise ValueError("Host tool receipt record tuple is invalid")
+    state = record.get("state")
+    if state not in HOST_TOOL_RECEIPT_STATES:
+        raise ValueError("Host tool receipt record state is invalid")
+    response = {
+        "state": state,
+        "tuple": dict(tuple_value),
+        "pre_receipt_sha256": record.get("pre_receipt_sha256"),
+        "receipt_record_sha256": _json_sha256(record, label="Host tool receipt record"),
+    }
+    for name in ("terminal_receipt_sha256", "guard_evidence_sha256"):
+        if name in record:
+            response[name] = record[name]
+    return response
+
+
+def _assert_new_pre_receipt(
+    records: dict[str, Any], *, tuple_value: dict[str, Any], digests: dict[str, str]
+) -> None:
+    execution_id = tuple_value["host_tool_execution_id"]
+    if execution_id in records:
+        raise PermissionError("Host tool execution id already has a receipt record")
+    for record in records.values():
+        if not isinstance(record, dict):
+            raise ValueError("Host tool receipt record is invalid")
+        stored_tuple = record.get("tuple")
+        if isinstance(stored_tuple, dict) and stored_tuple.get("bridge_call_id") == tuple_value["bridge_call_id"]:
+            raise PermissionError("Host bridge call id replay refused")
+        for name in ("pre_receipt_sha256", "pre_receipt_id_sha256", "pre_nonce_sha256"):
+            if record.get(name) == digests[name]:
+                raise PermissionError("Host pre receipt replay refused")
+
+
+def _stored_host_tool_record(
+    registry: dict[str, Any], *, controller_id: str, execution_id: str
+) -> dict[str, Any]:
+    record = _host_tool_receipts_for_host(
+        registry, controller_id=controller_id, host="web"
+    ).get(execution_id)
+    if not isinstance(record, dict):
+        raise PermissionError("Host tool execution is not prepared")
+    return record
+
+
+def _assert_exact_record_tuple(record: dict[str, Any], tuple_value: dict[str, Any]) -> None:
+    if record.get("tuple") != tuple_value:
+        raise PermissionError("Host tool receipt tuple does not match the prepared execution")
+
+
+def _persist_host_tool_record(
+    registry: dict[str, Any], *, controller_id: str, execution_id: str, record: dict[str, Any]
+) -> None:
+    receipts = registry.setdefault(CONTROLLER_HOST_TOOL_RECEIPTS_KEY, {})
+    if not isinstance(receipts, dict):
+        raise ValueError("controller Host tool receipt registry is invalid")
+    controller_receipts = receipts.setdefault(controller_id, {})
+    if not isinstance(controller_receipts, dict):
+        raise ValueError("Controller Host tool receipt map is invalid")
+    host_receipts = controller_receipts.setdefault("web", {})
+    if not isinstance(host_receipts, dict):
+        raise ValueError("Controller Host tool receipt host map is invalid")
+    host_receipts[execution_id] = record
+
+
+def prepare_host_tool_execution(
+    *, repo: Path, controller_id: str, verified_turn: dict[str, Any], host_pre_receipt: dict[str, Any],
+    snapshot_path: Path, lifecycle_path: Path, registry_path: Path = DEFAULT_REGISTRY,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    """Durably prepare one Host-bound Web tool execution before dispatch."""
+    repo = repo.expanduser().resolve()
+    registry_path = registry_path.expanduser()
+    with _locked_host_tool_receipt_mutation(
+        registry_path=registry_path, lifecycle_path=lifecycle_path,
+        deadline_monotonic=deadline_monotonic,
+    ) as (registry, lifecycle_state):
+        tuple_base = _current_host_tool_tuple(
+            registry=registry, repo=repo, controller_id=controller_id,
+            verified_turn=verified_turn, snapshot_path=snapshot_path,
+            lifecycle_state=lifecycle_state,
+            deadline_monotonic=deadline_monotonic,
+        )
+        tuple_value, digests = _host_receipt_tuple(
+            host_pre_receipt, tuple_base=tuple_base, phase="pre"
+        )
+        records = _host_tool_receipts_for_host(
+            registry, controller_id=tuple_value["controller_id"], host="web"
+        )
+        record = {
+            "state": "PREPARED", "tuple": tuple_value, **digests,
+            "capability_id_sha256": _receipt_value_sha256(
+                host_pre_receipt.get("capability_id"), label="Host capability id"
+            ),
+        }
+        _assert_new_pre_receipt(records, tuple_value=tuple_value, digests=digests)
+        if len(records) >= MAX_HOST_TOOL_RECEIPTS_PER_HOST:
+            raise PermissionError("Host tool receipt limit reached for web")
+        _persist_host_tool_record(
+            registry, controller_id=tuple_value["controller_id"],
+            execution_id=tuple_value["host_tool_execution_id"], record=record,
+        )
+        _write_registry(
+            registry_path, registry, deadline_monotonic=deadline_monotonic
+        )
+        return _receipt_record_response(record)
+
+
+def terminalize_host_tool_execution(
+    *, repo: Path, controller_id: str, verified_turn: dict[str, Any], host_terminal_receipt: dict[str, Any],
+    snapshot_path: Path, lifecycle_path: Path, registry_path: Path = DEFAULT_REGISTRY,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    """Persist a verified Host terminal receipt without closing lifecycle debt."""
+    repo = repo.expanduser().resolve()
+    registry_path = registry_path.expanduser()
+    with _locked_host_tool_receipt_mutation(
+        registry_path=registry_path, lifecycle_path=lifecycle_path,
+        deadline_monotonic=deadline_monotonic,
+    ) as (registry, lifecycle_state):
+        tuple_base = _current_host_tool_tuple(
+            registry=registry, repo=repo, controller_id=controller_id,
+            verified_turn=verified_turn, snapshot_path=snapshot_path,
+            lifecycle_state=lifecycle_state,
+            deadline_monotonic=deadline_monotonic,
+        )
+        tuple_value, digests = _host_receipt_tuple(
+            host_terminal_receipt, tuple_base=tuple_base, phase="terminal"
+        )
+        record = _stored_host_tool_record(
+            registry, controller_id=tuple_value["controller_id"],
+            execution_id=tuple_value["host_tool_execution_id"],
+        )
+        _assert_exact_record_tuple(record, tuple_value)
+        if (
+            record.get("pre_receipt_id_sha256") != digests["referenced_pre_receipt_id_sha256"]
+            or record.get("pre_receipt_sha256") != digests["referenced_pre_receipt_sha256"]
+            or record.get("capability_id_sha256") != _receipt_value_sha256(
+                host_terminal_receipt.get("capability_id"), label="Host capability id"
+            )
+        ):
+            raise PermissionError("Host terminal pre receipt does not match the prepared execution")
+        existing = record.get("terminal_receipt_sha256")
+        if existing is not None:
+            if existing != digests["terminal_receipt_sha256"]:
+                raise PermissionError("Host terminal receipt does not match the pending execution")
+            _write_registry(
+                registry_path, registry, deadline_monotonic=deadline_monotonic
+            )
+            return _receipt_record_response(record)
+        if record.get("state") != "PREPARED":
+            raise PermissionError("Host tool execution cannot accept a terminal receipt")
+        records = _host_tool_receipts_for_host(
+            registry, controller_id=tuple_value["controller_id"], host="web"
+        )
+        for other_execution_id, other_record in records.items():
+            if other_execution_id == tuple_value["host_tool_execution_id"]:
+                continue
+            if not isinstance(other_record, dict):
+                raise ValueError("Host tool receipt record is invalid")
+            for name in ("terminal_receipt_sha256", "terminal_receipt_id_sha256"):
+                if other_record.get(name) == digests[name]:
+                    raise PermissionError("Host terminal receipt replay refused")
+        record.update(digests)
+        record["state"] = "TERMINAL_PENDING"
+        _persist_host_tool_record(
+            registry, controller_id=tuple_value["controller_id"],
+            execution_id=tuple_value["host_tool_execution_id"], record=record,
+        )
+        _write_registry(
+            registry_path, registry, deadline_monotonic=deadline_monotonic
+        )
+        return _receipt_record_response(record)
+
+
+def _assert_exact_guard_evidence(
+    guard_evidence: object, *, tuple_value: dict[str, Any], terminal_receipt_sha256: str
+) -> str:
+    if not isinstance(guard_evidence, dict):
+        raise PermissionError("Host tool guard evidence is invalid")
+    for name, expected in tuple_value.items():
+        if guard_evidence.get(name) != expected:
+            raise PermissionError(f"Host tool guard evidence {name} does not match the prepared tuple")
+    if guard_evidence.get("terminal_receipt_sha256") != terminal_receipt_sha256:
+        raise PermissionError("Host tool guard evidence terminal receipt does not match")
+    if guard_evidence.get("terminal_status") != "CLOSED":
+        raise PermissionError("Host tool guard evidence is not CLOSED")
+    return _json_sha256(guard_evidence, label="Host tool guard evidence")
+
+
+def close_host_tool_execution(
+    *, repo: Path, controller_id: str, verified_turn: dict[str, Any], host_terminal_receipt: dict[str, Any],
+    guard_evidence: dict[str, Any], snapshot_path: Path, lifecycle_path: Path,
+    registry_path: Path = DEFAULT_REGISTRY,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    """Deprecated: lifecycle evidence must be committed by the atomic commit API."""
+    del (
+        repo, controller_id, verified_turn, host_terminal_receipt, guard_evidence,
+        snapshot_path, lifecycle_path, registry_path, deadline_monotonic,
+    )
+    raise PermissionError(
+        "Host tool execution requires commit_host_tool_execution; direct CLOSED is disabled"
+    )
+
+
+def commit_host_tool_execution(
+    *, repo: Path, controller_id: str, verified_turn: dict[str, Any],
+    host_terminal_receipt: dict[str, Any], guard_evidence: dict[str, Any],
+    guard_evidence_id: str, guard_evidence_file_sha256: str,
+    snapshot_path: Path, lifecycle_path: Path,
+    lifecycle_transition: Callable[
+        [dict[str, Any], dict[str, Any]],
+        tuple[dict[str, Any], dict[str, Any]],
+    ],
+    registry_path: Path = DEFAULT_REGISTRY,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    """Commit lifecycle evidence before the matching registry CAS becomes CLOSED.
+
+    The registry->lifecycle lock order is shared with prepare/terminalize.  An
+    already-written exact lifecycle commit is the retry marker after a registry
+    close failure, so the reducer and trace are never applied twice.
+    """
+    repo = repo.expanduser().resolve()
+    registry_path = registry_path.expanduser()
+    lifecycle_path = lifecycle_path.expanduser()
+    evidence_id = _bounded_string(
+        guard_evidence_id, label="Host tool guard evidence id",
+        maximum=MAX_CONTROLLER_IDENTIFIER_LENGTH,
+    )
+    evidence_file_sha256 = _sha256_field(
+        guard_evidence_file_sha256, label="Host tool guard evidence file sha256"
+    )
+    with _locked_host_tool_receipt_mutation(
+        registry_path=registry_path, lifecycle_path=lifecycle_path,
+        deadline_monotonic=deadline_monotonic,
+    ) as (registry, lifecycle_state):
+        tuple_base = _current_host_tool_tuple(
+            registry=registry, repo=repo, controller_id=controller_id,
+            verified_turn=verified_turn, snapshot_path=snapshot_path,
+            lifecycle_state=lifecycle_state,
+            deadline_monotonic=deadline_monotonic,
+        )
+        tuple_value, terminal_digests = _host_receipt_tuple(
+            host_terminal_receipt, tuple_base=tuple_base, phase="terminal"
+        )
+        record = _stored_host_tool_record(
+            registry, controller_id=tuple_value["controller_id"],
+            execution_id=tuple_value["host_tool_execution_id"],
+        )
+        _assert_exact_record_tuple(record, tuple_value)
+        if (
+            record.get("pre_receipt_id_sha256")
+            != terminal_digests["referenced_pre_receipt_id_sha256"]
+            or record.get("pre_receipt_sha256")
+            != terminal_digests["referenced_pre_receipt_sha256"]
+            or record.get("capability_id_sha256")
+            != _receipt_value_sha256(
+                host_terminal_receipt.get("capability_id"), label="Host capability id"
+            )
+        ):
+            raise PermissionError("Host terminal pre receipt does not match the prepared execution")
+        if record.get("terminal_receipt_sha256") != terminal_digests["terminal_receipt_sha256"]:
+            raise PermissionError("Host terminal receipt does not match the pending execution")
+        guard_contract_sha256 = _assert_exact_guard_evidence(
+            guard_evidence, tuple_value=tuple_value,
+            terminal_receipt_sha256=terminal_digests["terminal_receipt_sha256"],
+        )
+        commit = {
+            "schema_version": 1,
+            "provenance": "host_tool_terminal_commit_v1",
+            "tuple": tuple_value,
+            "terminal_receipt_sha256": terminal_digests["terminal_receipt_sha256"],
+            "guard_evidence_id": evidence_id,
+            "guard_evidence_sha256": evidence_file_sha256,
+            "guard_contract_sha256": guard_contract_sha256,
+        }
+        commits = lifecycle_state.get("host_tool_terminal_commits")
+        if commits is None:
+            commits = {}
+        if not isinstance(commits, dict):
+            raise ValueError("Host tool terminal commit registry is invalid")
+        execution_id = tuple_value["host_tool_execution_id"]
+        existing_commit = commits.get(execution_id)
+        lifecycle_output: dict[str, Any] = {}
+        if existing_commit is not None:
+            if existing_commit != commit:
+                raise PermissionError("Host tool terminal commit does not match exact retry")
+            _write_registry(
+                lifecycle_path, lifecycle_state,
+                deadline_monotonic=deadline_monotonic,
+            )
+        else:
+            if record.get("state") != "TERMINAL_PENDING":
+                raise PermissionError("Host tool execution is not terminal pending")
+            _require_before_deadline(
+                deadline_monotonic, operation="Host tool lifecycle transition"
+            )
+            lifecycle_output, next_state = lifecycle_transition(lifecycle_state, commit)
+            if not isinstance(lifecycle_output, dict) or not isinstance(next_state, dict):
+                raise ValueError("Host tool lifecycle transition returned invalid state")
+            next_commits = dict(
+                next_state.get("host_tool_terminal_commits")
+                if isinstance(next_state.get("host_tool_terminal_commits"), dict)
+                else {}
+            )
+            next_commits[execution_id] = commit
+            next_state["host_tool_terminal_commits"] = next_commits
+            _write_registry(
+                lifecycle_path, next_state, deadline_monotonic=deadline_monotonic
+            )
+        if record.get("state") == "CLOSED":
+            if record.get("guard_evidence_sha256") != guard_contract_sha256:
+                raise PermissionError("Host tool guard evidence does not match the closed execution")
+            _write_registry(
+                registry_path, registry, deadline_monotonic=deadline_monotonic
+            )
+            return {**_receipt_record_response(record), "lifecycle_output": lifecycle_output}
+        if record.get("state") != "TERMINAL_PENDING":
+            raise PermissionError("Host tool execution is not terminal pending")
+        record["guard_evidence_sha256"] = guard_contract_sha256
+        record["state"] = "CLOSED"
+        _persist_host_tool_record(
+            registry, controller_id=tuple_value["controller_id"],
+            execution_id=execution_id, record=record,
+        )
+        _write_registry(
+            registry_path, registry, deadline_monotonic=deadline_monotonic
+        )
+        return {**_receipt_record_response(record), "lifecycle_output": lifecycle_output}
 
 
 def acquire_outbound_lease(

@@ -831,7 +831,7 @@ class ManualControlCycleReconcileTests(unittest.TestCase):
         }) + "\n", encoding="utf-8")
         return repo, registry, lease_file, state_path, reconcile_path, audit_log, control_json
 
-    def test_manual_fenced_control_cycle_reconcile_closes_only_reconciled_terminal_debt_without_verifying_web_identity(self):
+    def test_manual_fenced_control_cycle_reconcile_rejects_untrusted_ai_bridge_receipt(self):
         module = self._module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -843,18 +843,17 @@ class ManualControlCycleReconcileTests(unittest.TestCase):
                 "control_loop_required": True,
                 "rule_handshake": {"state": "current", "blocking": False},
             }
+            state_before = state_path.read_bytes()
             with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
                 module.lifecycle, "project_snapshot", return_value=snapshot
 ):
-                result = module.reconcile_control_cycle_closure(
-                    repo=repo, registry_path=registry, audit_log=audit_log,
-                    manual_lease_path=lease_file, now_unix=500,
-                )
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+                with self.assertRaisesRegex(PermissionError, "no durable AI-Bridge"):
+                    module.reconcile_control_cycle_closure(
+                        repo=repo, registry_path=registry, audit_log=audit_log,
+                        manual_lease_path=lease_file, now_unix=500,
+                    )
             registry_after = json.loads(registry.read_text(encoding="utf-8"))
-        self.assertEqual(state.get("pending_terminal_receipts"), [])
-        self.assertEqual(result["closed_terminal_receipt_count"], 1)
-        self.assertEqual(result["binding_verification"], "manual_fenced_not_host_attested")
+            self.assertEqual(state_path.read_bytes(), state_before)
         self.assertFalse(registry_after["__controller_targets__"]["controller-1"]["web"]["host_attested"])
 
     def test_manual_fenced_control_cycle_reconcile_requires_unexpired_matching_manual_lease(self):
@@ -870,6 +869,35 @@ class ManualControlCycleReconcileTests(unittest.TestCase):
                         manual_lease_path=lease_file, now_unix=500,
                     )
 
+    def test_immutable_cycle_evidence_rejects_forged_snapshot_hash(self):
+        import hashlib
+        module = self._module()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _registry, _lease_file, _state_path, _reconcile_path, _audit_log, control_json = self._fixture(Path(tmp))
+            control = json.loads(control_json.read_text(encoding="utf-8"))
+            cycle_id = control["event_contract"]["event_id"]
+            cycle_path = repo / ".git" / "adaptive-delivery" / "controller-cycle-evidence" / (
+                hashlib.sha256(cycle_id.encode("utf-8")).hexdigest() + ".json"
+            )
+            evidence = json.loads(cycle_path.read_text(encoding="utf-8"))
+            evidence["snapshot_sha256"] = "0" * 64
+            cycle_path.write_text(json.dumps(evidence), encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "snapshot_sha256"):
+                module._immutable_closed_cycle_evidence(
+                    repo=repo, controller_id="controller-1", control_snapshot=control
+                )
+
+    def test_immutable_cycle_evidence_requires_terminal_debt_event_type(self):
+        module = self._module()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _registry, _lease_file, _state_path, _reconcile_path, _audit_log, control_json = self._fixture(Path(tmp))
+            control = json.loads(control_json.read_text(encoding="utf-8"))
+            control["event_contract"]["event_type"] = "generic_control_cycle"
+            with self.assertRaisesRegex(PermissionError, "event_type=terminal_debt_reconciliation"):
+                module._immutable_closed_cycle_evidence(
+                    repo=repo, controller_id="controller-1", control_snapshot=control
+                )
+
     def test_reconcile_control_cycle_cli_accepts_no_receipt_or_web_session_identity_argument(self):
         module = self._module()
         parser = module.build_parser()
@@ -881,7 +909,7 @@ class ManualControlCycleReconcileTests(unittest.TestCase):
         self.assertFalse(hasattr(args, "audit_log"))
         self.assertFalse(hasattr(args, "manual_lease_file"))
 
-def _manual_reconcile_skips_later_unrelated_allowed_receipt(self):
+def _manual_reconcile_rejects_untrusted_ai_bridge_even_with_later_receipt(self):
     module = self._module()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -907,12 +935,12 @@ def _manual_reconcile_skips_later_unrelated_allowed_receipt(self):
         with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
             module.lifecycle, "project_snapshot", return_value=snapshot
 ):
-            result = module.reconcile_control_cycle_closure(
-                repo=repo, registry_path=registry, audit_log=audit_log,
-                manual_lease_path=lease_file, now_unix=500,
-            )
-        self.assertEqual(result["control_receipt_id"], "receipt-control-1")
-        self.assertEqual(json.loads(state_path.read_text())["pending_terminal_receipts"], [])
+            with self.assertRaisesRegex(PermissionError, "no durable AI-Bridge"):
+                module.reconcile_control_cycle_closure(
+                    repo=repo, registry_path=registry, audit_log=audit_log,
+                    manual_lease_path=lease_file, now_unix=500,
+                )
+        self.assertNotEqual(json.loads(state_path.read_text())["pending_terminal_receipts"], [])
 
 
 def _manual_reconcile_requires_target_lineage_membership(self):
@@ -932,10 +960,10 @@ def _manual_reconcile_requires_target_lineage_membership(self):
                     manual_lease_path=lease_file, now_unix=500,
                 )
 
-ManualControlCycleReconcileTests.test_manual_reconcile_skips_later_unrelated_allowed_receipt = _manual_reconcile_skips_later_unrelated_allowed_receipt
+ManualControlCycleReconcileTests.test_manual_reconcile_rejects_untrusted_ai_bridge_even_with_later_receipt = _manual_reconcile_rejects_untrusted_ai_bridge_even_with_later_receipt
 ManualControlCycleReconcileTests.test_manual_reconcile_requires_target_lineage_membership = _manual_reconcile_requires_target_lineage_membership
 
-def _manual_reconcile_rejects_forged_immutable_cycle_evidence(self):
+def _manual_reconcile_rejects_untrusted_ai_bridge_before_cycle_evidence(self):
     module = self._module()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -955,7 +983,7 @@ def _manual_reconcile_rejects_forged_immutable_cycle_evidence(self):
         with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
             module.lifecycle, "project_snapshot", return_value=snapshot
         ):
-            with self.assertRaisesRegex(PermissionError, "snapshot_sha256"):
+            with self.assertRaisesRegex(PermissionError, "no durable AI-Bridge"):
                 module.reconcile_control_cycle_closure(
                     repo=repo, registry_path=registry, audit_log=audit_log,
                     manual_lease_path=lease_file, now_unix=500,
@@ -984,10 +1012,10 @@ def _manual_reconcile_rejects_receipt_from_before_current_target_rotation(self):
                     manual_lease_path=lease_file, now_unix=500,
                 )
 
-ManualControlCycleReconcileTests.test_manual_reconcile_rejects_forged_immutable_cycle_evidence = _manual_reconcile_rejects_forged_immutable_cycle_evidence
+ManualControlCycleReconcileTests.test_manual_reconcile_rejects_untrusted_ai_bridge_before_cycle_evidence = _manual_reconcile_rejects_untrusted_ai_bridge_before_cycle_evidence
 ManualControlCycleReconcileTests.test_manual_reconcile_rejects_receipt_from_before_current_target_rotation = _manual_reconcile_rejects_receipt_from_before_current_target_rotation
 
-def _manual_reconcile_is_idempotent_after_durable_lifecycle_closure(self):
+def _manual_reconcile_never_establishes_idempotence_from_untrusted_ai_bridge(self):
     module = self._module()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -1000,23 +1028,17 @@ def _manual_reconcile_is_idempotent_after_durable_lifecycle_closure(self):
         with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
             module.lifecycle, "project_snapshot", return_value=snapshot
         ):
-            first = module.reconcile_control_cycle_closure(
-                repo=repo, registry_path=registry, audit_log=audit_log,
-                manual_lease_path=lease_file, now_unix=500,
-            )
-            with patch.object(module, "_latest_allowed_control_receipt", side_effect=AssertionError("idempotent replay must not reconsume audit")):
-                second = module.reconcile_control_cycle_closure(
+            for now_unix in (500, 501):
+                with self.assertRaisesRegex(PermissionError, "no durable AI-Bridge"):
+                    module.reconcile_control_cycle_closure(
                     repo=repo, registry_path=registry, audit_log=audit_log,
-                    manual_lease_path=lease_file, now_unix=501,
-                )
-        self.assertFalse(first.get("idempotent", False))
-        self.assertTrue(second["idempotent"])
-        self.assertEqual(second["control_receipt_id"], first["control_receipt_id"])
-        self.assertEqual(json.loads(state_path.read_text())["pending_terminal_receipts"], [])
+                        manual_lease_path=lease_file, now_unix=now_unix,
+                    )
+        self.assertNotEqual(json.loads(state_path.read_text())["pending_terminal_receipts"], [])
 
-ManualControlCycleReconcileTests.test_manual_reconcile_is_idempotent_after_durable_lifecycle_closure = _manual_reconcile_is_idempotent_after_durable_lifecycle_closure
+ManualControlCycleReconcileTests.test_manual_reconcile_never_establishes_idempotence_from_untrusted_ai_bridge = _manual_reconcile_never_establishes_idempotence_from_untrusted_ai_bridge
 
-def _manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash(self):
+def _manual_reconcile_rejects_untrusted_ai_bridge_before_event_type(self):
     module = self._module()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -1040,13 +1062,13 @@ def _manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_
         with patch.object(module.lifecycle, "state_path", return_value=state_path), patch.object(
             module.lifecycle, "project_snapshot", return_value=snapshot
         ):
-            with self.assertRaisesRegex(PermissionError, "terminal_debt_reconciliation"):
+            with self.assertRaisesRegex(PermissionError, "no durable AI-Bridge"):
                 module.reconcile_control_cycle_closure(
                     repo=repo, registry_path=registry, audit_log=audit_log,
                     manual_lease_path=lease_file, now_unix=500,
                 )
 
-ManualControlCycleReconcileTests.test_manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash = _manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash
+ManualControlCycleReconcileTests.test_manual_reconcile_rejects_untrusted_ai_bridge_before_event_type = _manual_reconcile_rejects_untrusted_ai_bridge_before_event_type
 
 def _manual_reconcile_closes_only_terminal_debt_and_preserves_current_nonterminal_triggers(self):
     module = self._module()

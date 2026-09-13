@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import shlex
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -488,23 +489,27 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_terminal_continuation.PendingTerminalReconcileTests."
     "test_atomic_audit_writer_handles_concurrent_publication",
     "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
-    "test_manual_fenced_control_cycle_reconcile_closes_only_reconciled_terminal_debt_without_verifying_web_identity",
+    "test_manual_fenced_control_cycle_reconcile_rejects_untrusted_ai_bridge_receipt",
     "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
     "test_manual_fenced_control_cycle_reconcile_requires_unexpired_matching_manual_lease",
     "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_immutable_cycle_evidence_rejects_forged_snapshot_hash",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
+    "test_immutable_cycle_evidence_requires_terminal_debt_event_type",
+    "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
     "test_manual_reconcile_requires_target_lineage_membership",
     "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
-    "test_manual_reconcile_skips_later_unrelated_allowed_receipt",
+    "test_manual_reconcile_rejects_untrusted_ai_bridge_even_with_later_receipt",
     "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
     "test_reconcile_control_cycle_cli_accepts_no_receipt_or_web_session_identity_argument",
     "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
-    "test_manual_reconcile_rejects_forged_immutable_cycle_evidence",
+    "test_manual_reconcile_rejects_untrusted_ai_bridge_before_cycle_evidence",
     "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
     "test_manual_reconcile_rejects_receipt_from_before_current_target_rotation",
     "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
-    "test_manual_reconcile_is_idempotent_after_durable_lifecycle_closure",
+    "test_manual_reconcile_never_establishes_idempotence_from_untrusted_ai_bridge",
     "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
-    "test_manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash",
+    "test_manual_reconcile_rejects_untrusted_ai_bridge_before_event_type",
     "tests.test_terminal_continuation.ManualControlCycleReconcileTests."
     "test_manual_reconcile_closes_only_terminal_debt_and_preserves_current_nonterminal_triggers",
     "tests.test_web_collaboration_continuation.WebCollaborationContinuationRegressionTests."
@@ -731,6 +736,36 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_caller_created_file_inside_codex_session_root_cannot_self_attest",
     "tests.test_web_agent_events.WebAgentMachineEventSourceTests."
     "test_health_supervisor_publishes_diagnostic_source_without_authorizing_it",
+    "tests.test_controller_target_guard.ControllerTargetGuardTests."
+    "test_host_tool_preparation_persists_full_tuple_and_redacts_receipt_material",
+    "tests.test_controller_target_guard.ControllerTargetGuardTests."
+    "test_host_tool_preparation_rejects_nonce_receipt_and_execution_replays_after_reload",
+    "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+    "test_verified_pre_is_prepared_and_dispatches_same_execution_id",
+    "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+    "test_pre_requires_verifier_v2_tool_capability",
+    "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+    "test_registered_v2_verifier_cli_is_used_across_the_real_process_boundary",
+    "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+    "test_terminal_requires_structured_success_and_closes_after_lifecycle_commit",
+    "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+    "test_terminal_without_pre_and_generation_rotation_fail_closed",
+    "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+    "test_real_unix_server_correlates_request_and_owns_socket_mode",
+    "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+    "test_unix_server_rejects_unsafe_paths_and_bad_frames",
+    "tests.test_controller_target_guard.ControllerTargetGuardTests."
+    "test_host_tool_terminal_retry_is_exact_and_direct_close_is_disabled",
+    "tests.test_governance.DurableHostToolReceiptPersistenceTests."
+    "test_lifecycle_commit_fsync_failure_keeps_registry_pending_and_exact_retry_is_single_trace",
+    "tests.test_governance.DurableHostToolReceiptPersistenceTests."
+    "test_verified_terminal_times_out_hung_snapshot_git_without_closed_or_trace",
+    "tests.test_governance.GovernanceTests."
+    "test_web_stdout_marker_never_closes_without_private_terminal_commit",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_loaded_verifier_rejects_writable_members_parents_and_replaced_path",
+    "tests.test_web_lifecycle_bridge.ControllerWakeSupervisorTests."
+    "test_audit_wake_retry_rejects_same_id_receipt_shape_replacement",
 )
 RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors",
@@ -792,6 +827,33 @@ RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "Grok Reviewer returns validated verdict after bounded cleanup even if CLI does not exit",
     "run_external_agent direct execution survives symlinked filesystem path",
 )
+RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES = (
+    "scripts/agent_target_resolution.py",
+    "scripts/assignment_runtime.py",
+    "scripts/control_event_guard.py",
+    "scripts/controller_health.py",
+    "scripts/controller_self_check.py",
+    "scripts/controller_state.py",
+    "scripts/controller_target_guard.py",
+    "scripts/event_scope_guard.py",
+    "scripts/goal_display_sync.py",
+    "scripts/ledger_consistency_guard.py",
+    "scripts/lifecycle_hook.py",
+    "scripts/lint_governance.py",
+    "scripts/preblock_guard.py",
+    "scripts/project_context_guard.py",
+    "scripts/project_state.py",
+    "scripts/reviewer_supervisor.py",
+    "scripts/route_contract.py",
+    "scripts/rule_handshake.py",
+    "scripts/runtime_host_tool_hook.py",
+    "scripts/terminal_continuation.py",
+    "scripts/web_agent_events.py",
+    "scripts/web_agent_execution.py",
+    "scripts/web_agent_health_supervisor.py",
+    "scripts/web_lifecycle_bridge.py",
+    "scripts/web_reentry_adapter.py",
+)
 RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/controller_runtime_supervisor.py",
     "scripts/web_agent_execution.py",
@@ -801,21 +863,28 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/web_reentry_adapter.py",
     "scripts/lifecycle_hook.py",
     "scripts/goal_display_sync.py",
+    "scripts/ledger_consistency_guard.py",
     "scripts/control_event_guard.py",
     "scripts/event_scope_guard.py",
     "scripts/controller_state.py",
+    "scripts/controller_health.py",
+    "scripts/controller_self_check.py",
     "scripts/controller_target_guard.py",
     "scripts/agent_target_resolution.py",
     "scripts/controller_scoring_guard.py",
     "scripts/controller_scoring_hook.py",
     "scripts/project_context_guard.py",
+    "scripts/project_state.py",
     "scripts/rule_handshake.py",
     "scripts/evaluation_transaction.py",
     "scripts/route_contract.py",
     "scripts/reviewer_supervisor.py",
     "scripts/assignment_lease_guard.py",
     "scripts/assignment_runtime.py",
+    "scripts/lint_governance.py",
+    "scripts/preblock_guard.py",
     "scripts/run_external_agent.mjs",
+    "scripts/runtime_host_tool_hook.py",
     "scripts/terminal_continuation.py",
     "tests/test_web_agent_execution.py",
     "tests/test_reviewer_supervisor.py",
@@ -835,6 +904,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_web_agent_events.py",
     "tests/test_evaluation_transaction.py",
     "tests/test_assignment_runtime.py",
+    "tests/test_runtime_host_tool_hook.py",
     "tests/external-agent-routing.test.mjs",
 )
 
@@ -1313,7 +1383,103 @@ def _machine_web_event_source_ready(path: Path) -> bool:
     return bool(machine_event_source_ready(path=path))
 
 
-def _installed_controller_identity_capability(skill_root: Path | None) -> dict[str, Any]:
+def _read_trusted_runtime_bundle_file(
+    path: Path, *, root: Path, maximum: int = 4 * 1024 * 1024
+) -> tuple[bytes, str]:
+    root = Path(os.path.abspath(os.fspath(root)))
+    path = Path(os.path.abspath(os.fspath(path)))
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise PermissionError("Runtime Host hook bundle member escapes the installed root") from exc
+    current = path.parent
+    while True:
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise PermissionError("Runtime Host hook bundle parent must be a real directory")
+        if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+            raise PermissionError("Runtime Host hook bundle parent owner mismatch")
+        if metadata.st_mode & 0o022:
+            raise PermissionError("Runtime Host hook bundle parent is group or other writable")
+        if current == root:
+            break
+        if current.parent == current:
+            raise PermissionError("Runtime Host hook bundle root is not an ancestor")
+        current = current.parent
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(nofollow, int) or nofollow == 0:
+        raise PermissionError("Runtime Host hook bundle requires O_NOFOLLOW support")
+    descriptor = os.open(path, os.O_RDONLY | nofollow)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError("Runtime Host hook bundle member must be a regular file")
+        if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+            raise PermissionError("Runtime Host hook bundle member owner mismatch")
+        if metadata.st_mode & 0o022:
+            raise PermissionError("Runtime Host hook bundle member is group or other writable")
+        if metadata.st_size < 0 or metadata.st_size > maximum:
+            raise PermissionError("Runtime Host hook bundle member exceeds size limit")
+        content = bytearray()
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, min(65536, maximum - len(content) + 1))
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > maximum:
+                raise PermissionError("Runtime Host hook bundle member exceeds size limit")
+            digest.update(chunk)
+        return bytes(content), digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _trusted_runtime_host_tool_bundle(
+    skill_root: Path,
+    *,
+    expected_files: dict[str, str] | None = None,
+    expected_revision: str | None = None,
+) -> tuple[str, dict[str, str], dict[str, bytes]]:
+    root = Path(os.path.abspath(os.fspath(skill_root)))
+    files = expected_files
+    revision = str(expected_revision or "").strip()
+    if files is None:
+        manifest_bytes, _ = _read_trusted_runtime_bundle_file(
+            root / MANIFEST_NAME, root=root, maximum=2 * 1024 * 1024
+        )
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        files = manifest.get("files") if isinstance(manifest, dict) else None
+        revision = str(manifest.get("revision") or "").strip() if isinstance(manifest, dict) else ""
+    if not isinstance(files, dict):
+        raise PermissionError("Runtime Host hook bundle hash manifest is unavailable")
+    if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision.lower()):
+        raise PermissionError("Runtime Host hook bundle Runtime revision is invalid")
+    bundle_hashes: dict[str, str] = {}
+    bundle_contents: dict[str, bytes] = {}
+    for relative in RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES:
+        expected = files.get(relative)
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or any(character not in "0123456789abcdef" for character in expected.lower())
+        ):
+            raise PermissionError(f"Runtime Host hook bundle hash is missing: {relative}")
+        content, actual = _read_trusted_runtime_bundle_file(root / relative, root=root)
+        if actual != expected.lower():
+            raise PermissionError(f"Runtime Host hook bundle hash mismatch: {relative}")
+        bundle_hashes[relative] = actual
+        bundle_contents[relative] = content
+    return revision.lower(), bundle_hashes, bundle_contents
+
+
+def _installed_controller_identity_capability(
+    skill_root: Path | None,
+    *,
+    expected_files: dict[str, str] | None = None,
+    expected_revision: str | None = None,
+    reported_root: Path | None = None,
+) -> dict[str, Any]:
     script = (
         skill_root / "scripts" / "controller_target_guard.py"
         if skill_root is not None
@@ -1323,6 +1489,11 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
         skill_root / "scripts" / "web_lifecycle_bridge.py"
         if skill_root is not None
         else Path(__file__).resolve().parent / "web_lifecycle_bridge.py"
+    )
+    tool_hook = (
+        skill_root / "scripts" / "runtime_host_tool_hook.py"
+        if skill_root is not None
+        else Path(__file__).resolve().parent / "runtime_host_tool_hook.py"
     )
     try:
         bridge_text = bridge.read_text(encoding="utf-8") if bridge.is_file() else ""
@@ -1344,6 +1515,66 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
         and "runtime_web_turn_lease_v1" in bridge_text
         and "host_current_entry_unavailable" in bridge_text
     )
+    bundle_revision: str | None = None
+    bundle_hashes: dict[str, str] | None = None
+    bundle_contents: dict[str, bytes] = {}
+    if skill_root is not None:
+        try:
+            bundle_revision, bundle_hashes, bundle_contents = _trusted_runtime_host_tool_bundle(
+                skill_root,
+                expected_files=expected_files,
+                expected_revision=expected_revision,
+            )
+        except (OSError, UnicodeError, ValueError, PermissionError, json.JSONDecodeError):
+            bundle_revision = None
+            bundle_hashes = None
+            bundle_contents = {}
+    try:
+        tool_hook_text = bundle_contents.get(
+            "scripts/runtime_host_tool_hook.py", b""
+        ).decode("utf-8")
+        trusted_bridge_text = bundle_contents.get(
+            "scripts/web_lifecycle_bridge.py", b""
+        ).decode("utf-8")
+    except UnicodeError:
+        tool_hook_text = ""
+        trusted_bridge_text = ""
+    runtime_host_tool_hook_supported = (
+        runtime_current_entry_supported
+        and bundle_hashes is not None
+        and "runtime_host_verifier_cli_v2" in trusted_bridge_text
+        and "verify_tool_pre" in trusted_bridge_text
+        and "verify_tool_terminal" in trusted_bridge_text
+        and "runtime_host_tool_hook_v1" in tool_hook_text
+        and "def handle_request(" in tool_hook_text
+        and "def serve_unix_socket(" in tool_hook_text
+    )
+    output_root = Path(reported_root or skill_root or Path(__file__).resolve().parent.parent)
+    tool_hook_output = output_root / "scripts" / "runtime_host_tool_hook.py"
+    tool_hook_sha256 = (
+        bundle_hashes.get("scripts/runtime_host_tool_hook.py")
+        if runtime_host_tool_hook_supported and bundle_hashes is not None
+        else None
+    )
+    tool_hook_bundle_sha256 = (
+        {str((output_root / relative).resolve()): digest for relative, digest in bundle_hashes.items()}
+        if runtime_host_tool_hook_supported and bundle_hashes is not None
+        else None
+    )
+    host_tool_contract = {
+        "host_verifier_protocol": (
+            "runtime_host_verifier_cli_v2"
+            if runtime_host_tool_hook_supported
+            else "runtime_host_verifier_cli_v1" if runtime_current_entry_supported else None
+        ),
+        "tool_hook_protocol": (
+            "runtime_host_tool_hook_v1" if runtime_host_tool_hook_supported else None
+        ),
+        "tool_hook_path": str(tool_hook_output.resolve()) if runtime_host_tool_hook_supported else None,
+        "tool_hook_sha256": tool_hook_sha256,
+        "tool_hook_runtime_revision": bundle_revision if runtime_host_tool_hook_supported else None,
+        "tool_hook_bundle_sha256": tool_hook_bundle_sha256,
+    }
     if not script.is_file():
         return {
             "status": "degraded",
@@ -1364,6 +1595,7 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
             "runtime_web_turn_edge_fallback_supported": runtime_web_turn_edge_supported,
             "host_schema_change_required_for_trace_rotation": False,
             "machine_turn_end_required_for_trace_rotation": runtime_web_turn_supported,
+            **host_tool_contract,
         }
     completed = subprocess.run(
         [sys.executable, str(script), "capabilities"],
@@ -1389,6 +1621,7 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
             "runtime_web_turn_edge_fallback_supported": runtime_web_turn_edge_supported,
             "host_schema_change_required_for_trace_rotation": False,
             "machine_turn_end_required_for_trace_rotation": runtime_web_turn_supported,
+            **host_tool_contract,
         }
     try:
         contract = json.loads(completed.stdout)
@@ -1472,7 +1705,7 @@ def _installed_controller_identity_capability(skill_root: Path | None) -> dict[s
         "runtime_web_turn_edge_fallback_supported": runtime_web_turn_edge_supported,
         "host_schema_change_required_for_trace_rotation": False,
         "machine_turn_end_required_for_trace_rotation": runtime_web_turn_supported,
-        "host_verifier_protocol": "runtime_host_verifier_cli_v1" if runtime_current_entry_supported else None,
+        **host_tool_contract,
     }
 
 
@@ -2272,7 +2505,12 @@ def install_skill(
         staged_capabilities = detect_host_capabilities(
             skill_root=target_path, controller_registry=controller_registry
         )
-        staged_capabilities["controller_identity"] = _installed_controller_identity_capability(stage)
+        staged_capabilities["controller_identity"] = _installed_controller_identity_capability(
+            stage,
+            expected_files=hashes,
+            expected_revision=revision,
+            reported_root=target_path,
+        )
         manifest: dict[str, Any] = {
             "schema_version": 2 if canonical_release_source is not None else 1,
             "product_name": PRODUCT_NAME,

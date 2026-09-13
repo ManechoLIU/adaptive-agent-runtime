@@ -414,7 +414,13 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertFalse(report["web_local_adapter"]["configured"])
 
     def test_identity_capability_report_exposes_runtime_current_entry_host_contract(self):
-        from scripts.install_skill import _installed_controller_identity_capability
+        import hashlib
+        import json
+        from scripts.install_skill import (
+            MANIFEST_NAME,
+            RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES,
+            _installed_controller_identity_capability,
+        )
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             scripts = root / "scripts"; scripts.mkdir()
@@ -437,7 +443,31 @@ class InstallCapabilityTests(unittest.TestCase):
                 "def runtime_web_turn_for_session_start(): pass\n"
                 "def watch_runtime_web_turn_end(): pass\n"
                 "runtime_web_turn_lease_v1 = True\n"
-                "host_current_entry_unavailable = True\n",
+                "host_current_entry_unavailable = True\n"
+                "runtime_host_verifier_cli_v2 = True\n"
+                "verify_tool_pre = True\n"
+                "verify_tool_terminal = True\n",
+                encoding="utf-8",
+            )
+            tool_hook = scripts / "runtime_host_tool_hook.py"
+            tool_hook.write_text(
+                "PROTOCOL = 'runtime_host_tool_hook_v1'\n"
+                "def handle_request(): pass\n"
+                "def serve_unix_socket(): pass\n",
+                encoding="utf-8",
+            )
+            for relative in RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES:
+                path = root / relative
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("# pinned runtime dependency\n", encoding="utf-8")
+            revision = "a" * 40
+            files = {
+                relative: hashlib.sha256((root / relative).read_bytes()).hexdigest()
+                for relative in RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES
+            }
+            (root / MANIFEST_NAME).write_text(
+                json.dumps({"schema_version": 2, "revision": revision, "files": files}),
                 encoding="utf-8",
             )
             capability = _installed_controller_identity_capability(root)
@@ -451,7 +481,15 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertTrue(capability["runtime_web_turn_edge_fallback_supported"])
         self.assertFalse(capability["host_schema_change_required_for_trace_rotation"])
         self.assertTrue(capability["machine_turn_end_required_for_trace_rotation"])
-        self.assertEqual(capability["host_verifier_protocol"], "runtime_host_verifier_cli_v1")
+        self.assertEqual(capability["host_verifier_protocol"], "runtime_host_verifier_cli_v2")
+        self.assertEqual(capability["tool_hook_protocol"], "runtime_host_tool_hook_v1")
+        self.assertEqual(capability["tool_hook_path"], str(tool_hook.resolve()))
+        self.assertEqual(len(capability["tool_hook_sha256"]), 64)
+        self.assertEqual(capability["tool_hook_runtime_revision"], revision)
+        self.assertEqual(
+            capability["tool_hook_bundle_sha256"],
+            {str((root / relative).resolve()): files[relative] for relative in RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES},
+        )
         self.assertEqual(capability["host_attestation"], "external_current_entry_required")
         self.assertEqual(capability["logical_agent_target_resolution_contract"], "logical_agent_target_resolution_v1")
         self.assertEqual(capability["verified_execution_target_contract"], "verified_execution_target_v1")
@@ -460,6 +498,84 @@ class InstallCapabilityTests(unittest.TestCase):
         self.assertEqual(capability["ownership_resolver_scope"], "controller_registry_only")
         self.assertEqual(capability["automatic_problem_attribution"], "post_migration_enhancement")
         self.assertFalse(capability["strong_web_binding_available"])
+
+    def test_identity_capability_v2_fails_closed_on_untrusted_or_unpinned_bundle(self):
+        import hashlib
+        import json
+        from scripts.install_skill import (
+            MANIFEST_NAME,
+            RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES,
+            _installed_controller_identity_capability,
+        )
+
+        def build(root: Path) -> tuple[Path, Path]:
+            scripts = root / "scripts"
+            scripts.mkdir()
+            guard = scripts / "controller_target_guard.py"
+            guard.write_text(
+                "#!/usr/bin/env python3\nimport json\n"
+                "print(json.dumps({'canonical_identity_cli':'controller_target_guard.py identity',"
+                "'capabilities':['controller_identity_projection','same_controller_recovery','web_session_binding','target_generation_fence','logical_agent_target_resolution','verified_execution_target_fence'],"
+                "'logical_agent_target_resolution_contract':'logical_agent_target_resolution_v1',"
+                "'verified_execution_target_contract':'verified_execution_target_v1',"
+                "'supported_logical_agent_types':['controller','agent','reviewer','runtime_repair_agent'],"
+                "'logical_agent_target_resolution_states':['VERIFIED','UNRESOLVED','STALE','CONFLICTED']}))\n",
+                encoding="utf-8",
+            )
+            guard.chmod(0o755)
+            bridge = scripts / "web_lifecycle_bridge.py"
+            bridge.write_text(
+                "def discover_current_web_entry_for_logical_agent(): pass\n"
+                "logical_agent_identity = {}\nHOST_OPERATION = \"discover_current_entry\"\n"
+                "PROVENANCE = 'runtime_host_current_entry_v1'\n"
+                "def verified_web_execution_turn_from_current_entry(): pass\n"
+                "verified_execution_turn = {}\n"
+                "def runtime_web_turn_for_session_start(): pass\n"
+                "def watch_runtime_web_turn_end(): pass\n"
+                "runtime_web_turn_lease_v1 = True\nhost_current_entry_unavailable = True\n"
+                "runtime_host_verifier_cli_v2 = True\nverify_tool_pre = True\nverify_tool_terminal = True\n",
+                encoding="utf-8",
+            )
+            hook = scripts / "runtime_host_tool_hook.py"
+            hook.write_text(
+                "HOOK_PROTOCOL = 'runtime_host_tool_hook_v1'\n"
+                "def handle_request(): pass\ndef serve_unix_socket(): pass\n",
+                encoding="utf-8",
+            )
+            for relative in RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES:
+                path = root / relative
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("# pinned runtime dependency\n", encoding="utf-8")
+            files = {
+                relative: hashlib.sha256((root / relative).read_bytes()).hexdigest()
+                for relative in RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES
+            }
+            (root / MANIFEST_NAME).write_text(
+                json.dumps({"schema_version": 2, "revision": "b" * 40, "files": files}),
+                encoding="utf-8",
+            )
+            return hook, scripts
+
+        for case in ("tamper", "symlink", "writable_parent", "missing"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                hook, scripts = build(root)
+                if case == "tamper":
+                    hook.write_text(hook.read_text(encoding="utf-8") + "# tampered\n", encoding="utf-8")
+                elif case == "symlink":
+                    replacement = root / "replacement.py"
+                    replacement.write_text(hook.read_text(encoding="utf-8"), encoding="utf-8")
+                    hook.unlink()
+                    hook.symlink_to(replacement)
+                elif case == "writable_parent":
+                    scripts.chmod(0o775)
+                else:
+                    (root / RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES[-1]).unlink()
+                capability = _installed_controller_identity_capability(root)
+                self.assertEqual(capability["host_verifier_protocol"], "runtime_host_verifier_cli_v1")
+                self.assertIsNone(capability["tool_hook_protocol"])
+                self.assertIsNone(capability["tool_hook_bundle_sha256"])
 
     def test_identity_capability_report_surfaces_missing_installed_guard_as_contract_drift(self):
         from scripts.install_skill import detect_host_capabilities
@@ -876,6 +992,72 @@ class InstallMigrationContractTests(unittest.TestCase):
             RUNTIME_RELEASE_REGRESSION_TESTS,
         )
 
+    def test_runtime_release_gate_includes_host_tool_receipt_closure_contract(self):
+        from scripts.install_skill import RUNTIME_RELEASE_REGRESSION_TESTS, RUNTIME_RELEASE_REQUIRED_FILES
+
+        required_tests = {
+            "tests.test_controller_target_guard.ControllerTargetGuardTests."
+            "test_host_tool_preparation_persists_full_tuple_and_redacts_receipt_material",
+            "tests.test_controller_target_guard.ControllerTargetGuardTests."
+            "test_host_tool_preparation_rejects_nonce_receipt_and_execution_replays_after_reload",
+            "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+            "test_verified_pre_is_prepared_and_dispatches_same_execution_id",
+            "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+            "test_pre_requires_verifier_v2_tool_capability",
+            "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+            "test_registered_v2_verifier_cli_is_used_across_the_real_process_boundary",
+            "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+            "test_terminal_requires_structured_success_and_closes_after_lifecycle_commit",
+            "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+            "test_terminal_without_pre_and_generation_rotation_fail_closed",
+            "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+            "test_real_unix_server_correlates_request_and_owns_socket_mode",
+            "tests.test_runtime_host_tool_hook.RuntimeHostToolHookTests."
+            "test_unix_server_rejects_unsafe_paths_and_bad_frames",
+            "tests.test_controller_target_guard.ControllerTargetGuardTests."
+            "test_host_tool_terminal_retry_is_exact_and_direct_close_is_disabled",
+            "tests.test_governance.DurableHostToolReceiptPersistenceTests."
+            "test_lifecycle_commit_fsync_failure_keeps_registry_pending_and_exact_retry_is_single_trace",
+            "tests.test_governance.DurableHostToolReceiptPersistenceTests."
+            "test_verified_terminal_times_out_hung_snapshot_git_without_closed_or_trace",
+            "tests.test_governance.GovernanceTests."
+            "test_web_stdout_marker_never_closes_without_private_terminal_commit",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+            "test_loaded_verifier_rejects_writable_members_parents_and_replaced_path",
+            "tests.test_web_lifecycle_bridge.ControllerWakeSupervisorTests."
+            "test_audit_wake_retry_rejects_same_id_receipt_shape_replacement",
+        }
+        self.assertTrue(required_tests.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
+        self.assertIn("scripts/runtime_host_tool_hook.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("tests/test_runtime_host_tool_hook.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        from scripts.install_skill import RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES
+        self.assertTrue(set(RUNTIME_HOST_TOOL_HOOK_BUNDLE_FILES).issubset(RUNTIME_RELEASE_REQUIRED_FILES))
+
+    def test_runtime_release_gate_rejects_missing_host_tool_hook_or_tests(self):
+        from unittest.mock import patch
+
+        from scripts.install_skill import (
+            RUNTIME_RELEASE_REQUIRED_FILES,
+            _verify_runtime_release_regressions,
+        )
+
+        for missing in (
+            "scripts/runtime_host_tool_hook.py",
+            "tests/test_runtime_host_tool_hook.py",
+        ):
+            with self.subTest(missing=missing):
+                entries = [
+                    ("100644", "blob", "0" * 40, path)
+                    for path in RUNTIME_RELEASE_REQUIRED_FILES
+                    if path != missing
+                ]
+                with patch(
+                    "scripts.install_skill._revision_tree_entries",
+                    return_value=entries,
+                ):
+                    with self.assertRaisesRegex(ValueError, missing):
+                        _verify_runtime_release_regressions(Path("/unused"), "candidate", required=True)
+
     def test_runtime_release_gate_includes_host_ownership_and_yield_enforcement_regressions(self):
         from scripts.install_skill import RUNTIME_RELEASE_REGRESSION_TESTS, RUNTIME_RELEASE_REQUIRED_FILES
 
@@ -1039,7 +1221,12 @@ class InstallMigrationContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source = self.make_source(root)
-            for name in ("web_agent_execution.py", "web_reentry_adapter.py", "terminal_continuation.py", "goal_display_sync.py"):
+            for name in (
+                "web_agent_execution.py", "web_reentry_adapter.py", "terminal_continuation.py",
+                "goal_display_sync.py", "runtime_host_tool_hook.py", "controller_health.py",
+                "controller_self_check.py", "ledger_consistency_guard.py", "lint_governance.py",
+                "preblock_guard.py", "project_state.py",
+            ):
                 (source / "scripts" / name).write_text("# runtime\n", encoding="utf-8")
             (source / "scripts" / "run_external_agent.mjs").write_text(
                 "export const marker = 'external-agent-routing';\n",
@@ -1194,15 +1381,17 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_reconcile_pending_fingerprint_is_order_independent(self): self.assertTrue(True)\n"
                 "    def test_atomic_audit_writer_handles_concurrent_publication(self): self.assertTrue(True)\n"
                 "class ManualControlCycleReconcileTests(unittest.TestCase):\n"
-                "    def test_manual_fenced_control_cycle_reconcile_closes_only_reconciled_terminal_debt_without_verifying_web_identity(self): self.assertTrue(True)\n"
+                "    def test_manual_fenced_control_cycle_reconcile_rejects_untrusted_ai_bridge_receipt(self): self.assertTrue(True)\n"
                 "    def test_manual_fenced_control_cycle_reconcile_requires_unexpired_matching_manual_lease(self): self.assertTrue(True)\n"
+                "    def test_immutable_cycle_evidence_rejects_forged_snapshot_hash(self): self.assertTrue(True)\n"
+                "    def test_immutable_cycle_evidence_requires_terminal_debt_event_type(self): self.assertTrue(True)\n"
                 "    def test_manual_reconcile_requires_target_lineage_membership(self): self.assertTrue(True)\n"
-                "    def test_manual_reconcile_skips_later_unrelated_allowed_receipt(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_untrusted_ai_bridge_even_with_later_receipt(self): self.assertTrue(True)\n"
                 "    def test_reconcile_control_cycle_cli_accepts_no_receipt_or_web_session_identity_argument(self): self.assertTrue(True)\n"
-                "    def test_manual_reconcile_rejects_forged_immutable_cycle_evidence(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_untrusted_ai_bridge_before_cycle_evidence(self): self.assertTrue(True)\n"
                 "    def test_manual_reconcile_rejects_receipt_from_before_current_target_rotation(self): self.assertTrue(True)\n"
-                "    def test_manual_reconcile_is_idempotent_after_durable_lifecycle_closure(self): self.assertTrue(True)\n"
-                "    def test_manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_never_establishes_idempotence_from_untrusted_ai_bridge(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_untrusted_ai_bridge_before_event_type(self): self.assertTrue(True)\n"
                 "    def test_manual_reconcile_closes_only_terminal_debt_and_preserves_current_nonterminal_triggers(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
@@ -1253,7 +1442,10 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_identity_projection_marks_old_target_stale_but_keeps_project_ownership(self): self.assertTrue(True)\n"
                 "    def test_identity_projection_reports_project_controller_conflict_without_silent_selection(self): self.assertTrue(True)\n"
                 "    def test_claim_controller_host_desktop_after_web_increments_one_cross_host_generation(self): self.assertTrue(True)\n"
-                "    def test_verified_logical_agent_target_projects_controller_and_defers_other_agent_ownership(self): self.assertTrue(True)\n",
+                "    def test_verified_logical_agent_target_projects_controller_and_defers_other_agent_ownership(self): self.assertTrue(True)\n"
+                "    def test_host_tool_preparation_persists_full_tuple_and_redacts_receipt_material(self): self.assertTrue(True)\n"
+                "    def test_host_tool_preparation_rejects_nonce_receipt_and_execution_replays_after_reload(self): self.assertTrue(True)\n"
+                "    def test_host_tool_terminal_retry_is_exact_and_direct_close_is_disabled(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_agent_target_resolution.py").write_text(
@@ -1268,10 +1460,24 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_verified_execution_turn_rejects_wrong_agent_target_or_invocation(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
+            (tests_dir / "test_runtime_host_tool_hook.py").write_text(
+                "import unittest\n"
+                "class RuntimeHostToolHookTests(unittest.TestCase):\n"
+                "    def test_verified_pre_is_prepared_and_dispatches_same_execution_id(self): self.assertTrue(True)\n"
+                "    def test_pre_requires_verifier_v2_tool_capability(self): self.assertTrue(True)\n"
+                "    def test_registered_v2_verifier_cli_is_used_across_the_real_process_boundary(self): self.assertTrue(True)\n"
+                "    def test_terminal_requires_structured_success_and_closes_after_lifecycle_commit(self): self.assertTrue(True)\n"
+                "    def test_terminal_without_pre_and_generation_rotation_fail_closed(self): self.assertTrue(True)\n"
+                "    def test_real_unix_server_correlates_request_and_owns_socket_mode(self): self.assertTrue(True)\n"
+                "    def test_unix_server_rejects_unsafe_paths_and_bad_frames(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "test_web_lifecycle_bridge.py").write_text(
                 "import unittest\n"
                 "class WebLifecycleComputerLeaseTests(unittest.TestCase):\n"
                 "    def test_audit_once_never_uses_manual_resume_lease_as_caller_identity(self): self.assertTrue(True)\n"
+                "class ControllerWakeSupervisorTests(unittest.TestCase):\n"
+                "    def test_audit_wake_retry_rejects_same_id_receipt_shape_replacement(self): self.assertTrue(True)\n"
                 "class WebLifecycleAuditTests(unittest.TestCase):\n"
                 "    def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership(self): self.assertTrue(True)\n"
@@ -1350,6 +1556,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_registered_web_verifier_loads_pinned_external_runtime_host_cli(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_exposes_pinned_host_submit_adapter(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_rechecks_bundle_before_each_execution(self): self.assertTrue(True)\n"
+                "    def test_loaded_verifier_rejects_writable_members_parents_and_replaced_path(self): self.assertTrue(True)\n"
                 "    def test_malformed_registered_web_verifier_config_fails_closed_without_manual_fallback(self): self.assertTrue(True)\n"
                 "    def test_browser_tab_receipt_cannot_recover_an_unverified_web_session(self): self.assertTrue(True)\n"
                 "    def test_replace_web_session_bootstrap_rotates_target_and_manual_lease_without_host_attestation(self): self.assertTrue(True)\n"
@@ -1453,6 +1660,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             (tests_dir / "test_governance.py").write_text(
                 "import unittest\n"
                 "class GovernanceTests(unittest.TestCase):\n"
+                "    def test_web_stdout_marker_never_closes_without_private_terminal_commit(self): self.assertTrue(True)\n"
                 "    def test_runtime_terminal_active_row_does_not_consume_dispatch_capacity(self): self.assertTrue(True)\n"
                 "    def test_runnable_hard_defer_requires_machine_evidence_and_checkpoint(self): self.assertTrue(True)\n"
                 "    def test_local_hard_defer_still_fills_other_nonconflicting_capacity(self): self.assertTrue(True)\n"
@@ -1482,6 +1690,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n"
                 "    def test_candidate_inventory_batches_ancestry_for_multiple_worktrees(self): self.assertTrue(True)\n"
+                "class DurableHostToolReceiptPersistenceTests(unittest.TestCase):\n"
+                "    def test_lifecycle_commit_fsync_failure_keeps_registry_pending_and_exact_retry_is_single_trace(self): self.assertTrue(True)\n"
+                "    def test_verified_terminal_times_out_hung_snapshot_git_without_closed_or_trace(self): self.assertTrue(True)\n"
                 "class RuntimeWebTurnLeaseTests(unittest.TestCase):\n"
                 "    def test_legacy_overflow_migrates_once_only_without_inflight(self): self.assertTrue(True)\n"
                 "    def test_legacy_overflow_with_inflight_cannot_migrate(self): self.assertTrue(True)\n"
@@ -1603,7 +1814,12 @@ class InstallMigrationContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source = self.make_source(root)
-            for name in ("web_agent_execution.py", "web_reentry_adapter.py", "terminal_continuation.py", "goal_display_sync.py"):
+            for name in (
+                "web_agent_execution.py", "web_reentry_adapter.py", "terminal_continuation.py",
+                "goal_display_sync.py", "runtime_host_tool_hook.py", "controller_health.py",
+                "controller_self_check.py", "ledger_consistency_guard.py", "lint_governance.py",
+                "preblock_guard.py", "project_state.py",
+            ):
                 (source / "scripts" / name).write_text("# runtime\n", encoding="utf-8")
             (source / "scripts" / "run_external_agent.mjs").write_text(
                 "export const marker = 'external-agent-routing';\n",
@@ -1729,15 +1945,17 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_reconcile_pending_fingerprint_is_order_independent(self): self.assertTrue(True)\n"
                 "    def test_atomic_audit_writer_handles_concurrent_publication(self): self.assertTrue(True)\n"
                 "class ManualControlCycleReconcileTests(unittest.TestCase):\n"
-                "    def test_manual_fenced_control_cycle_reconcile_closes_only_reconciled_terminal_debt_without_verifying_web_identity(self): self.assertTrue(True)\n"
+                "    def test_manual_fenced_control_cycle_reconcile_rejects_untrusted_ai_bridge_receipt(self): self.assertTrue(True)\n"
                 "    def test_manual_fenced_control_cycle_reconcile_requires_unexpired_matching_manual_lease(self): self.assertTrue(True)\n"
+                "    def test_immutable_cycle_evidence_rejects_forged_snapshot_hash(self): self.assertTrue(True)\n"
+                "    def test_immutable_cycle_evidence_requires_terminal_debt_event_type(self): self.assertTrue(True)\n"
                 "    def test_manual_reconcile_requires_target_lineage_membership(self): self.assertTrue(True)\n"
-                "    def test_manual_reconcile_skips_later_unrelated_allowed_receipt(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_untrusted_ai_bridge_even_with_later_receipt(self): self.assertTrue(True)\n"
                 "    def test_reconcile_control_cycle_cli_accepts_no_receipt_or_web_session_identity_argument(self): self.assertTrue(True)\n"
-                "    def test_manual_reconcile_rejects_forged_immutable_cycle_evidence(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_untrusted_ai_bridge_before_cycle_evidence(self): self.assertTrue(True)\n"
                 "    def test_manual_reconcile_rejects_receipt_from_before_current_target_rotation(self): self.assertTrue(True)\n"
-                "    def test_manual_reconcile_is_idempotent_after_durable_lifecycle_closure(self): self.assertTrue(True)\n"
-                "    def test_manual_reconcile_rejects_non_terminal_debt_closed_cycle_even_with_matching_hash(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_never_establishes_idempotence_from_untrusted_ai_bridge(self): self.assertTrue(True)\n"
+                "    def test_manual_reconcile_rejects_untrusted_ai_bridge_before_event_type(self): self.assertTrue(True)\n"
                 "    def test_manual_reconcile_closes_only_terminal_debt_and_preserves_current_nonterminal_triggers(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
@@ -1781,13 +1999,30 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_identity_projection_keeps_unique_project_controller_when_session_id_unavailable(self): self.assertTrue(True)\n"
                 "    def test_identity_projection_verifies_current_desktop_target_without_changing_controller_id(self): self.assertTrue(True)\n"
                 "    def test_identity_projection_marks_old_target_stale_but_keeps_project_ownership(self): self.assertTrue(True)\n"
-                "    def test_identity_projection_reports_project_controller_conflict_without_silent_selection(self): self.assertTrue(True)\n",
+                "    def test_identity_projection_reports_project_controller_conflict_without_silent_selection(self): self.assertTrue(True)\n"
+                "    def test_host_tool_preparation_persists_full_tuple_and_redacts_receipt_material(self): self.assertTrue(True)\n"
+                "    def test_host_tool_preparation_rejects_nonce_receipt_and_execution_replays_after_reload(self): self.assertTrue(True)\n"
+                "    def test_host_tool_terminal_retry_is_exact_and_direct_close_is_disabled(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_runtime_host_tool_hook.py").write_text(
+                "import unittest\n"
+                "class RuntimeHostToolHookTests(unittest.TestCase):\n"
+                "    def test_verified_pre_is_prepared_and_dispatches_same_execution_id(self): self.assertTrue(True)\n"
+                "    def test_pre_requires_verifier_v2_tool_capability(self): self.assertTrue(True)\n"
+                "    def test_registered_v2_verifier_cli_is_used_across_the_real_process_boundary(self): self.assertTrue(True)\n"
+                "    def test_terminal_requires_structured_success_and_closes_after_lifecycle_commit(self): self.assertTrue(True)\n"
+                "    def test_terminal_without_pre_and_generation_rotation_fail_closed(self): self.assertTrue(True)\n"
+                "    def test_real_unix_server_correlates_request_and_owns_socket_mode(self): self.assertTrue(True)\n"
+                "    def test_unix_server_rejects_unsafe_paths_and_bad_frames(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_web_lifecycle_bridge.py").write_text(
                 "import unittest\n"
                 "class WebLifecycleComputerLeaseTests(unittest.TestCase):\n"
                 "    def test_audit_once_never_uses_manual_resume_lease_as_caller_identity(self): self.assertTrue(True)\n"
+                "class ControllerWakeSupervisorTests(unittest.TestCase):\n"
+                "    def test_audit_wake_retry_rejects_same_id_receipt_shape_replacement(self): self.assertTrue(True)\n"
                 "class WebLifecycleAuditTests(unittest.TestCase):\n"
                 "    def test_rule_wake_target_resolution_fails_closed_instead_of_falling_back_to_logical_controller(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership(self): self.assertTrue(True)\n"
@@ -1814,6 +2049,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):\n"
                 "    def test_host_neutral_supervisor_omits_missing_desktop_codex_argument(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
+                "    def test_loaded_verifier_rejects_writable_members_parents_and_replaced_path(self): self.assertTrue(True)\n"
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_is_idempotent_after_user_reconfirms_ownership(self): self.assertTrue(True)\n"
@@ -1880,6 +2116,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             (tests_dir / "test_governance.py").write_text(
                 "import unittest\n"
                 "class GovernanceTests(unittest.TestCase):\n"
+                "    def test_web_stdout_marker_never_closes_without_private_terminal_commit(self): self.assertTrue(True)\n"
                 "    def test_project_wide_projection_web_active_verify_do_not_starve_mini_runnables(self): self.assertTrue(True)\n"
                 "    def test_project_wide_projection_mini_active_does_not_starve_server_or_web(self): self.assertTrue(True)\n"
                 "    def test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists(self): self.assertTrue(True)\n"
@@ -1903,6 +2140,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_event_scope_guard_allows_project_wide_dispatch_across_business_lines(self): self.assertTrue(True)\n"
                 "    def test_event_scope_guard_rejects_cross_task_work_without_project_wide_dispatch_proof(self): self.assertTrue(True)\n"
                 "    def test_candidate_inventory_batches_ancestry_for_multiple_worktrees(self): self.assertTrue(True)\n"
+                "class DurableHostToolReceiptPersistenceTests(unittest.TestCase):\n"
+                "    def test_lifecycle_commit_fsync_failure_keeps_registry_pending_and_exact_retry_is_single_trace(self): self.assertTrue(True)\n"
+                "    def test_verified_terminal_times_out_hung_snapshot_git_without_closed_or_trace(self): self.assertTrue(True)\n"
                 "class ControllerActionSourcePromptTests(unittest.TestCase):\n"
                 "    def test_rule_ack_prompt_carries_logical_controller_and_actual_execution_source(self): self.assertTrue(True)\n"
                 "    def test_live_e2e_accept_prompt_carries_actual_execution_source(self): self.assertTrue(True)\n"

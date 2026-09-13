@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import atexit
 from contextlib import contextmanager
+from io import BytesIO, TextIOWrapper
 import importlib.util
 import json
 import os
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -679,6 +683,384 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             web_bridge.PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS,
             15,
         )
+
+    def test_registered_web_verifier_clamps_cli_timeout_to_hook_deadline(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version": 1, "verifiers": {"web": {
+                "protocol": "runtime_host_verifier_cli_v1", "executable": str(executable),
+                "sha256": digest, "bundle_sha256": {str(executable): digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            payload = {
+                "ok": True, "operation": "attest_and_verify", "host_receipt_id": "hr-budget",
+                "verified_target": {
+                    "provenance": "runtime_host_verifier_v1", "conversation_id": "web-budget",
+                    "target_generation": 4, "ownership_generation": 9,
+                },
+            }
+            kwargs = {
+                "phase": "pre_delivery", "controller_id": "controller-1", "host": "web",
+                "expected_target_session_id": "web-budget", "expected_target_generation": 4,
+                "expected_ownership_generation": 9,
+            }
+            with patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True), patch.object(
+                web_bridge, "_call_pinned_host_verifier_helper",
+                side_effect=[
+                    {
+                        "delivery_fingerprint": "a" * 64,
+                        "manifest_identity": "b" * 64,
+                        "verifier_protocol": "runtime_host_verifier_cli_v1",
+                    },
+                    payload,
+                    payload,
+                ],
+            ) as helper:
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                self.assertTrue(callable(verifier))
+                verifier(**kwargs, deadline_monotonic=102.5)
+                self.assertEqual(helper.call_args.kwargs["deadline_monotonic"], 102.5)
+                self.assertEqual(
+                    helper.call_args.kwargs["message"]["expected_delivery_fingerprint"],
+                    "a" * 64,
+                )
+                self.assertEqual(
+                    helper.call_args.kwargs["message"]["expected_manifest_identity"],
+                    "b" * 64,
+                )
+                verifier(**kwargs)
+                self.assertIsNone(helper.call_args.kwargs["deadline_monotonic"])
+            self.assertEqual(helper.call_count, 3)
+
+    def test_private_verifier_helper_is_not_reachable_from_normal_cli_input(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+
+        stdin = TextIOWrapper(BytesIO(b'{"operation":"probe"}'), encoding="utf-8")
+        stderr = StringIO()
+        with patch.object(sys, "stdin", stdin), patch.dict(
+            os.environ, {}, clear=True
+        ), redirect_stderr(stderr):
+            code = web_bridge.main([
+                "__pinned-host-verifier-helper", "--host", "web",
+                "--config", "/tmp/user-selected-verifier.json",
+            ])
+        self.assertEqual(code, 78)
+        self.assertIn("private verifier helper authorization required", stderr.getvalue())
+
+    def test_helper_termination_reaps_even_when_process_group_is_already_missing(self) -> None:
+        from unittest.mock import Mock, patch
+
+        process = Mock(pid=4321)
+        process.wait.return_value = 0
+        with patch.object(web_bridge.os, "killpg", side_effect=ProcessLookupError):
+            web_bridge._terminate_helper_process_group(process)
+        process.wait.assert_called()
+        process.communicate.assert_not_called()
+
+    def test_helper_termination_kills_process_group_after_leader_is_reaped(self) -> None:
+        from unittest.mock import Mock, call, patch
+
+        process = Mock(pid=4321)
+        process.wait.return_value = 0
+        with patch.object(web_bridge.os, "killpg") as killpg:
+            web_bridge._terminate_helper_process_group(process)
+        self.assertEqual(killpg.call_args_list[:2], [
+            call(4321, web_bridge.signal.SIGTERM),
+            call(4321, web_bridge.signal.SIGKILL),
+        ])
+        process.communicate.assert_not_called()
+
+    def test_blocked_helper_stages_are_bounded_and_leave_unix_listener_healthy(self) -> None:
+        from unittest.mock import patch
+        from tests import test_runtime_host_tool_hook as host_hook_tests
+
+        for blocked_stage in ("config", "bundle", "cli"):
+            with self.subTest(blocked_stage=blocked_stage):
+                fixture = host_hook_tests.RuntimeHostToolHookTests(methodName="runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                root = fixture.root
+                ready = root / f"{blocked_stage}.ready"
+                harness = root / "helper_harness.py"
+                harness.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import importlib.util,signal,sys,time\n"
+                    "from pathlib import Path\n"
+                    f"sys.path.insert(0, {str(ROOT)!r})\n"
+                    f"spec=importlib.util.spec_from_file_location('isolated_bridge', {str(BRIDGE)!r})\n"
+                    "bridge=importlib.util.module_from_spec(spec);spec.loader.exec_module(bridge)\n"
+                    "original=bridge._read_pinned_verifier_file\n"
+                    f"stage={blocked_stage!r};ready=Path({str(ready)!r})\n"
+                    "def wrapped(path, **kwargs):\n"
+                    " label=kwargs.get('label','')\n"
+                    " if not ready.exists() and ((stage=='config' and label.endswith('config')) or (stage=='bundle' and label.endswith('bundle member'))):\n"
+                    "  ready.write_text(str(__import__('os').getpid()))\n"
+                    "  signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                    "  time.sleep(2)\n"
+                    " return original(path, **kwargs)\n"
+                    "bridge._read_pinned_verifier_file=wrapped\n"
+                    "raise SystemExit(bridge.main())\n",
+                    encoding="utf-8",
+                )
+                harness.chmod(0o700)
+                executable = root / "runtime-verifier"
+                executable.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json,os,signal,sys,time\n"
+                    "from pathlib import Path\n"
+                    f"stage={blocked_stage!r};ready=Path({str(ready)!r})\n"
+                    "if stage=='cli' and not ready.exists():\n"
+                    " ready.write_text(json.dumps({'pid':os.getpid(),'pgid':os.getpgrp()}))\n"
+                    " signal.signal(signal.SIGTERM,signal.SIG_IGN);signal.pause()\n"
+                    "r=json.loads(sys.stdin.read());receipt=r['receipt'];phase=r['operation'].removeprefix('verify_tool_')\n"
+                    "entry={'provenance':'runtime_host_current_entry_v1','entry_scope':'runtime_invocation','machine_source':'host_invocation_context_v1','conversation_id':receipt['conversation_id'],'browser_target_id':receipt['browser_target_id'],'top_frame_id':receipt['top_frame_id'],'loader_id':receipt['loader_id'],'generation_anchor_sha256':receipt['generation_anchor_sha256'],'secure_origin':receipt['secure_origin'],'target_generation':r['expected_target_generation'],'ownership_generation':r['expected_ownership_generation'],'runtime_invocation_id':'runtime-invocation-1','host_receipt_id':'entry-cli','observed_at_unix_ms':int(time.time()*1000)}\n"
+                    "out={'ok':True,'protocol':'runtime_host_verifier_cli_v2','operation':r['operation'],'receipt_sha256':r['receipt_sha256'],'receipt_id':receipt[phase+'_receipt_id'],'capability_id':receipt['capability_id'],'host_tool_execution_id':receipt['host_tool_execution_id'],'current_entry':entry}\n"
+                    "print(json.dumps(out))\n",
+                    encoding="utf-8",
+                )
+                executable.chmod(0o700)
+                digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+                config = root / "host-verifiers.json"
+                config.write_text(json.dumps({
+                    "schema_version": 1,
+                    "verifiers": {"web": {
+                        "protocol": "runtime_host_verifier_cli_v2",
+                        "executable": str(executable), "sha256": digest,
+                        "bundle_sha256": {str(executable): digest},
+                    }},
+                }), encoding="utf-8")
+                config.chmod(0o600)
+                socket_parent = root / "socket-parent"
+                socket_parent.mkdir(mode=0o700)
+                socket_path = socket_parent / "runtime.sock"
+                stop = threading.Event()
+                runtime_hook = host_hook_tests.runtime_hook
+                thread = threading.Thread(target=runtime_hook.serve_unix_socket, kwargs={
+                    "socket_path": socket_path,
+                    "registry_path": fixture.registry,
+                    "lifecycle_path": fixture.lifecycle,
+                    "verifier_config_path": config,
+                    "stop_event": stop,
+                }, daemon=True)
+                self.addCleanup(thread.join, 3)
+                self.addCleanup(stop.set)
+
+                def exchange(request: dict[str, object]) -> dict[str, object]:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.settimeout(4)
+                        connect_deadline = time.monotonic() + 1
+                        while True:
+                            try:
+                                client.connect(str(socket_path))
+                                break
+                            except (ConnectionRefusedError, FileNotFoundError):
+                                if not thread.is_alive() or time.monotonic() >= connect_deadline:
+                                    raise
+                                time.sleep(0.005)
+                        client.sendall(json.dumps(request, sort_keys=True).encode() + b"\n")
+                        response = b""
+                        while not response.endswith(b"\n"):
+                            chunk = client.recv(65536)
+                            if not chunk:
+                                break
+                            response += chunk
+                    return json.loads(response) if response else {
+                        "request_id": request.get("request_id"), "ok": False,
+                        "error": "listener closed timed-out request",
+                    }
+
+                with runtime_hook.target_guard.locked_registry(fixture.registry):
+                    pass
+                before_files = {path.relative_to(root) for path in root.rglob("*")}
+                with patch.object(runtime_hook, "IO_TIMEOUT_SECONDS", 2.0), patch.object(
+                    runtime_hook.web_bridge, "__file__", str(harness)
+                ):
+                    thread.start()
+                    deadline = time.monotonic() + 2
+                    while not socket_path.exists():
+                        if time.monotonic() >= deadline:
+                            self.fail("Runtime Host hook listener did not start")
+                        time.sleep(0.01)
+                    started = time.monotonic()
+                    blocked = exchange(fixture.request("pre"))
+                    elapsed = time.monotonic() - started
+                    self.assertLess(elapsed, 2.05)
+                    self.assertFalse(blocked["ok"])
+                    self.assertTrue(ready.exists(), blocked)
+                    if blocked_stage == "cli":
+                        verifier_process = json.loads(ready.read_text(encoding="utf-8"))
+                        verifier_pid = verifier_process["pid"]
+                        verifier_pgid = verifier_process["pgid"]
+                        self.assertNotEqual(verifier_pid, verifier_pgid)
+                        try:
+                            process_state = subprocess.run(
+                                ["/bin/ps", "-p", str(verifier_pid), "-o", "state="],
+                                text=True, capture_output=True, check=False,
+                            ).stdout.strip()
+                            self.assertEqual(
+                                process_state, "",
+                                f"verifier PID {verifier_pid} remains in state {process_state}",
+                            )
+                        finally:
+                            try:
+                                os.kill(verifier_pid, signal.SIGKILL)
+                            except (ProcessLookupError, PermissionError):
+                                pass
+                    registry = json.loads(fixture.registry.read_text(encoding="utf-8"))
+                    self.assertNotIn("__controller_host_tool_receipts__", registry)
+                    lifecycle = json.loads(fixture.lifecycle.read_text(encoding="utf-8"))
+                    self.assertNotIn("control_receipt_inflight", lifecycle)
+                    self.assertFalse(lifecycle.get("tool_trace"))
+                    after_failure = {path.relative_to(root) for path in root.rglob("*")}
+                    unexpected = {
+                        path for path in after_failure - before_files
+                        if path.suffix in {".lock", ".tmp"} or "temporary" in path.name
+                    }
+                    self.assertEqual(unexpected, set())
+                    runtime_hook.IO_TIMEOUT_SECONDS = 5.0
+                    healthy = exchange(fixture.request("pre"))
+                    self.assertTrue(healthy["ok"], healthy)
+                    self.assertEqual(healthy["result"]["decision"], "ALLOW")
+                stop.set()
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+
+    def test_factory_pinned_identity_rejects_valid_config_replacement_before_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executables = []
+            for number in (1, 2):
+                executable = root / f"runtime-verifier-{number}"
+                executable.write_text("#!/bin/sh\nprintf '%s\\n' '{\"ok\":false}'\n", encoding="utf-8")
+                executable.chmod(0o700)
+                executables.append(executable)
+
+            def write_config(executable: Path) -> Path:
+                digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+                config = root / "host-verifiers.json"
+                config.write_text(json.dumps({"schema_version": 1, "verifiers": {"web": {
+                    "protocol": "runtime_host_verifier_cli_v1", "executable": str(executable),
+                    "sha256": digest, "bundle_sha256": {str(executable): digest},
+                }}}), encoding="utf-8")
+                config.chmod(0o600)
+                return config
+
+            config = write_config(executables[0])
+            verifier = web_bridge._external_peer_attestation_verifier("web", config_path=config)
+            self.assertTrue(callable(verifier))
+            write_config(executables[1])
+            with self.assertRaisesRegex(PermissionError, "changed after factory probe"):
+                verifier(
+                    phase="pre_delivery", controller_id="controller-1", host="web",
+                    expected_target_session_id="web-current", expected_target_generation=4,
+                    expected_ownership_generation=8,
+                )
+
+    def test_external_verifier_deadline_covers_config_and_bundle_reads(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text("#!/bin/sh\nprintf '%s\\n' '{\"ok\":false}'\n", encoding="utf-8")
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version": 1, "verifiers": {"web": {
+                "protocol": "runtime_host_verifier_cli_v1", "executable": str(executable),
+                "sha256": digest, "bundle_sha256": {str(executable): digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(
+                web_bridge,
+                "_call_pinned_host_verifier_helper",
+                side_effect=web_bridge.PeerHostTransientUnavailable("request budget exhausted"),
+            ):
+                with self.assertRaisesRegex(
+                    web_bridge.PeerHostTransientUnavailable, "request budget exhausted"
+                ):
+                    web_bridge._external_peer_attestation_verifier(
+                        "web", config_path=config, deadline_monotonic=101.0
+                    )
+
+    def test_loaded_verifier_rejects_writable_members_parents_and_replaced_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text("#!/bin/sh\nprintf '%s\\n' '{\"ok\":false}'\n", encoding="utf-8")
+            executable.chmod(0o700)
+            dependency = root / "dependency.mjs"
+            dependency.write_text("export default 1;\n", encoding="utf-8")
+            dependency.chmod(0o600)
+            def write_config() -> Path:
+                config = root / "host-verifiers.json"
+                config.write_text(json.dumps({"schema_version": 1, "verifiers": {"web": {
+                    "protocol": "runtime_host_verifier_cli_v1", "executable": str(executable),
+                    "sha256": __import__("hashlib").sha256(executable.read_bytes()).hexdigest(),
+                    "bundle_sha256": {
+                        str(executable): __import__("hashlib").sha256(executable.read_bytes()).hexdigest(),
+                        str(dependency): __import__("hashlib").sha256(dependency.read_bytes()).hexdigest(),
+                    },
+                }}}), encoding="utf-8")
+                config.chmod(0o600)
+                return config
+            with self.subTest("0777 executable"):
+                executable.chmod(0o777)
+                verifier = web_bridge._loaded_external_peer_attestation_verifier("web", config_path=write_config())
+                with self.assertRaisesRegex(PermissionError, "writable"):
+                    verifier()
+                executable.chmod(0o700)
+            with self.subTest("0666 dependency"):
+                dependency.chmod(0o666)
+                verifier = web_bridge._loaded_external_peer_attestation_verifier("web", config_path=write_config())
+                with self.assertRaisesRegex(PermissionError, "writable"):
+                    verifier()
+                dependency.chmod(0o600)
+            with self.subTest("symlink parent"):
+                trusted = root / "trusted"
+                trusted.mkdir(mode=0o700)
+                linked_member = trusted / "runtime-verifier"
+                linked_member.write_bytes(executable.read_bytes())
+                linked_member.chmod(0o700)
+                link = root / "link"
+                link.symlink_to(trusted, target_is_directory=True)
+                linked_digest = __import__("hashlib").sha256(linked_member.read_bytes()).hexdigest()
+                config = root / "linked-host-verifiers.json"
+                config.write_text(json.dumps({"schema_version": 1, "verifiers": {"web": {
+                    "protocol": "runtime_host_verifier_cli_v1",
+                    "executable": str(link / "runtime-verifier"),
+                    "sha256": linked_digest,
+                    "bundle_sha256": {str(link / "runtime-verifier"): linked_digest},
+                }}}), encoding="utf-8")
+                config.chmod(0o600)
+                verifier = web_bridge._loaded_external_peer_attestation_verifier(
+                    "web", config_path=config
+                )
+                with self.assertRaisesRegex(PermissionError, "parent.*symlink"):
+                    verifier()
+            with self.subTest("writable parent"):
+                root.chmod(0o777)
+                verifier = web_bridge._loaded_external_peer_attestation_verifier("web", config_path=write_config())
+                with self.assertRaisesRegex(PermissionError, "parent"):
+                    verifier()
+                root.chmod(0o700)
+            with self.subTest("replaced bundle path"):
+                verifier = web_bridge._loaded_external_peer_attestation_verifier("web", config_path=write_config())
+                replacement = root / "replacement.mjs"
+                replacement.write_text("export default 2;\n", encoding="utf-8")
+                replacement.chmod(0o600)
+                replacement.replace(dependency)
+                with self.assertRaisesRegex(PermissionError, "identity changed"):
+                    verifier(phase="pre_delivery", controller_id="c", host="web", expected_target_session_id="x", expected_target_generation=1, expected_ownership_generation=1)
 
     def test_registered_web_verifier_loads_pinned_external_runtime_host_cli(self) -> None:
         from unittest.mock import patch
@@ -2480,7 +2862,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
             env=dict(os.environ),
         )
 
-    def test_audit_once_captures_successful_control_guard_receipt_and_advances_cursor(self) -> None:
+    def test_audit_once_keeps_translated_guard_receipt_diagnostic_and_advances_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             repo = tmp_path / "repo"
@@ -2525,13 +2907,10 @@ class WebLifecycleAuditTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            events = [json.loads(line) for line in capture.read_text().splitlines()]
-            self.assertEqual(len(events), 1)
-            self.assertIn("control_event_guard.py", events[0]["tool_input"]["command"])
-            self.assertIn("control-event: allowed", events[0]["tool_response"]["output"])
+            self.assertFalse(capture.exists())
             self.assertEqual(json.loads(cursor.read_text())["offset"], audit.stat().st_size)
 
-    def test_audit_consumer_waits_for_cross_process_cursor_lock_before_dispatch(self) -> None:
+    def test_audit_consumer_waits_for_cross_process_cursor_lock_before_diagnostic_advance(self) -> None:
         import fcntl, time
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
@@ -2571,9 +2950,9 @@ class WebLifecycleAuditTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(released)
         self.assertGreater(elapsed, 0.25)
-        self.assertEqual(dispatch.call_count, 1)
+        self.assertEqual(dispatch.call_count, 0)
 
-    def test_audit_dispatch_failure_does_not_advance_cursor_and_replay_is_fail_closed(self) -> None:
+    def test_audit_diagnostic_guard_receipt_never_enters_dispatch_replay_state(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); repo = root / "repo"; repo.mkdir()
@@ -2598,10 +2977,10 @@ class WebLifecycleAuditTests(unittest.TestCase):
             offset1 = json.loads(cursor.read_text()).get("offset", 0) if cursor.exists() else 0
             with patch.object(web_bridge, "dispatch_event", return_value=0) as second:
                 code2 = web_bridge.main(args)
-        self.assertNotEqual(code1, 0)
-        self.assertEqual(offset1, 0)
-        self.assertEqual(first.call_count, 1)
-        self.assertNotEqual(code2, 0)
+        self.assertEqual(code1, 0)
+        self.assertGreater(offset1, 0)
+        self.assertEqual(first.call_count, 0)
+        self.assertEqual(code2, 0)
         self.assertEqual(second.call_count, 0)
 
     def test_audit_once_rule_update_uses_guarded_scheduler_and_never_direct_scheduler(self) -> None:
@@ -3704,7 +4083,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
                 self.assertNotEqual(result, "scheduled")
                 self.assertFalse(capture.exists())
 
-    def test_audit_once_schedules_native_stop_after_allowed_guard_receipt(self) -> None:
+    def test_audit_once_never_schedules_native_stop_from_diagnostic_guard_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             repo = tmp_path / "repo"
@@ -3749,11 +4128,9 @@ class WebLifecycleAuditTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            scheduled = json.loads(capture.read_text(encoding="utf-8"))
-            self.assertIn("auto-native-stop", scheduled)
-            self.assertIn("controller-1", scheduled)
-            self.assertIn(str(repo.resolve()), scheduled)
-            self.assertIn("guard-auto-stop-1", scheduled)
+            self.assertFalse(capture.exists())
+            self.assertFalse(state.exists())
+            self.assertEqual(json.loads(cursor.read_text())["offset"], audit.stat().st_size)
 
     def test_audit_once_ignores_non_guard_shell_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7367,7 +7744,7 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertNotEqual(native, 0)
             self.assertFalse(marker.exists())
 
-    def test_audit_wake_pending_ignores_capture_mode_and_retries_only_wake(self) -> None:
+    def test_audit_diagnostic_guard_receipt_ignores_capture_mode_without_wake(self) -> None:
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -7392,22 +7769,17 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry), "--web-session-id", "web-session-1",
                 "--codex", str(codex),
             ]
-            wake_results = [
-                {"result": "DEFERRED", "decision": "DEFER", "pending_control_event": True},
-                {"result": "CONFIRMED", "decision": "RESUME_CURRENT_HOST", "pending_control_event": True},
-            ]
             with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch, patch.object(
                 web_bridge, "_load_lifecycle_state", return_value=state
-            ), patch.object(web_bridge, "dispatch_pending_lifecycle_wake", side_effect=wake_results) as wake:
+            ), patch.object(web_bridge, "dispatch_pending_lifecycle_wake") as wake:
                 first = web_bridge.main(base_args)
                 second = web_bridge.main(base_args + ["--capture-events", str(capture)])
-            self.assertNotEqual(first, 0)
+            self.assertEqual(first, 0)
             self.assertEqual(second, 0)
-            self.assertEqual(dispatch.call_count, 1)
-            self.assertEqual(wake.call_count, 2)
+            self.assertEqual(dispatch.call_count, 0)
+            self.assertEqual(wake.call_count, 0)
             self.assertFalse(capture.exists())
-            stored = json.loads(cursor.with_suffix(cursor.suffix + ".receipts.json").read_text(encoding="utf-8"))
-            self.assertEqual(stored["receipts"]["wake-capture-retry-1"], "handled")
+            self.assertFalse(cursor.with_suffix(cursor.suffix + ".receipts.json").exists())
             self.assertEqual(json.loads(cursor.read_text(encoding="utf-8"))["offset"], audit.stat().st_size)
 
     def test_audit_wake_pending_is_strict_wake_only_even_with_capture_events(self) -> None:
@@ -7419,9 +7791,9 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             _provision_verified_current_web_target(registry, web_session_id="web-session-1")
             audit = root / "audit.jsonl"
             receipt = {
-                "receiptId": "wake-only-capture-1", "childTool": "shell_command", "state": "succeeded",
-                "rootLabel": str(repo), "targetLabel": GUARD_COMMAND,
-                "detail": f"命令：{GUARD_COMMAND}\n\n命令输出：\ncontrol-event: allowed\n",
+                "receiptId": "wake-only-capture-1", "childTool": "computer", "state": "succeeded",
+                "targetLabel": "Google Chrome",
+                "detail": "电脑操作：get_app_state · 应用 Google Chrome",
             }
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             cursor = root / "cursor.json"
@@ -7431,12 +7803,12 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 "snapshot": {"head": "h1", "ledger_sha256": "l1", "worktree_status_sha256": "s1"},
             }
             state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
-            state_path.write_text(json.dumps({
-                "receipts": {"wake-only-capture-1": "wake_pending"},
-                "wake_fingerprints": {
-                    "wake-only-capture-1": web_bridge._wake_event_fingerprint(lifecycle_state)
-                },
-            }), encoding="utf-8")
+            web_bridge._set_audit_receipt_status(
+                cursor,
+                receipt,
+                "wake_pending",
+                wake_fingerprint=web_bridge._wake_event_fingerprint(lifecycle_state),
+            )
             with patch.object(
                 web_bridge, "successful_guard_event_from_receipt",
                 side_effect=AssertionError("wake_pending must not reconstruct event"),
@@ -7466,7 +7838,101 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertEqual(saved["receipts"]["wake-only-capture-1"], "handled")
             self.assertEqual(json.loads(cursor.read_text(encoding="utf-8"))["offset"], audit.stat().st_size)
 
-    def test_audit_wake_pending_requires_same_generation_and_present_state(self) -> None:
+    def test_audit_wake_retry_rejects_same_id_receipt_shape_replacement(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
+            original = {
+                "receiptId": "receipt-shape-binding-1", "childTool": "computer", "state": "succeeded",
+                "rootLabel": str(repo), "targetLabel": "Google Chrome",
+                "detail": "电脑操作：get_app_state · 应用 Google Chrome", "occurredAtUnixMs": 2000,
+            }
+            lifecycle_state = {
+                "pending_control_event": True, "triggers": ["READY:F1"],
+                "snapshot": {"head": "h1", "ledger_sha256": "l1", "worktree_status_sha256": "s1"},
+            }
+            replacements = {
+                "shell": {
+                    "receiptId": "receipt-shape-binding-1", "childTool": "shell_command", "state": "succeeded",
+                    "rootLabel": str(repo), "targetLabel": GUARD_COMMAND,
+                    "detail": f"命令：{GUARD_COMMAND}\\n\\n命令输出：\\ncontrol-event: allowed\\n",
+                },
+                "foreign_root": {**original, "rootLabel": str(root / "foreign-repo")},
+                "changed_detail": {**original, "detail": "电脑操作：click · 应用 Google Chrome"},
+            }
+            for name, replacement in replacements.items():
+                with self.subTest(name=name):
+                    audit = root / f"{name}.audit.jsonl"
+                    audit.write_text(json.dumps(replacement) + "\n", encoding="utf-8")
+                    cursor = root / f"{name}.cursor.json"
+                    web_bridge._set_audit_receipt_status(
+                        cursor,
+                        original,
+                        "wake_pending",
+                        wake_fingerprint=web_bridge._wake_event_fingerprint(lifecycle_state),
+                    )
+                    with patch.object(
+                        web_bridge, "computer_event_from_receipt",
+                        side_effect=AssertionError("receipt shape replacement must not revalidate or consume a lease"),
+                    ), patch.object(
+                        web_bridge, "dispatch_event",
+                        side_effect=AssertionError("receipt shape replacement must not redispatch"),
+                    ), patch.object(
+                        web_bridge, "_load_lifecycle_state", return_value=lifecycle_state
+                    ), patch.object(
+                        web_bridge, "dispatch_pending_lifecycle_wake",
+                        side_effect=AssertionError("receipt shape replacement must not wake"),
+                    ) as wake:
+                        code = web_bridge.main([
+                            "audit-once", "--repo", str(repo), "--session-id", "controller-1",
+                            "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry),
+                            "--web-session-id", "web-session-1", "--codex", str(codex),
+                        ])
+                    self.assertEqual(code, 0)
+                    wake.assert_not_called()
+                    self.assertEqual(
+                        json.loads(cursor.read_text(encoding="utf-8"))["offset"], audit.stat().st_size,
+                    )
+
+    def test_audit_unbound_legacy_wake_pending_never_directly_wakes(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, registry, codex, _receipt_path, _ = self.make_controller(root)
+            _provision_verified_current_web_target(registry, web_session_id="web-session-1")
+            receipt = {
+                "receiptId": "legacy-computer-wake-1", "childTool": "computer", "state": "succeeded",
+                "rootLabel": str(repo), "targetLabel": "Google Chrome",
+                "detail": "电脑操作：get_app_state · 应用 Google Chrome", "occurredAtUnixMs": 2000,
+            }
+            audit = root / "audit.jsonl"
+            audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            cursor = root / "cursor.json"
+            cursor.with_suffix(cursor.suffix + ".receipts.json").write_text(json.dumps({
+                "receipts": {"legacy-computer-wake-1": "wake_pending"},
+                "wake_fingerprints": {"legacy-computer-wake-1": "old-fingerprint"},
+            }), encoding="utf-8")
+            with patch.object(
+                web_bridge, "computer_event_from_receipt",
+                side_effect=AssertionError("unbound legacy wake state must not consume a lease"),
+            ) as revalidate, patch.object(
+                web_bridge, "dispatch_pending_lifecycle_wake",
+                side_effect=AssertionError("unbound legacy wake state must not directly wake"),
+            ) as wake:
+                code = web_bridge.main([
+                    "audit-once", "--repo", str(repo), "--session-id", "controller-1",
+                    "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry),
+                    "--web-session-id", "web-session-1", "--codex", str(codex),
+                ])
+            self.assertEqual(code, 0)
+            revalidate.assert_not_called()
+            wake.assert_not_called()
+
+    def test_historical_guard_wake_pending_is_diagnostic_and_never_wakes(self) -> None:
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -7485,38 +7951,37 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
                 "pending_control_event": True, "triggers": ["READY:F1"],
                 "snapshot": {"head": "h1", "ledger_sha256": "l1", "worktree_status_sha256": "s1"},
             }
-            changed_state = {
-                "pending_control_event": True, "triggers": ["READY:F1"],
-                "snapshot": {"head": "h2", "ledger_sha256": "l1", "worktree_status_sha256": "s1"},
-            }
             args = [
                 "audit-once", "--repo", str(repo), "--session-id", "controller-1",
                 "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry), "--web-session-id", "web-session-1",
                 "--codex", str(codex),
             ]
+            state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
+            state_path.write_text(json.dumps({
+                "receipts": {"wake-generation-1": "wake_pending"},
+                "wake_fingerprints": {
+                    "wake-generation-1": web_bridge._wake_event_fingerprint(first_state)
+                },
+            }), encoding="utf-8")
             with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch, patch.object(
-                web_bridge, "_load_lifecycle_state", side_effect=[first_state, changed_state, {}]
+                web_bridge, "_load_lifecycle_state", return_value=first_state
             ), patch.object(
                 web_bridge, "dispatch_pending_lifecycle_wake", return_value={
-                    "result": "DEFERRED", "decision": "DEFER", "pending_control_event": True
+                    "result": "CONFIRMED", "decision": "RESUME_CURRENT_HOST",
+                    "pending_control_event": True,
                 }
             ) as wake:
-                first = web_bridge.main(args)
-                changed = web_bridge.main(args)
-                missing = web_bridge.main(args)
-            self.assertNotEqual(first, 0)
-            self.assertNotEqual(changed, 0)
-            self.assertNotEqual(missing, 0)
-            self.assertEqual(dispatch.call_count, 1)
-            self.assertEqual(wake.call_count, 1)
-            self.assertFalse(cursor.exists())
-            state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
-            stored = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(stored["receipts"]["wake-generation-1"], "wake_pending")
+                code = web_bridge.main(args)
+            self.assertEqual(code, 0)
+            self.assertEqual(dispatch.call_count, 0)
+            self.assertEqual(wake.call_count, 0)
             self.assertEqual(
-                stored["wake_fingerprints"]["wake-generation-1"],
-                web_bridge._wake_event_fingerprint(first_state),
+                json.loads(cursor.read_text(encoding="utf-8"))["offset"],
+                audit.stat().st_size,
             )
+            stored = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(stored["receipts"]["wake-generation-1"], "diagnostic")
+            self.assertNotIn("wake-generation-1", stored["wake_fingerprints"])
 
     def test_audit_once_schedules_background_retry_when_computer_wake_hits_active_writer(self) -> None:
         from unittest.mock import patch
@@ -7604,9 +8069,14 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             self.assertEqual(second, 0)
             self.assertEqual(dispatch.call_count, 1)
             self.assertEqual(wake.call_count, 2)
+            saved = json.loads(cursor.with_suffix(cursor.suffix + ".receipts.json").read_text(encoding="utf-8"))
+            binding = saved["receipt_bindings"]["computer-wake-retry-1"]
+            self.assertEqual(binding["receipt_kind"], "computer")
+            self.assertTrue(binding["receipt_digest"])
+            self.assertTrue(binding["receipt_provenance"])
             self.assertEqual(json.loads(cursor.read_text(encoding="utf-8"))["offset"], audit.stat().st_size)
 
-    def test_audit_once_retries_wake_after_dispatch_succeeded_but_wake_deferred(self) -> None:
+    def test_audit_diagnostic_guard_receipt_never_starts_wake_retry(self) -> None:
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -7622,10 +8092,6 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             cursor = root / "cursor.json"
             state = {"pending_control_event": True, "triggers": ["READY:F1"]}
-            wake_results = [
-                {"result": "DEFERRED", "decision": "DEFER", "pending_control_event": True},
-                {"result": "CONFIRMED", "decision": "RESUME_CURRENT_HOST", "pending_control_event": True},
-            ]
             args = [
                 "audit-once", "--repo", str(repo), "--session-id", "controller-1",
                 "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry), "--web-session-id", "web-session-1",
@@ -7633,19 +8099,18 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             ]
             with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch, patch.object(
                 web_bridge, "_load_lifecycle_state", return_value=state
-            ), patch.object(web_bridge, "dispatch_pending_lifecycle_wake", side_effect=wake_results) as wake:
+            ), patch.object(web_bridge, "dispatch_pending_lifecycle_wake") as wake:
                 first = web_bridge.main(args)
                 second = web_bridge.main(args)
-            self.assertNotEqual(first, 0)
+            self.assertEqual(first, 0)
             self.assertEqual(second, 0)
-            self.assertEqual(dispatch.call_count, 1)
-            self.assertEqual(wake.call_count, 2)
+            self.assertEqual(dispatch.call_count, 0)
+            self.assertEqual(wake.call_count, 0)
             state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
-            saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["receipts"]["wake-retry-1"], "handled")
+            self.assertFalse(state_path.exists())
             self.assertEqual(json.loads(cursor.read_text(encoding="utf-8"))["offset"], audit.stat().st_size)
 
-    def test_audit_once_keeps_receipt_pending_when_pending_wake_dispatch_returns_none(self) -> None:
+    def test_audit_diagnostic_guard_receipt_ignores_missing_wake_dispatcher(self) -> None:
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -7660,20 +8125,22 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             }
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             cursor = root / "cursor.json"
-            with patch.object(web_bridge, "dispatch_event", return_value=0), patch.object(
+            with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch, patch.object(
                 web_bridge, "_load_lifecycle_state", return_value={"pending_control_event": True, "triggers": ["READY:F1"]}
-            ), patch.object(web_bridge, "dispatch_pending_lifecycle_wake", return_value=None):
+            ), patch.object(web_bridge, "dispatch_pending_lifecycle_wake", return_value=None) as wake:
                 code = web_bridge.main([
                     "audit-once", "--repo", str(repo), "--session-id", "controller-1",
                     "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry), "--web-session-id", "web-session-1",
                     "--codex", str(codex),
                 ])
-            self.assertNotEqual(code, 0)
+            self.assertEqual(code, 0)
+            dispatch.assert_not_called()
+            wake.assert_not_called()
             state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
-            saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["receipts"]["wake-none-1"], "wake_pending")
+            self.assertFalse(state_path.exists())
+            self.assertEqual(json.loads(cursor.read_text(encoding="utf-8"))["offset"], audit.stat().st_size)
 
-    def test_audit_once_does_not_mark_receipt_handled_when_wake_is_not_confirmed(self) -> None:
+    def test_audit_diagnostic_guard_receipt_ignores_failed_wake_dispatcher(self) -> None:
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -7688,22 +8155,24 @@ class ControllerWakeSupervisorTests(unittest.TestCase):
             }
             audit.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             cursor = root / "cursor.json"
-            with patch.object(web_bridge, "dispatch_event", return_value=0), patch.object(
+            with patch.object(web_bridge, "dispatch_event", return_value=0) as dispatch, patch.object(
                 web_bridge, "_load_lifecycle_state", return_value={"pending_control_event": True, "triggers": ["READY:F1"]}
             ), patch.object(
                 web_bridge, "dispatch_pending_lifecycle_wake", return_value={
                     "result": "FAILED", "decision": "DEFER", "pending_control_event": True
                 }
-            ):
+            ) as wake:
                 code = web_bridge.main([
                     "audit-once", "--repo", str(repo), "--session-id", "controller-1",
                     "--audit-log", str(audit), "--cursor", str(cursor), "--registry", str(registry), "--web-session-id", "web-session-1",
                     "--codex", str(codex),
                 ])
-            self.assertNotEqual(code, 0)
+            self.assertEqual(code, 0)
+            dispatch.assert_not_called()
+            wake.assert_not_called()
             state_path = cursor.with_suffix(cursor.suffix + ".receipts.json")
-            saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["receipts"]["wake-fail-1"], "wake_pending")
+            self.assertFalse(state_path.exists())
+            self.assertEqual(json.loads(cursor.read_text(encoding="utf-8"))["offset"], audit.stat().st_size)
 
     def test_post_shell_audit_and_native_stop_route_pending_events_through_one_dispatcher(self) -> None:
         from unittest.mock import patch

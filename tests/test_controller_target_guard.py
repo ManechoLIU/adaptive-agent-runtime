@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import fcntl
+import hashlib
 import json
 import subprocess
 import sys
@@ -73,6 +74,339 @@ class ControllerTargetGuardTests(unittest.TestCase):
             self.assertEqual(
                 saved["__controller_targets__"]["controller-1"]["desktop_codex"]["goal_rebind"],
                 contract,
+            )
+
+    def make_web_receipt_registry(self, root: Path, repo: Path) -> Path:
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps({
+            "controller-1": str(repo.resolve()),
+            "__controller_sessions__": {"controller-1": {"web": ["0123456789abcdef0123"]}},
+            "__controller_targets__": {"controller-1": {"web": {
+                "status": "active", "session_id": "0123456789abcdef0123", "generation": 4,
+            }}},
+            "__controller_execution_ownership__": {"controller-1": {
+                "active_host": "web", "execution_target_session_id": "0123456789abcdef0123", "generation": 9,
+            }},
+        }), encoding="utf-8")
+        return registry
+
+    def verified_web_turn(self, guard, *, runtime_invocation_id: str = "runtime-invocation-1") -> dict[str, object]:
+        identity = guard.agent_target.logical_agent_identity(
+            agent_type="controller", agent_id="controller-1"
+        )
+        target = guard.agent_target.verified_execution_target(
+            logical_agent=identity, host="web", execution_target_session_id="0123456789abcdef0123",
+            target_generation=4, ownership_generation=9, provenance="test_host_entry",
+        )
+        return guard.agent_target.verified_execution_turn(
+            verified_target=target, runtime_invocation_id=runtime_invocation_id,
+            provenance="test_runtime_web_turn",
+        )
+
+    def write_active_web_turn_lease(
+        self, root: Path, turn: dict[str, object]
+    ) -> Path:
+        lifecycle = root / "lifecycle.json"
+        lifecycle.write_text(json.dumps({
+            "active_turn_id": turn["turn_id"],
+            "web_turn_lease": {
+                "contract": "runtime_web_turn_lease_v1", "status": "active",
+                "generation": 1, "turn_id": turn["turn_id"],
+                "runtime_invocation_id": turn["runtime_invocation_id"],
+                "execution_target_session_id": "0123456789abcdef0123",
+                "target_generation": 4, "ownership_generation": 9,
+                "watcher_nonce": "watcher-nonce",
+            },
+        }), encoding="utf-8")
+        return lifecycle
+
+    def host_pre_receipt(
+        self, *, bridge_call_id: str = "bridge-1", execution_id: str = "hte-1",
+        receipt_id: str = "pre-receipt-1", nonce: str = "pre-nonce-1",
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1, "provenance": "lab_host_tool_pre_receipt_v1",
+            "pre_receipt_id": receipt_id, "capability_id": "hic_1",
+            "host_tool_execution_id": execution_id, "bridge_call_id": bridge_call_id,
+            "bridge_challenge_nonce": "challenge-nonce", "transport_binding_id": "tb_1",
+            "workspace": "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge",
+            "production_release_revision": "1" * 40, "production_endpoint_generation": 1,
+            "bridge_principal_id": "bridge-principal", "bridge_execution_session_id": "bridge-session",
+            "bridge_capability_id": "bridge-capability", "bridge_workspace_id": "local-agent-bridge-production",
+            "tool_name": "run_command", "outer_request_sha256": "c" * 64,
+            "forwarded_request_sha256": "d" * 64, "normalized_request_sha256": "a" * 64,
+            "conversation_id": "0123456789abcdef0123", "browser_target_id": "target-1",
+            "top_frame_id": "frame-1", "loader_id": "loader-1", "secure_origin": "https://chatgpt.com",
+            "generation_anchor_sha256": "e" * 64, "extension_binding_sha256": "f" * 64,
+            "extension_instance_id_sha256": "0" * 64, "extension_loaded_at_ms": 1,
+            "pre_nonce": nonce, "issued_at_unix_ms": 2, "host_epoch_binding_sha256": "1" * 64,
+            "host_mac_sha256": "2" * 64,
+        }
+
+    def host_terminal_receipt(
+        self, *, bridge_call_id: str = "bridge-1", execution_id: str = "hte-1",
+        pre_receipt: dict[str, object], receipt_id: str = "terminal-receipt-1",
+        response_sha256: str = "b" * 64,
+    ) -> dict[str, object]:
+        return {
+            **{key: value for key, value in pre_receipt.items() if key not in {
+                "pre_receipt_id", "pre_nonce", "issued_at_unix_ms", "host_mac_sha256",
+            }},
+            "schema_version": 1, "provenance": "lab_host_tool_terminal_receipt_v1",
+            "terminal_receipt_id": receipt_id,
+            "pre_receipt_id": pre_receipt["pre_receipt_id"],
+            "pre_receipt_sha256": hashlib.sha256(json.dumps(
+                pre_receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest(),
+            "host_tool_execution_id": execution_id, "bridge_call_id": bridge_call_id,
+            "backend_route": "/run-command", "http_status": 200,
+            "response_body_sha256": response_sha256, "terminal_classification": "completed",
+            "issued_at_unix_ms": 3, "host_epoch_binding_sha256": "1" * 64,
+            "host_mac_sha256": "3" * 64,
+        }
+
+    def host_tool_guard_evidence(
+        self, *, terminal_receipt_sha256: str, snapshot_sha256: str,
+        turn: dict[str, object], execution_id: str = "hte-1",
+    ) -> dict[str, object]:
+        return {
+            "controller_id": "controller-1", "host": "web",
+            "execution_target_session_id": "0123456789abcdef0123", "turn_id": turn["turn_id"],
+            "target_generation": 4, "ownership_generation": 9,
+            "bridge_call_id": "bridge-1", "host_tool_execution_id": execution_id,
+            "normalized_request_sha256": "a" * 64,
+            "snapshot_sha256": snapshot_sha256,
+            "terminal_receipt_sha256": terminal_receipt_sha256,
+            "terminal_status": "CLOSED",
+        }
+
+    def test_host_tool_preparation_persists_full_tuple_and_redacts_receipt_material(self) -> None:
+        """Would fail if prepare did not durably bind the canonical tuple or redacted receipts."""
+        guard = load_guard()
+        self.assertTrue(hasattr(guard, "prepare_host_tool_execution"), "prepare_host_tool_execution is missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = self.make_web_receipt_registry(root, repo)
+            snapshot = root / "snapshot.json"
+            snapshot.write_text('{"snapshot":"current"}', encoding="utf-8")
+            turn = self.verified_web_turn(guard)
+            lifecycle = self.write_active_web_turn_lease(root, turn)
+            pre = self.host_pre_receipt()
+
+            prepared = guard.prepare_host_tool_execution(
+                repo=repo, controller_id="controller-1", verified_turn=turn,
+                host_pre_receipt=pre, snapshot_path=snapshot, registry_path=registry,
+                lifecycle_path=lifecycle,
+            )
+
+            self.assertEqual(prepared["state"], "PREPARED")
+            self.assertEqual(prepared["tuple"], {
+                "controller_id": "controller-1", "host": "web",
+                "execution_target_session_id": "0123456789abcdef0123", "turn_id": turn["turn_id"],
+                "target_generation": 4, "ownership_generation": 9,
+                "bridge_call_id": "bridge-1", "host_tool_execution_id": "hte-1",
+                "normalized_request_sha256": "a" * 64,
+                "snapshot_sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+            })
+            saved = guard.load_json(registry)
+            record = saved["__controller_host_tool_receipts__"]["controller-1"]["web"]["hte-1"]
+            self.assertEqual(record["state"], "PREPARED")
+            self.assertNotIn("bridge_capability_id", json.dumps(record, sort_keys=True))
+            self.assertNotIn("host_mac_sha256", json.dumps(record, sort_keys=True))
+            self.assertEqual(record["pre_receipt_sha256"], prepared["pre_receipt_sha256"])
+
+    def test_host_tool_preparation_rejects_nonce_receipt_and_execution_replays_after_reload(self) -> None:
+        """Would fail if any pre replay could claim a second persisted tuple after reload."""
+        guard = load_guard()
+        self.assertTrue(hasattr(guard, "prepare_host_tool_execution"), "prepare_host_tool_execution is missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = self.make_web_receipt_registry(root, repo)
+            snapshot = root / "snapshot.json"
+            snapshot.write_text('{"snapshot":"current"}', encoding="utf-8")
+            turn = self.verified_web_turn(guard)
+            lifecycle = self.write_active_web_turn_lease(root, turn)
+            guard.prepare_host_tool_execution(
+                repo=repo, controller_id="controller-1", verified_turn=turn,
+                host_pre_receipt=self.host_pre_receipt(), snapshot_path=snapshot, registry_path=registry,
+                lifecycle_path=lifecycle,
+            )
+            for replay in (
+                self.host_pre_receipt(
+                    receipt_id="pre-receipt-2", nonce="pre-nonce-2",
+                ),
+                self.host_pre_receipt(
+                    execution_id="hte-2", receipt_id="pre-receipt-2",
+                ),
+                self.host_pre_receipt(
+                    execution_id="hte-3", nonce="pre-nonce-3",
+                ),
+            ):
+                with self.assertRaisesRegex(PermissionError, "replay|already"):
+                    guard.prepare_host_tool_execution(
+                        repo=repo, controller_id="controller-1", verified_turn=turn,
+                        host_pre_receipt=replay, snapshot_path=snapshot, registry_path=registry,
+                        lifecycle_path=lifecycle,
+                    )
+            self.assertEqual(
+                list(guard.load_json(registry)["__controller_host_tool_receipts__"]["controller-1"]["web"]),
+                ["hte-1"],
+            )
+
+    def test_host_tool_terminal_retry_is_exact_and_direct_close_is_disabled(self) -> None:
+        """Would fail if changed terminal data overwrote pending state or a public API made a bare CLOSED."""
+        guard = load_guard()
+        self.assertTrue(hasattr(guard, "prepare_host_tool_execution"), "prepare_host_tool_execution is missing")
+        self.assertTrue(hasattr(guard, "terminalize_host_tool_execution"), "terminalize_host_tool_execution is missing")
+        self.assertTrue(hasattr(guard, "close_host_tool_execution"), "close_host_tool_execution is missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = self.make_web_receipt_registry(root, repo)
+            snapshot = root / "snapshot.json"
+            snapshot.write_text('{"snapshot":"current"}', encoding="utf-8")
+            turn = self.verified_web_turn(guard)
+            lifecycle = self.write_active_web_turn_lease(root, turn)
+            pre = self.host_pre_receipt()
+            guard.prepare_host_tool_execution(
+                repo=repo, controller_id="controller-1", verified_turn=turn,
+                host_pre_receipt=pre, snapshot_path=snapshot, registry_path=registry,
+                lifecycle_path=lifecycle,
+            )
+            terminal = self.host_terminal_receipt(pre_receipt=pre)
+            pending = guard.terminalize_host_tool_execution(
+                repo=repo, controller_id="controller-1", verified_turn=turn,
+                host_terminal_receipt=terminal, snapshot_path=snapshot, registry_path=registry,
+                lifecycle_path=lifecycle,
+            )
+            retry = guard.terminalize_host_tool_execution(
+                repo=repo, controller_id="controller-1", verified_turn=turn,
+                host_terminal_receipt=terminal, snapshot_path=snapshot, registry_path=registry,
+                lifecycle_path=lifecycle,
+            )
+            self.assertEqual(pending, retry)
+            self.assertEqual(pending["state"], "TERMINAL_PENDING")
+            with self.assertRaisesRegex(PermissionError, "terminal receipt"):
+                guard.terminalize_host_tool_execution(
+                    repo=repo, controller_id="controller-1", verified_turn=turn,
+                    host_terminal_receipt=self.host_terminal_receipt(pre_receipt=pre, response_sha256="c" * 64),
+                    snapshot_path=snapshot, registry_path=registry, lifecycle_path=lifecycle,
+                )
+            before_pre_chain_mismatch = registry.read_bytes()
+            for mismatch in (
+                terminal | {"pre_receipt_id": "hpr_other"},
+                terminal | {"pre_receipt_sha256": "9" * 64},
+            ):
+                with self.assertRaisesRegex(PermissionError, "pre receipt"):
+                    guard.terminalize_host_tool_execution(
+                        repo=repo, controller_id="controller-1", verified_turn=turn,
+                        host_terminal_receipt=mismatch, snapshot_path=snapshot, registry_path=registry,
+                        lifecycle_path=lifecycle,
+                    )
+                self.assertEqual(registry.read_bytes(), before_pre_chain_mismatch)
+            evidence = self.host_tool_guard_evidence(
+                terminal_receipt_sha256=pending["terminal_receipt_sha256"],
+                snapshot_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+                turn=turn,
+            )
+            with self.assertRaisesRegex(PermissionError, "commit_host_tool_execution"):
+                guard.close_host_tool_execution(
+                    repo=repo, controller_id="controller-1", verified_turn=turn,
+                    host_terminal_receipt=terminal, guard_evidence=evidence,
+                    snapshot_path=snapshot, registry_path=registry, lifecycle_path=lifecycle,
+                )
+            saved = guard.load_json(registry)
+            record = saved["__controller_host_tool_receipts__"]["controller-1"]["web"]["hte-1"]
+            self.assertEqual(record["state"], "TERMINAL_PENDING")
+            self.assertNotIn("host_tool_terminal_commits", guard.load_json(lifecycle))
+
+    def test_host_tool_cas_has_one_concurrent_winner_and_fails_closed_on_tuple_drift_and_capacity(self) -> None:
+        """Would fail if races, stale canonical bindings, or a full ledger admitted another execution."""
+        guard = load_guard()
+        self.assertTrue(hasattr(guard, "prepare_host_tool_execution"), "prepare_host_tool_execution is missing")
+        self.assertTrue(
+            hasattr(guard, "MAX_HOST_TOOL_RECEIPTS_PER_HOST"),
+            "MAX_HOST_TOOL_RECEIPTS_PER_HOST is missing",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = self.make_web_receipt_registry(root, repo)
+            snapshot = root / "snapshot.json"
+            snapshot.write_text('{"snapshot":"current"}', encoding="utf-8")
+            turn = self.verified_web_turn(guard)
+            lifecycle = self.write_active_web_turn_lease(root, turn)
+            outcomes: list[str] = []
+
+            def prepare() -> None:
+                try:
+                    guard.prepare_host_tool_execution(
+                        repo=repo, controller_id="controller-1", verified_turn=turn,
+                        host_pre_receipt=self.host_pre_receipt(), snapshot_path=snapshot, registry_path=registry,
+                        lifecycle_path=lifecycle,
+                    )
+                    outcomes.append("winner")
+                except PermissionError:
+                    outcomes.append("blocked")
+
+            threads = [threading.Thread(target=prepare), threading.Thread(target=prepare)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(sorted(outcomes), ["blocked", "winner"])
+
+            saved = guard.load_json(registry)
+            saved["__controller_targets__"]["controller-1"]["web"]["generation"] = 5
+            registry.write_text(json.dumps(saved), encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "target generation"):
+                guard.prepare_host_tool_execution(
+                    repo=repo, controller_id="controller-1", verified_turn=turn,
+                    host_pre_receipt=self.host_pre_receipt(execution_id="hte-drift", receipt_id="pre-drift", nonce="nonce-drift"),
+                    snapshot_path=snapshot, registry_path=registry, lifecycle_path=lifecycle,
+                )
+
+            saved["__controller_targets__"]["controller-1"]["web"]["generation"] = 4
+            saved["__controller_execution_ownership__"]["controller-1"]["generation"] = 10
+            registry.write_text(json.dumps(saved), encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "ownership generation"):
+                guard.prepare_host_tool_execution(
+                    repo=repo, controller_id="controller-1", verified_turn=turn,
+                    host_pre_receipt=self.host_pre_receipt(execution_id="hte-owner", receipt_id="pre-owner", nonce="nonce-owner"),
+                    snapshot_path=snapshot, registry_path=registry, lifecycle_path=lifecycle,
+                )
+
+            saved["__controller_execution_ownership__"]["controller-1"]["generation"] = 9
+            registry.write_text(json.dumps(saved), encoding="utf-8")
+            before_coordinated_turn = registry.read_bytes()
+            with self.assertRaisesRegex(PermissionError, "Runtime Web turn lease"):
+                guard.prepare_host_tool_execution(
+                    repo=repo, controller_id="controller-1",
+                    verified_turn=self.verified_web_turn(guard, runtime_invocation_id="caller-invented-turn"),
+                    host_pre_receipt=self.host_pre_receipt(execution_id="hte-turn", receipt_id="pre-turn", nonce="nonce-turn"),
+                    snapshot_path=snapshot, registry_path=registry, lifecycle_path=lifecycle,
+                )
+            self.assertEqual(registry.read_bytes(), before_coordinated_turn)
+
+            saved = self.make_web_receipt_registry(root, repo)
+            lifecycle = self.write_active_web_turn_lease(root, turn)
+            full = guard.load_json(saved)
+            full["__controller_host_tool_receipts__"] = {"controller-1": {"web": {
+                f"hte-{index}": {"state": "PREPARED"} for index in range(guard.MAX_HOST_TOOL_RECEIPTS_PER_HOST)
+            }}}
+            saved.write_text(json.dumps(full), encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "receipt limit"):
+                guard.prepare_host_tool_execution(
+                    repo=repo, controller_id="controller-1", verified_turn=turn,
+                    host_pre_receipt=self.host_pre_receipt(execution_id="hte-overflow", receipt_id="pre-overflow", nonce="nonce-overflow"),
+                    snapshot_path=snapshot, registry_path=saved, lifecycle_path=lifecycle,
+                )
+            self.assertEqual(
+                len(guard.load_json(saved)["__controller_host_tool_receipts__"]["controller-1"]["web"]),
+                guard.MAX_HOST_TOOL_RECEIPTS_PER_HOST,
             )
 
     def test_claim_controller_host_web_initializes_cross_host_ownership(self) -> None:
