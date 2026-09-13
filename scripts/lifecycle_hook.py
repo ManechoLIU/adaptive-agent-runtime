@@ -87,8 +87,8 @@ DESKTOP_CANARY_SEQUENCE = (
     "receipt_latched",
     "same_turn_continuation_invalidated_receipt",
     "stop_observed",
-    "next_turn_allowed",
-    "subagent_stop_observed",
+    "post_stop_receipt_latched",
+    "post_stop_continuation_invalidated_receipt",
 )
 DESKTOP_CANARY_OBSERVATIONS = set(DESKTOP_CANARY_SEQUENCE)
 
@@ -1833,7 +1833,7 @@ def _desktop_canary_identity(
     lifecycle = root / "scripts" / "lifecycle_hook.py"
     target_guard_path = root / "scripts" / "controller_target_guard.py"
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "skill_root": str(root),
         "hooks_sha256": sha256_bytes(hooks_path.read_bytes()),
         "lifecycle_sha256": sha256_bytes(lifecycle.read_bytes()),
@@ -1920,7 +1920,7 @@ def arm_desktop_canary(
         or ownership_generation is None
     ):
         raise ValueError(
-            "schema 5 desktop canary requires exact target and ownership generations"
+            "schema 6 desktop canary requires exact target and ownership generations"
         )
     target_session_id = str(execution_target_session_id).strip()
     if not target_session_id:
@@ -2054,14 +2054,22 @@ def record_desktop_canary_observation(
                 observation = "stop_observed"
             elif (
                 index == 6
+                and event_name == "PostToolUse"
+                and state.get("must_yield") is True
+                and str(state.get("receipt_turn_id", "")) == turn_id
+                and turn_id == str(current.get("receipt_latched_turn_id", ""))
+            ):
+                observation = "post_stop_receipt_latched"
+            elif (
+                index == 7
                 and event_name == "PreToolUse"
                 and not denied
-                and turn_id
-                and turn_id != str(current.get("receipt_latched_turn_id", ""))
+                and turn_id == str(current.get("receipt_latched_turn_id", ""))
+                and state.get("must_yield") is not True
+                and state.get("pending_control_event") is True
+                and "post_receipt_action_started" in state.get("triggers", [])
             ):
-                observation = "next_turn_allowed"
-            elif index == 7 and event_name == "SubagentStop":
-                observation = "subagent_stop_observed"
+                observation = "post_stop_continuation_invalidated_receipt"
             if observation:
                 observations.append(observation)
                 current["sequence_index"] = index + 1

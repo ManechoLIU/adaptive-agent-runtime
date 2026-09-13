@@ -1009,8 +1009,8 @@ DESKTOP_CANARY_SEQUENCE = (
     "receipt_latched",
     "same_turn_continuation_invalidated_receipt",
     "stop_observed",
-    "next_turn_allowed",
-    "subagent_stop_observed",
+    "post_stop_receipt_latched",
+    "post_stop_continuation_invalidated_receipt",
 )
 DESKTOP_CANARY_MAX_AGE_SECONDS = 24 * 60 * 60
 
@@ -1097,7 +1097,7 @@ def _valid_desktop_canary(
     target_generation = receipt.get("target_generation")
     ownership_generation = receipt.get("ownership_generation")
     return (
-        receipt.get("schema_version") == 5
+        receipt.get("schema_version") == 6
         and receipt.get("status") == "passed"
         and isinstance(receipt.get("controller_id"), str)
         and bool(receipt.get("controller_id"))

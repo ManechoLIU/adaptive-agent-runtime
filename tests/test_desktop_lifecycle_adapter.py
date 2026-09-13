@@ -2068,7 +2068,7 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 skill_root=skill_root,
             )
 
-            self.assertEqual(armed["schema_version"], 5)
+            self.assertEqual(armed["schema_version"], 6)
             self.assertEqual(armed["controller_id"], "controller-1")
             self.assertEqual(armed["controller_session_id"], "controller-1")
             self.assertEqual(armed["execution_target_session_id"], "desktop-current")
@@ -2198,9 +2198,9 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                     {"active_turn_id": "t1", "must_yield": True, "receipt_turn_id": "t1"},
                 ),
                 (
-                    {"hook_event_name": "PreToolUse", "session_id": "c1", "turn_id": "t2"},
+                    {"hook_event_name": "PostToolUse", "session_id": "c1", "turn_id": "t1"},
                     {},
-                    {"active_turn_id": "t2", "must_yield": False},
+                    {"active_turn_id": "t1", "must_yield": True, "receipt_turn_id": "t1"},
                 ),
             ]
             for event, output, state in sequence:
@@ -2219,19 +2219,27 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 )
 
             self.assertEqual(receipt["status"], "pending")
-            self.assertNotIn("subagent_stop_observed", receipt["observations"])
+            self.assertEqual(
+                receipt["observations"][-1],
+                "post_stop_receipt_latched",
+            )
 
             receipt = lifecycle_hook.record_desktop_canary_observation(
                 {
-                    "hook_event_name": "SubagentStop",
+                    "hook_event_name": "PreToolUse",
                     "session_id": "c1",
                     "controller_session_id": "c1",
-                    "turn_id": "t2",
+                    "turn_id": "t1",
                     "controller_target_generation": 1,
                     "controller_ownership_generation": 1,
                 },
                 {},
-                {"active_turn_id": "t2", "must_yield": False},
+                {
+                    "active_turn_id": "t1",
+                    "must_yield": False,
+                    "pending_control_event": True,
+                    "triggers": ["post_receipt_action_started"],
+                },
                 canary_path=canary,
                 hooks_path=hooks,
                 skill_root=skill_root,
@@ -2241,8 +2249,8 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             self.assertEqual(receipt["controller_session_id"], "c1")
             self.assertEqual(receipt["sequence_index"], 8)
             self.assertEqual(
-                receipt["observations"][4],
-                "same_turn_continuation_invalidated_receipt",
+                receipt["observations"][-1],
+                "post_stop_continuation_invalidated_receipt",
             )
             self.assertEqual(receipt["skill_root"], str(skill_root.resolve()))
             self.assertEqual(len(receipt["hooks_sha256"]), 64)

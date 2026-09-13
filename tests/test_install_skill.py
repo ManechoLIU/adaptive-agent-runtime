@@ -53,7 +53,7 @@ class InstallCapabilityTests(unittest.TestCase):
             registry.write_text(json.dumps(registry_value), encoding="utf-8")
             canary = root / "desktop-canary.json"
             receipt = {
-                "schema_version": 5,
+                "schema_version": 6,
                 "status": "passed",
                 "controller_id": "controller-1",
                 "controller_session_id": "controller-1",
@@ -80,8 +80,8 @@ class InstallCapabilityTests(unittest.TestCase):
                     "receipt_latched",
                     "same_turn_continuation_invalidated_receipt",
                     "stop_observed",
-                    "next_turn_allowed",
-                    "subagent_stop_observed",
+                    "post_stop_receipt_latched",
+                    "post_stop_continuation_invalidated_receipt",
                 ],
             }
             canary.write_text(json.dumps(receipt), encoding="utf-8")
@@ -248,7 +248,7 @@ class InstallCapabilityTests(unittest.TestCase):
             canary.write_text(
                 json.dumps(
                     {
-                        "schema_version": 5,
+                        "schema_version": 6,
                         "status": "passed",
                         "controller_id": "controller-1",
                         "controller_session_id": "controller-1",
@@ -275,8 +275,8 @@ class InstallCapabilityTests(unittest.TestCase):
                                 "receipt_latched",
                                 "same_turn_continuation_invalidated_receipt",
                                 "stop_observed",
-                                "next_turn_allowed",
-                                "subagent_stop_observed",
+                                "post_stop_receipt_latched",
+                                "post_stop_continuation_invalidated_receipt",
                         ],
                     }
                 ),
