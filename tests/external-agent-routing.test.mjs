@@ -12,6 +12,37 @@ import { parseArgs, renderExternalAgentCard, resolveDispatchRoute } from "../scr
 const skillRoot = fileURLToPath(new URL("../", import.meta.url));
 const adapter = path.join(skillRoot, "scripts", "run_external_agent.mjs");
 
+async function terminateSingleProcessFixture(child) {
+  const exited = () => child.exitCode !== null || child.signalCode !== null;
+  if (!exited()) {
+    try {
+      child.kill("SIGKILL");
+    } catch (error) {
+      if (error?.code !== "ESRCH") {
+        return { confirmed: false, diagnostic: `fixture SIGKILL failed: ${error.message}` };
+      }
+    }
+  }
+  if (!exited()) {
+    await new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.off("exit", finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, 1000);
+      child.once("exit", finish);
+    });
+  }
+  return {
+    confirmed: exited(),
+    diagnostic: exited() ? "fixture child exited" : "fixture child did not exit",
+  };
+}
+
 async function assignmentAckFile(directory, overrides = {}, repositoryRoot = skillRoot) {
   const branch = execFileSync("git", ["-C", repositoryRoot, "branch", "--show-current"], { encoding: "utf8" }).trim();
   const head = execFileSync("git", ["-C", repositoryRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
@@ -1859,7 +1890,9 @@ test("Grok unstructured stdout does not satisfy structured first-output progress
   process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
   try {
     await assert.rejects(
-      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], {
+        cwd: bin, env: process.env, terminateGroup: terminateSingleProcessFixture,
+      }),
       (error) => error?.failureClass === "first_output_timeout",
     );
   } finally {
@@ -1887,7 +1920,9 @@ test("Grok 1.0.13 streaming text output satisfies first-output progress then sta
   process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
   try {
     await assert.rejects(
-      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], {
+        cwd: bin, env: process.env, terminateGroup: terminateSingleProcessFixture,
+      }),
       (error) => error?.failureClass === "generation_stalled",
     );
   } finally {
@@ -1918,7 +1953,9 @@ test("Grok 1.0.13 streaming thought tool-call and tool-update events count as mo
   try {
     const started = Date.now();
     await assert.rejects(
-      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], {
+        cwd: bin, env: process.env, terminateGroup: terminateSingleProcessFixture,
+      }),
       (error) => error?.failureClass === "generation_stalled",
     );
     assert.ok(Date.now() - started >= 260, "later valid streaming updates should extend the stall deadline");
@@ -1949,7 +1986,9 @@ test("Grok 1.0.13 bare type and metadata events cannot spoof model progress", as
   process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
   try {
     await assert.rejects(
-      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], {
+        cwd: bin, env: process.env, terminateGroup: terminateSingleProcessFixture,
+      }),
       (error) => error?.failureClass === "first_output_timeout",
     );
   } finally {
@@ -1979,7 +2018,9 @@ test("Grok malformed stdout after one structured event does not prevent generati
   process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
   try {
     await assert.rejects(
-      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], {
+        cwd: bin, env: process.env, terminateGroup: terminateSingleProcessFixture,
+      }),
       (error) => error?.failureClass === "generation_stalled",
     );
   } finally {
@@ -2182,7 +2223,9 @@ test("Grok structured metadata stdout does not satisfy model first-output progre
   process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
   try {
     await assert.rejects(
-      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], {
+        cwd: bin, env: process.env, terminateGroup: terminateSingleProcessFixture,
+      }),
       (error) => error?.failureClass === "first_output_timeout",
     );
   } finally {
@@ -2209,7 +2252,9 @@ test("Grok metadata after agent activity does not prevent generation stall", asy
   process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
   try {
     await assert.rejects(
-      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], {
+        cwd: bin, env: process.env, terminateGroup: terminateSingleProcessFixture,
+      }),
       (error) => error?.failureClass === "generation_stalled",
     );
   } finally {
@@ -2283,7 +2328,9 @@ test("Grok empty tool-call updates do not count as provider progress", async () 
   process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
   try {
     await assert.rejects(
-      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], {
+        cwd: bin, env: process.env, terminateGroup: terminateSingleProcessFixture,
+      }),
       (error) => error?.failureClass === "first_output_timeout",
     );
   } finally {
@@ -2310,7 +2357,9 @@ test("Grok misleading type or event fields do not count as ACP model progress", 
   process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
   try {
     await assert.rejects(
-      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], {
+        cwd: bin, env: process.env, terminateGroup: terminateSingleProcessFixture,
+      }),
       (error) => error?.failureClass === "first_output_timeout",
     );
   } finally {
@@ -2356,7 +2405,9 @@ test("Grok payload or data wrappers cannot spoof ACP model progress", async () =
   process.env.AD_EXTERNAL_KILL_GRACE_MS = "25";
   try {
     await assert.rejects(
-      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], { cwd: bin, env: process.env }),
+      runtimeModule.runMonitoredGrok(process.execPath, ["-e", code], {
+        cwd: bin, env: process.env, terminateGroup: terminateSingleProcessFixture,
+      }),
       (error) => error?.failureClass === "first_output_timeout",
     );
   } finally {
