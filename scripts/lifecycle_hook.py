@@ -81,11 +81,11 @@ CODEX_HOOKS_PATH = Path(
     os.environ.get("AD_CODEX_HOOKS_PATH", str(Path.home() / ".codex" / "hooks.json"))
 ).expanduser()
 DESKTOP_CANARY_SEQUENCE = (
-    "session_started",
     "pre_tool_allowed",
     "post_tool_observed",
     "receipt_latched",
     "same_turn_continuation_invalidated_receipt",
+    "post_invalidation_tool_observed",
     "stop_observed",
     "post_stop_receipt_latched",
     "post_stop_continuation_invalidated_receipt",
@@ -1833,7 +1833,7 @@ def _desktop_canary_identity(
     lifecycle = root / "scripts" / "lifecycle_hook.py"
     target_guard_path = root / "scripts" / "controller_target_guard.py"
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "skill_root": str(root),
         "hooks_sha256": sha256_bytes(hooks_path.read_bytes()),
         "lifecycle_sha256": sha256_bytes(lifecycle.read_bytes()),
@@ -1920,7 +1920,7 @@ def arm_desktop_canary(
         or ownership_generation is None
     ):
         raise ValueError(
-            "schema 6 desktop canary requires exact target and ownership generations"
+            "schema 7 desktop canary requires exact target and ownership generations"
         )
     target_session_id = str(execution_target_session_id).strip()
     if not target_session_id:
@@ -2025,15 +2025,13 @@ def record_desktop_canary_observation(
             )
             index = int(current.get("sequence_index", 0) or 0)
             observation = ""
-            if index == 0 and event_name == "SessionStart" and turn_id:
-                observation = "session_started"
-                current["first_turn_id"] = turn_id
-            elif index == 1 and event_name == "PreToolUse" and not denied:
+            if index == 0 and event_name == "PreToolUse" and not denied and turn_id:
                 observation = "pre_tool_allowed"
-            elif index == 2 and event_name == "PostToolUse" and state.get("must_yield") is not True:
+                current["first_turn_id"] = turn_id
+            elif index == 1 and event_name == "PostToolUse" and state.get("must_yield") is not True:
                 observation = "post_tool_observed"
             elif (
-                index == 3
+                index == 2
                 and event_name == "PostToolUse"
                 and state.get("must_yield") is True
                 and str(state.get("receipt_turn_id", "")) == turn_id
@@ -2041,7 +2039,7 @@ def record_desktop_canary_observation(
                 observation = "receipt_latched"
                 current["receipt_latched_turn_id"] = turn_id
             elif (
-                index == 4
+                index == 3
                 and event_name == "PreToolUse"
                 and not denied
                 and turn_id == str(current.get("receipt_latched_turn_id", ""))
@@ -2050,6 +2048,15 @@ def record_desktop_canary_observation(
                 and "post_receipt_action_started" in state.get("triggers", [])
             ):
                 observation = "same_turn_continuation_invalidated_receipt"
+            elif (
+                index == 4
+                and event_name == "PostToolUse"
+                and turn_id == str(current.get("receipt_latched_turn_id", ""))
+                and state.get("must_yield") is not True
+                and state.get("pending_control_event") is True
+                and "post_receipt_action_started" in state.get("triggers", [])
+            ):
+                observation = "post_invalidation_tool_observed"
             elif index == 5 and event_name == "Stop":
                 observation = "stop_observed"
             elif (

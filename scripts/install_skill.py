@@ -1003,11 +1003,11 @@ def _hook_event_contains(
 
 
 DESKTOP_CANARY_SEQUENCE = (
-    "session_started",
     "pre_tool_allowed",
     "post_tool_observed",
     "receipt_latched",
     "same_turn_continuation_invalidated_receipt",
+    "post_invalidation_tool_observed",
     "stop_observed",
     "post_stop_receipt_latched",
     "post_stop_continuation_invalidated_receipt",
@@ -1097,7 +1097,7 @@ def _valid_desktop_canary(
     target_generation = receipt.get("target_generation")
     ownership_generation = receipt.get("ownership_generation")
     return (
-        receipt.get("schema_version") == 6
+        receipt.get("schema_version") == 7
         and receipt.get("status") == "passed"
         and isinstance(receipt.get("controller_id"), str)
         and bool(receipt.get("controller_id"))

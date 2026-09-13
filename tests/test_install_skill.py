@@ -53,7 +53,7 @@ class InstallCapabilityTests(unittest.TestCase):
             registry.write_text(json.dumps(registry_value), encoding="utf-8")
             canary = root / "desktop-canary.json"
             receipt = {
-                "schema_version": 6,
+                "schema_version": 7,
                 "status": "passed",
                 "controller_id": "controller-1",
                 "controller_session_id": "controller-1",
@@ -74,11 +74,11 @@ class InstallCapabilityTests(unittest.TestCase):
                 ).hexdigest(),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "observations": [
-                    "session_started",
                     "pre_tool_allowed",
                     "post_tool_observed",
                     "receipt_latched",
                     "same_turn_continuation_invalidated_receipt",
+                    "post_invalidation_tool_observed",
                     "stop_observed",
                     "post_stop_receipt_latched",
                     "post_stop_continuation_invalidated_receipt",
@@ -248,7 +248,7 @@ class InstallCapabilityTests(unittest.TestCase):
             canary.write_text(
                 json.dumps(
                     {
-                        "schema_version": 6,
+                        "schema_version": 7,
                         "status": "passed",
                         "controller_id": "controller-1",
                         "controller_session_id": "controller-1",
@@ -269,11 +269,11 @@ class InstallCapabilityTests(unittest.TestCase):
                         ).hexdigest(),
                         "completed_at": "2020-01-01T00:00:00+00:00",
                         "observations": [
-                                "session_started",
                                 "pre_tool_allowed",
                                 "post_tool_observed",
                                 "receipt_latched",
                                 "same_turn_continuation_invalidated_receipt",
+                                "post_invalidation_tool_observed",
                                 "stop_observed",
                                 "post_stop_receipt_latched",
                                 "post_stop_continuation_invalidated_receipt",

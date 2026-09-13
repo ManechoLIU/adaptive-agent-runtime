@@ -1614,7 +1614,7 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n", encoding="utf-8"
             )
             hooks = root / "hooks.json"
-            hooks.write_text('{"hooks": {"SessionStart": []}}\n', encoding="utf-8")
+            hooks.write_text('{"hooks": {"PreToolUse": []}}\n', encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "target and ownership generations"):
                 lifecycle_hook.arm_desktop_canary(
@@ -1678,10 +1678,12 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 )
 
             event = {
-                "hook_event_name": "SessionStart",
+                "hook_event_name": "PreToolUse",
                 "session_id": "desktop-current",
                 "turn_id": "turn-1",
                 "cwd": str(repo),
+                "tool_name": "exec_command",
+                "tool_input": {"cmd": "pwd"},
             }
             with patch.object(lifecycle_hook, "REGISTRY_PATH", registry), patch.object(
                 lifecycle_hook, "project_snapshot", return_value={"root": str(repo.resolve())}
@@ -1701,7 +1703,7 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             receipt = json.loads(canary.read_text(encoding="utf-8"))
             self.assertEqual(code, 0)
             self.assertEqual(receipt["sequence_index"], 1)
-            self.assertEqual(receipt["observations"], ["session_started"])
+            self.assertEqual(receipt["observations"], ["pre_tool_allowed"])
 
             registry_value = json.loads(registry.read_text(encoding="utf-8"))
             registry_value["controller-2"] = str(repo.resolve())
@@ -2068,7 +2070,7 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 skill_root=skill_root,
             )
 
-            self.assertEqual(armed["schema_version"], 6)
+            self.assertEqual(armed["schema_version"], 7)
             self.assertEqual(armed["controller_id"], "controller-1")
             self.assertEqual(armed["controller_session_id"], "controller-1")
             self.assertEqual(armed["execution_target_session_id"], "desktop-current")
@@ -2087,7 +2089,7 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n", encoding="utf-8"
             )
             hooks = root / "hooks.json"
-            hooks.write_text('{"hooks": {"SessionStart": []}}\n', encoding="utf-8")
+            hooks.write_text('{"hooks": {"PreToolUse": []}}\n', encoding="utf-8")
             canary = root / "desktop-canary.json"
 
             armed = lifecycle_hook.arm_desktop_canary(
@@ -2101,7 +2103,7 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             )
             ignored = lifecycle_hook.record_desktop_canary_observation(
                 {
-                    "hook_event_name": "SessionStart",
+                    "hook_event_name": "PreToolUse",
                     "session_id": "controller-1",
                     "controller_session_id": "controller-1",
                     "turn_id": "t-logical",
@@ -2116,7 +2118,7 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             )
             observed = lifecycle_hook.record_desktop_canary_observation(
                 {
-                    "hook_event_name": "SessionStart",
+                    "hook_event_name": "PreToolUse",
                     "session_id": "desktop-current",
                     "controller_session_id": "controller-1",
                     "turn_id": "t-target",
@@ -2136,7 +2138,7 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             self.assertEqual(armed["ownership_generation"], 4)
             self.assertEqual(ignored["sequence_index"], 0)
             self.assertEqual(observed["sequence_index"], 1)
-            self.assertEqual(observed["observations"], ["session_started"])
+            self.assertEqual(observed["observations"], ["pre_tool_allowed"])
 
     def test_live_observations_are_required_before_canary_passes(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -2163,11 +2165,6 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             )
             sequence = [
                 (
-                    {"hook_event_name": "SessionStart", "session_id": "c1", "turn_id": "t1"},
-                    {},
-                    {"active_turn_id": "t1", "must_yield": False},
-                ),
-                (
                     {"hook_event_name": "PreToolUse", "session_id": "c1", "turn_id": "t1"},
                     {},
                     {"active_turn_id": "t1", "must_yield": False},
@@ -2184,6 +2181,16 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 ),
                 (
                     {"hook_event_name": "PreToolUse", "session_id": "c1", "turn_id": "t1"},
+                    {},
+                    {
+                        "active_turn_id": "t1",
+                        "must_yield": False,
+                        "pending_control_event": True,
+                        "triggers": ["post_receipt_action_started"],
+                    },
+                ),
+                (
+                    {"hook_event_name": "PostToolUse", "session_id": "c1", "turn_id": "t1"},
                     {},
                     {
                         "active_turn_id": "t1",
