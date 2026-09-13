@@ -1007,7 +1007,7 @@ DESKTOP_CANARY_SEQUENCE = (
     "pre_tool_allowed",
     "post_tool_observed",
     "receipt_latched",
-    "same_turn_denied",
+    "same_turn_continuation_invalidated_receipt",
     "stop_observed",
     "next_turn_allowed",
     "subagent_stop_observed",
@@ -1097,7 +1097,7 @@ def _valid_desktop_canary(
     target_generation = receipt.get("target_generation")
     ownership_generation = receipt.get("ownership_generation")
     return (
-        receipt.get("schema_version") == 4
+        receipt.get("schema_version") == 5
         and receipt.get("status") == "passed"
         and isinstance(receipt.get("controller_id"), str)
         and bool(receipt.get("controller_id"))

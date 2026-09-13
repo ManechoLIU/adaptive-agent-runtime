@@ -772,6 +772,56 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         self.assertEqual(state["receipt_turn_id"], "new")
         self.assertEqual(state["inflight_tool_use_ids"], [])
 
+    def test_missing_guard_post_recovery_is_exposed_before_same_turn_continuation(self):
+        repo, guard_snapshot, command, snapshot, pre_event = self.make_guard_case()
+        _pre_output, pre_state = lifecycle_hook.evaluate_event(
+            pre_event,
+            snapshot=snapshot,
+            prior_state={
+                "active_turn_id": "new",
+                "pending_control_event": True,
+                "triggers": ["ledger_changed"],
+            },
+        )
+        incomplete_post = self.event("PostToolUse")
+        incomplete_post["cwd"] = str(repo)
+        incomplete_post["tool_use_id"] = "guard-call"
+        incomplete_post["tool_input"] = {"command": command}
+        _post_output, post_state = lifecycle_hook.evaluate_event(
+            incomplete_post, snapshot=snapshot, prior_state=pre_state,
+        )
+        self.append_command_completion(
+            tool_use_id="guard-call", command=command, output="control-event: allowed",
+        )
+        self.write_closed_evidence(repo, guard_snapshot, snapshot)
+
+        recovered_observations = []
+        continuation = self.event("PreToolUse")
+        continuation["cwd"] = str(repo)
+        continuation["tool_use_id"] = "continuation-call"
+        continuation["tool_name"] = "Bash"
+        continuation["tool_input"] = {"command": "git status --short"}
+        output, state = lifecycle_hook.evaluate_event(
+            continuation,
+            snapshot=snapshot,
+            prior_state=post_state,
+            recovered_event_observer=lambda event, event_output, event_state: (
+                recovered_observations.append((event, event_output, dict(event_state)))
+            ),
+        )
+
+        self.assertEqual(output, {})
+        self.assertEqual(len(recovered_observations), 1)
+        recovered_event, recovered_output, recovered_state = recovered_observations[0]
+        self.assertEqual(recovered_event["hook_event_name"], "PostToolUse")
+        self.assertEqual(recovered_event["tool_use_id"], "guard-call")
+        self.assertEqual(recovered_output, {})
+        self.assertTrue(recovered_state["must_yield"])
+        self.assertEqual(recovered_state["receipt_turn_id"], "new")
+        self.assertFalse(state["must_yield"])
+        self.assertTrue(state["pending_control_event"])
+        self.assertIn("post_receipt_action_started", state["triggers"])
+
     def test_rollout_guard_recovery_uses_durable_evidence_after_input_is_consumed(self):
         repo, guard_snapshot, command, snapshot, pre_event = self.make_guard_case()
         _pre_output, pre_state = lifecycle_hook.evaluate_event(

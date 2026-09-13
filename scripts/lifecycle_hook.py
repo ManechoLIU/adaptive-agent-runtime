@@ -85,7 +85,7 @@ DESKTOP_CANARY_SEQUENCE = (
     "pre_tool_allowed",
     "post_tool_observed",
     "receipt_latched",
-    "same_turn_denied",
+    "same_turn_continuation_invalidated_receipt",
     "stop_observed",
     "next_turn_allowed",
     "subagent_stop_observed",
@@ -1833,7 +1833,7 @@ def _desktop_canary_identity(
     lifecycle = root / "scripts" / "lifecycle_hook.py"
     target_guard_path = root / "scripts" / "controller_target_guard.py"
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "skill_root": str(root),
         "hooks_sha256": sha256_bytes(hooks_path.read_bytes()),
         "lifecycle_sha256": sha256_bytes(lifecycle.read_bytes()),
@@ -1920,7 +1920,7 @@ def arm_desktop_canary(
         or ownership_generation is None
     ):
         raise ValueError(
-            "schema 4 desktop canary requires exact target and ownership generations"
+            "schema 5 desktop canary requires exact target and ownership generations"
         )
     target_session_id = str(execution_target_session_id).strip()
     if not target_session_id:
@@ -2039,14 +2039,17 @@ def record_desktop_canary_observation(
                 and str(state.get("receipt_turn_id", "")) == turn_id
             ):
                 observation = "receipt_latched"
-                current["denied_turn_id"] = turn_id
+                current["receipt_latched_turn_id"] = turn_id
             elif (
                 index == 4
                 and event_name == "PreToolUse"
-                and denied
-                and turn_id == str(current.get("denied_turn_id", ""))
+                and not denied
+                and turn_id == str(current.get("receipt_latched_turn_id", ""))
+                and state.get("must_yield") is not True
+                and state.get("pending_control_event") is True
+                and "post_receipt_action_started" in state.get("triggers", [])
             ):
-                observation = "same_turn_denied"
+                observation = "same_turn_continuation_invalidated_receipt"
             elif index == 5 and event_name == "Stop":
                 observation = "stop_observed"
             elif (
@@ -2054,7 +2057,7 @@ def record_desktop_canary_observation(
                 and event_name == "PreToolUse"
                 and not denied
                 and turn_id
-                and turn_id != str(current.get("denied_turn_id", ""))
+                and turn_id != str(current.get("receipt_latched_turn_id", ""))
             ):
                 observation = "next_turn_allowed"
             elif index == 7 and event_name == "SubagentStop":
@@ -2351,7 +2354,13 @@ def successful_control_receipt(
 
 
 def _reconcile_desktop_rollout(
-    state: dict[str, Any], event: dict[str, Any], snapshot: dict[str, Any]
+    state: dict[str, Any],
+    event: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    recovered_event_observer: Callable[
+        [dict[str, Any], dict[str, Any], dict[str, Any]], None
+    ] | None = None,
 ) -> dict[str, Any]:
     inflight = {
         str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)
@@ -2396,7 +2405,8 @@ def _reconcile_desktop_rollout(
             for key in (
                 "session_id", "controller_session_id", "source_session_id",
                 "controller_host", "controller_target_generation",
-                "controller_ownership_generation", "transcript_path", "cwd",
+                "controller_ownership_generation", "controller_registry_path",
+                "transcript_path", "cwd",
             )
             if key in event
         }
@@ -2417,9 +2427,11 @@ def _reconcile_desktop_rollout(
             recovered["recovered_input_sha256"] = input_sha256
         if is_control_receipt and isinstance(proposal, dict):
             recovered["rollout_control_receipt_proposal"] = dict(proposal)
-        _output, state = evaluate_event(
+        recovered_output, state = evaluate_event(
             recovered, snapshot=snapshot, prior_state=state
         )
+        if recovered_event_observer is not None:
+            recovered_event_observer(recovered, recovered_output, state)
         inflight = {
             str(value)
             for value in state.get("inflight_tool_use_ids", [])
@@ -2714,6 +2726,9 @@ def evaluate_event(
     snapshot: dict[str, Any] | None,
     prior_state: dict[str, Any] | None,
     trusted_host_terminal_commit: dict[str, Any] | None = None,
+    recovered_event_observer: Callable[
+        [dict[str, Any], dict[str, Any], dict[str, Any]], None
+    ] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if snapshot is None:
         return {}, {}
@@ -2792,7 +2807,12 @@ def evaluate_event(
     if "tool_trace" not in state:
         state["tool_trace"] = []
     if event_name in {"PreToolUse", "Stop"}:
-        state = _reconcile_desktop_rollout(state, event, snapshot)
+        state = _reconcile_desktop_rollout(
+            state,
+            event,
+            snapshot,
+            recovered_event_observer=recovered_event_observer,
+        )
     if _is_observation_status_query(event):
         state["observation_query_only"] = True
         state["observation_query_turn_id"] = _event_turn_id(event)
@@ -3879,6 +3899,9 @@ def persist_event_state(
     path: Path, event: dict[str, Any], snapshot: dict[str, Any], *,
     preserve_controller_host: bool = False,
     prior_state_validator: Callable[[dict[str, Any]], None] | None = None,
+    recovered_event_observer: Callable[
+        [dict[str, Any], dict[str, Any], dict[str, Any]], None
+    ] | None = None,
     deadline_monotonic: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     target_guard._require_before_deadline(
@@ -3905,10 +3928,14 @@ def persist_event_state(
             if preserve_controller_host:
                 prior_host = str(previous.get("controller_host") or "desktop_codex").strip()
                 persisted_event["controller_host"] = prior_host if prior_host in {"web", "desktop_codex"} else "desktop_codex"
+            evaluate_kwargs: dict[str, Any] = {}
+            if recovered_event_observer is not None:
+                evaluate_kwargs["recovered_event_observer"] = recovered_event_observer
             output, next_state = evaluate_event(
                 persisted_event,
                 snapshot=snapshot,
                 prior_state=previous,
+                **evaluate_kwargs,
             )
             if previous.get("active_turn_id") and previous.get("active_turn_id") != next_state.get("active_turn_id"):
                 # Preserve unresolved old evidence before rotating the current-turn
@@ -4400,7 +4427,19 @@ def run_hook() -> int:
                 )
                 if canary_ownership_current:
                     normalized_event["controller_ownership_generation"] = ownership_generation
-        output, next_state = persist_event_state(path, normalized_event, snapshot)
+        recovered_canary_observations: list[
+            tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
+        ] = []
+        output, next_state = persist_event_state(
+            path,
+            normalized_event,
+            snapshot,
+            recovered_event_observer=lambda recovered_event, recovered_output, recovered_state: (
+                recovered_canary_observations.append(
+                    (recovered_event, recovered_output, dict(recovered_state))
+                )
+            ),
+        )
         if canary_ownership_current:
             try:
                 persist_confirmed_desktop_native_wake(
@@ -4449,6 +4488,10 @@ def run_hook() -> int:
         )
     if canary_ownership_current:
         try:
+            for recovered_event, recovered_output, recovered_state in recovered_canary_observations:
+                record_desktop_canary_observation(
+                    recovered_event, recovered_output, recovered_state
+                )
             record_desktop_canary_observation(normalized_event, output, next_state)
         except (OSError, ValueError, json.JSONDecodeError):
             pass

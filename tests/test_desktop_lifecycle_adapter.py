@@ -1287,7 +1287,7 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             old_registry = lifecycle_hook.REGISTRY_PATH
             lifecycle_hook.REGISTRY_PATH = registry
             try:
-                def persist(_path, _event, _snapshot):
+                def persist(_path, _event, _snapshot, **_kwargs):
                     self.assertEqual(_event["controller_target_generation"], 1)
                     entered.set()
                     self.assertTrue(release.wait(1))
@@ -1565,7 +1565,7 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
                 ):
                     self.invoke_hook({"hook_event_name": "PreToolUse", **event})
 
-                    def persist(_path, _event, _snapshot):
+                    def persist(_path, _event, _snapshot, **_kwargs):
                         self.assertTrue(controller_target_guard.has_active_outbound_lease(
                             repo=repo, host="desktop_codex", registry_path=registry
                         ))
@@ -1602,7 +1602,7 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
 
 
 class DesktopLifecycleCanaryTests(unittest.TestCase):
-    def test_schema_four_arm_rejects_missing_target_generation_fences(self) -> None:
+    def test_schema_five_arm_rejects_missing_target_generation_fences(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             skill_root = root / "adaptive-delivery"
@@ -1763,6 +1763,78 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
 
             after_handoff = json.loads(canary.read_text(encoding="utf-8"))
             self.assertEqual(after_handoff["sequence_index"], 1)
+
+    def test_run_hook_records_recovered_post_before_outer_pre(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {
+                    "desktop_codex": ["desktop-current"],
+                }},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 7,
+                }},
+            }), encoding="utf-8")
+            event = {
+                "hook_event_name": "PreToolUse",
+                "session_id": "desktop-current",
+                "turn_id": "turn-1",
+                "cwd": str(repo),
+                "tool_name": "exec_command",
+                "tool_use_id": "continuation-call",
+                "tool_input": {"cmd": "git status --short"},
+            }
+            observed = []
+
+            def persist(_path, normalized_event, _snapshot, **kwargs):
+                recovered = {
+                    **normalized_event,
+                    "hook_event_name": "PostToolUse",
+                    "tool_use_id": "guard-call",
+                }
+                kwargs["recovered_event_observer"](
+                    recovered,
+                    {},
+                    {
+                        "active_turn_id": "turn-1",
+                        "must_yield": True,
+                        "receipt_turn_id": "turn-1",
+                    },
+                )
+                return {}, {
+                    "active_turn_id": "turn-1",
+                    "must_yield": False,
+                    "pending_control_event": True,
+                    "triggers": ["post_receipt_action_started"],
+                }
+
+            def record(recorded_event, _output, state):
+                observed.append((recorded_event["hook_event_name"], state["must_yield"]))
+                return {}
+
+            with patch.object(lifecycle_hook, "REGISTRY_PATH", registry), patch.object(
+                lifecycle_hook, "project_snapshot", return_value={"root": str(repo.resolve())}
+            ), patch.object(
+                lifecycle_hook, "controller_event_is_managed", return_value=True
+            ), patch.object(
+                lifecycle_hook, "persist_event_state", side_effect=persist
+            ), patch.object(
+                lifecycle_hook, "record_desktop_canary_observation", side_effect=record
+            ), patch.object(sys, "stdin", StringIO(json.dumps(event))):
+                code = lifecycle_hook.run_hook()
+
+            self.assertEqual(code, 0)
+            self.assertEqual(observed, [("PostToolUse", True), ("PreToolUse", False)])
 
     def test_run_hook_does_not_advance_canary_armed_from_another_registry(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -1996,7 +2068,7 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 skill_root=skill_root,
             )
 
-            self.assertEqual(armed["schema_version"], 4)
+            self.assertEqual(armed["schema_version"], 5)
             self.assertEqual(armed["controller_id"], "controller-1")
             self.assertEqual(armed["controller_session_id"], "controller-1")
             self.assertEqual(armed["execution_target_session_id"], "desktop-current")
@@ -2112,13 +2184,13 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
                 ),
                 (
                     {"hook_event_name": "PreToolUse", "session_id": "c1", "turn_id": "t1"},
+                    {},
                     {
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "deny",
-                        }
+                        "active_turn_id": "t1",
+                        "must_yield": False,
+                        "pending_control_event": True,
+                        "triggers": ["post_receipt_action_started"],
                     },
-                    {"active_turn_id": "t1", "must_yield": True, "receipt_turn_id": "t1"},
                 ),
                 (
                     {"hook_event_name": "Stop", "session_id": "c1", "turn_id": "t1"},
@@ -2168,6 +2240,10 @@ class DesktopLifecycleCanaryTests(unittest.TestCase):
             self.assertEqual(receipt["status"], "passed")
             self.assertEqual(receipt["controller_session_id"], "c1")
             self.assertEqual(receipt["sequence_index"], 8)
+            self.assertEqual(
+                receipt["observations"][4],
+                "same_turn_continuation_invalidated_receipt",
+            )
             self.assertEqual(receipt["skill_root"], str(skill_root.resolve()))
             self.assertEqual(len(receipt["hooks_sha256"]), 64)
             self.assertEqual(len(receipt["lifecycle_sha256"]), 64)
