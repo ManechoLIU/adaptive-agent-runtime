@@ -632,6 +632,89 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             code = lifecycle_hook.run_hook()
         return code, output.getvalue()
 
+    def test_host_owned_subagent_turn_does_not_enter_controller_turn_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            transcript = sessions / "subagent.jsonl"
+            transcript.write_text(json.dumps({
+                "type": "session_meta",
+                "payload": {
+                    "id": "worker-thread",
+                    "session_id": "desktop-current",
+                    "parent_thread_id": "desktop-current",
+                    "thread_source": "subagent",
+                    "source": {"subagent": {"thread_spawn": {
+                        "parent_thread_id": "desktop-current",
+                        "agent_role": "worker",
+                    }}},
+                },
+            }) + "\n", encoding="utf-8")
+            event = {
+                "hook_event_name": "PreToolUse",
+                "session_id": "desktop-current",
+                "turn_id": "worker-turn",
+                "transcript_path": str(transcript),
+                "cwd": str(repo),
+                "tool_name": "Bash",
+                "tool_use_id": "worker-tool",
+                "tool_input": {"command": "pwd"},
+            }
+            with patch.dict(os.environ, {"CODEX_HOME": str(root)}):
+                is_subagent = lifecycle_hook._host_owned_desktop_subagent_event(event)
+
+        self.assertTrue(is_subagent)
+
+    def test_foreign_transcript_id_without_subagent_provenance_stays_managed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            transcript = sessions / "foreign.jsonl"
+            transcript.write_text(json.dumps({
+                "type": "session_meta",
+                "payload": {
+                    "id": "foreign-thread",
+                    "session_id": "desktop-current",
+                    "thread_source": "user",
+                },
+            }) + "\n", encoding="utf-8")
+            event = {
+                "hook_event_name": "PreToolUse",
+                "session_id": "desktop-current",
+                "turn_id": "foreign-turn",
+                "transcript_path": str(transcript),
+                "cwd": str(repo),
+                "tool_name": "Bash",
+                "tool_use_id": "foreign-tool",
+                "tool_input": {"command": "pwd"},
+            }
+            with patch.dict(os.environ, {"CODEX_HOME": str(root)}):
+                is_subagent = lifecycle_hook._host_owned_desktop_subagent_event(event)
+
+        self.assertFalse(is_subagent)
+
+    def test_run_hook_bypasses_controller_state_for_host_owned_subagent(self) -> None:
+        event = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "desktop-current",
+            "turn_id": "worker-turn",
+            "cwd": "/tmp/project",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pwd"},
+        }
+        with patch.object(
+            lifecycle_hook, "_host_owned_desktop_subagent_event", return_value=True
+        ), patch.object(lifecycle_hook, "registered_controller_id") as registered:
+            code, output = self.invoke_hook(event)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+        registered.assert_not_called()
+
     def test_current_desktop_user_prompt_persists_confirmed_native_wake(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

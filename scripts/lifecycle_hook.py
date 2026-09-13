@@ -116,6 +116,47 @@ def _event_turn_id(event: dict[str, Any]) -> str:
     return str(event.get("turn_id", "")).strip()
 
 
+def _host_owned_desktop_subagent_event(event: dict[str, Any]) -> bool:
+    """Keep Host-created worker turns out of the Controller turn ledger.
+
+    Desktop subagents inherit the parent task's ``session_id`` in Hook input,
+    while their Host-owned rollout has a distinct ``session_meta.payload.id``.
+    Treat the mismatch as a subagent only when the rollout itself proves both
+    the inherited parent session and subagent provenance. Unknown or forged
+    mismatches stay on the normal fail-closed Controller path.
+    """
+    parent_session_id = str(event.get("session_id") or "").strip()
+    transcript = str(event.get("transcript_path") or "").strip()
+    if not parent_session_id or not transcript:
+        return False
+    sessions = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
+    try:
+        path = Path(transcript).resolve(strict=True)
+        if not path.is_relative_to(sessions.resolve()):
+            return False
+        with path.open("rb") as stream:
+            header = json.loads(stream.readline(65536))
+        if header.get("type") != "session_meta":
+            return False
+        meta = header.get("payload")
+        if not isinstance(meta, dict):
+            return False
+        execution_session_id = str(meta.get("id") or "").strip()
+        inherited_session_id = str(meta.get("session_id") or "").strip()
+        source = meta.get("source")
+        subagent = source.get("subagent") if isinstance(source, dict) else None
+        thread_spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        return bool(
+            execution_session_id
+            and execution_session_id != parent_session_id
+            and inherited_session_id == parent_session_id
+            and str(meta.get("thread_source") or "").strip() == "subagent"
+            and isinstance(thread_spawn, dict)
+        )
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
 def _desktop_turn_start(event: dict[str, Any]) -> dict[str, str] | None:
     """Attest a delegated turn against host-owned rollout records, not tool input.
 
@@ -4266,6 +4307,8 @@ def run_hook() -> int:
     except (json.JSONDecodeError, TypeError):
         return 0
     if not isinstance(event, dict):
+        return 0
+    if _host_owned_desktop_subagent_event(event):
         return 0
     source_session_id = str(event.get("session_id", "")).strip()
     cwd = Path(str(event.get("cwd", "."))).expanduser().resolve()
