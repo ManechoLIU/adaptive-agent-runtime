@@ -6924,6 +6924,38 @@ def ensure_continuation_supervisor(
     return True
 
 
+def _canonical_auto_stop_fence(
+    *, repo: Path, registry: Path, session_id: str
+) -> dict[str, Any] | None:
+    del repo  # Scheduling fence is registry-only; never launch Git/subprocess work here.
+    registry_data = load_json(registry)
+    ownership = target_guard.execution_ownership_record(
+        registry_data, controller_id=session_id
+    )
+    if ownership is None:
+        return None
+    active_host, ownership_target, ownership_generation = (
+        target_guard.validate_execution_ownership_record(ownership)
+    )
+    target = target_guard.target_record(
+        registry_data, controller_id=session_id, host=active_host
+    )
+    if target is None:
+        return None
+    status, target_session, target_generation = target_guard.validate_target_record(
+        target, host=active_host
+    )
+    if status != "active" or target_session != ownership_target:
+        raise PermissionError(
+            "canonical Controller ownership does not match its current execution target"
+        )
+    return {
+        "execution_target_session_id": target_session,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+    }
+
+
 def _schedule_auto_native_stop_locked(
     *,
     session_id: str,
@@ -6941,6 +6973,24 @@ def _schedule_auto_native_stop_locked(
     """Schedule while the caller holds the supervisor lock."""
     prior = load_json(state_path)
     same_receipt = prior.get("receipt_id") == receipt_id
+    try:
+        current_fence = _canonical_auto_stop_fence(
+            repo=repo, registry=registry, session_id=session_id
+        )
+    except (OSError, ValueError, PermissionError, TypeError):
+        current_fence = None
+    prior_fence = _controller_delivery_fence_identity(prior)
+    current_fence_identity = _controller_delivery_fence_identity(current_fence)
+    stale_pre_dispatch_target = (
+        same_receipt
+        and str(prior.get("state") or "")
+        in {"RESUME_STALLED_NO_PROGRESS", "WAITING_EXTERNAL_HOST_RELOAD"}
+        and prior_fence is not None
+        and current_fence_identity is not None
+        and prior_fence != current_fence_identity
+    )
+    if stale_pre_dispatch_target:
+        same_receipt = False
     terminal_receipt = str(prior.get("delivery_terminal_receipt_id") or "").strip()
     terminal_outcome = str(prior.get("delivery_terminal_outcome") or "").strip()
     legacy_terminal = str(prior.get("state") or "") in {
@@ -7001,6 +7051,8 @@ def _schedule_auto_native_stop_locked(
         "supervisor_due_at_unix_ms": now_ms + int(max(0.0, delay_seconds) * 1000),
         "supervisor_spawned_at_unix_ms": now_ms,
     }
+    if current_fence is not None:
+        value.update(current_fence)
     if same_receipt and prior.get("last_lifecycle_fingerprint"):
         value["last_lifecycle_fingerprint"] = str(prior["last_lifecycle_fingerprint"])
     if same_receipt and prior.get("approval_id"):

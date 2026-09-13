@@ -4312,6 +4312,61 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
             self.assertEqual(saved["supervisor_pid"], 1111)
             self.assertEqual(saved["coalesced_schedule_count"], 1)
 
+    def test_same_receipt_stale_desktop_target_is_rearmed_for_current_generation(self) -> None:
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state = self.make_paths(Path(tmp))
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {
+                    "controller-1": {
+                        "desktop_codex": {
+                            "status": "active",
+                            "session_id": "desktop-current",
+                            "generation": 9,
+                        },
+                    },
+                },
+                "__controller_execution_ownership__": {
+                    "controller-1": {
+                        "active_host": "desktop_codex",
+                        "execution_target_session_id": "desktop-current",
+                        "generation": 10,
+                        "provenance": "desktop_entry",
+                    },
+                },
+            }), encoding="utf-8")
+            state.write_text(json.dumps({
+                "receipt_id": "bootstrap:9",
+                "session_id": "controller-1",
+                "repo": str(repo.resolve()),
+                "state": "RESUME_STALLED_NO_PROGRESS",
+                "execution_target_session_id": "desktop-stale",
+                "target_generation": 6,
+                "ownership_generation": 7,
+            }), encoding="utf-8")
+
+            with patch.object(
+                web_bridge.subprocess, "Popen", return_value=Mock(pid=2222)
+            ) as popen:
+                scheduled = web_bridge.schedule_auto_native_stop(
+                    session_id="controller-1",
+                    repo=repo,
+                    receipt_id="bootstrap:9",
+                    registry=registry,
+                    codex="codex",
+                    delay_seconds=1,
+                    state_path=state,
+                )
+
+            self.assertTrue(scheduled)
+            popen.assert_called_once()
+            saved = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(saved["execution_target_session_id"], "desktop-current")
+            self.assertEqual(saved["target_generation"], 9)
+            self.assertEqual(saved["ownership_generation"], 10)
+            self.assertEqual(saved["state"], "RESUME_PENDING")
+
     def test_new_receipt_supersedes_live_old_supervisor(self) -> None:
         from unittest.mock import Mock, patch
         with tempfile.TemporaryDirectory() as tmp:
