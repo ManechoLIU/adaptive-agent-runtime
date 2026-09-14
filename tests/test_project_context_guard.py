@@ -88,6 +88,70 @@ class ProjectContextGuardTests(unittest.TestCase):
         self.assertIn("verified_facts=", context)
         self.assertIn("unknown_facts=", context)
 
+    def test_known_projectless_session_allows_project_fact_prompt_with_unknown_context(self):
+        hook = self.hook()
+        projectless = Path(self.tmp.name) / "projectless-chat"
+        projectless.mkdir()
+        references = self.skill / "references"
+        references.mkdir()
+        (references / "controller-performance-scoring.md").write_text(
+            "# Controller Performance Scoring\n\n"
+            "当前评分模型：RUNTIME_SCORING_SHOULD_NOT_LEAK_INTO_PROJECTLESS_CONTEXT\n",
+            encoding="utf-8",
+        )
+        _, state = hook.evaluate_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "projectless-session",
+                "turn_id": "startup",
+                "source": "startup",
+                "cwd": str(projectless),
+            },
+            skill_root=self.skill,
+            prior_state={},
+        )
+
+        output, state = hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "projectless-session",
+                "turn_id": "t1",
+                "cwd": str(projectless),
+                "prompt": "这个项目当前评分模型是什么？",
+            },
+            skill_root=self.skill,
+            prior_state=state,
+        )
+
+        self.assertNotEqual(output.get("decision"), "block")
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("project_context_state=not_project_or_unavailable", context)
+        self.assertIn('unknown_facts=["project_root", "AGENTS.md", "SKILL.md"]', context)
+        self.assertEqual(state["mechanism_resolution"]["state"], "not_found")
+        self.assertNotIn("RUNTIME_SCORING_SHOULD_NOT_LEAK", context)
+        self.assertFalse(state["pending_project_fact_turn"])
+        self.assertEqual(state["turn_id"], "t1")
+
+    def test_project_fact_prompt_without_session_context_remains_fail_closed(self):
+        hook = self.hook()
+        projectless = Path(self.tmp.name) / "unverified-chat"
+        projectless.mkdir()
+
+        output, state = hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "unverified-session",
+                "turn_id": "t1",
+                "cwd": str(projectless),
+                "prompt": "这个项目当前状态是什么？",
+            },
+            skill_root=self.skill,
+            prior_state={},
+        )
+
+        self.assertEqual(output["decision"], "block")
+        self.assertEqual(state, {})
+
     def test_project_context_separates_unique_controller_from_unverified_web_session(self):
         module = self.hook()
         registry = Path(self.tmp.name) / "controllers.json"

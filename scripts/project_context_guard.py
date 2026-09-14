@@ -995,6 +995,48 @@ def evaluate_event(
                 ),
             )
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            prior_receipt = state.get("project_context_receipt")
+            current_working_directory = Path(
+                str(event.get("cwd", "") or Path.cwd())
+            ).expanduser().resolve(strict=False)
+            prior_project_root = (
+                Path(str(prior_receipt.get("project_root", "")))
+                .expanduser()
+                .resolve(strict=False)
+                if isinstance(prior_receipt, dict)
+                else None
+            )
+            if (
+                isinstance(prior_receipt, dict)
+                and prior_receipt.get("state") == "not_project_or_unavailable"
+                and prior_project_root == current_working_directory
+            ):
+                mechanism = {
+                    "state": (
+                        "not_found"
+                        if EXISTING_MECHANISM_REQUEST.search(prompt)
+                        else "not_requested"
+                    )
+                }
+                state.update(
+                    {
+                        "pending_project_fact_turn": False,
+                        "correction_required": False,
+                        "mechanism_resolution": mechanism,
+                        "prompt": prompt,
+                        "turn_id": current_turn,
+                        "controller_identity_required": False,
+                    }
+                )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": _context_text(
+                            prior_receipt,
+                            mechanism=mechanism,
+                        ),
+                    }
+                }, state
             return {
                 "decision": "block",
                 "reason": (

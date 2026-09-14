@@ -679,6 +679,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_new_session_project_governance_question_requires_initialized_current_rules",
     "tests.test_project_context_guard.ProjectContextGuardTests."
+    "test_known_projectless_session_allows_project_fact_prompt_with_unknown_context",
+    "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_existing_scoring_model_request_must_resolve_real_current_definition",
     "tests.test_project_context_guard.ProjectContextGuardTests."
     "test_source_change_before_stop_fails_closed_and_refreshes_for_same_turn_correction",
