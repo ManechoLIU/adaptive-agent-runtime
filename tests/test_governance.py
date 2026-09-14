@@ -6751,7 +6751,7 @@ class WebMachineTurnLifecycleTests(unittest.TestCase):
                         event, registry_path=registry, lifecycle_path=root / "state.json"
                     )
 
-    def test_multiple_web_turns_under_limit_and_completed_trace_is_archived(self) -> None:
+    def test_multiple_web_turns_under_limit_do_not_accumulate_overflow_but_single_turn_still_does(self) -> None:
         _, state = lifecycle_hook.evaluate_event(self.event("machine-A"), snapshot=self.snapshot(), prior_state=None)
         turn_a = state["active_turn_id"]
         for index in range(100):
