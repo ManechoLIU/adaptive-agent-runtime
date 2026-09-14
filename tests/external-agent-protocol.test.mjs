@@ -71,6 +71,7 @@ test("provider start timeout publishes canonical outcome and stops before PROVID
   const runtime = await runtimeModule("start-timeout");
   const child = fakeChild();
   await withMonitorTimeouts({ launch: 30, first: 500, stall: 500, absolute: 1000, grace: 20 }, async () => {
+    const spawnTimer = setTimeout(() => child.emit("spawn"), 5);
     await assert.rejects(
       runtime.runMonitoredGrok("fake-grok", [], {
         cwd: process.cwd(), env: process.env, spawnChild: () => child,
@@ -80,6 +81,7 @@ test("provider start timeout publishes canonical outcome and stops before PROVID
         && error?.outcomeCode === "PROVIDER_START_TIMEOUT"
         && !error?.phaseHistory?.includes("PROVIDER_STARTED"),
     );
+    clearTimeout(spawnTimer);
   });
 });
 
@@ -88,7 +90,10 @@ test("first-token timeout is anchored after provider start", async () => {
   const child = fakeChild();
   await withMonitorTimeouts({ launch: 250, first: 70, stall: 500, absolute: 1000, grace: 20 }, async () => {
     const startedAt = Date.now();
-    const spawnTimer = setTimeout(() => child.emit("spawn"), 90);
+    const timers = [
+      setTimeout(() => child.emit("spawn"), 5),
+      setTimeout(() => child.stdout.write(`${JSON.stringify({ type: "provider_started", provider: "grok-build", session_id: "s1" })}\n`), 90),
+    ];
     try {
       await assert.rejects(
         runtime.runMonitoredGrok("fake-grok", [], {
@@ -99,11 +104,89 @@ test("first-token timeout is anchored after provider start", async () => {
           && error?.outcomeCode === "FIRST_TOKEN_TIMEOUT"
           && error?.phaseHistory?.at(-1) === "PROVIDER_STARTED",
       );
-      assert.ok(Date.now() - startedAt >= 135, "first-token clock must start after provider start");
+      assert.ok(Date.now() - startedAt >= 135, "first-token clock must start after validated provider start");
+    } finally {
+      for (const timer of timers) clearTimeout(timer);
+    }
+  });
+});
+
+test("an OS child spawn is not PROVIDER_STARTED without a validated provider event", async () => {
+  const runtime = await runtimeModule("spawn-is-not-provider-start");
+  const child = fakeChild();
+  await withMonitorTimeouts({ launch: 40, first: 500, stall: 500, absolute: 1000, grace: 20 }, async () => {
+    const spawnedAt = Date.now();
+    const spawnTimer = setTimeout(() => child.emit("spawn"), 5);
+    try {
+      await assert.rejects(
+        runtime.runMonitoredGrok("fake-grok", [], {
+          cwd: process.cwd(), env: process.env, spawnChild: () => child,
+          terminateGroup: async () => ({ confirmed: true, diagnostic: "fake group gone" }),
+        }),
+        (error) => error?.outcomeCode === "PROVIDER_START_TIMEOUT"
+          && error?.details?.provider_started === false
+          && !error?.phaseHistory?.includes("PROVIDER_STARTED"),
+      );
+      assert.ok(Date.now() - spawnedAt >= 35);
     } finally {
       clearTimeout(spawnTimer);
     }
   });
+});
+
+test("ACP progress envelopes without type-specific payload do not count as progress", async () => {
+  const runtime = await runtimeModule("payloadless-acp");
+  const child = fakeChild();
+  await withMonitorTimeouts({ launch: 100, first: 70, stall: 500, absolute: 1000, grace: 20 }, async () => {
+    const timers = [
+      setTimeout(() => child.emit("spawn"), 5),
+      setTimeout(() => child.stdout.write(`${JSON.stringify({ type: "provider_started", provider: "grok-build", session_id: "s1" })}\n`), 10),
+      setTimeout(() => child.stdout.write(`${JSON.stringify({ sessionId: "s1", update: { sessionUpdate: "agent_message_chunk" } })}\n`), 35),
+    ];
+    try {
+      await assert.rejects(
+        runtime.runMonitoredGrok("fake-grok", [], {
+          cwd: process.cwd(), env: process.env, spawnChild: () => child,
+          terminateGroup: async () => ({ confirmed: true, diagnostic: "fake group gone" }),
+        }),
+        (error) => error?.outcomeCode === "FIRST_TOKEN_TIMEOUT"
+          && error?.phaseHistory?.at(-1) === "PROVIDER_STARTED",
+      );
+    } finally {
+      for (const timer of timers) clearTimeout(timer);
+    }
+  });
+});
+
+test("Kimi uses the same bounded provider protocol and cleanup for every watchdog class", async () => {
+  const runtime = await runtimeModule("kimi-bounded-protocol");
+  assert.equal(typeof runtime.runMonitoredKimi, "function");
+  const scenarios = [
+    { name: "provider start", events: [], values: { launch: 35, first: 200, stall: 200, absolute: 500 }, outcome: "PROVIDER_START_TIMEOUT" },
+    { name: "first progress", events: [[10, { type: "system", subtype: "init", session_id: "k1" }]], values: { launch: 100, first: 35, stall: 200, absolute: 500 }, outcome: "FIRST_TOKEN_TIMEOUT" },
+    { name: "heartbeat", events: [[10, { type: "system", subtype: "init", session_id: "k1" }], [15, { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "working" }] } }]], values: { launch: 100, first: 100, stall: 35, absolute: 500 }, outcome: "HEARTBEAT_TIMEOUT" },
+    { name: "absolute", events: [[10, { type: "system", subtype: "init", session_id: "k1" }], [15, { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "working" }] } }], [40, { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "still working" }] } }]], values: { launch: 100, first: 100, stall: 100, absolute: 55 }, outcome: "PROVIDER_TIMEOUT" },
+  ];
+  for (const scenario of scenarios) {
+    const child = fakeChild();
+    let cleanupCalls = 0;
+    await withMonitorTimeouts({ ...scenario.values, grace: 20 }, async () => {
+      const timers = [setTimeout(() => child.emit("spawn"), 5), ...scenario.events.map(([delay, event]) => setTimeout(() => child.stdout.write(`${JSON.stringify(event)}\n`), delay))];
+      try {
+        await assert.rejects(
+          runtime.runMonitoredKimi("fake-kimi", [], {
+            cwd: process.cwd(), env: process.env, spawnChild: () => child,
+            terminateGroup: async () => { cleanupCalls += 1; return { confirmed: true, diagnostic: "fake group gone" }; },
+          }),
+          (error) => error?.outcomeCode === scenario.outcome,
+          scenario.name,
+        );
+        assert.equal(cleanupCalls, 1, `${scenario.name} must clean the process group`);
+      } finally {
+        for (const timer of timers) clearTimeout(timer);
+      }
+    });
+  }
 });
 
 test("only validated model progress refreshes the heartbeat clock", async () => {
@@ -176,6 +259,22 @@ test("final-result validation distinguishes parse failure from canonical success
   });
 });
 
+test("ordinary zero exit without a validated final result stays RESULT_PARSE_FAILED", async () => {
+  const runtime = await runtimeModule("missing-final-result");
+  const child = fakeChild();
+  const completion = runtime.runMonitoredGrok("fake-grok", [], {
+    cwd: process.cwd(), env: process.env, spawnChild: () => child, returnProtocol: true,
+  });
+  child.emit("spawn");
+  child.stdout.write(`${JSON.stringify({ type: "provider_started", provider: "grok-build", session_id: "s1" })}\n`);
+  child.stdout.write(`${JSON.stringify({ type: "text", data: "analysis only" })}\n`);
+  child.exitCode = 0;
+  child.emit("exit", 0, null);
+  const terminal = await completion;
+  assert.equal(terminal.outcome_code, "RESULT_PARSE_FAILED");
+  assert.equal(terminal.phase_history.includes("FINAL_RESULT"), false);
+});
+
 test("advisory hypothesis mode is bounded and preserves supported contradicted insufficient verdicts", async () => {
   const runtime = await runtimeModule("advisory-hypotheses");
   const packet = runtime.parseAdvisoryHypothesisPacket(JSON.stringify({
@@ -204,14 +303,14 @@ test("advisory hypothesis mode is bounded and preserves supported contradicted i
   })), /bounded hypotheses|open-ended root-cause/i);
 });
 
-test("safe downgrade retry requires explicit authorization and never crosses provider boundary", async () => {
+test("the runner never retries a provider route; Controller must issue a new route and assignment", async () => {
   const runtime = await runtimeModule("retry-gate");
   const preBoundary = { retrySafe: true, providerStarted: false, hadModelOutput: false, resultUnknown: false };
   assert.deepEqual(runtime.externalRetryDecision(preBoundary, { attempt: 1, authorizedSafeRetry: false }), {
-    retry: false, reason: "explicit_authorization_required",
+    retry: false, reason: "controller_route_reassignment_required",
   });
   assert.deepEqual(runtime.externalRetryDecision(preBoundary, { attempt: 1, authorizedSafeRetry: true }), {
-    retry: true, reason: "authorized_safe_downgrade_before_provider",
+    retry: false, reason: "controller_route_reassignment_required",
   });
   assert.deepEqual(runtime.externalRetryDecision(preBoundary, { attempt: 2, authorizedSafeRetry: true }), {
     retry: false, reason: "retry_budget_exhausted",

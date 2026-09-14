@@ -27,7 +27,7 @@ export {
 const KIMI_KEYCHAIN_SERVICE = "adaptive-delivery-kimi-k3";
 const XAI_KEYCHAIN_SERVICE = "adaptive-delivery-xai-grok";
 const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
-const GROK_EXECUTION_WORK_TYPES = new Set(["implementation", "review"]);
+const GROK_EXECUTION_WORK_TYPES = new Set(["implementation", "review", "advisory_hypothesis_review"]);
 const CARD_CATEGORIES = new Set(["frontend", "backend", "general"]);
 const REVIEW_PHASES = new Set(["full", "shard", "synthesis"]);
 const CARD_STATUSES = {
@@ -265,11 +265,77 @@ function grokModelProgressKind(event) {
   if (!update || typeof update !== "object" || Array.isArray(update)) return null;
   for (const key of ["sessionUpdate", "session_update"]) {
     const value = update[key];
-    if (typeof value === "string" && GROK_MODEL_PROGRESS_SESSION_UPDATES.has(value.trim())) {
-      return value.trim();
+    if (typeof value !== "string" || !GROK_MODEL_PROGRESS_SESSION_UPDATES.has(value.trim())) continue;
+    const kind = value.trim();
+    if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
+      const content = update.content;
+      const text = typeof content === "string"
+        ? content
+        : content && typeof content === "object" && !Array.isArray(content)
+          ? [content.text, content.data].find((item) => typeof item === "string")
+          : null;
+      return typeof text === "string" && text.trim() ? kind : null;
+    }
+    if (kind === "tool_call") {
+      const toolCallId = [update.toolCallId, update.tool_call_id].find((item) => typeof item === "string" && item.trim());
+      const toolName = [update.toolName, update.tool_name, update.title].find((item) => typeof item === "string" && item.trim());
+      const rawInput = update.rawInput ?? update.raw_input;
+      return toolCallId && toolName && rawInput && typeof rawInput === "object" && !Array.isArray(rawInput) ? kind : null;
+    }
+    if (kind === "tool_call_update") {
+      const toolCallId = [update.toolCallId, update.tool_call_id].find((item) => typeof item === "string" && item.trim());
+      if (!toolCallId) return null;
+      const hasPayload = (typeof update.status === "string" && update.status.trim())
+        || (Array.isArray(update.content) && update.content.some(meaningfulStreamValue))
+        || meaningfulStreamValue(update.rawOutput ?? update.raw_output)
+        || (Array.isArray(update.locations) && update.locations.some((item) => item && typeof item.path === "string" && item.path.trim()));
+      return hasPayload ? kind : null;
     }
   }
   return null;
+}
+
+function kimiModelProgressKind(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return null;
+  if (event.type !== "assistant" || !event.message || typeof event.message !== "object" || Array.isArray(event.message)) return null;
+  const content = event.message.content;
+  if (!Array.isArray(content)) return null;
+  const meaningful = content.some((item) => item && typeof item === "object" && !Array.isArray(item)
+    && ((item.type === "text" && typeof item.text === "string" && item.text.trim())
+      || (item.type === "tool_use" && typeof item.name === "string" && item.name.trim() && item.input && typeof item.input === "object")));
+  return meaningful ? "assistant" : null;
+}
+
+function providerStartKind(event, modelProgressKind) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return null;
+  if (event.type === "provider_started"
+      && typeof event.provider === "string" && event.provider.trim()
+      && typeof (event.session_id ?? event.sessionId) === "string" && (event.session_id ?? event.sessionId).trim()) {
+    return "provider_started";
+  }
+  if (event.type === "system" && event.subtype === "init"
+      && typeof (event.session_id ?? event.sessionId) === "string" && (event.session_id ?? event.sessionId).trim()) {
+    return "session_init";
+  }
+  if (event.type === "final_result" && event.result && typeof event.result === "object" && !Array.isArray(event.result)) {
+    return "final_result";
+  }
+  if (event.type === "result" && event.subtype === "success" && meaningfulStreamValue(event.result)) {
+    return "result";
+  }
+  if (event.type === "usage" && event.usage && typeof event.usage === "object" && !Array.isArray(event.usage)) {
+    return "usage";
+  }
+  if (event.type === "available_commands" && (Array.isArray(event.tools) || Array.isArray(event.commands))) {
+    return "available_commands";
+  }
+  const sessionId = [event.sessionId, event.session_id].find((value) => typeof value === "string" && value.trim());
+  const update = event.update;
+  if (sessionId && update && typeof update === "object" && !Array.isArray(update)
+      && [update.sessionUpdate, update.session_update].some((value) => typeof value === "string" && value.trim())) {
+    return "session_update";
+  }
+  return modelProgressKind(event) ? "model_progress" : null;
 }
 
 function removeDirectoryConfirmed(directory) {
@@ -1155,7 +1221,7 @@ function persistExternalTerminalReceipt(options, {
   exitCode, summary, deliveryOutcome = "unresolved", failureClass = null, retryClass = null,
   retrySafe = null, resultUnknown = null, failureDetails = null, reviewStatus = null, reviewVerdict = null,
   outcomeCode = null, phaseHistory = null, cancellationSource = null,
-  advisory = null, criticalPath = null,
+  advisory = null, criticalPath = null, advisoryResult = null,
 }) {
   if (!options.terminalReceipt) return null;
   const target = atomicWriteJson(options.terminalReceipt, {
@@ -1189,6 +1255,9 @@ function persistExternalTerminalReceipt(options, {
     ...(outcomeCode ? { outcome_code: outcomeCode } : {}),
     ...(Array.isArray(phaseHistory) ? { phase_history: [...phaseHistory] } : {}),
     ...(cancellationSource ? { cancellation_source: cancellationSource } : {}),
+    ...(advisoryResult && typeof advisoryResult === "object" && !Array.isArray(advisoryResult)
+      ? { advisory_hypothesis_result: advisoryResult }
+      : {}),
     advisory: typeof advisory === "boolean" ? advisory : true,
     critical_path: typeof criticalPath === "boolean" ? criticalPath : false,
     completed_at: new Date().toISOString(),
@@ -1531,6 +1600,32 @@ export function parseGrokReviewOutput(stdout, { candidateRevision = null } = {})
   return validateGrokReviewResult(value, { candidateRevision });
 }
 
+function parseFinalResultEvent(stdout) {
+  const records = String(stdout || "").split("\n").map((line) => line.trim()).filter(Boolean);
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    let event;
+    try {
+      event = JSON.parse(records[index]);
+    } catch {
+      continue;
+    }
+    if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+    if (event.type === "final_result" && event.result && typeof event.result === "object" && !Array.isArray(event.result)) {
+      return event.result;
+    }
+    if (event.type === "result" && event.subtype === "success") {
+      if (event.result && typeof event.result === "object" && !Array.isArray(event.result)) return event.result;
+      if (typeof event.result === "string" && event.result.trim()) {
+        try {
+          const value = JSON.parse(event.result);
+          if (value && typeof value === "object" && !Array.isArray(value)) return value;
+        } catch {}
+      }
+    }
+  }
+  throw new Error("missing required structured final result event");
+}
+
 export function classifyGrokReviewTerminal({
   exitCode = null, stdout = "", stderr = "", timedOut = false, cleanupConfirmed = true,
   candidateRevision = null, hadModelOutput = null,
@@ -1599,6 +1694,7 @@ export function runMonitoredGrok(executable, args, {
   cwd, env, progressDeadlineMinutes = null, onStructuredProgress = null,
   terminateGroup = terminateProcessGroup, spawnChild = spawn, parentProcess = process,
   validateFinalResult = null, returnProtocol = false,
+  providerName = "Grok", modelProgressKind = grokModelProgressKind,
 }) {
   const launchTimeoutMs = grokLaunchTimeoutMs();
   const absoluteTimeoutMs = externalAttemptTimeoutMs(progressDeadlineMinutes);
@@ -1626,6 +1722,8 @@ export function runMonitoredGrok(executable, args, {
       return;
     }
     let launchConfirmed = false;
+    let providerStarted = false;
+    let childSpawnedAt = null;
     let launchedAt = null;
     let firstStructuredOutputAt = null;
     let lastStructuredOutputAt = startedAt;
@@ -1647,6 +1745,14 @@ export function runMonitoredGrok(executable, args, {
       fn(value);
     };
 
+    const markProviderStarted = () => {
+      if (providerStarted) return;
+      providerStarted = true;
+      launchedAt = Date.now();
+      lastStructuredOutputAt = launchedAt;
+      protocol.advance("PROVIDER_STARTED");
+    };
+
     const observeStructuredLines = (text) => {
       stdoutCapture += text;
       if (Buffer.byteLength(stdoutCapture, "utf8") > 2 * 1024 * 1024) {
@@ -1662,7 +1768,8 @@ export function runMonitoredGrok(executable, args, {
         try {
           const event = JSON.parse(line);
           if (event && typeof event === "object" && !Array.isArray(event)) {
-            const progressKind = grokModelProgressKind(event);
+            const progressKind = modelProgressKind(event);
+            if (providerStartKind(event, modelProgressKind)) markProviderStarted();
             if (progressKind) {
               const now = Date.now();
               if (firstStructuredOutputAt === null) {
@@ -1681,11 +1788,8 @@ export function runMonitoredGrok(executable, args, {
     };
 
     child.once("spawn", () => {
-      const now = Date.now();
       launchConfirmed = true;
-      launchedAt = now;
-      lastStructuredOutputAt = now;
-      protocol.advance("PROVIDER_STARTED");
+      childSpawnedAt = Date.now();
     });
 
     child.stdout?.on("data", (chunk) => {
@@ -1711,7 +1815,7 @@ export function runMonitoredGrok(executable, args, {
         phaseHistory: protocol.phaseHistory,
         cancellationSource,
         details: {
-          cleanup_confirmed: cleanup.confirmed, cleanup_diagnostic: cleanup.diagnostic, provider_started: launchConfirmed,
+          cleanup_confirmed: cleanup.confirmed, cleanup_diagnostic: cleanup.diagnostic, provider_started: providerStarted,
           outcome_code: cleanup.confirmed ? outcomeCode : "PROVIDER_TIMEOUT",
           phase_history: protocol.phaseHistory,
           ...(cancellationSource ? { cancellation_source: cancellationSource } : {}),
@@ -1726,19 +1830,23 @@ export function runMonitoredGrok(executable, args, {
       if (settled || terminating) return;
       const now = Date.now();
       if (!launchConfirmed && now - startedAt >= launchTimeoutMs) {
-        void terminateFor("cli_launch_timeout", "PROVIDER_START_TIMEOUT", `Grok CLI launch was not confirmed within ${launchTimeoutMs}ms`);
+        void terminateFor("cli_launch_timeout", "PROVIDER_START_TIMEOUT", `${providerName} CLI launch was not confirmed within ${launchTimeoutMs}ms`);
         return;
       }
-      if (launchConfirmed && now - launchedAt >= absoluteTimeoutMs) {
+      if (launchConfirmed && !providerStarted && now - (childSpawnedAt ?? startedAt) >= launchTimeoutMs) {
+        void terminateFor("cli_launch_timeout", "PROVIDER_START_TIMEOUT", `${providerName} provider start was not confirmed within ${launchTimeoutMs}ms`);
+        return;
+      }
+      if (providerStarted && now - launchedAt >= absoluteTimeoutMs) {
         void terminateFor("provider_timeout", "PROVIDER_TIMEOUT", `absolute provider deadline ${absoluteTimeoutMs}ms exceeded`);
         return;
       }
-      if (launchConfirmed && firstStructuredOutputAt === null && now - (launchedAt ?? startedAt) >= firstOutputTimeoutMs) {
-        void terminateFor("first_output_timeout", "FIRST_TOKEN_TIMEOUT", `no structured Grok stdout within ${firstOutputTimeoutMs}ms`);
+      if (providerStarted && firstStructuredOutputAt === null && now - launchedAt >= firstOutputTimeoutMs) {
+        void terminateFor("first_output_timeout", "FIRST_TOKEN_TIMEOUT", `no structured ${providerName} stdout within ${firstOutputTimeoutMs}ms`);
         return;
       }
       if (firstStructuredOutputAt !== null && now - lastStructuredOutputAt >= stallTimeoutMs) {
-        void terminateFor("generation_stalled", "HEARTBEAT_TIMEOUT", `no structured Grok stdout progress within ${stallTimeoutMs}ms`);
+        void terminateFor("generation_stalled", "HEARTBEAT_TIMEOUT", `no structured ${providerName} stdout progress within ${stallTimeoutMs}ms`);
       }
     }, watchdogIntervalMs);
     for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
@@ -1754,9 +1862,9 @@ export function runMonitoredGrok(executable, args, {
       if (terminating || settled) return;
       finish(reject, new ExternalAgentExecutionError(`cli_launch_failed: ${error.message}`, {
         failureClass: "cli_launch_failed", retrySafe: true,
-        outcomeCode: launchConfirmed ? "RESULT_PARSE_FAILED" : "LOCAL_PRECHECK_FAILED",
+        outcomeCode: providerStarted ? "RESULT_PARSE_FAILED" : "LOCAL_PRECHECK_FAILED",
         phaseHistory: protocol.phaseHistory,
-        details: { provider_started: launchConfirmed, phase_history: protocol.phaseHistory },
+        details: { provider_started: providerStarted, process_spawned: launchConfirmed, phase_history: protocol.phaseHistory },
       }));
     });
     child.once("exit", (code, signal) => {
@@ -1770,7 +1878,7 @@ export function runMonitoredGrok(executable, args, {
         } catch (error) {
           finish(reject, new ExternalAgentExecutionError(`process_group_cleanup_failed: terminal group probe failed: ${error.message}`, {
             failureClass: "process_group_cleanup_failed", retrySafe: false, resultUnknown: true,
-            details: { cleanup_confirmed: false, cleanup_diagnostic: `terminal group probe failed: ${error.message}`, provider_started: launchConfirmed },
+            details: { cleanup_confirmed: false, cleanup_diagnostic: `terminal group probe failed: ${error.message}`, provider_started: providerStarted },
           }));
           return;
         }
@@ -1779,7 +1887,7 @@ export function runMonitoredGrok(executable, args, {
         if (!cleanup.confirmed) {
           finish(reject, new ExternalAgentExecutionError(`process_group_cleanup_failed: provider leader exited but descendants survived cleanup; cleanup=${cleanup.diagnostic}`, {
             failureClass: "process_group_cleanup_failed", retrySafe: false, resultUnknown: true,
-            details: { cleanup_confirmed: false, cleanup_diagnostic: cleanup.diagnostic, provider_started: launchConfirmed },
+            details: { cleanup_confirmed: false, cleanup_diagnostic: cleanup.diagnostic, provider_started: providerStarted },
           }));
           return;
         }
@@ -1787,7 +1895,7 @@ export function runMonitoredGrok(executable, args, {
           finish(reject, new ExternalAgentExecutionError(`provider_terminated_by_signal: ${signal}`, {
             failureClass: "provider_terminated_by_signal", retrySafe: true,
             outcomeCode: "RESULT_PARSE_FAILED", phaseHistory: protocol.phaseHistory,
-            details: { provider_started: launchConfirmed, cleanup_confirmed: true, cleanup_diagnostic: cleanup.diagnostic, phase_history: protocol.phaseHistory },
+            details: { provider_started: providerStarted, cleanup_confirmed: true, cleanup_diagnostic: cleanup.diagnostic, phase_history: protocol.phaseHistory },
           }));
         } else {
           const finalCode = code ?? 1;
@@ -1795,6 +1903,7 @@ export function runMonitoredGrok(executable, args, {
             let result;
             try {
               result = validateFinalResult(stdoutCapture);
+              markProviderStarted();
               if (protocol.currentPhase === "PROVIDER_STARTED") {
                 protocol.advance("FIRST_PROGRESS");
                 protocol.advance("ANALYZING");
@@ -1804,7 +1913,7 @@ export function runMonitoredGrok(executable, args, {
               finish(reject, new ExternalAgentExecutionError(`result_parse_failed: ${error.message}`, {
                 failureClass: "result_parse_failed", retrySafe: false,
                 outcomeCode: "RESULT_PARSE_FAILED", phaseHistory: protocol.phaseHistory,
-                details: { provider_started: launchConfirmed, phase_history: protocol.phaseHistory, parse_error: String(error?.message || error) },
+                details: { provider_started: providerStarted, phase_history: protocol.phaseHistory, parse_error: String(error?.message || error) },
               }));
               return;
             }
@@ -1812,11 +1921,19 @@ export function runMonitoredGrok(executable, args, {
             return;
           }
           finish(resolve, returnProtocol
-            ? { code: finalCode, outcome_code: finalCode === 0 ? null : "RESULT_PARSE_FAILED", ...protocol.snapshot() }
+            ? { code: finalCode, ...protocol.snapshot("RESULT_PARSE_FAILED") }
             : finalCode);
         }
       })();
     });
+  });
+}
+
+export function runMonitoredKimi(executable, args, options = {}) {
+  return runMonitoredGrok(executable, args, {
+    ...options,
+    providerName: "Kimi",
+    modelProgressKind: kimiModelProgressKind,
   });
 }
 
@@ -1837,6 +1954,8 @@ export function runMonitoredGrokReview(executable, args, {
     const startedAt = Date.now();
     let child = null;
     let launchConfirmed = false;
+    let providerStarted = false;
+    let childSpawnedAt = null;
     let launchedAt = null;
     let firstOutputAt = null;
     let lastOutputAt = null;
@@ -1874,8 +1993,8 @@ export function runMonitoredGrokReview(executable, args, {
       const parseFailure = new Set(["REVIEW_OUTPUT_INVALID", "REVIEW_NO_VERDICT", "REVIEW_MAX_TURNS"]).has(terminal.reviewStatus);
       resolve({
         ...terminal,
-        retrySafe: launchConfirmed ? false : terminal.retrySafe,
-        providerStarted: launchConfirmed,
+        retrySafe: providerStarted ? false : terminal.retrySafe,
+        providerStarted,
         outcomeCode: terminal.outcomeCode || (validVerdict ? "SUCCESS" : parseFailure ? "RESULT_PARSE_FAILED" : null),
         phaseHistory: protocol.phaseHistory,
         advisory: true,
@@ -1926,9 +2045,14 @@ export function runMonitoredGrokReview(executable, args, {
 
     child.once("spawn", () => {
       launchConfirmed = true;
+      childSpawnedAt = Date.now();
+    });
+    const markProviderStarted = () => {
+      if (providerStarted) return;
+      providerStarted = true;
       launchedAt = Date.now();
       protocol.advance("PROVIDER_STARTED");
-    });
+    };
     const observeValidatedProgress = (text) => {
       progressBuffer += text;
       while (true) {
@@ -1939,7 +2063,9 @@ export function runMonitoredGrokReview(executable, args, {
         if (!line) continue;
         try {
           const event = JSON.parse(line);
-          if (!grokModelProgressKind(event)) continue;
+          const progressKind = grokModelProgressKind(event);
+          if (providerStartKind(event, grokModelProgressKind)) markProviderStarted();
+          if (!progressKind) continue;
           const now = Date.now();
           if (firstOutputAt === null) {
             firstOutputAt = now;
@@ -1958,6 +2084,7 @@ export function runMonitoredGrokReview(executable, args, {
       } catch {
         return;
       }
+      markProviderStarted();
       const now = Date.now();
       if (firstOutputAt === null) {
         firstOutputAt = now;
@@ -2018,11 +2145,15 @@ export function runMonitoredGrokReview(executable, args, {
         void terminateForTimeout(`review launch timeout after ${launchTimeoutMs}ms`, { outcomeCode: "PROVIDER_START_TIMEOUT" });
         return;
       }
-      if (launchConfirmed && now - launchedAt >= absoluteTimeoutMs) {
+      if (launchConfirmed && !providerStarted && now - (childSpawnedAt ?? startedAt) >= launchTimeoutMs) {
+        void terminateForTimeout(`review provider-start timeout after ${launchTimeoutMs}ms`, { outcomeCode: "PROVIDER_START_TIMEOUT" });
+        return;
+      }
+      if (providerStarted && now - launchedAt >= absoluteTimeoutMs) {
         void terminateForTimeout(`review absolute timeout after ${absoluteTimeoutMs}ms`, { outcomeCode: "PROVIDER_TIMEOUT" });
         return;
       }
-      if (launchConfirmed && firstOutputAt === null && now - (launchedAt ?? startedAt) >= firstOutputTimeoutMs) {
+      if (providerStarted && firstOutputAt === null && now - launchedAt >= firstOutputTimeoutMs) {
         void terminateForTimeout(`review first-output timeout after ${firstOutputTimeoutMs}ms`, { outcomeCode: "FIRST_TOKEN_TIMEOUT" });
         return;
       }
@@ -2194,6 +2325,7 @@ async function executeExternalAgent({
   const normalizedRole = String(assignmentRole || "").trim().toLowerCase();
   const normalizedReviewPhase = String(reviewPhase || "").trim().toLowerCase();
   const purePacketReview = engine === "grok-build" && normalizedWorkType === "review";
+  const advisoryHypothesisReview = normalizedWorkType === "advisory_hypothesis_review";
   if (engine === "grok-build" && !normalizedWorkType) {
     throw reviewPacketError("Grok Build execution requires explicit work_type");
   }
@@ -2218,8 +2350,11 @@ async function executeExternalAgent({
   const reviewPacket = purePacketReview
     ? parseGrokReviewPacket(rawPrompt, { candidateRevision, reviewPhase: normalizedReviewPhase })
     : null;
+  const advisoryPacket = advisoryHypothesisReview ? parseAdvisoryHypothesisPacket(rawPrompt) : null;
   const prompt = purePacketReview
     ? JSON.stringify(reviewPacket)
+    : advisoryHypothesisReview
+      ? JSON.stringify(advisoryPacket)
     : sideEffect && idempotencyKey
       ? `[Adaptive Agent Runtime side-effect contract] Any external side effect in this execution MUST use the exact idempotency key: ${idempotencyKey}. Do not perform the side effect without applying this key through the provider/API mechanism.\n\n${rawPrompt}`
       : rawPrompt;
@@ -2317,6 +2452,9 @@ async function executeExternalAgent({
       }
       const monitored = await runMonitoredGrok(executable, args, {
         cwd, env, progressDeadlineMinutes, onStructuredProgress, returnProtocol: true,
+        ...(advisoryHypothesisReview ? {
+          validateFinalResult: (stdout) => validateAdvisoryHypothesisResult(parseFinalResultEvent(stdout), { packet: advisoryPacket }),
+        } : {}),
       });
       const code = monitored.code;
       if (code !== 0) {
@@ -2327,9 +2465,15 @@ async function executeExternalAgent({
           details: { provider_exit_code: code },
         });
       }
-      return { code, executionProtocol: monitored };
+      return { code, executionProtocol: monitored, ...(advisoryHypothesisReview ? { advisoryResult: monitored.result } : {}) };
     }
-    return await runAttached(executable, args, { cwd, env });
+    const monitored = await runMonitoredKimi(executable, args, {
+      cwd, env, progressDeadlineMinutes, onStructuredProgress, returnProtocol: true,
+      ...(advisoryHypothesisReview ? {
+        validateFinalResult: (stdout) => validateAdvisoryHypothesisResult(parseFinalResultEvent(stdout), { packet: advisoryPacket }),
+      } : {}),
+    });
+    return { code: monitored.code, executionProtocol: monitored, ...(advisoryHypothesisReview ? { advisoryResult: monitored.result } : {}) };
   } catch (error) {
     executionError = error;
     throw error;
@@ -2426,6 +2570,7 @@ async function main() {
     let code;
     let reviewTerminal = null;
     let executionProtocol = null;
+    let advisoryResult = null;
     try {
       const executionResult = await executeExternalAgent(options);
       if (executionResult && typeof executionResult === "object" && !Array.isArray(executionResult) && "reviewTerminal" in executionResult) {
@@ -2434,6 +2579,7 @@ async function main() {
       } else if (executionResult && typeof executionResult === "object" && !Array.isArray(executionResult) && "executionProtocol" in executionResult) {
         code = executionResult.code;
         executionProtocol = executionResult.executionProtocol;
+        advisoryResult = executionResult.advisoryResult || null;
       } else {
         code = executionResult;
       }
@@ -2526,7 +2672,7 @@ async function main() {
           : reviewStatus === "REVIEW_MAX_TURNS"
             ? "repair Reviewer invocation policy; do not repeat the same max-turns command"
             : retrySafe
-              ? "retry the same pure-packet review at most once after verified process cleanup"
+              ? "return to Controller for a new Controller route and Assignment; do not repeat this provider invocation"
               : "do not retry automatically; inspect Reviewer terminal evidence";
       const failureDetails = validVerdict ? null : {
         review_status: reviewStatus,
@@ -2595,11 +2741,19 @@ async function main() {
         deliveryError = error;
       }
     }
+    const protocolOutcomeCode = executionProtocol?.outcome_code || null;
+    const hasValidatedProviderResult = protocolOutcomeCode === "SUCCESS" || protocolOutcomeCode === "MODEL_CONTRADICTED_BY_LOCAL_EVIDENCE";
+    const hasValidatedDelivery = delivery !== null && deliveryError === null;
+    const finalOutcomeCode = code === 0 && (hasValidatedProviderResult || hasValidatedDelivery)
+      ? (advisoryResult?.outcome_code || "SUCCESS")
+      : "RESULT_PARSE_FAILED";
     const underlyingFinalFailureClass = deliveryError
       ? "delivery_receipt_invalid"
-      : code === 0
-        ? null
-        : "provider_exit";
+      : code !== 0
+        ? "provider_exit"
+        : finalOutcomeCode === "RESULT_PARSE_FAILED"
+          ? "result_parse_failed"
+          : null;
     const finalResultUnknown = Boolean(options.sideEffect)
       && (code !== 0 || deliveryError !== null || delivery?.delivery_outcome === "unresolved" || delivery === null);
     const finalFailureClass = finalResultUnknown ? "result_unknown" : underlyingFinalFailureClass;
@@ -2627,12 +2781,14 @@ async function main() {
           ? { underlying_failure_class: "provider_result_unreconciled" }
           : null;
     const finalSummary = delivery?.summary || deliveryError?.message
-      || (code === 0 ? "external agent process completed" : `external agent exited ${code}`);
-    const finalOutcomeCode = code === 0 && !deliveryError ? "SUCCESS" : "RESULT_PARSE_FAILED";
+      || (advisoryResult ? "external advisory hypothesis result validated"
+        : finalOutcomeCode === "RESULT_PARSE_FAILED" && code === 0
+          ? "external agent exited zero without a validated final result or delivery receipt"
+          : code === 0 ? "external agent process completed" : `external agent exited ${code}`);
     let finalPhaseHistory = Array.isArray(executionProtocol?.phase_history)
       ? [...executionProtocol.phase_history]
       : [];
-    if (finalOutcomeCode === "SUCCESS") {
+    if (finalOutcomeCode === "SUCCESS" || finalOutcomeCode === "MODEL_CONTRADICTED_BY_LOCAL_EVIDENCE") {
       finalPhaseHistory = [...EXTERNAL_EXECUTION_PHASES];
     }
     recordRuntimeReceipt(options, "assignment_terminal", eventSeq, {
@@ -2651,6 +2807,7 @@ async function main() {
       result_unknown: finalResultUnknown,
       outcome_code: finalOutcomeCode,
       phase_history: finalPhaseHistory,
+      ...(advisoryResult ? { advisory_hypothesis_result: advisoryResult } : {}),
       advisory: true,
       critical_path: false,
     });
@@ -2665,6 +2822,7 @@ async function main() {
       failureDetails: finalFailureDetails,
       outcomeCode: finalOutcomeCode,
       phaseHistory: finalPhaseHistory,
+      advisoryResult,
       advisory: true,
       criticalPath: false,
     });

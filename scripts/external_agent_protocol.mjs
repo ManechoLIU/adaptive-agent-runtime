@@ -241,10 +241,24 @@ export function parseAdvisoryHypothesisPacket(rawPacket) {
     const evidence = hypothesis.evidence.map((item) => boundedString(item, `evidence for ${id}`));
     return { id, statement, evidence };
   });
-  return { schema_version: 1, mode: packet.mode, question, hypotheses };
+  const localEvidenceContradictions = packet.local_evidence_contradictions ?? [];
+  if (!Array.isArray(localEvidenceContradictions)
+      || localEvidenceContradictions.some((id) => typeof id !== "string" || !ids.has(id.trim()))
+      || new Set(localEvidenceContradictions.map((id) => id.trim())).size !== localEvidenceContradictions.length) {
+    throw new ExternalAgentProtocolError("local_evidence_contradictions must contain unique bounded hypothesis ids", {
+      failureClass: "advisory_packet_invalid",
+    });
+  }
+  return {
+    schema_version: 1,
+    mode: packet.mode,
+    question,
+    hypotheses,
+    local_evidence_contradictions: localEvidenceContradictions.map((id) => id.trim()),
+  };
 }
 
-export function validateAdvisoryHypothesisResult(value, { packet, localEvidenceContradictions = [] } = {}) {
+export function validateAdvisoryHypothesisResult(value, { packet, localEvidenceContradictions = null } = {}) {
   const normalizedPacket = parseAdvisoryHypothesisPacket(packet);
   if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.hypotheses)) {
     throw new ExternalAgentProtocolError("advisory hypothesis result requires a hypotheses array", {
@@ -272,7 +286,8 @@ export function validateAdvisoryHypothesisResult(value, { packet, localEvidenceC
       outcomeCode: "RESULT_PARSE_FAILED", failureClass: "result_parse_failed",
     });
   }
-  const contradictionIds = new Set(localEvidenceContradictions.map((id) => String(id).trim()).filter(Boolean));
+  const contradictionIds = new Set((localEvidenceContradictions ?? normalizedPacket.local_evidence_contradictions)
+    .map((id) => String(id).trim()).filter(Boolean));
   const contradictedByLocalEvidence = results.some(({ id, verdict }) => contradictionIds.has(id) && verdict !== "contradicted");
   return {
     outcome_code: contradictedByLocalEvidence ? "MODEL_CONTRADICTED_BY_LOCAL_EVIDENCE" : "SUCCESS",
@@ -288,7 +303,7 @@ export function externalRetryDecision(terminal, { attempt = 1, authorizedSafeRet
   if (terminal?.resultUnknown) return { retry: false, reason: "result_unknown" };
   if (terminal?.hadModelOutput) return { retry: false, reason: "model_output_observed" };
   if (terminal?.providerStarted) return { retry: false, reason: "provider_boundary_crossed" };
-  if (!authorizedSafeRetry) return { retry: false, reason: "explicit_authorization_required" };
   if (terminal?.retrySafe !== true) return { retry: false, reason: "not_retry_safe" };
-  return { retry: true, reason: "authorized_safe_downgrade_before_provider" };
+  void authorizedSafeRetry;
+  return { retry: false, reason: "controller_route_reassignment_required" };
 }
