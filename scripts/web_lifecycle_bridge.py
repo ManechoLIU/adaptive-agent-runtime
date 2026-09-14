@@ -8917,12 +8917,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError(f"no registered controller for {repo}")
             try:
                 supplied_receipt_json = str(args.host_identity_receipt_json or "").strip()
-                if supplied_receipt_json:
+                supplied_receipt = json.loads(supplied_receipt_json) if supplied_receipt_json else None
+                supplied_is_current_entry = (
+                    isinstance(supplied_receipt, dict)
+                    and supplied_receipt.get("provenance") == "runtime_host_current_entry_v1"
+                    and supplied_receipt.get("entry_scope") == "runtime_invocation"
+                    and supplied_receipt.get("machine_source") == "host_invocation_context_v1"
+                )
+                if supplied_is_current_entry:
                     current_entry = current_web_entry_from_host_identity_receipt(
                         repo=repo,
                         controller_id=controller_id,
                         registry_path=registry_path,
-                        host_identity_receipt=json.loads(supplied_receipt_json),
+                        host_identity_receipt=supplied_receipt,
                     )
                 else:
                     current_entry = discover_current_web_entry(
