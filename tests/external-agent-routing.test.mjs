@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
 import crypto from "node:crypto";
@@ -111,7 +111,7 @@ async function fakeInstalledSkill(directory) {
   const root = path.join(directory, "installed-skill");
   const scripts = path.join(root, "scripts");
   await mkdir(scripts, { recursive: true });
-  for (const file of ["run_external_agent.mjs", "assignment_lease_guard.py", "assignment_runtime.py", "route_contract.py", "project_state.py", "rule_handshake.py", "controller_target_guard.py", "agent_target_resolution.py"]) {
+  for (const file of ["run_external_agent.mjs", "external_agent_protocol.mjs", "assignment_lease_guard.py", "assignment_runtime.py", "route_contract.py", "project_state.py", "rule_handshake.py", "controller_target_guard.py", "agent_target_resolution.py"]) {
     await copyFile(path.join(skillRoot, "scripts", file), path.join(scripts, file));
   }
   const rel = "scripts/rule_handshake.py";
@@ -1615,6 +1615,64 @@ test("Grok first-output timeout terminates a silent provider attempt", async () 
   assert.ok(Date.now() - started < 900, `timeout took ${Date.now() - started}ms`);
 });
 
+test("Grok invalid cwd is LOCAL_PRECHECK_FAILED and never spawns the provider", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-local-precheck-"));
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", path.join(bin, "missing"), "--work-type", "implementation",
+  ], {
+    encoding: "utf8", input: "bounded",
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome, SPAWN_MARKER: marker },
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /LOCAL_PRECHECK_FAILED/);
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
+test("Grok unclosed stdin times out before provider spawn with LOCAL_PRECHECK_FAILED", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-input-timeout-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  const marker = path.join(bin, "spawned.txt");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const result = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [adapter,
+      "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+      "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
+    ], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
+        SPAWN_MARKER: marker, AD_EXTERNAL_INPUT_TIMEOUT_MS: "30",
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("bounded input fixture did not terminate"));
+    }, 2_000);
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /LOCAL_PRECHECK_FAILED|input did not close/i);
+  await assert.rejects(readFile(marker, "utf8"));
+});
+
 test("Grok generation stall timeout terminates after structured output stops", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-stall-timeout-"));
   const repo = await makeAssignmentRepo(bin);
@@ -1746,12 +1804,17 @@ test("Grok side-effect timeout crosses provider boundary as result_unknown and d
   assert.equal(terminal.retry_safe, false);
   assert.equal(terminal.result_unknown, true);
   assert.equal(terminal.failure_details.provider_failure_class, "first_output_timeout");
+  assert.equal(terminal.outcome_code, "FIRST_TOKEN_TIMEOUT");
+  assert.deepEqual(terminal.phase_history, ["PRECHECK", "PACKET_VALIDATED", "PROVIDER_STARTING", "PROVIDER_STARTED"]);
   const durable = JSON.parse(await readFile(terminalReceipt, "utf8"));
   assert.equal(durable.failure_class, "result_unknown");
   assert.equal(durable.retry_class, "result_unknown");
   assert.equal(durable.retry_safe, false);
   assert.equal(durable.result_unknown, true);
   assert.equal(durable.failure_details.provider_failure_class, "first_output_timeout");
+  assert.equal(durable.outcome_code, "FIRST_TOKEN_TIMEOUT");
+  assert.equal(durable.advisory, true);
+  assert.equal(durable.critical_path, false);
 });
 
 test("Grok implementation stall timeout persists structured canonical terminal classification", async () => {
@@ -1787,12 +1850,17 @@ test("Grok implementation stall timeout persists structured canonical terminal c
   assert.equal(terminal.retry_safe, true);
   assert.equal(terminal.result_unknown, false);
   assert.equal(terminal.failure_details.cleanup_confirmed, true);
+  assert.equal(terminal.outcome_code, "HEARTBEAT_TIMEOUT");
+  assert.deepEqual(terminal.phase_history, ["PRECHECK", "PACKET_VALIDATED", "PROVIDER_STARTING", "PROVIDER_STARTED", "FIRST_PROGRESS", "ANALYZING"]);
   assert.match(terminal.next_action, /inspect bounded external agent failure/i);
   const durable = JSON.parse(await readFile(terminalReceipt, "utf8"));
   assert.equal(durable.failure_class, "generation_stalled");
   assert.equal(durable.retry_class, "generation_stalled");
   assert.equal(durable.retry_safe, true);
   assert.equal(durable.result_unknown, false);
+  assert.equal(durable.outcome_code, "HEARTBEAT_TIMEOUT");
+  assert.equal(durable.advisory, true);
+  assert.equal(durable.critical_path, false);
 });
 
 
@@ -2567,18 +2635,26 @@ test("Grok Reviewer timeout distinguishes clean timeout from stuck residual proc
   assert.equal(stuck.retrySafe, false);
 });
 
-test("Grok Reviewer retry policy never retries findings, max-turns, or invalid verdict", async () => {
+test("Grok Reviewer retry policy requires explicit authorization and never retries after provider start", async () => {
   const runtimeModule = await import(`../scripts/run_external_agent.mjs?review-retry=${Date.now()}`);
   assert.equal(typeof runtimeModule.grokReviewRetryDecision, "function");
   for (const reviewStatus of ["REVIEW_FAIL", "REVIEW_MAX_TURNS", "REVIEW_OUTPUT_INVALID", "REVIEW_PROCESS_STUCK", "REVIEW_NO_VERDICT"]) {
     assert.deepEqual(runtimeModule.grokReviewRetryDecision({ reviewStatus, retrySafe: false }, { attempt: 1 }), { retry: false, reason: "terminal_review_outcome" });
   }
   assert.deepEqual(
-    runtimeModule.grokReviewRetryDecision({ reviewStatus: "REVIEW_TIMEOUT", retrySafe: true, hadModelOutput: false }, { attempt: 1 }),
-    { retry: true, reason: "transient_before_model_output" },
+    runtimeModule.grokReviewRetryDecision({ reviewStatus: "REVIEW_TIMEOUT", retrySafe: true, providerStarted: false, hadModelOutput: false }, { attempt: 1 }),
+    { retry: false, reason: "explicit_authorization_required" },
   );
   assert.deepEqual(
-    runtimeModule.grokReviewRetryDecision({ reviewStatus: "REVIEW_TIMEOUT", retrySafe: true, hadModelOutput: true }, { attempt: 1 }),
+    runtimeModule.grokReviewRetryDecision({ reviewStatus: "REVIEW_TIMEOUT", retrySafe: true, providerStarted: false, hadModelOutput: false }, { attempt: 1, authorizedSafeRetry: true }),
+    { retry: true, reason: "authorized_safe_downgrade_before_provider" },
+  );
+  assert.deepEqual(
+    runtimeModule.grokReviewRetryDecision({ reviewStatus: "REVIEW_TIMEOUT", retrySafe: true, providerStarted: true, hadModelOutput: false }, { attempt: 1, authorizedSafeRetry: true }),
+    { retry: false, reason: "provider_boundary_crossed" },
+  );
+  assert.deepEqual(
+    runtimeModule.grokReviewRetryDecision({ reviewStatus: "REVIEW_TIMEOUT", retrySafe: true, providerStarted: false, hadModelOutput: true }, { attempt: 1, authorizedSafeRetry: true }),
     { retry: false, reason: "model_output_observed" },
   );
   assert.deepEqual(
@@ -2604,7 +2680,7 @@ test("Grok Reviewer timeout performs bounded cleanup before REVIEW_TIMEOUT", asy
     });
     const terminal = await promise;
     assert.equal(terminal.reviewStatus, "REVIEW_TIMEOUT");
-    assert.equal(terminal.retrySafe, true);
+    assert.equal(terminal.retrySafe, false);
     assert.equal(cleaned, 1);
     assert.match(terminal.cleanupDiagnostic, /group-gone/);
   } finally {
@@ -2724,6 +2800,10 @@ test("Grok work_type=review accepts only structured PASS into canonical acceptan
   assert.equal(terminal.review_status, "REVIEW_PASS");
   assert.equal(terminal.review_verdict.reviewed_head, head);
   assert.equal(terminal.review_verdict.verdict, "PASS");
+  assert.equal(terminal.outcome_code, "SUCCESS");
+  assert.deepEqual(terminal.phase_history, ["PRECHECK", "PACKET_VALIDATED", "PROVIDER_STARTING", "PROVIDER_STARTED", "FIRST_PROGRESS", "ANALYZING", "FINAL_RESULT"]);
+  assert.equal(terminal.advisory, true);
+  assert.equal(terminal.critical_path, false);
 });
 
 test("Grok work_type=review valid FAIL is terminal findings and is never retried into PASS", async () => {
@@ -2810,13 +2890,13 @@ setInterval(() => {}, 1000);
   const receipts = (await readFile(runtimeReceipts, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
   const terminal = receipts.at(-1);
   assert.equal(terminal.review_status, "REVIEW_TIMEOUT");
-  assert.equal(terminal.retry_safe, false); // model output existed; never blind-retry
-  assert.match(terminal.failure_details.cleanup_diagnostic, /SIGTERM;SIGKILL/);
+  assert.equal(terminal.retry_safe, false); // provider boundary was crossed; never blind-retry
+  assert.match(terminal.failure_details.cleanup_diagnostic, /SIGTERM/);
   await new Promise((resolve) => setTimeout(resolve, 550));
   await assert.rejects(readFile(marker, "utf8"));
 });
 
-test("ordinary Grok parent SIGTERM also performs bounded process-group cleanup", async () => {
+test("ordinary Grok parent SIGTERM is parent cancellation and performs bounded process-group cleanup", async () => {
   const runtimeModule = await import(`../scripts/run_external_agent.mjs?ordinary-parent-signal=${Date.now()}`);
   const { EventEmitter } = await import("node:events");
   const { PassThrough } = await import("node:stream");
@@ -2828,7 +2908,11 @@ test("ordinary Grok parent SIGTERM also performs bounded process-group cleanup",
     spawnChild: () => { queueMicrotask(() => { child.emit("spawn"); parent.emit("SIGTERM"); }); return child; },
     terminateGroup: async () => { cleaned += 1; child.exitCode = 1; return { confirmed: true, diagnostic: "ordinary-parent-group-gone" }; },
   });
-  await assert.rejects(promise, (error) => error?.failureClass === "provider_timeout" && error?.details?.cleanup_confirmed === true);
+  await assert.rejects(promise, (error) => error?.failureClass === "parent_cancelled"
+    && error?.outcomeCode === "PARENT_CANCELLED"
+    && error?.cancellationSource === "parent_process"
+    && error?.details?.parent_signal === "SIGTERM"
+    && error?.details?.cleanup_confirmed === true);
   assert.equal(cleaned, 1);
 });
 
@@ -2847,7 +2931,7 @@ test("Grok Reviewer distinguishes REVIEW_NO_VERDICT and REVIEW_PROVIDER_ERROR", 
   assert.equal(provider.retrySafe, true);
 });
 
-test("Grok work_type=review retries transient pre-output failure only once then accepts PASS", async () => {
+test("Grok work_type=review does not implicitly retry a transient provider failure", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-review-transient-retry-"));
   const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
@@ -2879,12 +2963,12 @@ process.stdout.write(JSON.stringify({ reviewed_head: process.env.REVIEW_HEAD, cr
     // This case verifies retry semantics, not cold-start watchdog sensitivity. Dedicated timeout tests cover 30-300ms deadlines.
     AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "1500", AD_GROK_STALL_TIMEOUT_MS: "1500", AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "4000", AD_EXTERNAL_KILL_GRACE_MS: "30",
   } });
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(Number((await readFile(countFile, "utf8")).trim()), 2);
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(Number((await readFile(countFile, "utf8")).trim()), 1);
   const receipts = (await readFile(runtimeReceipts, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
   const terminal = receipts.at(-1);
-  assert.equal(terminal.review_status, "REVIEW_PASS");
-  assert.equal(terminal.delivery_outcome, "pass");
+  assert.equal(terminal.review_status, "REVIEW_PROVIDER_ERROR");
+  assert.equal(terminal.delivery_outcome, "unresolved");
 });
 
 test("Grok Reviewer waits for stdio close before classifying final verdict", async () => {
@@ -2988,6 +3072,7 @@ test("run_external_agent direct execution survives symlinked filesystem path", a
   const linkDir = path.join(root, "link");
   await mkdir(realDir, { recursive: true });
   const copied = path.join(realDir, "run_external_agent.mjs");
+  await copyFile(path.join(skillRoot, "scripts", "external_agent_protocol.mjs"), path.join(realDir, "external_agent_protocol.mjs"));
   await copyFile(adapter, copied);
   const { symlink } = await import("node:fs/promises");
   await symlink(realDir, linkDir, "dir");
