@@ -564,6 +564,49 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(completed["response_status"], 0)
 
+    def test_truncated_rollout_does_not_reconcile_old_completion_after_later_turn_started(self):
+        tail_bytes = 8 * 1024 * 1024
+        prefix = "".join(
+            json.dumps(row) + "\n"
+            for row in (
+                {"type": "session_meta", "payload": {"id": "source"}},
+                {"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": "old"}},
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "new"}},
+            )
+        ).encode("utf-8")
+        task_started_at = prefix.find(b"task_started")
+        with self.transcript.open("wb") as stream:
+            stream.write(prefix)
+            stream.write(b'{"type":"response_item","payload":{"type":"message","text":"')
+            stream.write(b"x" * tail_bytes)
+            stream.write(b'"}}\n')
+            later_turn_started_at = stream.tell()
+            stream.write(json.dumps({
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "later"},
+            }).encode("utf-8") + b"\n")
+        self.append_command_completion()
+        size = self.transcript.stat().st_size
+        self.assertGreater(size, tail_bytes)
+        self.assertLess(task_started_at, size - tail_bytes)
+        self.assertGreaterEqual(later_turn_started_at, size - tail_bytes)
+
+        prior = {
+            **self.prior,
+            "active_turn_id": "new",
+            "tool_trace_overflow": False,
+            "tool_trace": [],
+            "inflight_tool_use_ids": ["new-call"],
+            "inflight_tool_records": {"new-call": self.inflight_record()},
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            self.event("Stop"), snapshot=self.snapshot, prior_state=prior,
+        )
+
+        self.assertIs(output.get("continue"), False)
+        self.assertEqual(state["inflight_tool_use_ids"], ["new-call"])
+        self.assertEqual(state["tool_trace"], [])
+
     def test_small_rollout_without_exact_task_started_does_not_reconcile_completion(self):
         self.transcript.write_text(json.dumps({
             "type": "session_meta", "payload": {"id": "source"},

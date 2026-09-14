@@ -256,8 +256,15 @@ def _desktop_rollout_completed_items(
             kind = payload.get("type")
             payload_turn_id = str(payload.get("turn_id") or "").strip()
             if kind == "task_started":
-                if (started or completed) and payload_turn_id != turn_id:
-                    return []
+                if payload_turn_id != turn_id:
+                    # A bounded tail cannot prove whether its first observed
+                    # non-target start predates the target turn. Once it is
+                    # truncated, accepting a following target completion could
+                    # therefore revive work from an older turn after a later
+                    # turn has begun. Fail closed instead.
+                    if tail_was_truncated or started or completed:
+                        return []
+                    continue
                 if payload_turn_id == turn_id:
                     started = True
                     completed = []
