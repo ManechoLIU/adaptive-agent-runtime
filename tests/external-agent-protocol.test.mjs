@@ -236,6 +236,8 @@ test("final-result validation distinguishes parse failure from canonical success
     invalidChild.stdout.write(`${JSON.stringify({ type: "text", data: "analysis" })}\n`);
     invalidChild.exitCode = 0;
     invalidChild.emit("exit", 0, null);
+    invalidChild.stdout.end(); invalidChild.stderr.end();
+    invalidChild.emit("close", 0, null);
     await assert.rejects(invalid, (error) => error?.outcomeCode === "RESULT_PARSE_FAILED");
 
     const validChild = fakeChild();
@@ -248,6 +250,8 @@ test("final-result validation distinguishes parse failure from canonical success
     validChild.stdout.write(`${JSON.stringify({ type: "final_result", result: { ok: true } })}\n`);
     validChild.exitCode = 0;
     validChild.emit("exit", 0, null);
+    validChild.stdout.end(); validChild.stderr.end();
+    validChild.emit("close", 0, null);
     assert.deepEqual(await valid, {
       code: 0,
       result: { ok: true },
@@ -270,6 +274,8 @@ test("ordinary zero exit without a validated final result stays RESULT_PARSE_FAI
   child.stdout.write(`${JSON.stringify({ type: "text", data: "analysis only" })}\n`);
   child.exitCode = 0;
   child.emit("exit", 0, null);
+  child.stdout.end(); child.stderr.end();
+  child.emit("close", 0, null);
   const terminal = await completion;
   assert.equal(terminal.outcome_code, "RESULT_PARSE_FAILED");
   assert.equal(terminal.phase_history.includes("FINAL_RESULT"), false);
