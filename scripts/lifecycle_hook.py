@@ -239,6 +239,7 @@ def _desktop_rollout_completed_items(
                 return []
             size = stream.seek(0, os.SEEK_END)
             offset = max(0, size - 8 * 1024 * 1024)
+            tail_was_truncated = offset > 0
             stream.seek(offset)
             if offset:
                 stream.readline()
@@ -255,13 +256,13 @@ def _desktop_rollout_completed_items(
             kind = payload.get("type")
             payload_turn_id = str(payload.get("turn_id") or "").strip()
             if kind == "task_started":
-                if started and payload_turn_id != turn_id:
+                if (started or completed) and payload_turn_id != turn_id:
                     return []
                 if payload_turn_id == turn_id:
                     started = True
                     completed = []
                 continue
-            if not started or payload_turn_id != turn_id:
+            if payload_turn_id != turn_id:
                 continue
             if kind in {"turn_aborted", "task_complete"}:
                 return []
@@ -280,7 +281,7 @@ def _desktop_rollout_completed_items(
             elif item_type != "FileChange":
                 continue
             completed.append(dict(item))
-        return completed if started else []
+        return completed if started or tail_was_truncated else []
     except (OSError, ValueError, TypeError, AttributeError):
         return []
 

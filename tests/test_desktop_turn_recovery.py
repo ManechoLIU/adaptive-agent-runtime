@@ -521,6 +521,71 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(completed["response_status"], 7)
 
+    def test_exact_turn_item_completed_in_tail_is_reconciled_when_task_started_is_outside_fixed_tail(self):
+        tail_bytes = 8 * 1024 * 1024
+        prefix = "".join(
+            json.dumps(row) + "\n"
+            for row in (
+                {"type": "session_meta", "payload": {"id": "source"}},
+                {"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": "old"}},
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "new"}},
+            )
+        ).encode("utf-8")
+        task_started_at = prefix.find(b"task_started")
+        with self.transcript.open("wb") as stream:
+            stream.write(prefix)
+            stream.write(b'{"type":"response_item","payload":{"type":"message","text":"')
+            stream.write(b"x" * tail_bytes)
+            stream.write(b'"}}\n')
+            item_completed_at = stream.tell()
+        self.append_command_completion()
+        size = self.transcript.stat().st_size
+        self.assertGreater(size, tail_bytes)
+        self.assertLess(task_started_at, size - tail_bytes)
+        self.assertGreaterEqual(item_completed_at, size - tail_bytes)
+
+        prior = {
+            **self.prior,
+            "active_turn_id": "new",
+            "tool_trace_overflow": False,
+            "tool_trace": [],
+            "inflight_tool_use_ids": ["new-call", "still-running"],
+            "inflight_tool_records": {
+                "new-call": self.inflight_record(),
+            },
+        }
+        _output, state = lifecycle_hook.evaluate_event(
+            self.event("Stop"), snapshot=self.snapshot, prior_state=prior,
+        )
+        self.assertEqual(state["inflight_tool_use_ids"], ["still-running"])
+        completed = next(
+            item for item in state["tool_trace"]
+            if item["tool_use_id"] == "new-call"
+        )
+        self.assertEqual(completed["response_status"], 0)
+
+    def test_small_rollout_without_exact_task_started_does_not_reconcile_completion(self):
+        self.transcript.write_text(json.dumps({
+            "type": "session_meta", "payload": {"id": "source"},
+        }) + "\n")
+        self.append_command_completion()
+        prior = {
+            **self.prior,
+            "active_turn_id": "new",
+            "tool_trace_overflow": False,
+            "tool_trace": [],
+            "inflight_tool_use_ids": ["new-call"],
+            "inflight_tool_records": {"new-call": self.inflight_record()},
+        }
+
+        output, state = lifecycle_hook.evaluate_event(
+            self.event("Stop"), snapshot=self.snapshot, prior_state=prior,
+        )
+
+        self.assertIs(output.get("continue"), False)
+        self.assertEqual(state["inflight_tool_use_ids"], ["new-call"])
+        self.assertEqual(state["tool_trace"], [])
+
     def test_rollout_file_change_completion_clears_only_exact_current_apply_patch(self):
         for case in (
             "exact", "wrong_turn", "wrong_id", "not_completed", "wrong_tool",
