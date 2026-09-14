@@ -245,6 +245,7 @@ def _desktop_rollout_completed_items(
                 stream.readline()
             raw = stream.read()
         started = False
+        non_target_start_seen = False
         completed: list[dict[str, Any]] = []
         for line in raw.splitlines():
             row = json.loads(line)
@@ -257,17 +258,21 @@ def _desktop_rollout_completed_items(
             payload_turn_id = str(payload.get("turn_id") or "").strip()
             if kind == "task_started":
                 if payload_turn_id != turn_id:
-                    # A bounded tail cannot prove whether its first observed
-                    # non-target start predates the target turn. Once it is
-                    # truncated, accepting a following target completion could
-                    # therefore revive work from an older turn after a later
-                    # turn has begun. Fail closed instead.
-                    if tail_was_truncated or started or completed:
+                    # Once the target boundary has begun, or an unbounded
+                    # completion has appeared, another turn start is later
+                    # evidence and closes this recovery window.
+                    if started or completed:
                         return []
+                    # Before the target boundary, an observed non-target start
+                    # may be an older turn. Retain that bounded state until a
+                    # target start can establish a fresh boundary.
+                    non_target_start_seen = True
                     continue
-                if payload_turn_id == turn_id:
-                    started = True
-                    completed = []
+                # A completion before an observed target start cannot be
+                # attributed to the freshly established target boundary.
+                if completed:
+                    return []
+                started = True
                 continue
             if payload_turn_id != turn_id:
                 continue
@@ -287,8 +292,14 @@ def _desktop_rollout_completed_items(
                     continue
             elif item_type != "FileChange":
                 continue
+            # Without a target start, a preceding non-target start proves this
+            # completion is outside the only trusted bounded window.
+            if non_target_start_seen and not started:
+                return []
             completed.append(dict(item))
-        return completed if started or tail_was_truncated else []
+        if started:
+            return completed
+        return completed if tail_was_truncated and not non_target_start_seen else []
     except (OSError, ValueError, TypeError, AttributeError):
         return []
 
