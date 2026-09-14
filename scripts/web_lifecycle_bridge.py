@@ -1269,6 +1269,31 @@ def discover_current_web_entry(
     )
 
 
+def current_web_entry_from_host_identity_receipt(
+    *, repo: Path, controller_id: str, registry_path: Path, host_identity_receipt: object
+) -> dict[str, Any]:
+    """Bind a supplied Host current-entry receipt to the current verified Controller target."""
+    if not isinstance(host_identity_receipt, dict):
+        raise ValueError("Host identity receipt JSON must decode to an object")
+    logical_agent = agent_target.logical_agent_identity(
+        agent_type="controller", agent_id=controller_id
+    )
+    verified_target = target_guard.resolve_verified_logical_agent_execution_target(
+        repo=canonical_root(repo),
+        host="web",
+        logical_agent_identity=logical_agent,
+        registry_path=registry_path,
+    )
+    evidence = _validated_current_web_entry_evidence(
+        host_identity_receipt,
+        expected_target_generation=verified_target["target_generation"],
+        expected_ownership_generation=verified_target["ownership_generation"],
+    )
+    evidence["logical_agent_identity"] = logical_agent
+    evidence["verified_execution_target_fence"] = verified_target
+    return evidence
+
+
 def recover_same_controller_web_session(
     *,
     repo: Path,
@@ -8891,11 +8916,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             if controller_id is None:
                 raise ValueError(f"no registered controller for {repo}")
             try:
-                current_entry = discover_current_web_entry(
-                    repo=repo,
-                    controller_id=controller_id,
-                    registry_path=registry_path,
-                )
+                supplied_receipt_json = str(args.host_identity_receipt_json or "").strip()
+                if supplied_receipt_json:
+                    current_entry = current_web_entry_from_host_identity_receipt(
+                        repo=repo,
+                        controller_id=controller_id,
+                        registry_path=registry_path,
+                        host_identity_receipt=json.loads(supplied_receipt_json),
+                    )
+                else:
+                    current_entry = discover_current_web_entry(
+                        repo=repo,
+                        controller_id=controller_id,
+                        registry_path=registry_path,
+                    )
             except Exception as exc:
                 identity = target_guard.controller_identity_projection(
                     repo=repo,

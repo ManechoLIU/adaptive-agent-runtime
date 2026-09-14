@@ -8508,6 +8508,83 @@ class WebCurrentEntryDiscoveryTests(unittest.TestCase):
             )
             self.assertEqual([kind for kind, _ in calls][:2], ["discover", "verify"])
 
+    def test_session_start_uses_supplied_host_current_entry_without_rediscovery(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            verifier, calls = self.verifier_with_current_entry("web-current")
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier):
+                current_entry = web_bridge.discover_current_web_entry(
+                    repo=repo, controller_id="controller-1", registry_path=registry
+                )
+            current_entry.pop("logical_agent_identity", None)
+            current_entry.pop("verified_execution_target_fence", None)
+            calls.clear()
+            out, err = StringIO(), StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), \
+                 patch.object(web_bridge, "discover_current_web_entry", return_value=current_entry) as rediscover, \
+                 redirect_stdout(out), redirect_stderr(err):
+                code = web_bridge.main([
+                    "session-start", "--repo", str(repo), "--registry", str(registry),
+                    "--host-identity-receipt-json", json.dumps(current_entry),
+                ])
+            self.assertEqual(code, 0, err.getvalue())
+            rediscover.assert_not_called()
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["web_session_id"], "web-current")
+            self.assertEqual(payload["current_entry_identity"]["host_receipt_id"], "current-entry-receipt")
+            self.assertEqual([kind for kind, _ in calls], ["verify"])
+
+    def test_session_start_rejects_stale_supplied_host_current_entry(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            verifier, _calls = self.verifier_with_current_entry("web-current")
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier):
+                current_entry = web_bridge.discover_current_web_entry(
+                    repo=repo, controller_id="controller-1", registry_path=registry
+                )
+            current_entry.pop("logical_agent_identity", None)
+            current_entry.pop("verified_execution_target_fence", None)
+            current_entry["observed_at_unix_ms"] = int(time.time() * 1000) - 31_000
+            err = StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), \
+                 redirect_stderr(err):
+                code = web_bridge.main([
+                    "session-start", "--repo", str(repo), "--registry", str(registry),
+                    "--host-identity-receipt-json", json.dumps(current_entry),
+                ])
+            self.assertEqual(code, 78)
+            self.assertIn("Host current-entry discovery evidence is stale", err.getvalue())
+
+    def test_session_start_rejects_generation_mismatched_supplied_host_current_entry(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            verifier, _calls = self.verifier_with_current_entry("web-current")
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier):
+                current_entry = web_bridge.discover_current_web_entry(
+                    repo=repo, controller_id="controller-1", registry_path=registry
+                )
+            current_entry.pop("logical_agent_identity", None)
+            current_entry.pop("verified_execution_target_fence", None)
+            current_entry["target_generation"] = 5
+            err = StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), \
+                 redirect_stderr(err):
+                code = web_bridge.main([
+                    "session-start", "--repo", str(repo), "--registry", str(registry),
+                    "--host-identity-receipt-json", json.dumps(current_entry),
+                ])
+            self.assertEqual(code, 78)
+            self.assertIn("target generation is stale or mismatched", err.getvalue())
+
     def test_session_start_without_host_current_entry_fails_closed(self) -> None:
         from contextlib import redirect_stderr
         from io import StringIO
