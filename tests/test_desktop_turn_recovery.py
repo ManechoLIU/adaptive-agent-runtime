@@ -313,6 +313,59 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         self.assertEqual(state["tool_trace"], self.prior["tool_trace"])
         self.assertEqual(state["inflight_tool_use_ids"], ["unfinished"])
 
+    def test_completed_tool_trace_is_hash_archived_without_overflow(self):
+        state = {
+            "active_turn_id": "long-controller-turn",
+            "tool_trace": [],
+            "tool_trace_overflow": False,
+            "inflight_tool_use_ids": [],
+        }
+        for index in range(lifecycle_hook.MAX_TOOL_TRACE_ENTRIES + 1):
+            lifecycle_hook._record_tool_trace(state, {
+                "hook_event_name": "PostToolUse",
+                "turn_id": "long-controller-turn",
+                "tool_use_id": f"completed-{index}",
+                "tool_name": "Bash",
+                "tool_input": {"command": f"git status --short #{index}"},
+                "tool_response": {"exit_code": 0},
+            })
+
+        self.assertFalse(state["tool_trace_overflow"])
+        self.assertEqual(len(state["tool_trace"]), lifecycle_hook.MAX_TOOL_TRACE_ENTRIES)
+        self.assertEqual(state["tool_trace"][0]["tool_use_id"], "completed-1")
+        self.assertEqual(state["tool_trace_archive"]["entry_count"], 1)
+        self.assertTrue(state["tool_trace_archive"]["trace_sha256"])
+        projection = lifecycle_hook.machine_trace_projection(state)
+        self.assertEqual(projection["archived_entry_count"], 1)
+        self.assertEqual(projection["archived_trace_sha256"], state["tool_trace_archive"]["trace_sha256"])
+
+    def test_trace_overflow_retains_every_unfinished_tool(self):
+        tool_ids = [f"inflight-{index}" for index in range(lifecycle_hook.MAX_TOOL_TRACE_ENTRIES)]
+        state = {
+            "active_turn_id": "parallel-controller-turn",
+            "tool_trace": [
+                {"turn_id": "parallel-controller-turn", "tool_use_id": tool_id}
+                for tool_id in tool_ids
+            ],
+            "tool_trace_overflow": False,
+            "inflight_tool_use_ids": tool_ids + ["inflight-new"],
+        }
+        lifecycle_hook._record_tool_trace(state, {
+            "hook_event_name": "PostToolUse",
+            "turn_id": "parallel-controller-turn",
+            "tool_use_id": "inflight-new",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git status --short"},
+        })
+
+        self.assertTrue(state["tool_trace_overflow"])
+        self.assertEqual(len(state["tool_trace"]), lifecycle_hook.MAX_TOOL_TRACE_ENTRIES + 1)
+        self.assertEqual(
+            {item["tool_use_id"] for item in state["tool_trace"]},
+            set(state["inflight_tool_use_ids"]),
+        )
+        self.assertNotIn("tool_trace_archive", state)
+
     def test_valid_delegated_turn_unlocks_prior_receipt_once(self):
         prior = {**self.prior, "must_yield": True, "receipt_turn_id": "old"}
         output, state = lifecycle_hook.evaluate_event(self.event(), snapshot=self.snapshot, prior_state=prior)

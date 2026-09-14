@@ -6751,7 +6751,7 @@ class WebMachineTurnLifecycleTests(unittest.TestCase):
                         event, registry_path=registry, lifecycle_path=root / "state.json"
                     )
 
-    def test_multiple_web_turns_under_limit_do_not_accumulate_overflow_but_single_turn_still_does(self) -> None:
+    def test_multiple_web_turns_under_limit_and_completed_trace_is_archived(self) -> None:
         _, state = lifecycle_hook.evaluate_event(self.event("machine-A"), snapshot=self.snapshot(), prior_state=None)
         turn_a = state["active_turn_id"]
         for index in range(100):
@@ -6776,7 +6776,9 @@ class WebMachineTurnLifecycleTests(unittest.TestCase):
                      "turn_id": turn_b, "verified_execution_turn": self.web_turn("machine-B"),
                      "tool_use_id": f"b-over-{index}", "tool_name": "Shell", "tool_input": {"command": "true"}, "tool_response": {"exit_code": 0}}
             _, state = lifecycle_hook.evaluate_event(event, snapshot=self.snapshot(), prior_state=state)
-        self.assertTrue(state["tool_trace_overflow"])
+        self.assertFalse(state["tool_trace_overflow"])
+        self.assertEqual(state["tool_trace_archive"]["entry_count"], 1)
+        self.assertEqual(len(state["tool_trace"]), lifecycle_hook.MAX_TOOL_TRACE_ENTRIES)
 
 class RuntimeWebTurnLeaseTests(unittest.TestCase):
     def snapshot(self) -> dict[str, object]:

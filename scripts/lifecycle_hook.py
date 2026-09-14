@@ -592,6 +592,7 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
     state["active_turn_id"] = turn_id
     state["must_yield"] = False
     state["tool_trace"] = []
+    state.pop("tool_trace_archive", None)
     state["tool_trace_overflow"] = False
     state["inflight_tool_use_ids"] = []
     state["inflight_tool_records"] = {}
@@ -922,6 +923,58 @@ def _verified_rollout_control_receipt(
     )
 
 
+def _archive_completed_tool_trace(
+    state: dict[str, Any],
+    entries: list[dict[str, Any]],
+    *,
+    turn_id: str,
+) -> None:
+    if not entries:
+        return
+    prior = state.get("tool_trace_archive")
+    if not isinstance(prior, dict) or str(prior.get("turn_id") or "") != turn_id:
+        prior = {"turn_id": turn_id, "entry_count": 0, "trace_sha256": ""}
+    prior_count = prior.get("entry_count")
+    if not isinstance(prior_count, int) or prior_count < 0:
+        prior_count = 0
+    prior_sha256 = str(prior.get("trace_sha256") or "")
+    state["tool_trace_archive"] = {
+        "turn_id": turn_id,
+        "entry_count": prior_count + len(entries),
+        "trace_sha256": _json_sha256({
+            "previous_trace_sha256": prior_sha256,
+            "entries": entries,
+        }),
+    }
+
+
+def _compact_completed_tool_trace(state: dict[str, Any], trace: list[dict[str, Any]]) -> None:
+    overflow = len(trace) - MAX_TOOL_TRACE_ENTRIES
+    if overflow <= 0:
+        state["tool_trace"] = trace
+        return
+    inflight = {
+        str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)
+    }
+    archived: list[dict[str, Any]] = []
+    retained: list[dict[str, Any]] = []
+    for item in trace:
+        if len(archived) < overflow and str(item.get("tool_use_id") or "") not in inflight:
+            archived.append(item)
+        else:
+            retained.append(item)
+    if len(archived) != overflow:
+        state["tool_trace_overflow"] = True
+        state["tool_trace"] = trace
+        return
+    _archive_completed_tool_trace(
+        state,
+        archived,
+        turn_id=str(state.get("active_turn_id") or ""),
+    )
+    state["tool_trace"] = retained
+
+
 def _record_tool_trace(state: dict[str, Any], event: dict[str, Any]) -> None:
     if event.get("hook_event_name") != "PostToolUse":
         return
@@ -986,9 +1039,7 @@ def _record_tool_trace(state: dict[str, Any], event: dict[str, Any]) -> None:
             state["tool_trace"] = trace
             return
     trace.append(entry)
-    if len(trace) > MAX_TOOL_TRACE_ENTRIES:
-        state["tool_trace_overflow"] = True
-    state["tool_trace"] = trace[-MAX_TOOL_TRACE_ENTRIES:]
+    _compact_completed_tool_trace(state, trace)
 
 
 def machine_trace_projection(state: dict[str, Any]) -> dict[str, Any]:
@@ -1006,10 +1057,24 @@ def machine_trace_projection(state: dict[str, Any]) -> dict[str, Any]:
                 "response_status": item.get("response_status"),
             }
         )
+    archive = state.get("tool_trace_archive")
+    archived_entry_count = 0
+    archived_trace_sha256 = ""
+    if isinstance(archive, dict) and str(archive.get("turn_id") or "") == turn_id:
+        count = archive.get("entry_count")
+        if isinstance(count, int) and count >= 0:
+            archived_entry_count = count
+        archived_trace_sha256 = str(archive.get("trace_sha256") or "")
     return {
         "turn_id": turn_id,
         "tool_use_ids": [item["tool_use_id"] for item in trace],
-        "trace_sha256": _json_sha256(trace),
+        "archived_entry_count": archived_entry_count,
+        "archived_trace_sha256": archived_trace_sha256,
+        "trace_sha256": _json_sha256({
+            "archived_entry_count": archived_entry_count,
+            "archived_trace_sha256": archived_trace_sha256,
+            "retained_trace": trace,
+        }),
     }
 
 
@@ -3997,7 +4062,7 @@ def persist_event_state(
                 # Preserve unresolved old evidence before rotating the current-turn
                 # projection. An archive failure must not silently discard it.
                 archived = {key: previous[key] for key in (
-                    "active_turn_id", "source_session_id", "tool_trace", "tool_trace_overflow",
+                    "active_turn_id", "source_session_id", "tool_trace", "tool_trace_archive", "tool_trace_overflow",
                     "inflight_tool_use_ids", "inflight_tool_records", "control_receipt_inflight", "must_yield",
                     "receipt_turn_id", "adapter_fault", "web_turn_lease",
                 ) if key in previous}

@@ -552,7 +552,7 @@ class DesktopLifecycleTurnGateTests(unittest.TestCase):
         self.assertEqual(len(entry["input_sha256"]), 64)
         self.assertNotIn("secret-free", str(entry))
 
-    def test_machine_trace_overflow_blocks_a_registered_receipt(self) -> None:
+    def test_completed_machine_trace_is_archived_for_a_registered_receipt(self) -> None:
         state = {"active_turn_id": "turn-1", "tool_trace": []}
         for index in range(lifecycle_hook.MAX_TOOL_TRACE_ENTRIES + 1):
             _output, state = lifecycle_hook.evaluate_event(
@@ -569,9 +569,11 @@ class DesktopLifecycleTurnGateTests(unittest.TestCase):
                 prior_state=state,
             )
 
-        self.assertTrue(state["tool_trace_overflow"])
-        with self.assertRaisesRegex(ValueError, "overflow"):
-            control_event_guard.observed_machine_trace_from_state(state)
+        self.assertFalse(state.get("tool_trace_overflow", False))
+        self.assertEqual(state["tool_trace_archive"]["entry_count"], 1)
+        observed = control_event_guard.observed_machine_trace_from_state(state)
+        self.assertEqual(observed["archived_entry_count"], 1)
+        self.assertTrue(observed["archived_trace_sha256"])
 
     def test_printing_the_trace_does_not_change_the_trace_it_printed(self) -> None:
         prior = {
