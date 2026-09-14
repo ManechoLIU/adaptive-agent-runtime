@@ -54,7 +54,8 @@ PEER_ATTESTATION_VERIFIER_TIMEOUT_SECONDS = 15
 PEER_ATTESTATION_VERIFIER_OUTPUT_LIMIT = 64 * 1024
 PEER_ATTESTATION_VERIFIER_CONFIG_BYTES_LIMIT = 256 * 1024
 PEER_ATTESTATION_VERIFIER_BUNDLE_MEMBER_BYTES_LIMIT = 8 * 1024 * 1024
-PEER_ATTESTATION_VERIFIER_BUNDLE_BYTES_LIMIT = 32 * 1024 * 1024
+PEER_ATTESTATION_VERIFIER_BUNDLE_EXECUTABLE_BYTES_LIMIT = 256 * 1024 * 1024
+PEER_ATTESTATION_VERIFIER_BUNDLE_BYTES_LIMIT = 256 * 1024 * 1024
 PEER_ATTESTATION_VERIFIER_READ_CHUNK_BYTES = 64 * 1024
 PEER_ATTESTATION_HELPER_AUTH_ENV = "ADAPTIVE_DELIVERY_PINNED_HELPER_AUTH"
 PEER_ATTESTATION_HELPER_TERM_GRACE_SECONDS = 0.01
@@ -4331,7 +4332,9 @@ def _verifier_remaining_seconds(deadline_monotonic: float | None) -> float | Non
 def _read_pinned_verifier_file(
     path: Path, *, label: str, max_bytes: int, deadline_monotonic: float | None,
     require_private_mode: bool = False, require_executable: bool = False,
-) -> tuple[bytes, str, tuple[int, int, int, int]]:
+    max_executable_bytes: int | None = None,
+    retain_content: bool = True,
+) -> tuple[bytes, int, str, tuple[int, int, int, int]]:
     """Read and hash one pinned verifier file through a single no-follow FD."""
     _verifier_remaining_seconds(deadline_monotonic)
     nofollow = getattr(os, "O_NOFOLLOW", None)
@@ -4350,22 +4353,36 @@ def _read_pinned_verifier_file(
             raise PermissionError(f"{label} is not executable")
         if (require_executable or label.endswith("bundle member")) and metadata.st_mode & 0o022:
             raise PermissionError(f"{label} must not be group or other writable")
-        if metadata.st_size < 0 or metadata.st_size > max_bytes:
+        effective_max_bytes = max_bytes
+        if metadata.st_mode & 0o111 and max_executable_bytes is not None:
+            effective_max_bytes = max(max_bytes, max_executable_bytes)
+        if metadata.st_size < 0 or metadata.st_size > effective_max_bytes:
             raise PermissionError(f"{label} exceeds size limit")
-        content = bytearray()
+        content = bytearray() if retain_content else None
+        total_bytes = 0
         digest = hashlib.sha256()
         while True:
             _verifier_remaining_seconds(deadline_monotonic)
-            chunk = os.read(fd, min(PEER_ATTESTATION_VERIFIER_READ_CHUNK_BYTES, max_bytes - len(content) + 1))
+            chunk = os.read(
+                fd,
+                min(
+                    PEER_ATTESTATION_VERIFIER_READ_CHUNK_BYTES,
+                    effective_max_bytes - total_bytes + 1,
+                ),
+            )
             if not chunk:
                 break
-            content.extend(chunk)
-            if len(content) > max_bytes:
+            total_bytes += len(chunk)
+            if total_bytes > effective_max_bytes:
                 raise PermissionError(f"{label} exceeds size limit")
+            if content is not None:
+                content.extend(chunk)
             digest.update(chunk)
             _verifier_remaining_seconds(deadline_monotonic)
         return (
-            bytes(content), digest.hexdigest(),
+            bytes(content) if content is not None else b"",
+            total_bytes,
+            digest.hexdigest(),
             (metadata.st_dev, metadata.st_ino, stat.S_IMODE(metadata.st_mode), metadata.st_uid),
         )
     finally:
@@ -4410,7 +4427,7 @@ def _loaded_external_peer_attestation_verifier(
     config_path = Path(os.path.abspath(os.fspath(config_path)))
     try:
         _trusted_verifier_parent_chain(config_path, root=config_path.parent)
-        config_bytes, config_digest, config_identity = _read_pinned_verifier_file(
+        config_bytes, _, config_digest, config_identity = _read_pinned_verifier_file(
             config_path,
             label="registered Host verifier config",
             max_bytes=PEER_ATTESTATION_VERIFIER_CONFIG_BYTES_LIMIT,
@@ -4449,12 +4466,13 @@ def _loaded_external_peer_attestation_verifier(
         executable = Path(executable_raw).expanduser()
         if not executable.is_absolute():
             raise PermissionError("registered Host verifier executable must be absolute")
-        _, actual_digest, _ = _read_pinned_verifier_file(
+        _, _, actual_digest, _ = _read_pinned_verifier_file(
             executable,
             label="registered Host verifier executable",
             max_bytes=PEER_ATTESTATION_VERIFIER_BUNDLE_MEMBER_BYTES_LIMIT,
             deadline_monotonic=deadline_monotonic,
             require_executable=True,
+            retain_content=False,
         )
         if not isinstance(digest, str) or len(digest) != 64 or not secrets.compare_digest(actual_digest, digest.lower()):
             raise PermissionError("registered Host verifier executable hash mismatch")
@@ -4479,13 +4497,15 @@ def _loaded_external_peer_attestation_verifier(
             if not bundle_path.is_absolute():
                 raise PermissionError("registered Host verifier bundle path must be absolute")
             _trusted_verifier_parent_chain(bundle_path, root=bundle_root)
-            bundle_bytes, actual_bundle_digest, identity = _read_pinned_verifier_file(
+            _, bundle_size, actual_bundle_digest, identity = _read_pinned_verifier_file(
                 bundle_path,
                 label="registered Host verifier bundle member",
                 max_bytes=PEER_ATTESTATION_VERIFIER_BUNDLE_MEMBER_BYTES_LIMIT,
                 deadline_monotonic=deadline_monotonic,
+                max_executable_bytes=PEER_ATTESTATION_VERIFIER_BUNDLE_EXECUTABLE_BYTES_LIMIT,
+                retain_content=False,
             )
-            bundle_total_bytes += len(bundle_bytes)
+            bundle_total_bytes += bundle_size
             pinned_identities[str(bundle_path)] = identity
             if bundle_total_bytes > PEER_ATTESTATION_VERIFIER_BUNDLE_BYTES_LIMIT:
                 raise PermissionError("registered Host verifier bundle exceeds total size limit")
@@ -4539,12 +4559,13 @@ def _loaded_external_peer_attestation_verifier(
 
     def validate_pinned_bundle(*, deadline_monotonic: float | None = None) -> None:
         _trusted_verifier_parent_chain(config_path, root=config_path.parent)
-        _, current_config_digest, current_config_identity = _read_pinned_verifier_file(
+        _, _, current_config_digest, current_config_identity = _read_pinned_verifier_file(
             config_path,
             label="registered Host verifier config",
             max_bytes=PEER_ATTESTATION_VERIFIER_CONFIG_BYTES_LIMIT,
             deadline_monotonic=deadline_monotonic,
             require_private_mode=True,
+            retain_content=False,
         )
         if current_config_identity != config_identity or not secrets.compare_digest(
             current_config_digest, config_digest
@@ -4555,13 +4576,15 @@ def _loaded_external_peer_attestation_verifier(
             _verifier_remaining_seconds(deadline_monotonic)
             bundle_path = Path(os.path.abspath(os.fspath(Path(bundle_path_raw).expanduser())))
             _trusted_verifier_parent_chain(bundle_path, root=bundle_root)
-            bundle_bytes, actual_bundle_digest, identity = _read_pinned_verifier_file(
+            _, bundle_size, actual_bundle_digest, identity = _read_pinned_verifier_file(
                 bundle_path,
                 label="registered Host verifier bundle member",
                 max_bytes=PEER_ATTESTATION_VERIFIER_BUNDLE_MEMBER_BYTES_LIMIT,
                 deadline_monotonic=deadline_monotonic,
+                max_executable_bytes=PEER_ATTESTATION_VERIFIER_BUNDLE_EXECUTABLE_BYTES_LIMIT,
+                retain_content=False,
             )
-            bundle_total_bytes += len(bundle_bytes)
+            bundle_total_bytes += bundle_size
             if pinned_identities.get(str(bundle_path)) != identity:
                 raise PermissionError("registered Host verifier bundle member identity changed")
             if bundle_total_bytes > PEER_ATTESTATION_VERIFIER_BUNDLE_BYTES_LIMIT:

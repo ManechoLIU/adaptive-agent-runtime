@@ -1129,6 +1129,58 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                     True,
                 )
 
+    def test_registered_web_verifier_stream_hashes_large_private_executable_bundle_member(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            node = root / "node-runtime"
+            node.write_bytes(
+                b"n" * (web_bridge.PEER_ATTESTATION_VERIFIER_BUNDLE_MEMBER_BYTES_LIMIT + 1)
+            )
+            node.chmod(0o700)
+            hashes = {
+                str(path): __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+                for path in (executable, node)
+            }
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({
+                "schema_version": 1,
+                "verifiers": {"web": {
+                    "protocol": "runtime_host_verifier_cli_v2",
+                    "executable": str(executable),
+                    "sha256": hashes[str(executable)],
+                    "bundle_sha256": hashes,
+                }},
+            }), encoding="utf-8")
+            config.chmod(0o600)
+
+            from unittest.mock import patch
+            original_reader = web_bridge._read_pinned_verifier_file
+            with patch.object(
+                web_bridge, "_read_pinned_verifier_file", wraps=original_reader
+            ) as reader:
+                verifier = web_bridge._loaded_external_peer_attestation_verifier(
+                    "web", config_path=config
+                )
+            self.assertTrue(callable(getattr(verifier, "discover_current_entry", None)))
+            bundle_reads = [
+                call for call in reader.call_args_list
+                if call.kwargs.get("label") == "registered Host verifier bundle member"
+            ]
+            self.assertTrue(bundle_reads)
+            self.assertTrue(
+                all(call.kwargs.get("retain_content") is False for call in bundle_reads)
+            )
+
+            node.chmod(0o600)
+            rejected = web_bridge._loaded_external_peer_attestation_verifier(
+                "web", config_path=config
+            )
+            with self.assertRaisesRegex(PermissionError, "bundle member exceeds size limit"):
+                rejected()
+
     def test_registered_web_verifier_exposes_pinned_current_entry_discovery(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
