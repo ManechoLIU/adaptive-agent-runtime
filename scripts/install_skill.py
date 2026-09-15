@@ -227,6 +227,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_rechecks_bundle_before_each_execution",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_registered_web_verifier_submit_adapter_ignores_runtime_local_path_kwargs",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_v2_identity_evidence_consumes_signed_current_entry_without_reattest",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
     "test_registered_external_web_host_submit_adapter_is_used_without_caller_injection",

@@ -5240,7 +5240,24 @@ def _external_peer_attestation_verifier(
     setattr(verify, "discover_current_entry", lambda **kwargs: call("discover_current_entry", **kwargs))
     if protocol == "runtime_host_verifier_cli_v2":
         setattr(verify, "verify_current_entry", lambda **kwargs: call("verify_current_entry", **kwargs))
-    setattr(verify, "submit_reentry", lambda **kwargs: call("submit_reentry", **kwargs))
+    def submit_reentry(**kwargs: Any) -> Any:
+        forwarded = {
+            key: kwargs[key]
+            for key in (
+                "controller_id",
+                "execution_target_session_id",
+                "target_generation",
+                "ownership_generation",
+                "target_mode",
+                "lifecycle_state",
+                "host_origin_attestation",
+                "deadline_monotonic",
+            )
+            if key in kwargs
+        }
+        return call("submit_reentry", **forwarded)
+
+    setattr(verify, "submit_reentry", submit_reentry)
     setattr(verify, "delivery_fingerprint", fingerprint)
     setattr(verify, "verifier_protocol", protocol)
     if protocol == "runtime_host_verifier_cli_v2":
