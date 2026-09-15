@@ -139,6 +139,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
     "test_session_start_auto_discovers_machine_current_entry_and_allows_controller_actions",
     "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_uses_supplied_host_current_entry_without_rediscovery",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
     "test_session_start_without_host_current_entry_fails_closed",
     "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
     "test_session_start_caller_claim_of_real_canonical_conversation_is_not_current_entry_proof",
@@ -220,6 +222,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_registered_web_verifier_exposes_pinned_host_submit_adapter",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_rechecks_bundle_before_each_execution",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_registered_v2_identity_evidence_consumes_signed_current_entry_without_reattest",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
     "test_registered_external_web_host_submit_adapter_is_used_without_caller_injection",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
@@ -232,6 +236,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_retry_exhausted_rearms_after_controller_fence_change_same_host_fingerprint",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_ensure_supervisor_uses_new_receipt_after_controller_fence_change",
+    "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
+    "test_ensure_supervisor_uses_new_receipt_for_new_rule_live_e2e_after_old_result_unknown",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_retry_exhausted_persists_host_delivery_fingerprint",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."

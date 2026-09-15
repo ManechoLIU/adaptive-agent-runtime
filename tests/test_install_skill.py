@@ -992,6 +992,16 @@ class InstallMigrationContractTests(unittest.TestCase):
             RUNTIME_RELEASE_REGRESSION_TESTS,
         )
 
+    def test_runtime_release_gate_includes_current_entry_receipt_and_distinct_live_e2e_rearm(self):
+        from scripts.install_skill import RUNTIME_RELEASE_REGRESSION_TESTS
+
+        required = {
+            "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests.test_session_start_uses_supplied_host_current_entry_without_rediscovery",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_v2_identity_evidence_consumes_signed_current_entry_without_reattest",
+            "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_ensure_supervisor_uses_new_receipt_for_new_rule_live_e2e_after_old_result_unknown",
+        }
+        self.assertTrue(required.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
+
     def test_runtime_release_gate_includes_host_tool_receipt_closure_contract(self):
         from scripts.install_skill import RUNTIME_RELEASE_REGRESSION_TESTS, RUNTIME_RELEASE_REQUIRED_FILES
 
@@ -1505,6 +1515,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class WebCurrentEntryDiscoveryTests(unittest.TestCase):\n"
                 "    def test_generic_current_entry_discovery_accepts_runtime_repair_agent_verified_target(self): self.assertTrue(True)\n"
                 "    def test_session_start_auto_discovers_machine_current_entry_and_allows_controller_actions(self): self.assertTrue(True)\n"
+                "    def test_session_start_uses_supplied_host_current_entry_without_rediscovery(self): self.assertTrue(True)\n"
                 "    def test_session_start_without_host_current_entry_fails_closed(self): self.assertTrue(True)\n"
                 "    def test_session_start_caller_claim_of_real_canonical_conversation_is_not_current_entry_proof(self): self.assertTrue(True)\n"
                 "    def test_session_start_same_conversation_different_browser_target_fails_closed(self): self.assertTrue(True)\n"
@@ -1557,6 +1568,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_registered_web_verifier_loads_pinned_external_runtime_host_cli(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_exposes_pinned_host_submit_adapter(self): self.assertTrue(True)\n"
                 "    def test_registered_web_verifier_rechecks_bundle_before_each_execution(self): self.assertTrue(True)\n"
+                "    def test_registered_v2_identity_evidence_consumes_signed_current_entry_without_reattest(self): self.assertTrue(True)\n"
                 "    def test_loaded_verifier_rejects_writable_members_parents_and_replaced_path(self): self.assertTrue(True)\n"
                 "    def test_malformed_registered_web_verifier_config_fails_closed_without_manual_fallback(self): self.assertTrue(True)\n"
                 "    def test_browser_tab_receipt_cannot_recover_an_unverified_web_session(self): self.assertTrue(True)\n"
@@ -1608,6 +1620,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_retry_exhausted_rearms_after_host_delivery_fingerprint_change(self): self.assertTrue(True)\n"
                 "    def test_retry_exhausted_rearms_after_controller_fence_change_same_host_fingerprint(self): self.assertTrue(True)\n"
                 "    def test_ensure_supervisor_uses_new_receipt_after_controller_fence_change(self): self.assertTrue(True)\n"
+                "    def test_ensure_supervisor_uses_new_receipt_for_new_rule_live_e2e_after_old_result_unknown(self): self.assertTrue(True)\n"
                 "    def test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change(self): self.assertTrue(True)\n"
                 "    def test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes(self): self.assertTrue(True)\n"
                 "    def test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot(self): self.assertTrue(True)\n"

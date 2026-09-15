@@ -4798,6 +4798,44 @@ def _loaded_external_peer_attestation_verifier(
             }
         return True
 
+    def verify_current_entry(**kwargs: Any) -> dict[str, Any]:
+        if verifier_protocol != "runtime_host_verifier_cli_v2":
+            raise PermissionError("registered Host verifier v2 current-entry verification is unavailable")
+        if host != "web" or str(kwargs.get("host") or "").strip() != "web":
+            raise PermissionError("registered Host current-entry verification host mismatch")
+        conversation_id = str(kwargs.get("expected_target_session_id") or "").strip()
+        target_generation = kwargs.get("expected_target_generation")
+        ownership_generation = kwargs.get("expected_ownership_generation")
+        receipt = kwargs.get("host_execution_receipt")
+        if not conversation_id or not isinstance(receipt, dict):
+            raise PermissionError("registered Host current-entry verification requires exact target and signed receipt")
+        if receipt.get("provenance") != "runtime_host_current_entry_v1":
+            raise PermissionError("registered Host current-entry receipt provenance is invalid")
+        payload = run_cli({
+            "operation": "verify_current_entry",
+            "conversation_id": conversation_id,
+            "target_generation": target_generation,
+            "ownership_generation": ownership_generation,
+            "current_entry": receipt,
+        }, deadline_monotonic=kwargs.get("deadline_monotonic"))
+        verified = payload.get("verified_target")
+        host_receipt_id = payload.get("host_receipt_id")
+        if (
+            payload.get("operation") != "verify_current_entry"
+            or not isinstance(verified, dict)
+            or verified.get("provenance") != "runtime_host_verifier_v1"
+            or verified.get("conversation_id") != conversation_id
+            or verified.get("target_generation") != target_generation
+            or verified.get("ownership_generation") != ownership_generation
+            or host_receipt_id != receipt.get("host_receipt_id")
+        ):
+            raise PermissionError("registered Host current-entry verifier returned mismatched verified target")
+        return {
+            "identity_attested": True,
+            "host_receipt_id": str(host_receipt_id),
+            "verified_target": dict(verified),
+        }
+
     def discover_current_entry(**kwargs: Any) -> dict[str, Any]:
         if host != "web":
             raise PermissionError("registered Host current-entry discovery is Web-only")
@@ -4931,6 +4969,8 @@ def _loaded_external_peer_attestation_verifier(
         raise PermissionError("registered Host submit adapter returned inconsistent result semantics")
 
     setattr(verify, "discover_current_entry", discover_current_entry)
+    if verifier_protocol == "runtime_host_verifier_cli_v2":
+        setattr(verify, "verify_current_entry", verify_current_entry)
     setattr(verify, "submit_reentry", submit_reentry)
     setattr(verify, "delivery_fingerprint", delivery_fingerprint)
     setattr(verify, "manifest_identity", manifest_identity)
@@ -5017,7 +5057,7 @@ def _pinned_host_verifier_helper_main(argv: Sequence[str]) -> int:
             if not isinstance(method_name, str) or not isinstance(kwargs, dict):
                 raise PermissionError("registered Host verifier helper call is invalid")
             allowed_methods = {
-                "verify", "discover_current_entry", "submit_reentry",
+                "verify", "discover_current_entry", "verify_current_entry", "submit_reentry",
                 "verify_tool_pre", "verify_tool_terminal",
             }
             method = verifier if method_name == "verify" else getattr(verifier, method_name, None)
@@ -5179,9 +5219,19 @@ def _external_peer_attestation_verifier(
         )
 
     def verify(**kwargs: Any) -> Any:
+        receipt = kwargs.get("host_execution_receipt")
+        if (
+            protocol == "runtime_host_verifier_cli_v2"
+            and kwargs.get("phase") == "identity_evidence"
+            and isinstance(receipt, dict)
+            and receipt.get("provenance") == "runtime_host_current_entry_v1"
+        ):
+            return call("verify_current_entry", **kwargs)
         return call("verify", **kwargs)
 
     setattr(verify, "discover_current_entry", lambda **kwargs: call("discover_current_entry", **kwargs))
+    if protocol == "runtime_host_verifier_cli_v2":
+        setattr(verify, "verify_current_entry", lambda **kwargs: call("verify_current_entry", **kwargs))
     setattr(verify, "submit_reentry", lambda **kwargs: call("submit_reentry", **kwargs))
     setattr(verify, "delivery_fingerprint", fingerprint)
     setattr(verify, "verifier_protocol", protocol)
@@ -7501,15 +7551,23 @@ def ensure_continuation_supervisor(
         return False
     generation = int(lifecycle_state.get("wake_generation", 0) or 0)
     receipt_id = f"bootstrap:{generation}"
+    current_delivery_key = _lifecycle_delivery_key(
+        lifecycle_state,
+        host_delivery_fingerprint=current_host_delivery_fingerprint,
+    )
+    prior_terminal_key = str(supervisor_state.get("delivery_terminal_key") or "").strip()
     if (
+        prior_terminal_key
+        and _delivery_key_base(prior_terminal_key)
+        != _delivery_key_base(current_delivery_key)
+    ):
+        delivery_fingerprint = hashlib.sha256(current_delivery_key.encode("utf-8")).hexdigest()
+        receipt_id += f":delivery-{delivery_fingerprint[:16]}"
+    elif (
         supervisor_state.get("delivery_terminal_outcome") == "retry_exhausted"
         and _delivery_key_base(supervisor_state.get("delivery_terminal_key"))
         == _delivery_key_base(_lifecycle_delivery_key(lifecycle_state))
     ):
-        current_delivery_key = _lifecycle_delivery_key(
-            lifecycle_state,
-            host_delivery_fingerprint=current_host_delivery_fingerprint,
-        )
         if (
             current_host_delivery_fingerprint
             and supervisor_state.get("delivery_terminal_key") != current_delivery_key

@@ -1229,6 +1229,49 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(entry["target_generation"], 4)
             self.assertEqual(entry["ownership_generation"], 9)
 
+    def test_registered_v2_identity_evidence_consumes_signed_current_entry_without_reattest(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "r=json.loads(sys.stdin.read())\n"
+                "assert r['operation']=='verify_current_entry', r\n"
+                "entry=r['current_entry']\n"
+                "print(json.dumps({'ok':True,'operation':'verify_current_entry','host_receipt_id':entry['host_receipt_id'],'verified_target':{'provenance':'runtime_host_verifier_v1','conversation_id':r['conversation_id'],'target_generation':r['target_generation'],'ownership_generation':r['ownership_generation']}}))\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+                "protocol":"runtime_host_verifier_cli_v2","executable":str(executable),
+                "sha256":digest,"bundle_sha256":{str(executable):digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            current_entry = {
+                "schema_version": 1, "provenance": "runtime_host_current_entry_v1",
+                "entry_scope": "runtime_invocation", "machine_source": "host_invocation_context_v1",
+                "conversation_id": "web-current", "browser_target_id": "target-current",
+                "top_frame_id": "top-current", "loader_id": "loader-current",
+                "secure_origin": "https://chatgpt.com", "generation_anchor_sha256": "a" * 64,
+                "target_generation": 4, "ownership_generation": 9,
+                "host_receipt_id": "hce_runtime", "observed_at_unix_ms": int(time.time() * 1000),
+                "issued_at_unix_ms": int(time.time() * 1000), "expires_at_unix_ms": int(time.time() * 1000) + 15000,
+                "host_mac_sha256": "b" * 64,
+            }
+            with patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                evidence = verifier(
+                    phase="identity_evidence", controller_id="controller-1", host="web",
+                    expected_target_session_id="web-current", expected_target_generation=4,
+                    expected_ownership_generation=9, host_execution_receipt=current_entry,
+                )
+            self.assertEqual(evidence["host_receipt_id"], "hce_runtime")
+            self.assertEqual(evidence["verified_target"]["conversation_id"], "web-current")
+
     def test_registered_web_verifier_classifies_frame_tree_timeout_as_transient(self) -> None:
         self.assertTrue(
             web_bridge._peer_host_error_is_transient("Page.getFrameTree timed out")
@@ -6131,6 +6174,48 @@ class WebContinuationSupervisorBootstrapTests(unittest.TestCase):
                     current_host_delivery_fingerprint="b" * 64,
                 ))
 
+
+    def test_ensure_supervisor_uses_new_receipt_for_new_rule_live_e2e_after_old_result_unknown(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_targets__": {"controller-1": {"web": {
+                    "status": "active", "session_id": "web-new", "generation": 9,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "web", "execution_target_session_id": "web-new",
+                    "generation": 9, "provenance": "web_entry",
+                }},
+            }), encoding="utf-8")
+            state = root / "auto.json"
+            state.write_text(json.dumps({
+                "receipt_id": "bootstrap:1", "state": "WEB_REENTRY_RESULT_UNKNOWN",
+                "pending_control_event": True,
+                "execution_target_session_id": "web-old", "target_generation": 7, "ownership_generation": 7,
+                "delivery_terminal_receipt_id": "bootstrap:1",
+                "delivery_terminal_key": "wake-generation:1|host:" + "a" * 64,
+                "delivery_terminal_outcome": "result_unknown",
+            }), encoding="utf-8")
+            lifecycle = {
+                "pending_control_event": True, "requires_user": False, "controller_host": "web",
+                "wake_generation": 1, "triggers": ["rule_live_e2e_pending:rev-new"],
+            }
+            captured = {}
+            with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state), \
+                 patch.object(web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64), \
+                 patch.object(web_bridge, "schedule_auto_native_stop", side_effect=lambda **kwargs: captured.update(kwargs) or True):
+                self.assertTrue(web_bridge.ensure_continuation_supervisor(
+                    lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                    registry=registry, codex="codex", delay_seconds=1.0,
+                ))
+            self.assertNotEqual(captured["receipt_id"], "bootstrap:1")
+            self.assertTrue(captured["receipt_id"].startswith("bootstrap:1:delivery-"))
 
     def test_ensure_supervisor_uses_new_receipt_after_controller_fence_change(self) -> None:
         from unittest.mock import patch
