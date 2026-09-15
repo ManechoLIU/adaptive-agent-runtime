@@ -8510,6 +8510,19 @@ class WebControllerSessionIdentityTests(unittest.TestCase):
 
 
 class WebCurrentEntryDiscoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        root = Path(os.environ["AD_LIFECYCLE_STATE_DIR"])
+        root.mkdir(parents=True, exist_ok=True)
+        for candidate in (
+            root / "controller-1.json",
+            root / "controller-1.turns.jsonl",
+            root / "controller-1.json.lock",
+        ):
+            candidate.unlink(missing_ok=True)
+
+    def tearDown(self) -> None:
+        self.setUp()
+
     @staticmethod
     def make_repo(root: Path) -> tuple[Path, Path]:
         repo = root / "repo"; repo.mkdir()
