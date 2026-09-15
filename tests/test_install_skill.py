@@ -996,7 +996,9 @@ class InstallMigrationContractTests(unittest.TestCase):
         from scripts.install_skill import RUNTIME_RELEASE_REGRESSION_TESTS
 
         required = {
+            "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests.test_session_start_auto_discovery_preserves_signed_current_entry_envelope_for_verifier",
             "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests.test_session_start_uses_supplied_host_current_entry_without_rediscovery",
+            "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests.test_session_start_preserves_signed_current_entry_envelope_for_verifier",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_v2_identity_evidence_consumes_signed_current_entry_without_reattest",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_ensure_supervisor_uses_new_receipt_for_new_rule_live_e2e_after_old_result_unknown",
         }
@@ -1515,7 +1517,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "class WebCurrentEntryDiscoveryTests(unittest.TestCase):\n"
                 "    def test_generic_current_entry_discovery_accepts_runtime_repair_agent_verified_target(self): self.assertTrue(True)\n"
                 "    def test_session_start_auto_discovers_machine_current_entry_and_allows_controller_actions(self): self.assertTrue(True)\n"
+                "    def test_session_start_auto_discovery_preserves_signed_current_entry_envelope_for_verifier(self): self.assertTrue(True)\n"
                 "    def test_session_start_uses_supplied_host_current_entry_without_rediscovery(self): self.assertTrue(True)\n"
+                "    def test_session_start_preserves_signed_current_entry_envelope_for_verifier(self): self.assertTrue(True)\n"
                 "    def test_session_start_without_host_current_entry_fails_closed(self): self.assertTrue(True)\n"
                 "    def test_session_start_caller_claim_of_real_canonical_conversation_is_not_current_entry_proof(self): self.assertTrue(True)\n"
                 "    def test_session_start_same_conversation_different_browser_target_fails_closed(self): self.assertTrue(True)\n"

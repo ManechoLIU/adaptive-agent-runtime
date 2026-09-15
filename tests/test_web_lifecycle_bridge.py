@@ -8593,6 +8593,67 @@ class WebCurrentEntryDiscoveryTests(unittest.TestCase):
             )
             self.assertEqual([kind for kind, _ in calls][:2], ["discover", "verify"])
 
+    def test_session_start_auto_discovery_preserves_signed_current_entry_envelope_for_verifier(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            raw_entry = {
+                "provenance": "runtime_host_current_entry_v1",
+                "entry_scope": "runtime_invocation",
+                "machine_source": "host_invocation_context_v1",
+                "conversation_id": "web-current",
+                "browser_target_id": "browser-target-current",
+                "top_frame_id": "top-current",
+                "loader_id": "loader-current",
+                "secure_origin": "https://chatgpt.com",
+                "target_generation": 4,
+                "ownership_generation": 7,
+                "host_receipt_id": "auto-signed-current-entry",
+                "observed_at_unix_ms": int(time.time() * 1000),
+                "runtime_invocation_id": "fixture-machine-invocation",
+                "future_host_signed_field": "preserve-me",
+            }
+            seen = []
+            calls = []
+            def verifier(**kwargs):
+                receipt = kwargs["host_execution_receipt"]
+                seen.append(dict(receipt))
+                if receipt != raw_entry:
+                    raise PermissionError("auto-discovered signed current-entry envelope was mutated before verification")
+                return {
+                    "identity_attested": True,
+                    "host_receipt_id": "auto-signed-current-entry",
+                    "verified_target": {
+                        "provenance": "runtime_host_verifier_v1",
+                        "conversation_id": "web-current",
+                        "browser_target_id": "browser-target-current",
+                        "top_frame_id": "top-current",
+                        "loader_id": "loader-current",
+                        "secure_origin": "https://chatgpt.com",
+                        "target_generation": 4,
+                        "ownership_generation": 7,
+                        "host_receipt_id": "auto-signed-current-entry",
+                    },
+                }
+            def discover(**kwargs):
+                calls.append(dict(kwargs))
+                return dict(raw_entry)
+            verifier.discover_current_entry = discover
+            out, err = StringIO(), StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), \
+                 redirect_stdout(out), redirect_stderr(err):
+                code = web_bridge.main([
+                    "session-start", "--repo", str(repo), "--registry", str(registry),
+                ])
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(seen, [raw_entry])
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["current_entry_identity"]["logical_agent_identity"]["agent_id"], "controller-1")
+            self.assertEqual(payload["current_entry_identity"]["verified_execution_target_fence"]["contract"], "verified_execution_target_v1")
+
     def test_session_start_uses_supplied_host_current_entry_without_rediscovery(self) -> None:
         from contextlib import redirect_stdout, redirect_stderr
         from io import StringIO
@@ -8621,6 +8682,62 @@ class WebCurrentEntryDiscoveryTests(unittest.TestCase):
             self.assertEqual(payload["web_session_id"], "web-current")
             self.assertEqual(payload["current_entry_identity"]["host_receipt_id"], "current-entry-receipt")
             self.assertEqual([kind for kind, _ in calls], ["verify"])
+
+    def test_session_start_preserves_signed_current_entry_envelope_for_verifier(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            current_entry = {
+                "provenance": "runtime_host_current_entry_v1",
+                "entry_scope": "runtime_invocation",
+                "machine_source": "host_invocation_context_v1",
+                "conversation_id": "web-current",
+                "browser_target_id": "browser-target-current",
+                "top_frame_id": "top-current",
+                "loader_id": "loader-current",
+                "secure_origin": "https://chatgpt.com",
+                "target_generation": 4,
+                "ownership_generation": 7,
+                "host_receipt_id": "signed-current-entry",
+                "observed_at_unix_ms": int(time.time() * 1000),
+                "runtime_invocation_id": "fixture-machine-invocation",
+            }
+            seen = []
+            def verifier(**kwargs):
+                receipt = kwargs["host_execution_receipt"]
+                seen.append(dict(receipt))
+                if receipt != current_entry:
+                    raise PermissionError("signed current-entry envelope was mutated before verification")
+                return {
+                    "identity_attested": True,
+                    "host_receipt_id": "signed-current-entry",
+                    "verified_target": {
+                        "provenance": "runtime_host_verifier_v1",
+                        "conversation_id": "web-current",
+                        "browser_target_id": "browser-target-current",
+                        "top_frame_id": "top-current",
+                        "loader_id": "loader-current",
+                        "secure_origin": "https://chatgpt.com",
+                        "target_generation": 4,
+                        "ownership_generation": 7,
+                        "host_receipt_id": "signed-current-entry",
+                    },
+                }
+            verifier.discover_current_entry = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not rediscover supplied receipt"))
+            out, err = StringIO(), StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), \
+                 redirect_stdout(out), redirect_stderr(err):
+                code = web_bridge.main([
+                    "session-start", "--repo", str(repo), "--registry", str(registry),
+                    "--host-identity-receipt-json", json.dumps(current_entry),
+                ])
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertEqual(seen, [current_entry])
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["current_entry_identity"]["logical_agent_identity"]["agent_id"], "controller-1")
+            self.assertEqual(payload["current_entry_identity"]["verified_execution_target_fence"]["contract"], "verified_execution_target_v1")
 
     def test_session_start_rejects_stale_supplied_host_current_entry(self) -> None:
         from contextlib import redirect_stderr

@@ -1294,6 +1294,14 @@ def current_web_entry_from_host_identity_receipt(
     return evidence
 
 
+def _host_signed_current_entry_receipt(current_entry: dict[str, Any]) -> dict[str, Any]:
+    """Return only the Host-signed current-entry envelope, excluding Runtime-local metadata."""
+    receipt = dict(current_entry)
+    receipt.pop("logical_agent_identity", None)
+    receipt.pop("verified_execution_target_fence", None)
+    return receipt
+
+
 def recover_same_controller_web_session(
     *,
     repo: Path,
@@ -9031,7 +9039,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repo=repo,
                 web_session_id=web_session_id,
                 registry_path=registry_path,
-                host_identity_receipt=current_entry,
+                host_identity_receipt=_host_signed_current_entry_receipt(current_entry),
                 current_entry_evidence=current_entry,
             )
             if recovery.get("result") not in {"RECOVERED", "ALREADY_VERIFIED"}:

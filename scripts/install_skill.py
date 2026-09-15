@@ -139,7 +139,11 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
     "test_session_start_auto_discovers_machine_current_entry_and_allows_controller_actions",
     "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_auto_discovery_preserves_signed_current_entry_envelope_for_verifier",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
     "test_session_start_uses_supplied_host_current_entry_without_rediscovery",
+    "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
+    "test_session_start_preserves_signed_current_entry_envelope_for_verifier",
     "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
     "test_session_start_without_host_current_entry_fails_closed",
     "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests."
