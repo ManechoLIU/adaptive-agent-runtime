@@ -1000,6 +1000,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests.test_session_start_uses_supplied_host_current_entry_without_rediscovery",
             "tests.test_web_lifecycle_bridge.WebCurrentEntryDiscoveryTests.test_session_start_preserves_signed_current_entry_envelope_for_verifier",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_submit_adapter_ignores_runtime_local_path_kwargs",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_submit_adapter_maps_controller_active_to_deferred_active",
+            "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_submit_adapter_keeps_other_retryable_failures_bounded",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_v2_identity_evidence_consumes_signed_current_entry_without_reattest",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_ensure_supervisor_uses_new_receipt_for_new_rule_live_e2e_after_old_result_unknown",
         }
@@ -1559,6 +1561,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_host_neutral_supervisor_omits_missing_desktop_codex_argument(self): self.assertTrue(True)\n"
                 "class WebLifecycleBridgeTests(unittest.TestCase):\n"
                 "    def test_registered_web_verifier_submit_adapter_ignores_runtime_local_path_kwargs(self): self.assertTrue(True)\n"
+                "    def test_registered_web_verifier_submit_adapter_maps_controller_active_to_deferred_active(self): self.assertTrue(True)\n"
+                "    def test_registered_web_verifier_submit_adapter_keeps_other_retryable_failures_bounded(self): self.assertTrue(True)\n"
                 "    def test_session_start_without_host_session_id_reports_existing_controller_not_new_controller(self): self.assertTrue(True)\n"
                 "    def test_session_start_host_attested_recovery_restores_pending_control_loop_same_controller(self): self.assertTrue(True)\n"
                 "    def test_same_controller_web_recovery_verifier_exception_degrades_without_revoking_controller(self): self.assertTrue(True)\n"

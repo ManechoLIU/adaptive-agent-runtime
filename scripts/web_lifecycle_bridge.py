@@ -4966,6 +4966,14 @@ def _loaded_external_peer_attestation_verifier(
             and not submit_confirmed
             and auto_retry_allowed is retryable
         ):
+            if retryable and str(receipt.get("status") or "").strip() == "controller_active":
+                return {
+                    **common,
+                    "result": "DEFERRED",
+                    "state": "WEB_REENTRY_DEFERRED_ACTIVE",
+                    "returncode": 0,
+                    "failure_class": "web_host_active",
+                }
             return {
                 **common,
                 "result": "DEFERRED" if retryable else "FAILED",
