@@ -1523,6 +1523,82 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 self.assertEqual(attempt["returncode"], 0)
                 self.assertEqual(attempt["host_execution_receipt"]["reentry_receipt"]["status"], "controller_active")
 
+    def test_registered_web_verifier_submit_adapter_rejects_controller_active_after_dispatch(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "request=json.loads(sys.stdin.read())\n"
+                "if request['operation']=='attest_and_verify':\n"
+                " print(json.dumps({'ok': True, 'operation':'attest_and_verify', 'host_receipt_id':'hr_active_dispatched', 'verified_target': {'provenance':'runtime_host_verifier_v1','conversation_id':request['conversation_id'],'target_generation':request['target_generation'],'ownership_generation':request['ownership_generation']}}))\n"
+                "else:\n"
+                " print(json.dumps({'ok': True, 'operation':'submit_reentry', 'reentry_receipt': {'provenance':'browser_host_reentry_receipt_v1','conversation_id':request['conversation_id'],'target_generation':request['expected_target_generation'],'ownership_generation':request['expected_ownership_generation'],'dispatch_attempted':True,'submit_confirmed':False,'retryable':True,'auto_retry_allowed':True,'result_class':'CONFIRMED_FAILURE_BEFORE_DISPATCH','status':'controller_active','receipt_id':'wr_active_dispatched'}}))\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+                "protocol":"runtime_host_verifier_cli_v1","executable":str(executable),"sha256":digest,
+                "bundle_sha256":{str(executable):digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                origin = verifier(
+                    phase="pre_delivery", controller_id="controller-1", host="web",
+                    expected_target_session_id="web-new", expected_target_generation=4,
+                    expected_ownership_generation=9,
+                )
+                with self.assertRaisesRegex(PermissionError, "inconsistent result semantics"):
+                    verifier.submit_reentry(
+                        controller_id="controller-1", execution_target_session_id="web-new",
+                        target_generation=4, ownership_generation=9, target_mode="explicit_current",
+                        lifecycle_state={"wake_generation": 7, "next_action": "continue"},
+                        host_origin_attestation=origin,
+                    )
+
+    def test_registered_web_verifier_submit_adapter_rejects_controller_active_generation_mismatch(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "request=json.loads(sys.stdin.read())\n"
+                "if request['operation']=='attest_and_verify':\n"
+                " print(json.dumps({'ok': True, 'operation':'attest_and_verify', 'host_receipt_id':'hr_active_mismatch', 'verified_target': {'provenance':'runtime_host_verifier_v1','conversation_id':request['conversation_id'],'target_generation':request['target_generation'],'ownership_generation':request['ownership_generation']}}))\n"
+                "else:\n"
+                " print(json.dumps({'ok': True, 'operation':'submit_reentry', 'reentry_receipt': {'provenance':'browser_host_reentry_receipt_v1','conversation_id':request['conversation_id'],'target_generation':request['expected_target_generation']+1,'ownership_generation':request['expected_ownership_generation'],'dispatch_attempted':False,'submit_confirmed':False,'retryable':True,'auto_retry_allowed':True,'result_class':'CONFIRMED_FAILURE_BEFORE_DISPATCH','status':'controller_active','receipt_id':'wr_active_mismatch'}}))\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+                "protocol":"runtime_host_verifier_cli_v1","executable":str(executable),"sha256":digest,
+                "bundle_sha256":{str(executable):digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                origin = verifier(
+                    phase="pre_delivery", controller_id="controller-1", host="web",
+                    expected_target_session_id="web-new", expected_target_generation=4,
+                    expected_ownership_generation=9,
+                )
+                with self.assertRaisesRegex(PermissionError, "mismatched receipt"):
+                    verifier.submit_reentry(
+                        controller_id="controller-1", execution_target_session_id="web-new",
+                        target_generation=4, ownership_generation=9, target_mode="explicit_current",
+                        lifecycle_state={"wake_generation": 7, "next_action": "continue"},
+                        host_origin_attestation=origin,
+                    )
+
     def test_registered_web_verifier_submit_adapter_keeps_other_retryable_failures_bounded(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
@@ -12980,6 +13056,28 @@ class RuntimeWebTurnEdgeWatcherTests(WebMachineInvocationTurnBridgeTests):
             self.assertEqual(saved["web_turn_lease"]["status"], "active")
 
 class RuntimeWebTurnEndClassificationTests(WebCurrentEntryDiscoveryTests):
+    def _clear_inherited_session_start_state(self) -> None:
+        root = Path(os.environ["AD_LIFECYCLE_STATE_DIR"])
+        root.mkdir(parents=True, exist_ok=True)
+        for candidate in (
+            root / "controller-1.json",
+            root / "controller-1.turns.jsonl",
+            root / "controller-1.json.lock",
+        ):
+            candidate.unlink(missing_ok=True)
+
+    def setUp(self) -> None:
+        from unittest.mock import patch
+        self._clear_inherited_session_start_state()
+        self._watcher_patch = patch.object(
+            web_bridge, "spawn_runtime_web_turn_end_watcher", return_value=424242
+        )
+        self._watcher_patch.start()
+
+    def tearDown(self) -> None:
+        self._watcher_patch.stop()
+        self._clear_inherited_session_start_state()
+
     def test_only_explicit_generation_end_errors_count_as_turn_end(self) -> None:
         self.assertTrue(web_bridge._runtime_web_turn_end_error(
             "HOST_CURRENT_ENTRY_UNAVAILABLE: no active ChatGPT generation"

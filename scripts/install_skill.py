@@ -231,7 +231,13 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_submit_adapter_maps_controller_active_to_deferred_active",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_registered_web_verifier_submit_adapter_rejects_controller_active_after_dispatch",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
+    "test_registered_web_verifier_submit_adapter_rejects_controller_active_generation_mismatch",
+    "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_web_verifier_submit_adapter_keeps_other_retryable_failures_bounded",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_detached_supervisor_defers_while_web_response_is_active_and_retries_without_counting_progress",
     "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests."
     "test_registered_v2_identity_evidence_consumes_signed_current_entry_without_reattest",
     "tests.test_web_lifecycle_bridge.WebHostNativeWakeIsolationTests."
