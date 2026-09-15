@@ -3466,3 +3466,81 @@ test("Reviewer async ENOENT and EACCES before spawn are LOCAL_PRECHECK_FAILED", 
     assert.equal(terminal.retrySafe, true, code);
   }
 });
+
+test("stream record overflow stops parsing new chunks while process-group cleanup is pending", async () => {
+  const runtime = await import(`../scripts/run_external_agent.mjs?overflow-cleanup-pending=${Date.now()}`);
+  await withExternalMonitorEnv({
+    AD_EXTERNAL_STREAM_RECORD_MAX_BYTES: 128,
+    AD_GROK_LAUNCH_TIMEOUT_MS: 500,
+    AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: 500,
+    AD_GROK_STALL_TIMEOUT_MS: 500,
+    AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: 1000,
+    AD_EXTERNAL_KILL_GRACE_MS: 20,
+  }, async () => {
+    const progressLine = `${JSON.stringify({ type: "text", data: "must be discarded while cleanup is pending" })}\n`;
+    const expectedPhaseHistory = ["PRECHECK", "PACKET_VALIDATED", "PROVIDER_STARTING", "PROVIDER_STARTED"];
+
+    const ordinaryChild = monitoredChild(585861);
+    let ordinaryCleanupStarted;
+    let releaseOrdinaryCleanup;
+    const ordinaryCleanupPending = new Promise((resolve) => { ordinaryCleanupStarted = resolve; });
+    const ordinaryCleanupRelease = new Promise((resolve) => { releaseOrdinaryCleanup = resolve; });
+    let ordinaryProgress = 0;
+    const ordinary = runtime.runMonitoredGrok("grok", [], {
+      cwd: os.tmpdir(), env: process.env, spawnChild: () => ordinaryChild,
+      onStructuredProgress: () => { ordinaryProgress += 1; },
+      terminateGroup: async () => {
+        ordinaryCleanupStarted();
+        await ordinaryCleanupRelease;
+        return { confirmed: true, diagnostic: "overflow-group-gone" };
+      },
+    });
+    ordinaryChild.emit("spawn");
+    ordinaryChild.stdout.write(`${JSON.stringify({ type: "provider_started", provider: "grok-build", session_id: "overflow" })}\n`);
+    ordinaryChild.stdout.write("x".repeat(129));
+    await ordinaryCleanupPending;
+    ordinaryChild.stdout.write(`\n${progressLine}`);
+    ordinaryChild.stdout.write(progressLine);
+    releaseOrdinaryCleanup();
+    let ordinaryError;
+    try {
+      await ordinary;
+    } catch (error) {
+      ordinaryError = error;
+    }
+    assert.equal(ordinaryError?.failureClass, "stream_record_too_large");
+    assert.equal(ordinaryError?.outcomeCode, "RESULT_PARSE_FAILED");
+
+    const reviewChild = monitoredChild(585862);
+    let reviewCleanupStarted;
+    let releaseReviewCleanup;
+    const reviewCleanupPending = new Promise((resolve) => { reviewCleanupStarted = resolve; });
+    const reviewCleanupRelease = new Promise((resolve) => { releaseReviewCleanup = resolve; });
+    const review = runtime.runMonitoredGrokReview("grok", [], {
+      cwd: os.tmpdir(), env: process.env, candidateRevision: "8".repeat(40), spawnChild: () => reviewChild,
+      terminateGroup: async () => {
+        reviewCleanupStarted();
+        await reviewCleanupRelease;
+        return { confirmed: true, diagnostic: "review-overflow-group-gone" };
+      },
+    });
+    reviewChild.emit("spawn");
+    reviewChild.stdout.write(`${JSON.stringify({ type: "provider_started", provider: "grok-build", session_id: "review-overflow" })}\n`);
+    reviewChild.stdout.write("y".repeat(129));
+    await reviewCleanupPending;
+    reviewChild.stdout.write(`\n${progressLine}`);
+    reviewChild.stdout.write(progressLine);
+    releaseReviewCleanup();
+    const terminal = await review;
+    assert.equal(terminal.failureClass, "stream_record_too_large");
+    assert.deepEqual({
+      ordinaryPhaseHistory: ordinaryError.phaseHistory,
+      ordinaryProgress,
+      reviewPhaseHistory: terminal.phaseHistory,
+    }, {
+      ordinaryPhaseHistory: expectedPhaseHistory,
+      ordinaryProgress: 0,
+      reviewPhaseHistory: expectedPhaseHistory,
+    });
+  });
+});

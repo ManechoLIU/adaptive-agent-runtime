@@ -1789,6 +1789,7 @@ export function runMonitoredGrok(executable, args, {
         stdoutBuffer = stdoutBuffer.slice(newline + 1);
         const lineBytes = Buffer.byteLength(rawLine, "utf8");
         if (lineBytes > maxRecordBytes) {
+          stdoutBuffer = "";
           void terminateFor(
             "stream_record_too_large",
             "RESULT_PARSE_FAILED",
@@ -1828,6 +1829,7 @@ export function runMonitoredGrok(executable, args, {
       }
       const observedBytes = Buffer.byteLength(stdoutBuffer, "utf8");
       if (observedBytes > maxRecordBytes && typeof terminateFor === "function") {
+        stdoutBuffer = "";
         void terminateFor(
           "stream_record_too_large",
           "RESULT_PARSE_FAILED",
@@ -1844,6 +1846,7 @@ export function runMonitoredGrok(executable, args, {
 
     child.stdout?.on("data", (chunk) => {
       process.stdout.write(chunk);
+      if (terminating || settled) return;
       observeStructuredLines(chunk.toString("utf8"));
     });
     child.stderr?.on("data", (chunk) => {
@@ -2185,6 +2188,7 @@ export function runMonitoredGrokReview(executable, args, {
         progressBuffer = progressBuffer.slice(newline + 1);
         const lineBytes = Buffer.byteLength(rawLine, "utf8");
         if (lineBytes > maxRecordBytes) {
+          progressBuffer = "";
           void terminateForStreamRecord(lineBytes);
           return;
         }
@@ -2208,7 +2212,10 @@ export function runMonitoredGrokReview(executable, args, {
         } catch {}
       }
       const observedBytes = Buffer.byteLength(progressBuffer, "utf8");
-      if (observedBytes > maxRecordBytes) void terminateForStreamRecord(observedBytes);
+      if (observedBytes > maxRecordBytes) {
+        progressBuffer = "";
+        void terminateForStreamRecord(observedBytes);
+      }
     };
     const maybeFinishFromValidatedVerdict = () => {
       if (settled || terminating || verdictCleanupStarted || !stdout.trim()) return;
@@ -2265,6 +2272,7 @@ export function runMonitoredGrokReview(executable, args, {
     child.stdout?.on("data", (chunk) => {
       const text = chunk.toString("utf8");
       process.stdout.write(chunk);
+      if (terminating || settled) return;
       stdout = appendBounded(stdout, text);
       observeValidatedProgress(text);
       maybeFinishFromValidatedVerdict();
