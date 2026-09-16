@@ -364,15 +364,15 @@ When project evidence is weak, the benchmark is context only. When project evide
 
 V1 ships a self-contained read-only HTML dashboard generated from one JSON report. It must not depend on a web service, package install, or third-party JavaScript CDN.
 
-Visual direction: a dark, space-themed model command center inspired by the user-provided reference pin. Reproduce the visual language—not copyrighted assets or brand identity—with:
+Visual direction: a bright editorial sci-fi command center inspired by the user-provided reference image. Reproduce the visual language—not copyrighted assets or brand identity—with:
 
-- near-black / deep navy background;
-- subtle radial/starfield atmosphere using CSS only;
-- generous negative space and large editorial typography;
-- luminous bordered metric cards rather than conventional enterprise tables;
-- compact cyan/violet/amber accents for score, reliability and decision states;
-- smooth SVG/CSS charts embedded in the HTML;
-- responsive desktop-first layout with usable narrow-screen fallback.
+- warm-white / very-light-gray canvas rather than a dark BI background;
+- deep navy editorial typography with very large statement headlines and generous negative space;
+- a cobalt / electric-blue / violet central “planet / energy field” motif created with CSS gradients and SVG, used as the visual anchor rather than decorative stock imagery;
+- hairline rules, small uppercase navigation/metadata, restrained borders and almost no conventional boxed-dashboard chrome;
+- score comparisons rendered as orbital/radial lines, thin bars and clean SVG plots that feel integrated into the composition;
+- cobalt, violet and small amber accents for model quality, reliability and decision states while keeping the page predominantly white;
+- responsive desktop-first layout with a calm narrow-screen fallback.
 
 The dashboard includes at minimum:
 

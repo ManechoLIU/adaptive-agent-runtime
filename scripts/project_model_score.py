@@ -465,3 +465,225 @@ def score_route_groups(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
     results.sort(key=lambda item: tuple(item["route"].values()))
     return results
+
+_EFFORT_ORDER = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4, "unknown": 99}
+
+
+def _route_for_model_group(group: dict[str, Any], route_groups: list[dict[str, Any]]) -> dict[str, Any] | None:
+    identity = group["identity"]
+    for route_group in route_groups:
+        route = route_group.get("route", {})
+        if all(
+            str(route.get(field) or "unknown") == str(identity.get(field) or "unknown")
+            for field in ("provider", "model", "auth_mode", "execution_transport")
+        ):
+            return route_group
+    return None
+
+
+def _same_model_effort_cohort(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    ia, ib = a["identity"], b["identity"]
+    return all(
+        ia.get(field) == ib.get(field)
+        for field in ("project", "provider", "model", "auth_mode", "execution_role", "policy_class", "execution_transport")
+    ) and ia.get("reasoning_effort") != ib.get("reasoning_effort")
+
+
+def _same_model_role_cohort(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    ia, ib = a["identity"], b["identity"]
+    return all(
+        ia.get(field) == ib.get(field)
+        for field in ("project", "provider", "model", "auth_mode", "policy_class", "execution_transport")
+    ) and ia.get("execution_role") != ib.get("execution_role")
+
+
+def _same_task_alternative(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    ia, ib = a["identity"], b["identity"]
+    return all(
+        ia.get(field) == ib.get(field)
+        for field in ("project", "execution_role", "policy_class")
+    ) and ia.get("model") != ib.get("model")
+
+
+def _elapsed_for_group(group: dict[str, Any]) -> float | None:
+    value = group.get("median_elapsed_seconds")
+    return float(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+
+def build_decisions(
+    model_groups: list[dict[str, Any]],
+    route_groups: list[dict[str, Any]],
+    benchmarks: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Produce conservative advisory actions without mutating route policy."""
+
+    groups = attach_benchmarks(model_groups, benchmarks or []) if benchmarks else [dict(group) for group in model_groups]
+    decisions: list[dict[str, Any]] = []
+
+    for group in groups:
+        identity = group["identity"]
+        score = group.get("project_model_score")
+        samples = int(group.get("quality_sample_count") or 0)
+        route = _route_for_model_group(group, route_groups)
+        route_score = route.get("route_reliability_score") if route else None
+        route_attempts = int(route.get("eligible_attempts") or 0) if route else 0
+        reason_codes: list[str] = []
+        suggested_target: dict[str, Any] | None = None
+        action = "KEEP"
+
+        if route_score is not None and route_attempts >= 3 and float(route_score) < 75:
+            action = "CHANGE_ROUTE"
+            reason_codes.append("route_reliability_degraded")
+        elif samples < 3 or score is None:
+            action = "INSUFFICIENT_EVIDENCE"
+            reason_codes.append("insufficient_project_samples")
+        else:
+            # Prefer a lower effort only when quality is materially unchanged and
+            # the comparable cohort is meaningfully faster.
+            effort_candidates: list[dict[str, Any]] = []
+            current_elapsed = _elapsed_for_group(group)
+            current_effort_rank = _EFFORT_ORDER.get(str(identity.get("reasoning_effort")), 99)
+            if current_elapsed and current_effort_rank < 99:
+                for other in groups:
+                    if other is group or not _same_model_effort_cohort(group, other):
+                        continue
+                    if int(other.get("quality_sample_count") or 0) < 3 or other.get("project_model_score") is None:
+                        continue
+                    other_rank = _EFFORT_ORDER.get(str(other["identity"].get("reasoning_effort")), 99)
+                    other_elapsed = _elapsed_for_group(other)
+                    if other_rank >= current_effort_rank or not other_elapsed:
+                        continue
+                    score_delta = float(score) - float(other["project_model_score"])
+                    speed_gain = 1.0 - (other_elapsed / current_elapsed)
+                    if abs(score_delta) <= 3 and speed_gain >= 0.25:
+                        effort_candidates.append(other)
+                if effort_candidates:
+                    best = min(
+                        effort_candidates,
+                        key=lambda item: (_EFFORT_ORDER.get(str(item["identity"].get("reasoning_effort")), 99), _elapsed_for_group(item) or 10**9),
+                    )
+                    action = "TUNE_EFFORT"
+                    reason_codes.extend(["similar_quality_lower_effort", "material_latency_reduction"])
+                    suggested_target = dict(best["identity"])
+
+            if action == "KEEP" and float(score) < 75:
+                role_candidates = [
+                    other
+                    for other in groups
+                    if other is not group
+                    and _same_model_role_cohort(group, other)
+                    and int(other.get("quality_sample_count") or 0) >= 3
+                    and other.get("project_model_score") is not None
+                    and float(other["project_model_score"]) >= float(score) + 15
+                ]
+                if role_candidates:
+                    best = max(role_candidates, key=lambda item: float(item["project_model_score"]))
+                    action = "CHANGE_ROLE"
+                    reason_codes.append("model_stronger_in_other_role")
+                    suggested_target = dict(best["identity"])
+
+            if action == "KEEP" and samples >= 5 and float(score) < 75:
+                alternatives = []
+                for other in groups:
+                    if other is group or not _same_task_alternative(group, other):
+                        continue
+                    if int(other.get("quality_sample_count") or 0) < 5 or other.get("project_model_score") is None:
+                        continue
+                    if float(other["project_model_score"]) < float(score) + 8:
+                        continue
+                    other_route = _route_for_model_group(other, route_groups)
+                    if other_route is not None:
+                        other_route_score = other_route.get("route_reliability_score")
+                        if other_route_score is not None and int(other_route.get("eligible_attempts") or 0) >= 3 and float(other_route_score) < 75:
+                            continue
+                    alternatives.append(other)
+                if alternatives:
+                    best = max(alternatives, key=lambda item: float(item["project_model_score"]))
+                    action = "SWITCH_MODEL"
+                    reason_codes.extend(["project_quality_materially_weaker", "stronger_observed_alternative"])
+                    suggested_target = dict(best["identity"])
+
+            if action == "KEEP":
+                reason_codes.append("project_evidence_supports_current_route")
+
+        decision = {
+            "identity": dict(identity),
+            "action": action,
+            "confidence": group.get("confidence", "low"),
+            "reason_codes": reason_codes,
+            "suggested_target": suggested_target,
+            "project_model_score": score,
+            "route_reliability_score": route_score,
+            "quality_sample_count": samples,
+        }
+        if "benchmark" in group:
+            decision["benchmark"] = group["benchmark"]
+            decision["baseline_comparison"] = group.get("baseline_comparison", "NOT_COMPARABLE")
+        decisions.append(decision)
+
+    decisions.sort(
+        key=lambda item: (
+            item["identity"].get("model", ""),
+            _EFFORT_ORDER.get(str(item["identity"].get("reasoning_effort")), 99),
+            item["identity"].get("execution_role", ""),
+            item["identity"].get("policy_class", ""),
+        )
+    )
+    return decisions
+
+
+def attach_benchmarks(model_groups: list[dict[str, Any]], benchmarks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach external benchmark context without changing project scores."""
+
+    enriched: list[dict[str, Any]] = []
+    for group in model_groups:
+        item = dict(group)
+        identity = item["identity"]
+        model = str(identity.get("model") or "")
+        effort = str(identity.get("reasoning_effort") or "unknown")
+        provider = str(identity.get("provider") or "unknown")
+        candidates = [b for b in benchmarks if str(b.get("model") or "") == model]
+        benchmark = None
+        match = "none"
+        if candidates:
+            exact = [
+                b
+                for b in candidates
+                if str(b.get("effort") or "unknown") == effort
+                and str(b.get("route") or "unknown") == provider
+            ]
+            if exact:
+                benchmark = exact[0]
+                match = "exact"
+            else:
+                same_effort = [b for b in candidates if str(b.get("effort") or "unknown") == effort]
+                benchmark = same_effort[0] if same_effort else candidates[0]
+                match = "partial"
+
+        if benchmark is not None:
+            item["benchmark"] = {
+                "source": str(benchmark.get("source") or "modeldial"),
+                "model": str(benchmark.get("model") or model),
+                "effort": str(benchmark.get("effort") or "unknown"),
+                "route": str(benchmark.get("route") or "unknown"),
+                "score": benchmark.get("score"),
+                "observed_at": benchmark.get("observed_at"),
+                "match": match,
+            }
+        else:
+            item["benchmark"] = {"source": "modeldial", "match": "none"}
+
+        baseline = "NOT_COMPARABLE"
+        project_score = item.get("project_model_score")
+        benchmark_score = item["benchmark"].get("score")
+        if match == "exact" and project_score is not None and isinstance(benchmark_score, (int, float)) and int(item.get("quality_sample_count") or 0) >= 3:
+            delta = float(project_score) - float(benchmark_score)
+            if delta >= 10:
+                baseline = "ABOVE_EXPECTATION"
+            elif delta <= -10:
+                baseline = "BELOW_EXPECTATION"
+            else:
+                baseline = "IN_LINE"
+        item["baseline_comparison"] = baseline
+        enriched.append(item)
+    return enriched

@@ -230,3 +230,127 @@ class ProjectModelScoringTests(unittest.TestCase):
         groups = score_model_groups([high_backend, xhigh_backend, frontend])
         keys = {(g["identity"]["reasoning_effort"], g["identity"]["policy_class"]) for g in groups}
         self.assertEqual(keys, {("high", "backend"), ("xhigh", "backend"), ("high", "frontend")})
+
+from scripts.project_model_score import build_decisions, attach_benchmarks
+
+
+def decision_group(
+    *,
+    model="grok-4.6",
+    score=85.0,
+    samples=5,
+    effort="high",
+    role="writer",
+    policy="backend",
+    provider="grok-build",
+    transport="external_process",
+    auth="oauth",
+    elapsed=600.0,
+):
+    return {
+        "identity": {
+            "project": "SelfAlone",
+            "provider": provider,
+            "model": model,
+            "auth_mode": auth,
+            "reasoning_effort": effort,
+            "execution_role": role,
+            "policy_class": policy,
+            "execution_transport": transport,
+        },
+        "project_model_score": score,
+        "dimension_scores": {"delivery_success": score},
+        "dimension_coverage": 0.55,
+        "quality_sample_count": samples,
+        "total_sample_count": samples,
+        "excluded_infrastructure_count": 0,
+        "excluded_external_count": 0,
+        "mixed_count": 0,
+        "unknown_count": 0,
+        "confidence": "high" if samples >= 5 else ("medium" if samples >= 3 else "low"),
+        "median_elapsed_seconds": elapsed,
+    }
+
+
+def route_group(*, model="grok-4.6", provider="grok-build", auth="oauth", transport="external_process", score=95.0, attempts=5):
+    return {
+        "route": {
+            "provider": provider,
+            "model": model,
+            "auth_mode": auth,
+            "execution_transport": transport,
+        },
+        "route_reliability_score": score,
+        "eligible_attempts": attempts,
+        "successful_transport_attempts": round(attempts * score / 100),
+        "failed_transport_attempts": attempts - round(attempts * score / 100),
+        "unknown_attempts": 0,
+        "result_unknown_count": 0,
+        "failure_classes": {},
+    }
+
+
+class ModelDecisionTests(unittest.TestCase):
+    def test_high_project_quality_with_degraded_route_recommends_change_route_not_switch(self):
+        groups = [decision_group(score=86, samples=6)]
+        routes = [route_group(score=60, attempts=5)]
+        decision = build_decisions(groups, routes)[0]
+        self.assertEqual(decision["action"], "CHANGE_ROUTE")
+        self.assertIn("route_reliability_degraded", decision["reason_codes"])
+
+    def test_semantically_weak_model_on_healthy_route_can_switch_to_stronger_observed_alternative(self):
+        weak = decision_group(model="grok-4.6", score=62, samples=7)
+        strong = decision_group(
+            model="gpt-5.6-sol",
+            provider="codex-native",
+            auth="host",
+            transport="codex_native_subagent",
+            score=84,
+            samples=8,
+            elapsed=500,
+        )
+        routes = [
+            route_group(score=92, attempts=8),
+            route_group(model="gpt-5.6-sol", provider="codex-native", auth="host", transport="codex_native_subagent", score=96, attempts=8),
+        ]
+        decisions = {item["identity"]["model"]: item for item in build_decisions([weak, strong], routes)}
+        self.assertEqual(decisions["grok-4.6"]["action"], "SWITCH_MODEL")
+        self.assertEqual(decisions["grok-4.6"]["suggested_target"]["model"], "gpt-5.6-sol")
+
+    def test_low_sample_count_never_switches_model(self):
+        weak = decision_group(model="grok-4.6", score=50, samples=2)
+        strong = decision_group(model="gpt-5.6-sol", provider="codex-native", auth="host", transport="codex_native_subagent", score=90, samples=8)
+        decisions = {item["identity"]["model"]: item for item in build_decisions([weak, strong], [route_group(), route_group(model="gpt-5.6-sol", provider="codex-native", auth="host", transport="codex_native_subagent")])}
+        self.assertEqual(decisions["grok-4.6"]["action"], "INSUFFICIENT_EVIDENCE")
+
+    def test_slower_effort_with_similar_quality_recommends_tune_effort(self):
+        high = decision_group(effort="high", score=85, samples=4, elapsed=600)
+        medium = decision_group(effort="medium", score=84, samples=4, elapsed=300)
+        decisions = {(item["identity"]["reasoning_effort"]): item for item in build_decisions([high, medium], [route_group(score=95, attempts=8)])}
+        self.assertEqual(decisions["high"]["action"], "TUNE_EFFORT")
+        self.assertEqual(decisions["high"]["suggested_target"]["reasoning_effort"], "medium")
+
+    def test_model_weak_in_writer_but_strong_in_reviewer_recommends_change_role(self):
+        writer = decision_group(role="writer", score=65, samples=4)
+        reviewer = decision_group(role="reviewer", score=88, samples=4)
+        decisions = {item["identity"]["execution_role"]: item for item in build_decisions([writer, reviewer], [route_group(score=95, attempts=8)])}
+        self.assertEqual(decisions["writer"]["action"], "CHANGE_ROLE")
+        self.assertEqual(decisions["writer"]["suggested_target"]["execution_role"], "reviewer")
+
+    def test_external_benchmark_is_sidecar_and_protocol_mismatch_is_visible(self):
+        exact_group = decision_group(model="grok-4.6", effort="high", score=85, samples=6)
+        project_score_before = exact_group["project_model_score"]
+        enriched = attach_benchmarks(
+            [exact_group],
+            [{"model": "grok-4.6", "effort": "high", "route": "grok-build", "score": 79.5, "observed_at": "2026-09-14"}],
+        )[0]
+        self.assertEqual(enriched["benchmark"]["match"], "exact")
+        self.assertEqual(enriched["baseline_comparison"], "IN_LINE")
+        self.assertEqual(enriched["project_model_score"], project_score_before)
+
+        partial = attach_benchmarks(
+            [decision_group(model="gpt-5.6-sol", effort="high", provider="codex-native")],
+            [{"model": "gpt-5.6-sol", "effort": "high", "route": "custom-endpoint", "score": 73, "observed_at": "2026-09-14"}],
+        )[0]
+        self.assertEqual(partial["benchmark"]["match"], "partial")
+        self.assertEqual(partial["baseline_comparison"], "NOT_COMPARABLE")

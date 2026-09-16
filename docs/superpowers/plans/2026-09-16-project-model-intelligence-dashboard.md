@@ -101,7 +101,7 @@
 
 - [ ] **Step 1: Write failing renderer tests** asserting doctype, no remote `http(s)` assets/scripts, embedded normalized report data, presence of overview/model comparison/decision/attribution/route-health/evidence sections, SVG chart markup, and escaped untrusted strings.
 - [ ] **Step 2: Verify RED.**
-- [ ] **Step 3: Implement renderer** with dark space-themed CSS, editorial typography, luminous cards, responsive grid, embedded SVG bar/radar-like comparisons, CSS-only atmospheric background, accessible labels, and a compact evidence table. Use only report decisions; browser JS may filter/sort but may not derive recommendations.
+- [ ] **Step 3: Implement renderer** with bright editorial sci-fi CSS matching the supplied reference: warm-white canvas, deep navy type, cobalt/violet planet motif, hairline structure, generous whitespace, responsive grid, and embedded SVG comparisons, accessible labels, and a compact evidence table. Use only report decisions; browser JS may filter/sort but may not derive recommendations.
 - [ ] **Step 4: Add CLI dashboard output** through the report builder and atomic HTML write.
 - [ ] **Step 5: Re-run renderer/CLI tests** to GREEN.
 - [ ] **Step 6: Commit** `feat(runtime): add model intelligence dashboard`.
