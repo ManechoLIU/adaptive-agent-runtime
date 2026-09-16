@@ -304,3 +304,105 @@ Default output lists every discovered model with sample count, Project Model Sco
 6. Reports expose sample size, exclusions, and confidence.
 7. ModelDial data is displayed only as a separate benchmark sidecar and never silently blended into project score.
 8. Derived score files are reproducible and do not become project state authority.
+
+## Model Decision Engine
+
+The score is useful only when it improves routing decisions. V1 therefore adds a deterministic advisory decision layer that compares:
+
+1. Project Model Score for a comparable task cohort;
+2. Route Reliability Score for the exact provider/model/auth/transport route;
+3. optional ModelDial benchmark sidecar for the closest comparable model/effort/route;
+4. elapsed-time and rework evidence when enough comparable samples exist;
+5. sample count and confidence.
+
+The engine produces one advisory action per comparable model configuration:
+
+```text
+KEEP
+TUNE_EFFORT
+CHANGE_ROUTE
+CHANGE_ROLE
+SWITCH_MODEL
+INSUFFICIENT_EVIDENCE
+```
+
+It must never silently change the project route. V1 is read-only/advisory.
+
+### Decision rules
+
+- `KEEP`: project score is healthy for the cohort and route reliability is healthy or the model materially outperforms alternatives with sufficient evidence.
+- `TUNE_EFFORT`: same-model adjacent effort cohorts show materially similar project quality but a meaningful efficiency difference; never compare effort cohorts with inadequate sample coverage.
+- `CHANGE_ROUTE`: project quality is healthy but route reliability is materially degraded. This means “keep the model, repair or change the execution route”, not “switch model”.
+- `CHANGE_ROLE`: the model is strong in one execution role/task class but weak in another with sufficient samples; preserve the strong role and stop routing the weak role there.
+- `SWITCH_MODEL`: project quality is persistently weak in a comparable cohort, route reliability is not the cause, and at least one alternative has materially stronger project evidence. External benchmark alone is insufficient to trigger this action.
+- `INSUFFICIENT_EVIDENCE`: sample count, evidence coverage, or benchmark protocol comparability is too weak for a safe recommendation.
+
+Default material-difference thresholds are intentionally conservative and must be surfaced in report metadata rather than hidden. V1 uses:
+
+- minimum 5 eligible model-quality samples for a high-confidence switch recommendation;
+- minimum 3 comparable samples for provisional role/effort guidance;
+- at least 8 Project Model Score points or 15 percentage points of first-pass/rework delta to call a project-performance difference material;
+- route reliability below 75 with at least 3 eligible route attempts blocks `SWITCH_MODEL` and prefers `CHANGE_ROUTE` when project-quality evidence is otherwise healthy;
+- `result_unknown` and infrastructure-only samples never count as model-quality evidence.
+
+### External baseline comparison
+
+The dashboard shows the external baseline beside the project score, but does not subtract the two raw numbers as if they were on the same measurement scale. Instead it derives a qualitative comparison:
+
+```text
+ABOVE_EXPECTATION
+IN_LINE
+BELOW_EXPECTATION
+NOT_COMPARABLE
+```
+
+The comparison requires at least a partial ModelDial match and sufficient project evidence. Exact match requires exact model + effort + route semantics. A partial match is displayed as context with an explicit protocol warning.
+
+When project evidence is weak, the benchmark is context only. When project evidence is strong, project evidence has decision priority for the user's route/task cohort.
+
+## Dashboard
+
+V1 ships a self-contained read-only HTML dashboard generated from one JSON report. It must not depend on a web service, package install, or third-party JavaScript CDN.
+
+Visual direction: a dark, space-themed model command center inspired by the user-provided reference pin. Reproduce the visual language—not copyrighted assets or brand identity—with:
+
+- near-black / deep navy background;
+- subtle radial/starfield atmosphere using CSS only;
+- generous negative space and large editorial typography;
+- luminous bordered metric cards rather than conventional enterprise tables;
+- compact cyan/violet/amber accents for score, reliability and decision states;
+- smooth SVG/CSS charts embedded in the HTML;
+- responsive desktop-first layout with usable narrow-screen fallback.
+
+The dashboard includes at minimum:
+
+1. global summary: model configurations observed, scored samples, infrastructure failures excluded, current degraded/open routes;
+2. model comparison chart: Project Model Score vs Route Reliability vs external benchmark when comparable;
+3. role/task matrix: writer/reviewer/controller and frontend/backend/general cohorts;
+4. effort comparison for models with multiple observed effort levels;
+5. decision cards with action, confidence, reasons and evidence counts;
+6. failure attribution chart separating model / infrastructure / external / mixed / unknown;
+7. route health section for external providers;
+8. sample/evidence explorer table so recommendations are auditable.
+
+The HTML is generated by Runtime from a normalized report JSON. No model recommendation may exist only in presentation JavaScript; all decisions are produced by Python and rendered verbatim.
+
+## Dashboard CLI
+
+```bash
+python3 scripts/project_model_score.py report --repo <repo> --window-days 30 --json <path>
+python3 scripts/project_model_score.py dashboard --repo <repo> --window-days 30 --output <path.html>
+```
+
+`dashboard` internally calls the same report builder used by `report`; the two surfaces cannot drift.
+
+## Decision/dashboard acceptance
+
+1. All models present in canonical evidence, including Kimi K3, are discoverable without a hard-coded model population.
+2. A high-quality model with a degraded route receives `CHANGE_ROUTE`, not `SWITCH_MODEL`.
+3. An infrastructure failure does not reduce Project Model Score.
+4. A semantically weak model on a healthy route can receive `SWITCH_MODEL` only with sufficient comparable samples and a stronger observed alternative.
+5. Low sample counts always return `INSUFFICIENT_EVIDENCE` for switch decisions.
+6. ModelDial values remain sidecar/context and protocol mismatches are visible.
+7. Dashboard HTML is self-contained, opens without network access, and displays model comparison, route reliability, external baseline, attribution, route health and decisions.
+8. Dashboard recommendation text is generated from structured decision output, not duplicated UI heuristics.
