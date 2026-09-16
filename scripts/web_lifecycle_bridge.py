@@ -5965,14 +5965,23 @@ def _clear_result_unknown_via_registered_host_reconcile(
         return successor_id
     except (PermissionError, PeerHostTransientUnavailable, OSError, ValueError, TypeError) as exc:
         message = str(exc)
-        state = load_json(state_path)
-        state["stderr_tail"] = bounded_tail(message)
-        if "exact original signed receipt" in message:
-            write_auto_stop_state(state_path, state)
+        attempts = 0
+        exact_original_error = "exact original signed receipt" in message
+        lock_path = auto_stop_supervisor_lock_path(state_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                state = load_json(state_path)
+                state["stderr_tail"] = bounded_tail(message)
+                if not exact_original_error:
+                    attempts = int(state.get("host_reentry_reconcile_attempts", 0) or 0) + 1
+                    state["host_reentry_reconcile_attempts"] = attempts
+                write_auto_stop_state(state_path, state)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        if exact_original_error:
             return None
-        attempts = int(state.get("host_reentry_reconcile_attempts", 0) or 0) + 1
-        state["host_reentry_reconcile_attempts"] = attempts
-        write_auto_stop_state(state_path, state)
         if attempts >= WEB_REENTRY_RECONCILE_RETRY_LIMIT:
             _persist_host_reentry_reconciliation(
                 state_path,

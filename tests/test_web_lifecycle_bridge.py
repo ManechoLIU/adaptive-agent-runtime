@@ -14587,3 +14587,59 @@ def _persist_reconciliation_state_write_requires_supervisor_lock(self):
 
 
 WebLocalReentryIntegrationTests.test_persist_reconciliation_state_write_requires_supervisor_lock = _persist_reconciliation_state_write_requires_supervisor_lock
+
+
+
+def _result_unknown_reconcile_exception_state_write_requires_supervisor_lock(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, _lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        real_load = web_bridge.load_json
+        real_write = web_bridge.write_auto_stop_state
+        lock_held = False
+        events = []
+
+        def traced_flock(_fd, operation):
+            nonlocal lock_held
+            events.append(("flock", operation))
+            if operation == web_bridge.fcntl.LOCK_EX:
+                lock_held = True
+            elif operation == web_bridge.fcntl.LOCK_UN:
+                lock_held = False
+
+        def guarded_load(path):
+            if Path(path) == state_path:
+                self.assertTrue(lock_held, "reconcile exception state must be read under supervisor lock")
+                events.append("state-load")
+            return real_load(path)
+
+        def guarded_write(path, value):
+            if Path(path) == state_path:
+                self.assertTrue(lock_held, "reconcile exception state must be written under supervisor lock")
+                events.append("state-write")
+            return real_write(path, value)
+
+        with patch.object(web_bridge.fcntl, "flock", side_effect=traced_flock), patch.object(
+            web_bridge, "load_json", side_effect=guarded_load
+        ), patch.object(web_bridge, "write_auto_stop_state", side_effect=guarded_write), patch.object(
+            web_bridge, "_execute_registered_web_host_reconcile",
+            side_effect=PermissionError("synthetic reconcile failure"),
+        ):
+            successor = web_bridge._clear_result_unknown_via_registered_host_reconcile(
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                state_path=state_path,
+                supervisor_state=real_load(state_path),
+            )
+
+        self.assertIsNone(successor)
+        self.assertIn(("flock", web_bridge.fcntl.LOCK_EX), events)
+        self.assertIn(("flock", web_bridge.fcntl.LOCK_UN), events)
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+        self.assertEqual(saved["host_reentry_reconcile_attempts"], 1)
+        self.assertIn("synthetic reconcile failure", saved["stderr_tail"])
+
+
+WebLocalReentryIntegrationTests.test_result_unknown_reconcile_exception_state_write_requires_supervisor_lock = _result_unknown_reconcile_exception_state_write_requires_supervisor_lock
