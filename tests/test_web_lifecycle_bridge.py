@@ -13227,6 +13227,25 @@ def _result_unknown_persisted_authorization_requires_complete_reconciliation_evi
         "",
     )
 
+    for missing_hash in ("wake_nonce_sha256", "continuation_payload_sha256"):
+        with self.subTest(missing_hash=missing_hash):
+            incomplete_original = dict(original)
+            incomplete_original.pop(missing_hash, None)
+            incomplete = dict(base_record)
+            incomplete["reconciliation_receipt"] = _signed_reconciliation_receipt(
+                incomplete_original
+            )
+            self.assertFalse(
+                web_bridge._is_durable_result_unknown_receipt(incomplete_original)
+            )
+            self.assertEqual(
+                web_bridge._authorized_result_unknown_successor_id({
+                    "original_reentry_receipt": incomplete_original,
+                    "host_reentry_reconciliation": incomplete,
+                }),
+                "",
+            )
+
     valid = dict(base_record)
     valid["reconciliation_receipt"] = _signed_reconciliation_receipt(original)
     self.assertEqual(
@@ -13236,6 +13255,56 @@ def _result_unknown_persisted_authorization_requires_complete_reconciliation_evi
         }),
         successor_id,
     )
+
+    wrong_successor = dict(valid)
+    wrong_successor["successor_receipt_id"] = "bootstrap:reconcile-not-the-derived-id"
+    self.assertEqual(
+        web_bridge._authorized_result_unknown_successor_id({
+            "original_reentry_receipt": original,
+            "host_reentry_reconciliation": wrong_successor,
+        }),
+        "",
+    )
+
+    for field, bad_value in (
+        ("conversation_id", "web-foreign"),
+        ("target_generation", 99),
+        ("ownership_generation", 99),
+        ("original_receipt_id", "wr_foreign"),
+        ("original_wake_id", "runtime_web_foreign"),
+    ):
+        with self.subTest(persisted_binding_field=field):
+            bad_record = dict(valid)
+            bad_record[field] = bad_value
+            self.assertEqual(
+                web_bridge._authorized_result_unknown_successor_id({
+                    "original_reentry_receipt": original,
+                    "host_reentry_reconciliation": bad_record,
+                }),
+                "",
+            )
+
+    for field, bad_value in (
+        ("conversation_id", "web-foreign"),
+        ("target_generation", 99),
+        ("ownership_generation", 99),
+        ("original_receipt_id", "wr_foreign"),
+        ("wake_id", "runtime_web_foreign"),
+        ("wake_nonce_sha256", "c" * 64),
+        ("continuation_payload_sha256", "d" * 64),
+    ):
+        with self.subTest(reconciliation_binding_field=field):
+            bad_record = dict(valid)
+            bad_receipt = dict(valid["reconciliation_receipt"])
+            bad_receipt[field] = bad_value
+            bad_record["reconciliation_receipt"] = bad_receipt
+            self.assertEqual(
+                web_bridge._authorized_result_unknown_successor_id({
+                    "original_reentry_receipt": original,
+                    "host_reentry_reconciliation": bad_record,
+                }),
+                "",
+            )
 
 
 def _result_unknown_successor_scheduled_marker_uses_supervisor_lock(self):
