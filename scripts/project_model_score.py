@@ -7,7 +7,12 @@ added incrementally behind tests.
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
 import re
+import statistics
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -687,3 +692,156 @@ def attach_benchmarks(model_groups: list[dict[str, Any]], benchmarks: list[dict[
         item["baseline_comparison"] = baseline
         enriched.append(item)
     return enriched
+
+
+def _load_benchmark_file(path: Path | None) -> list[dict[str, Any]]:
+    if path is None:
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("benchmarks"), list):
+        rows = payload["benchmarks"]
+    else:
+        raise ValueError("benchmark JSON must be a list or contain benchmarks[]")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def build_report(
+    repo: Path | str,
+    *,
+    window_days: int = 30,
+    benchmarks: list[dict[str, Any]] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    repo_path = Path(repo).resolve()
+    samples = load_project_samples(repo_path, window_days=window_days, now=now)
+
+    attribution_counts = {name: 0 for name in ("model", "infrastructure", "external", "mixed", "unknown")}
+    enriched_samples: list[dict[str, Any]] = []
+    for sample in samples:
+        current = dict(sample)
+        attribution, reasons = classify_attribution(current)
+        current["attribution"] = attribution
+        current["attribution_reasons"] = reasons
+        attribution_counts[attribution] += 1
+        enriched_samples.append(current)
+
+    model_groups = score_model_groups(enriched_samples)
+    # Median elapsed is exposed for comparable-effort optimization.  It is not
+    # folded into the model score until enough comparable evidence exists.
+    for group in model_groups:
+        values = [
+            float(sample["elapsed_seconds"])
+            for sample in enriched_samples
+            if sample.get("elapsed_seconds") is not None
+            and _model_group_key(sample) == _model_group_key({"identity": group["identity"]})
+            and classify_attribution(sample)[0] in {"model", "mixed"}
+        ]
+        group["median_elapsed_seconds"] = round(statistics.median(values), 1) if values else None
+
+    if benchmarks:
+        model_groups = attach_benchmarks(model_groups, benchmarks)
+    route_groups = score_route_groups(enriched_samples)
+    decisions = build_decisions(model_groups, route_groups)
+
+    return {
+        "schema_version": 1,
+        "project": repo_path.name,
+        "repo": str(repo_path),
+        "window_days": window_days,
+        "generated_at": (now or datetime.now(tz=UTC)).astimezone(UTC).isoformat(),
+        "summary": {
+            "observed_model_configurations": len(model_groups),
+            "terminal_samples": len(enriched_samples),
+            "quality_scored_samples": attribution_counts["model"] + attribution_counts["mixed"],
+            "infrastructure_failures_excluded_from_model_score": attribution_counts["infrastructure"],
+            "external_failures_excluded_from_model_score": attribution_counts["external"],
+            "unknown_samples": attribution_counts["unknown"],
+        },
+        "attribution_counts": attribution_counts,
+        "model_groups": model_groups,
+        "route_groups": route_groups,
+        "decisions": decisions,
+        "samples": enriched_samples,
+        "thresholds": {
+            "switch_min_quality_samples": 5,
+            "role_effort_min_quality_samples": 3,
+            "material_project_score_delta": 8,
+            "material_role_delta": 15,
+            "route_degraded_below": 75,
+        },
+    }
+
+
+def _parse_now(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    parsed = _parse_datetime(value)
+    if parsed is None:
+        raise ValueError("--now must be an ISO-8601 timestamp")
+    return parsed
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Score model performance from canonical project Runtime evidence.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    report_parser = sub.add_parser("report", help="Build a machine-readable project model report")
+    report_parser.add_argument("--repo", required=True)
+    report_parser.add_argument("--window-days", type=int, default=30)
+    report_parser.add_argument("--benchmark-json")
+    report_parser.add_argument("--json", dest="json_output")
+    report_parser.add_argument("--now", help=argparse.SUPPRESS)
+
+    dashboard_parser = sub.add_parser("dashboard", help="Render a self-contained HTML model intelligence dashboard")
+    dashboard_parser.add_argument("--repo", required=True)
+    dashboard_parser.add_argument("--window-days", type=int, default=30)
+    dashboard_parser.add_argument("--benchmark-json")
+    dashboard_parser.add_argument("--output", required=True)
+    dashboard_parser.add_argument("--now", help=argparse.SUPPRESS)
+
+    args = parser.parse_args(argv)
+    if args.command in {"report", "dashboard"}:
+        benchmarks = _load_benchmark_file(Path(args.benchmark_json)) if args.benchmark_json else []
+        report = build_report(
+            Path(args.repo),
+            window_days=args.window_days,
+            benchmarks=benchmarks,
+            now=_parse_now(args.now),
+        )
+        if args.command == "report":
+            rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            if args.json_output:
+                _atomic_write_text(Path(args.json_output), rendered)
+            else:
+                print(rendered, end="")
+            return 0
+
+        from scripts.model_score_dashboard import render_dashboard
+
+        _atomic_write_text(Path(args.output), render_dashboard(report))
+        return 0
+    raise AssertionError(f"unhandled command: {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

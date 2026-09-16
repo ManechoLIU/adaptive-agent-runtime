@@ -354,3 +354,101 @@ class ModelDecisionTests(unittest.TestCase):
         )[0]
         self.assertEqual(partial["benchmark"]["match"], "partial")
         self.assertEqual(partial["baseline_comparison"], "NOT_COMPARABLE")
+
+from scripts.project_model_score import build_report, main as project_model_score_main
+
+
+class ProjectModelReportTests(unittest.TestCase):
+    def make_repo(self, leases):
+        temp = tempfile.TemporaryDirectory()
+        repo = Path(temp.name) / "demo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        state_path = runtime_state_path(repo)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({"schema_version": 1, "leases": leases, "lineages": {}}), encoding="utf-8")
+        return temp, repo
+
+    def test_build_report_contains_summary_scores_decisions_and_attribution(self):
+        leases = {
+            "g1": terminal_lease(assignment_id="g1"),
+            "g2": terminal_lease(assignment_id="g2"),
+            "g3": terminal_lease(assignment_id="g3"),
+            "g4": terminal_lease(
+                assignment_id="g4",
+                terminal_state="failed",
+                transport_outcome="failed",
+                delivery_outcome="unresolved",
+                failure_class="provider_timeout",
+                outcome_code="PROVIDER_TIMEOUT",
+                evidence=[],
+                artifacts=[],
+            ),
+            "k1": terminal_lease(
+                assignment_id="k1",
+                provider="kimi-code",
+                model="kimi-k3",
+                auth_mode="api",
+                policy_class="frontend",
+                strategy="engine=kimi-code;model=kimi-k3;auth_mode=api;reasoning_effort=medium",
+            ),
+        }
+        temp, repo = self.make_repo(leases)
+        self.addCleanup(temp.cleanup)
+        report = build_report(repo, window_days=30, now=NOW)
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(report["summary"]["observed_model_configurations"], 2)
+        self.assertEqual(report["summary"]["terminal_samples"], 5)
+        self.assertEqual(report["summary"]["infrastructure_failures_excluded_from_model_score"], 1)
+        self.assertEqual({g["identity"]["model"] for g in report["model_groups"]}, {"grok-4.6", "kimi-k3"})
+        self.assertEqual(report["attribution_counts"]["infrastructure"], 1)
+        self.assertTrue(report["decisions"])
+
+    def test_cli_report_writes_deterministic_json_file(self):
+        temp, repo = self.make_repo({"g1": terminal_lease(assignment_id="g1")})
+        self.addCleanup(temp.cleanup)
+        output = Path(temp.name) / "report.json"
+        rc = project_model_score_main([
+            "report",
+            "--repo",
+            str(repo),
+            "--window-days",
+            "30",
+            "--json",
+            str(output),
+            "--now",
+            NOW.isoformat(),
+        ])
+        self.assertEqual(rc, 0)
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(payload["project"], "demo")
+        self.assertEqual(payload["summary"]["terminal_samples"], 1)
+
+
+class ProjectModelDashboardCliTests(unittest.TestCase):
+    def test_dashboard_cli_writes_self_contained_html_from_same_report_builder(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        repo = Path(temp.name) / "demo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        state_path = runtime_state_path(repo)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({"schema_version": 1, "leases": {"g1": terminal_lease(assignment_id="g1")}, "lineages": {}}), encoding="utf-8")
+        output = Path(temp.name) / "dashboard.html"
+        rc = project_model_score_main([
+            "dashboard",
+            "--repo",
+            str(repo),
+            "--window-days",
+            "30",
+            "--output",
+            str(output),
+            "--now",
+            NOW.isoformat(),
+        ])
+        self.assertEqual(rc, 0)
+        rendered = output.read_text(encoding="utf-8")
+        self.assertTrue(rendered.startswith("<!doctype html>"))
+        self.assertIn("grok-4.6", rendered)
+        self.assertIn('id="model-comparison"', rendered)
