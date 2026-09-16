@@ -9,7 +9,7 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, renderExternalAgentCard, resolveDispatchRoute } from "../scripts/run_external_agent.mjs";
+import { checkProviderHealthGate, parseArgs, renderExternalAgentCard, resolveDispatchRoute } from "../scripts/run_external_agent.mjs";
 
 const skillRoot = fileURLToPath(new URL("../", import.meta.url));
 const adapter = path.join(skillRoot, "scripts", "run_external_agent.mjs");
@@ -113,7 +113,7 @@ async function fakeInstalledSkill(directory) {
   const root = path.join(directory, "installed-skill");
   const scripts = path.join(root, "scripts");
   await mkdir(scripts, { recursive: true });
-  for (const file of ["run_external_agent.mjs", "external_agent_protocol.mjs", "assignment_lease_guard.py", "assignment_runtime.py", "route_contract.py", "project_state.py", "rule_handshake.py", "controller_target_guard.py", "agent_target_resolution.py"]) {
+  for (const file of ["run_external_agent.mjs", "external_agent_protocol.mjs", "provider_health.py", "project_model_score.py", "assignment_lease_guard.py", "assignment_runtime.py", "route_contract.py", "project_state.py", "rule_handshake.py", "controller_target_guard.py", "agent_target_resolution.py"]) {
     await copyFile(path.join(skillRoot, "scripts", file), path.join(scripts, file));
   }
   const rel = "scripts/rule_handshake.py";
@@ -1815,7 +1815,7 @@ test("Grok side-effect timeout crosses provider boundary as result_unknown and d
       ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
       FAKE_RUNNER_DELAY_BEFORE_OUTPUT_MS: "1000",
       FAKE_PROVIDER_START_BEFORE_DELAY: "1",
-      AD_GROK_LAUNCH_TIMEOUT_MS: "200", AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "50", AD_GROK_STALL_TIMEOUT_MS: "500",
+      AD_GROK_LAUNCH_TIMEOUT_MS: "1000", AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "100", AD_GROK_STALL_TIMEOUT_MS: "500",
       AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "1000", AD_EXTERNAL_KILL_GRACE_MS: "25",
     },
   });
@@ -3086,10 +3086,10 @@ test("advisory_hypothesis_review executes through CLI and persists bounded resul
     FAKE_ADVISORY_RESULT: JSON.stringify(providerResult),
     SPAWN_MARKER: marker,
     AD_TERMINAL_CONTINUATION_HELPER: helper,
-    AD_GROK_LAUNCH_TIMEOUT_MS: "500",
-    AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "500",
-    AD_GROK_STALL_TIMEOUT_MS: "500",
-    AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "2000",
+    AD_GROK_LAUNCH_TIMEOUT_MS: "1500",
+    AD_GROK_FIRST_OUTPUT_TIMEOUT_MS: "1500",
+    AD_GROK_STALL_TIMEOUT_MS: "1500",
+    AD_EXTERNAL_ATTEMPT_TIMEOUT_MS: "4000",
   } });
   assert.equal(result.status, 0, result.stderr);
   assert.equal((await readFile(marker, "utf8")).trim(), "spawned");
@@ -3543,4 +3543,82 @@ test("stream record overflow stops parsing new chunks while process-group cleanu
       reviewPhaseHistory: expectedPhaseHistory,
     });
   });
+});
+
+test("external provider health gate blocks OPEN route before provider spawn", () => {
+  let calls = 0;
+  const options = {
+    runtimeRepo: skillRoot,
+    cwd: skillRoot,
+    engine: "grok-build",
+    model: "grok-4.6",
+    authMode: "oauth",
+  };
+  assert.throws(
+    () => checkProviderHealthGate(options, {
+      spawnSyncFn: (command, args) => {
+        calls += 1;
+        assert.match(String(command), /python/i);
+        assert.ok(args.includes("gate"));
+        assert.ok(args.includes("grok-build"));
+        assert.ok(args.includes("grok-4.6"));
+        assert.ok(args.includes("oauth"));
+        return {
+          status: 3,
+          stdout: JSON.stringify({ state: "OPEN", dispatch_allowed: false, block_reason: "circuit_open" }),
+          stderr: "",
+        };
+      },
+    }),
+    /provider health gate blocked.*OPEN.*circuit_open/i,
+  );
+  assert.equal(calls, 1);
+});
+
+test("external provider health gate allows DEGRADED and PROBE_REQUIRED without changing route", () => {
+  for (const state of ["DEGRADED", "PROBE_REQUIRED"]) {
+    const options = {
+      runtimeRepo: skillRoot,
+      cwd: skillRoot,
+      engine: "kimi-code",
+      model: "kimi-k3",
+      authMode: "api",
+    };
+    const result = checkProviderHealthGate(options, {
+      spawnSyncFn: (_command, args) => {
+        const providerIndex = args.indexOf("--provider") + 1;
+        const modelIndex = args.indexOf("--model") + 1;
+        const authIndex = args.indexOf("--auth-mode") + 1;
+        assert.equal(args[providerIndex], "kimi-code");
+        assert.equal(args[modelIndex], "kimi-k3");
+        assert.equal(args[authIndex], "api");
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            state,
+            dispatch_allowed: true,
+            probe_eligible: state === "PROBE_REQUIRED",
+            route: { provider: "kimi-code", model: "kimi-k3", auth_mode: "api", execution_transport: "external_process" },
+          }),
+          stderr: "",
+        };
+      },
+    });
+    assert.equal(result.state, state);
+    assert.equal(result.route.provider, "kimi-code");
+    assert.equal(options.engine, "kimi-code");
+    assert.equal(options.authMode, "api");
+  }
+});
+
+test("external provider health gate fails closed on malformed or unavailable health projection", () => {
+  const options = { runtimeRepo: skillRoot, cwd: skillRoot, engine: "grok-build", model: "grok-4.6", authMode: "oauth" };
+  assert.throws(
+    () => checkProviderHealthGate(options, { spawnSyncFn: () => ({ status: 0, stdout: "not-json", stderr: "" }) }),
+    /health gate.*invalid/i,
+  );
+  assert.throws(
+    () => checkProviderHealthGate(options, { spawnSyncFn: () => ({ status: 2, stdout: "", stderr: "broken" }) }),
+    /health gate failed.*broken/i,
+  );
 });

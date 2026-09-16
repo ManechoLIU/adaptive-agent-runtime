@@ -725,6 +725,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "web_agent_events.py", "route_contract.py", "reviewer_supervisor.py",
             "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "agent_target_resolution.py", "assignment_lease_guard.py", "assignment_runtime.py",
             "controller_scoring_guard.py", "project_context_guard.py", "rule_handshake.py", "evaluation_transaction.py",
+            "provider_health.py", "project_model_score.py", "model_score_dashboard.py", "global_model_intelligence.py",
         ):
             script = source / "scripts" / name
             if name == "controller_target_guard.py":
@@ -1223,6 +1224,18 @@ class InstallMigrationContractTests(unittest.TestCase):
         self.assertIn("tests/test_assignment_runtime.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("scripts/agent_target_resolution.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("tests/test_agent_target_resolution.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("scripts/provider_health.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("scripts/project_model_score.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("scripts/model_score_dashboard.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("scripts/global_model_intelligence.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("tests/test_global_model_intelligence.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn(
+            "tests.test_global_model_intelligence.GlobalReportTests.test_global_report_contains_project_reports_and_global_groups",
+            RUNTIME_RELEASE_REGRESSION_TESTS,
+        )
+        self.assertIn("tests/test_provider_health.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("tests/test_project_model_score.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("tests/test_model_score_dashboard.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn(
             "tests.test_terminal_continuation.PendingTerminalReconcileTests.test_reconcile_pending_classifies_legacy_assignment_without_weakening_current_lease_checks",
             RUNTIME_RELEASE_REGRESSION_TESTS,
@@ -1252,9 +1265,35 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
             tests_dir = source / "tests"
             tests_dir.mkdir()
+            (tests_dir / "test_provider_health.py").write_text(
+                "import unittest\n"
+                "class ProviderHealthCliTests(unittest.TestCase):\n"
+                "    def test_gate_cli_blocks_open_route_before_provider_spawn(self): self.assertTrue(True)\n"
+                "class ProviderHealthProjectionTests(unittest.TestCase):\n"
+                "    def test_result_unknown_is_diagnostic_but_does_not_globally_block_unrelated_new_assignments(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_project_model_score.py").write_text(
+                "import unittest\n"
+                "class ModelDialNativeBenchmarkTests(unittest.TestCase):\n"
+                "    def test_loads_native_modeldial_radar_and_aligns_capability_axis(self): self.assertTrue(True)\n"
+                "class ProjectModelDashboardCliTests(unittest.TestCase):\n"
+                "    def test_dashboard_cli_writes_self_contained_html_from_same_report_builder(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_model_score_dashboard.py").write_text("import unittest\n", encoding="utf-8")
+            (tests_dir / "test_global_model_intelligence.py").write_text(
+                "import unittest\n"
+                "class GlobalReportTests(unittest.TestCase):\n"
+                "    def test_global_report_contains_project_reports_and_global_groups(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "external-agent-routing.test.mjs").write_text(
                 "import test from 'node:test';\n"
                 "import assert from 'node:assert/strict';\n"
+                "test('external provider health gate blocks OPEN route before provider spawn', () => { assert.equal(1, 1); });\n"
+                "test('external provider health gate allows DEGRADED and PROBE_REQUIRED without changing route', () => { assert.equal(1, 1); });\n"
+                "test('external provider health gate fails closed on malformed or unavailable health projection', () => { assert.equal(1, 1); });\n"
                 "test('heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors', () => { assert.equal(1, 1); });\n"
                 "test('assignment-bound execute rejects CLI route mismatch before provider spawn', () => { assert.equal(1, 1); });\n"
                 "test('assignment-bound safe fallback requires canonical prior terminal before provider spawn', () => { assert.equal(1, 1); });\n"
@@ -1857,9 +1896,35 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
             tests_dir = source / "tests"
             tests_dir.mkdir()
+            (tests_dir / "test_provider_health.py").write_text(
+                "import unittest\n"
+                "class ProviderHealthCliTests(unittest.TestCase):\n"
+                "    def test_gate_cli_blocks_open_route_before_provider_spawn(self): self.assertTrue(True)\n"
+                "class ProviderHealthProjectionTests(unittest.TestCase):\n"
+                "    def test_result_unknown_is_diagnostic_but_does_not_globally_block_unrelated_new_assignments(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_project_model_score.py").write_text(
+                "import unittest\n"
+                "class ModelDialNativeBenchmarkTests(unittest.TestCase):\n"
+                "    def test_loads_native_modeldial_radar_and_aligns_capability_axis(self): self.assertTrue(True)\n"
+                "class ProjectModelDashboardCliTests(unittest.TestCase):\n"
+                "    def test_dashboard_cli_writes_self_contained_html_from_same_report_builder(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "test_model_score_dashboard.py").write_text("import unittest\n", encoding="utf-8")
+            (tests_dir / "test_global_model_intelligence.py").write_text(
+                "import unittest\n"
+                "class GlobalReportTests(unittest.TestCase):\n"
+                "    def test_global_report_contains_project_reports_and_global_groups(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "external-agent-routing.test.mjs").write_text(
                 "import test from 'node:test';\n"
                 "import assert from 'node:assert/strict';\n"
+                "test('external provider health gate blocks OPEN route before provider spawn', () => { assert.equal(1, 1); });\n"
+                "test('external provider health gate allows DEGRADED and PROBE_REQUIRED without changing route', () => { assert.equal(1, 1); });\n"
+                "test('external provider health gate fails closed on malformed or unavailable health projection', () => { assert.equal(1, 1); });\n"
                 "test('heterogeneous frontend and backend tasks stay on Kimi and Grok canonical executors', () => { assert.equal(1, 1); });\n"
                 "test('assignment-bound execute rejects CLI route mismatch before provider spawn', () => { assert.equal(1, 1); });\n"
                 "test('assignment-bound safe fallback requires canonical prior terminal before provider spawn', () => { assert.equal(1, 1); });\n"

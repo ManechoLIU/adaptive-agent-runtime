@@ -1169,6 +1169,44 @@ export function readDeliveryReceipt(pathname, {
   };
 }
 
+export function checkProviderHealthGate(options, { spawnSyncFn = spawnSync } = {}) {
+  const helper = fileURLToPath(new URL("./provider_health.py", import.meta.url));
+  const python = process.env.AD_PYTHON || "python3";
+  const args = [
+    helper, "gate",
+    "--repo", runtimeRepository(options),
+    "--provider", options.engine,
+    "--model", options.model,
+    "--auth-mode", options.authMode,
+    "--execution-transport", "external_process",
+  ];
+  const result = spawnSyncFn(python, args, { encoding: "utf8" });
+  if (result?.error) {
+    throw new Error(`provider health gate failed: ${result.error.message}`);
+  }
+  let payload = null;
+  const stdout = String(result?.stdout || "").trim();
+  if (stdout) {
+    try {
+      payload = JSON.parse(stdout);
+    } catch {
+      throw new Error("provider health gate returned invalid JSON");
+    }
+  }
+  if (result?.status === 3) {
+    const state = String(payload?.state || "UNKNOWN");
+    const reason = String(payload?.block_reason || "blocked");
+    throw new Error(`provider health gate blocked route: state=${state}; reason=${reason}`);
+  }
+  if (result?.status !== 0) {
+    throw new Error(`provider health gate failed: ${stdout || String(result?.stderr || "").trim() || `exit ${result?.status}`}`);
+  }
+  if (!payload || payload.dispatch_allowed !== true) {
+    throw new Error("provider health gate returned invalid allow decision");
+  }
+  return payload;
+}
+
 function validateRuleHandshake(options) {
   if (!options.assignmentId) return;
   const guard = fileURLToPath(new URL("./rule_handshake.py", import.meta.url));
@@ -2696,6 +2734,7 @@ async function main() {
     }
     validateGrokAssignmentExecutionContract(options);
     validateRuleHandshake(options);
+    checkProviderHealthGate(options);
     let eventSeq = 1;
     let previousSnapshot = runtimeGitSnapshot(options.cwd);
     recordRuntimeReceipt(options, "assignment_started", eventSeq, {
