@@ -224,3 +224,62 @@ class GlobalReportTests(unittest.TestCase):
         self.assertEqual(len(report["configuration_groups"]), 2)
         self.assertEqual(len(report["route_groups"]), 2)
         self.assertEqual(set(report["project_reports"]), {"Alpha", "Beta"})
+
+class GlobalDecisionTests(unittest.TestCase):
+    def _report(self, samples, now=NOW, benchmarks=None):
+        from scripts.global_model_intelligence import build_global_report_from_samples
+        projects = sorted({
+            (sample["project_id"], sample["identity"]["project"])
+            for sample in samples
+        })
+        repositories = [
+            {"project_id": pid, "project_name": name, "project_root": f"/tmp/{name}", "project_common_dir": f"/tmp/{name}/.git", "source": "explicit"}
+            for pid, name in projects
+        ]
+        return build_global_report_from_samples(
+            repositories, samples, window_days=30, benchmarks=benchmarks or [], diagnostics=[], now=now
+        )
+
+    def test_insufficient_global_quality_stays_insufficient_even_with_public_benchmark(self):
+        samples = [normalized_global_sample(
+            "Alpha", "a", "timeout", terminal_state="failed", transport_outcome="failed",
+            delivery_outcome="unresolved", failure_class="provider_timeout", evidence=[], artifacts=[]
+        )]
+        report = self._report(samples, benchmarks=[{"model": "grok-4.6", "effort": "high", "route": "grok-build", "backend_score": 99}])
+        summary = report["model_summaries"][0]
+        self.assertEqual(summary["recommended_action"], "INSUFFICIENT_EVIDENCE")
+
+    def test_strong_quality_with_degraded_route_recommends_route_fix(self):
+        samples = [normalized_global_sample("Alpha", "a", f"good-{idx}") for idx in range(3)]
+        samples.extend([
+            normalized_global_sample("Alpha", "a", "timeout-1", terminal_at="2026-09-16T10:10:00+00:00", terminal_state="failed", transport_outcome="failed", delivery_outcome="unresolved", failure_class="provider_timeout", evidence=[], artifacts=[]),
+            normalized_global_sample("Alpha", "a", "timeout-2", terminal_at="2026-09-16T10:20:00+00:00", terminal_state="failed", transport_outcome="failed", delivery_outcome="unresolved", failure_class="provider_timeout", evidence=[], artifacts=[]),
+        ])
+        report = self._report(samples)
+        summary = report["model_summaries"][0]
+        self.assertEqual(summary["recommended_action"], "CHANGE_ROUTE")
+        self.assertEqual(summary["route_status"], "修复后待复测")
+        self.assertEqual(report["route_health"][0]["state"], "PROBE_REQUIRED")
+
+    def test_same_model_strong_reviewer_and_weak_writer_recommends_role_change(self):
+        samples = []
+        for idx in range(3):
+            samples.append(normalized_global_sample("Alpha", "a", f"writer-{idx}", delivery_outcome="fail", evidence=["test-log:red"], artifacts=[]))
+            samples.append(normalized_global_sample("Alpha", "a", f"review-{idx}", execution_role="reviewer"))
+        report = self._report(samples)
+        summary = report["model_summaries"][0]
+        self.assertEqual(summary["recommended_action"], "CHANGE_ROLE")
+        self.assertIn("reviewer", summary["preferred_roles"])
+
+    def test_healthy_weak_model_can_switch_to_stronger_observed_alternative(self):
+        samples = []
+        for idx in range(5):
+            samples.append(normalized_global_sample("Alpha", "a", f"grok-{idx}", delivery_outcome="fail", evidence=["test-log:red"], artifacts=[]))
+            samples.append(normalized_global_sample(
+                "Alpha", "a", f"sol-{idx}", model="gpt-5.6-sol", provider="codex-native",
+                strategy="provider=codex-native;model=gpt-5.6-sol;auth_mode=host;reasoning_effort=high"
+            ))
+        report = self._report(samples)
+        grok = next(item for item in report["model_summaries"] if item["identity"]["model"] == "grok-4.6")
+        self.assertEqual(grok["recommended_action"], "SWITCH_MODEL")
+        self.assertEqual(grok["suggested_target"]["model"], "gpt-5.6-sol")

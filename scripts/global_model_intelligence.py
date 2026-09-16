@@ -13,14 +13,19 @@ from typing import Any, Sequence
 
 try:
     from scripts.project_model_score import (
-        attach_benchmarks, classify_attribution, load_project_samples, score_model_groups, score_route_groups,
+        attach_benchmarks, build_decisions, classify_attribution, load_project_samples, score_model_groups, score_route_groups,
     )
     from scripts.project_state import git_common_dir, repository_root
 except ModuleNotFoundError:  # direct script execution from scripts/
     from project_model_score import (
-        attach_benchmarks, classify_attribution, load_project_samples, score_model_groups, score_route_groups,
+        attach_benchmarks, build_decisions, classify_attribution, load_project_samples, score_model_groups, score_route_groups,
     )
     from project_state import git_common_dir, repository_root
+
+try:
+    from scripts.provider_health import derive_route_health
+except ModuleNotFoundError:  # direct script execution from scripts/
+    from provider_health import derive_route_health
 
 
 def _project_id(common_dir: Path) -> str:
@@ -310,6 +315,7 @@ def build_global_report_from_samples(
     window_days: int | None,
     benchmarks: list[dict[str, Any]],
     diagnostics: list[dict[str, Any]],
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     model_summaries = score_global_model_summaries(samples)
     configuration_groups = score_global_configuration_groups(samples, benchmarks=benchmarks)
@@ -323,7 +329,7 @@ def build_global_report_from_samples(
         attribution_counts[classify_attribution(sample)[0]] += 1
     for project, project_samples in sorted(by_project.items()):
         project_reports[project] = _project_report_from_samples(project, project_samples, benchmarks)
-    return {
+    report = {
         "schema_version": 1,
         "scope": "global",
         "window_days": window_days,
@@ -343,6 +349,7 @@ def build_global_report_from_samples(
         "project_reports": project_reports,
         "diagnostics": diagnostics,
     }
+    return apply_global_recommendations(report, samples, benchmarks=benchmarks, now=now)
 
 
 def build_global_report(
@@ -360,4 +367,112 @@ def build_global_report(
         window_days=window_days,
         benchmarks=benchmarks,
         diagnostics=[*(diagnostics or []), *sample_diagnostics],
+        now=now,
     )
+
+_ROUTE_STATE_LABELS = {
+    "HEALTHY": "稳定",
+    "DEGRADED": "执行链需优化",
+    "OPEN": "执行链已熔断",
+    "PROBE_REQUIRED": "修复后待复测",
+}
+_ROUTE_STATE_PRIORITY = {"HEALTHY": 0, "DEGRADED": 1, "PROBE_REQUIRED": 2, "OPEN": 3}
+_ACTION_PRIORITY = {
+    "KEEP": 0,
+    "INSUFFICIENT_EVIDENCE": 1,
+    "TUNE_EFFORT": 2,
+    "CHANGE_ROLE": 3,
+    "SWITCH_MODEL": 4,
+    "CHANGE_ROUTE": 5,
+}
+
+
+def _route_tuple(mapping: dict[str, Any]) -> tuple[str, str, str, str]:
+    return tuple(str(mapping.get(field) or "unknown") for field in ("provider", "model", "auth_mode", "execution_transport"))
+
+
+def _preferred_roles(configuration_groups: list[dict[str, Any]], model: str) -> list[str]:
+    role_scores: dict[str, tuple[float, int]] = {}
+    for group in configuration_groups:
+        identity = group.get("identity") if isinstance(group.get("identity"), dict) else {}
+        if str(identity.get("model") or "") != model:
+            continue
+        score = group.get("project_model_score")
+        count = int(group.get("quality_sample_count") or 0)
+        role = str(identity.get("execution_role") or "unknown")
+        if score is None or count < 3 or role == "unknown":
+            continue
+        current = role_scores.get(role)
+        candidate = (float(score), count)
+        if current is None or candidate > current:
+            role_scores[role] = candidate
+    if not role_scores:
+        return []
+    best = max(score for score, _ in role_scores.values())
+    return [
+        role for role, (score, _) in sorted(role_scores.items(), key=lambda item: (-item[1][0], -item[1][1], item[0]))
+        if score >= best - 5
+    ][:2]
+
+
+def apply_global_recommendations(
+    report: dict[str, Any],
+    samples: list[dict[str, Any]],
+    *,
+    benchmarks: list[dict[str, Any]],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    configuration_groups = report.get("configuration_groups", [])
+    route_groups = report.get("route_groups", [])
+    decisions = build_decisions(configuration_groups, route_groups, benchmarks or [])
+    route_health = derive_route_health([copy.deepcopy(sample) for sample in samples], now=now)
+    health_by_route = {_route_tuple(row.get("route") or {}): row for row in route_health}
+
+    for decision in decisions:
+        identity = decision.get("identity") if isinstance(decision.get("identity"), dict) else {}
+        health = health_by_route.get(_route_tuple(identity))
+        if health:
+            decision["route_health_state"] = health.get("state")
+            decision["route_status"] = _ROUTE_STATE_LABELS.get(str(health.get("state")), "待确认")
+
+    for summary in report.get("model_summaries", []):
+        model = str((summary.get("identity") or {}).get("model") or "")
+        model_decisions = [decision for decision in decisions if str((decision.get("identity") or {}).get("model") or "") == model]
+        model_health = [row for row in route_health if str((row.get("route") or {}).get("model") or "") == model]
+        worst_health = max(model_health, key=lambda row: _ROUTE_STATE_PRIORITY.get(str(row.get("state")), -1), default=None)
+        state = str(worst_health.get("state")) if worst_health else "HEALTHY"
+        summary["route_health_state"] = state
+        summary["route_status"] = _ROUTE_STATE_LABELS.get(state, "待确认")
+        summary["preferred_roles"] = _preferred_roles(configuration_groups, model)
+
+        quality_count = int(summary.get("quality_sample_count") or 0)
+        score = summary.get("project_model_score")
+        suggested_target = None
+        if quality_count < 3 or score is None:
+            action = "INSUFFICIENT_EVIDENCE"
+            reason = "跨项目有效质量样本不足，继续积累后再判断是否换模。"
+        else:
+            actionable = [decision for decision in model_decisions if decision.get("action") != "INSUFFICIENT_EVIDENCE"]
+            if actionable:
+                selected = max(actionable, key=lambda item: _ACTION_PRIORITY.get(str(item.get("action")), -1))
+                action = str(selected.get("action") or "KEEP")
+                suggested_target = selected.get("suggested_target")
+            else:
+                action = "KEEP"
+            if action == "CHANGE_ROUTE":
+                reason = "模型质量有可用证据，但执行链可靠性拖后腿，优先修复或复测 route。"
+            elif action == "CHANGE_ROLE":
+                reason = "同一模型在其他角色的真实项目表现明显更强，建议调整岗位而不是直接换模。"
+            elif action == "TUNE_EFFORT":
+                reason = "较低 effort 在相近质量下更高效，建议调整推理档位。"
+            elif action == "SWITCH_MODEL":
+                reason = "当前 route 健康且同类任务中存在稳定更强的实战替代模型，可考虑换模。"
+            else:
+                reason = "跨项目实战证据支持继续使用当前模型。"
+        summary["recommended_action"] = action
+        summary["recommended_reason"] = reason
+        summary["suggested_target"] = suggested_target
+
+    report["decisions"] = decisions
+    report["route_health"] = route_health
+    return report
