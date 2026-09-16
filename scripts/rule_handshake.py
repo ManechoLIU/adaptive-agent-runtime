@@ -33,6 +33,8 @@ CRITICAL_WAKE_FILES = {
     "scripts/lifecycle_hook.py",
     "scripts/rule_handshake.py",
     "scripts/run_external_agent.mjs",
+    "scripts/provider_health.py",
+    "scripts/project_model_score.py",
     "scripts/web_lifecycle_bridge.py",
     "references/agent-delivery-contract.md",
     "references/agent-model-routing.md",

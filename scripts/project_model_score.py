@@ -17,7 +17,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from scripts.assignment_runtime import load_runtime_state
+try:
+    from scripts.assignment_runtime import load_runtime_state
+except ModuleNotFoundError:  # direct script execution from scripts/
+    from assignment_runtime import load_runtime_state
 
 UTC = timezone.utc
 _REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
@@ -84,6 +87,14 @@ def normalize_lease_sample(project: str, assignment_id: str, lease: dict[str, An
         "execution_transport": str(lease.get("execution_transport") or "unknown").strip() or "unknown",
     }
 
+    failure_details = lease.get("failure_details") if isinstance(lease.get("failure_details"), dict) else {}
+    provider_started = lease.get("provider_started")
+    if not isinstance(provider_started, bool):
+        provider_started = failure_details.get("provider_started") if isinstance(failure_details.get("provider_started"), bool) else None
+    cleanup_confirmed = lease.get("cleanup_confirmed")
+    if not isinstance(cleanup_confirmed, bool):
+        cleanup_confirmed = failure_details.get("cleanup_confirmed") if isinstance(failure_details.get("cleanup_confirmed"), bool) else None
+
     return {
         "assignment_id": str(lease.get("assignment_id") or assignment_id),
         "task_id": str(lease.get("task_id") or ""),
@@ -99,6 +110,9 @@ def normalize_lease_sample(project: str, assignment_id: str, lease: dict[str, An
         "retry_class": str(lease.get("retry_class") or "").strip().lower() or None,
         "retry_safe": lease.get("retry_safe") if isinstance(lease.get("retry_safe"), bool) else None,
         "result_unknown": bool(lease.get("result_unknown")),
+        "provider_started": provider_started,
+        "cleanup_confirmed": cleanup_confirmed,
+        "failure_details": dict(failure_details),
         "recovery_count": int(lease.get("recovery_count") or 0),
         "candidate_revision": lease.get("candidate_revision"),
         "review_verdict": lease.get("review_verdict") if isinstance(lease.get("review_verdict"), dict) else None,
@@ -163,6 +177,9 @@ _EXTERNAL_FAILURE_MARKERS = (
     "credential_revoked",
     "auth_invalid",
     "authentication_failed",
+    "insufficient_balance",
+    "provider_insufficient_balance",
+    "insufficient_credit",
 )
 
 _INFRA_FAILURE_MARKERS = (
@@ -220,6 +237,18 @@ def classify_attribution(sample: dict[str, Any]) -> tuple[str, list[str]]:
     external_reasons = [marker for marker in _EXTERNAL_FAILURE_MARKERS if marker in combined]
     infra_reasons = [marker for marker in _INFRA_FAILURE_MARKERS if marker in combined]
     model_reasons = [marker for marker in _MODEL_FAILURE_MARKERS if marker in combined]
+
+    identity = sample.get("identity") if isinstance(sample.get("identity"), dict) else {}
+    role = str(identity.get("execution_role") or "").strip().lower()
+    review = sample.get("review_verdict") if isinstance(sample.get("review_verdict"), dict) else None
+    review_verdict = str(review.get("verdict") or "").strip().upper() if review else ""
+    if role == "reviewer" and transport == "completed":
+        if review_verdict in {"PASS", "FINDINGS"}:
+            return "model", ["validated_review_verdict"]
+        if failure == "review_findings" or retry == "review_findings":
+            return "model", ["review_findings_terminal"]
+        if delivery in {"pass", "fail"}:
+            return "model", ["legacy_reviewer_terminal"]
 
     semantic_fail = delivery == "fail" or bool(model_reasons)
     if semantic_fail and (external_reasons or infra_reasons):
@@ -292,7 +321,17 @@ def _sample_dimensions(sample: dict[str, Any], attribution: str) -> dict[str, fl
         return {key: None for key in _MODEL_DIMENSION_WEIGHTS}
 
     delivery = str(sample.get("delivery_outcome") or "").lower()
-    delivery_score = {"pass": 100.0, "fail": 0.0, "blocked": 25.0, "unresolved": 0.0}.get(delivery)
+    identity = sample.get("identity") if isinstance(sample.get("identity"), dict) else {}
+    role = str(identity.get("execution_role") or "").strip().lower()
+    review = sample.get("review_verdict") if isinstance(sample.get("review_verdict"), dict) else None
+    review_verdict = str(review.get("verdict") or "").strip().upper() if review else ""
+    reviewer_success = role == "reviewer" and (
+        review_verdict in {"PASS", "FINDINGS"}
+        or str(sample.get("failure_class") or "").lower() == "review_findings"
+        or str(sample.get("retry_class") or "").lower() == "review_findings"
+        or delivery in {"pass", "fail"}
+    )
+    delivery_score = 100.0 if reviewer_success else {"pass": 100.0, "fail": 0.0, "blocked": 25.0, "unresolved": 0.0}.get(delivery)
     recovery_score = None
     failure = str(sample.get("failure_class") or "").lower()
     if any(marker in failure for marker in _MODEL_FAILURE_MARKERS):
@@ -637,6 +676,74 @@ def build_decisions(
     return decisions
 
 
+def _canonical_benchmark_model(model: Any) -> str:
+    value = str(model or "").strip().lower()
+    aliases = {
+        "k3": "kimi-k3",
+        "kimi-k3": "kimi-k3",
+    }
+    return aliases.get(value, value)
+
+
+def load_benchmarks(path: Path | str) -> list[dict[str, Any]]:
+    """Load ModelDial native Radar JSON or the legacy normalized benchmark list.
+
+    Native Radar rows retain every public capability axis so the project cohort
+    can select the matching backend/frontend/overall baseline at render time.
+    """
+    source_path = Path(path)
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        rows = payload
+        generated_at = None
+    elif isinstance(payload, dict) and isinstance(payload.get("overallRankings"), list):
+        rows = payload["overallRankings"]
+        generated_at = payload.get("generatedAt")
+    elif isinstance(payload, dict) and isinstance(payload.get("benchmarks"), list):
+        rows = payload["benchmarks"]
+        generated_at = payload.get("generatedAt")
+    else:
+        raise ValueError("benchmark JSON must be ModelDial Radar JSON, a list, or contain benchmarks[]")
+
+    normalized: list[dict[str, Any]] = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        model = _canonical_benchmark_model(raw.get("model"))
+        if not model:
+            continue
+        effort = str(raw.get("reasoningEffort") or raw.get("effort") or "unknown").strip().lower()
+        route = str(raw.get("route") or "unknown").strip()
+        item = {
+            "source": str(raw.get("source") or "modeldial"),
+            "provider": str(raw.get("provider") or "unknown"),
+            "model": model,
+            "effort": effort,
+            "route": route,
+            "overall_score": raw.get("overallScore", raw.get("score")),
+            "backend_score": raw.get("backendScore"),
+            "frontend_score": raw.get("frontendScore"),
+            "knowledge_score": raw.get("knowledgeScore"),
+            "rank": raw.get("rank"),
+            "elapsed_ms": raw.get("elapsedMs"),
+            "observed_at": raw.get("observed_at") or generated_at,
+        }
+        # Preserve legacy callers that supply one generic score.
+        if raw.get("score") is not None:
+            item["score"] = raw.get("score")
+        normalized.append(item)
+    return normalized
+
+
+def _benchmark_axis(policy_class: Any) -> tuple[str, str]:
+    policy = str(policy_class or "").strip().lower()
+    if policy == "backend":
+        return "backend", "backend_score"
+    if policy == "frontend":
+        return "frontend", "frontend_score"
+    return "overall", "overall_score"
+
+
 def attach_benchmarks(model_groups: list[dict[str, Any]], benchmarks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Attach external benchmark context without changing project scores."""
 
@@ -644,13 +751,14 @@ def attach_benchmarks(model_groups: list[dict[str, Any]], benchmarks: list[dict[
     for group in model_groups:
         item = dict(group)
         identity = item["identity"]
-        model = str(identity.get("model") or "")
+        model = _canonical_benchmark_model(identity.get("model"))
         effort = str(identity.get("reasoning_effort") or "unknown")
         provider = str(identity.get("provider") or "unknown")
-        candidates = [b for b in benchmarks if str(b.get("model") or "") == model]
+        capability, score_key = _benchmark_axis(identity.get("policy_class"))
+        candidates = [b for b in benchmarks if _canonical_benchmark_model(b.get("model")) == model]
         benchmark = None
         match = "none"
-        if candidates:
+        if candidates and effort != "unknown":
             exact = [
                 b
                 for b in candidates
@@ -671,7 +779,14 @@ def attach_benchmarks(model_groups: list[dict[str, Any]], benchmarks: list[dict[
                 "model": str(benchmark.get("model") or model),
                 "effort": str(benchmark.get("effort") or "unknown"),
                 "route": str(benchmark.get("route") or "unknown"),
-                "score": benchmark.get("score"),
+                "score": benchmark.get(score_key) if benchmark.get(score_key) is not None else benchmark.get("score"),
+                "capability": capability,
+                "overall_score": benchmark.get("overall_score"),
+                "backend_score": benchmark.get("backend_score"),
+                "frontend_score": benchmark.get("frontend_score"),
+                "knowledge_score": benchmark.get("knowledge_score"),
+                "rank": benchmark.get("rank"),
+                "elapsed_ms": benchmark.get("elapsed_ms"),
                 "observed_at": benchmark.get("observed_at"),
                 "match": match,
             }
@@ -695,16 +810,7 @@ def attach_benchmarks(model_groups: list[dict[str, Any]], benchmarks: list[dict[
 
 
 def _load_benchmark_file(path: Path | None) -> list[dict[str, Any]]:
-    if path is None:
-        return []
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(payload, list):
-        rows = payload
-    elif isinstance(payload, dict) and isinstance(payload.get("benchmarks"), list):
-        rows = payload["benchmarks"]
-    else:
-        raise ValueError("benchmark JSON must be a list or contain benchmarks[]")
-    return [row for row in rows if isinstance(row, dict)]
+    return load_benchmarks(path) if path is not None else []
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -836,7 +942,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(rendered, end="")
             return 0
 
-        from scripts.model_score_dashboard import render_dashboard
+        try:
+            from scripts.model_score_dashboard import render_dashboard
+        except ModuleNotFoundError:  # direct script execution from scripts/
+            from model_score_dashboard import render_dashboard
 
         _atomic_write_text(Path(args.output), render_dashboard(report))
         return 0

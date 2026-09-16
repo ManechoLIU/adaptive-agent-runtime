@@ -245,7 +245,7 @@ a{{color:inherit;text-decoration:none}}
 .energy-core:before{{content:"";position:absolute;inset:-27px;border:1px solid rgba(39,65,214,.24);border-radius:50%;transform:scaleY(.62) rotate(-17deg)}}
 .energy-core:after{{content:"";position:absolute;width:46px;height:46px;border-radius:50%;background:radial-gradient(circle at 30% 25%,#e9ecff,#5861ee 55%,#282359);top:-8px;right:-42px;box-shadow:0 10px 30px rgba(57,56,148,.24)}}
 .energy-grid{{position:absolute;inset:0;background:repeating-radial-gradient(ellipse at 73% 94%,transparent 0 17px,rgba(31,42,110,.09) 18px 19px);opacity:.8}}
-.hero-stats{{position:absolute;left:0;bottom:26px;display:flex;gap:38px;font-size:11px;letter-spacing:.12em;text-transform:uppercase}}.hero-stats b{{display:block;font-family:Georgia,serif;font-size:28px;letter-spacing:-.02em;text-transform:none;margin-bottom:2px}}
+.hero-stats{{margin-top:34px;display:flex;gap:38px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;position:relative;z-index:2}}.hero-stats b{{display:block;font-family:Georgia,serif;font-size:28px;letter-spacing:-.02em;text-transform:none;margin-bottom:2px}}
 .section{{padding:92px 0;border-top:1px solid var(--line)}}
 .section-head{{display:grid;grid-template-columns:180px minmax(0,1fr);gap:34px;margin-bottom:48px}}.section-index{{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}}.section-head h2{{font-family:Georgia,serif;font-size:clamp(40px,5vw,72px);font-weight:500;letter-spacing:-.045em;line-height:.95;margin:0;max-width:920px}}
 .overview-grid{{display:grid;grid-template-columns:1.2fr .8fr;gap:54px;align-items:center}}
@@ -267,10 +267,9 @@ a{{color:inherit;text-decoration:none}}
   <header class="topbar"><a class="brand" href="#overview">MODEL ORBIT</a><nav class="nav"><a href="#model-comparison">Scores</a><a href="#decisions">Decisions</a><a href="#route-health">Routes</a><a href="#evidence">Evidence</a></nav><span>{_e(report.get('window_days',30))}D WINDOW</span></header>
   <main>
     <section class="hero">
-      <div><span class="eyebrow">Project intelligence / {project}</span><h1>SEE WHICH MODELS<br>ACTUALLY WORK<br>IN YOUR WORLD.</h1></div>
+      <div><span class="eyebrow">Project intelligence / {project}</span><h1>SEE WHICH MODELS<br>ACTUALLY WORK<br>IN YOUR WORLD.</h1><div class="hero-stats"><span><b>{_e(summary.get('observed_model_configurations',0))}</b>configs</span><span><b>{_e(summary.get('terminal_samples',0))}</b>terminal samples</span><span><b>{_e(summary.get('quality_scored_samples',0))}</b>quality samples</span></div></div>
       <div class="hero-copy"><span class="stamp">Generated {generated}</span><p>Project evidence is separated from execution-chain reliability, then compared with external baselines before any routing recommendation is made.</p><span class="eyebrow">Project truth first. Benchmark context second.</span></div>
       <div class="energy-wrap"><div class="energy-grid"></div><div class="energy-core"></div></div>
-      <div class="hero-stats"><span><b>{_e(summary.get('observed_model_configurations',0))}</b>configs</span><span><b>{_e(summary.get('terminal_samples',0))}</b>terminal samples</span><span><b>{_e(summary.get('quality_scored_samples',0))}</b>quality samples</span></div>
     </section>
 
     <section id="overview" class="section">

@@ -452,3 +452,153 @@ class ProjectModelDashboardCliTests(unittest.TestCase):
         self.assertTrue(rendered.startswith("<!doctype html>"))
         self.assertIn("grok-4.6", rendered)
         self.assertIn('id="model-comparison"', rendered)
+
+class ReviewerScoringSemanticsTests(unittest.TestCase):
+    def test_structured_reviewer_findings_are_successful_review_work_not_model_failure(self):
+        lease = terminal_lease(
+            assignment_id="review-findings",
+            execution_role="reviewer",
+            terminal_state="completed",
+            transport_outcome="completed",
+            delivery_outcome="fail",
+            review_verdict={
+                "verdict": "FINDINGS",
+                "critical": [],
+                "important": ["real defect"],
+                "minor": [],
+                "reviewed_head": "abc123",
+            },
+            evidence=["git:abc123", "test-log:review"],
+            artifacts=["git:abc123"],
+        )
+        sample = normalize_lease_sample("P", "review-findings", lease)
+        self.assertIsNotNone(sample)
+        attribution, reasons = classify_attribution(sample)
+        self.assertEqual(attribution, "model")
+        self.assertIn("validated_review_verdict", reasons)
+        group = score_model_groups([sample])[0]
+        self.assertEqual(group["project_model_score"], 100.0)
+
+    def test_legacy_reviewer_findings_terminal_is_not_penalized_when_transport_completed(self):
+        lease = terminal_lease(
+            assignment_id="legacy-review-findings",
+            execution_role="reviewer",
+            terminal_state="completed",
+            transport_outcome="completed",
+            delivery_outcome="fail",
+            failure_class="review_findings",
+            retry_class="review_findings",
+            review_verdict=None,
+            evidence=["git:abc123"],
+            artifacts=["git:abc123"],
+        )
+        sample = normalize_lease_sample("P", "legacy-review-findings", lease)
+        self.assertIsNotNone(sample)
+        self.assertEqual(classify_attribution(sample)[0], "model")
+        group = score_model_groups([sample])[0]
+        self.assertGreaterEqual(group["project_model_score"], 90.0)
+
+    def test_provider_insufficient_balance_is_external_not_infrastructure(self):
+        sample = normalize_lease_sample(
+            "P",
+            "balance",
+            terminal_lease(
+                assignment_id="balance",
+                terminal_state="failed",
+                transport_outcome="failed",
+                delivery_outcome="unresolved",
+                failure_class="provider_insufficient_balance",
+                evidence=[], artifacts=[],
+            ),
+        )
+        self.assertIsNotNone(sample)
+        self.assertEqual(classify_attribution(sample)[0], "external")
+
+class LegacyReviewerCompatibilityTests(unittest.TestCase):
+    def test_completed_legacy_reviewer_delivery_fail_means_findings_not_reviewer_failure(self):
+        sample = normalize_lease_sample(
+            "P",
+            "legacy-review",
+            terminal_lease(
+                assignment_id="legacy-review",
+                execution_role="reviewer",
+                transport_outcome="completed",
+                terminal_state="completed",
+                delivery_outcome="fail",
+                review_verdict=None,
+                failure_class=None,
+                retry_class="none",
+                evidence=["git:abc123"],
+                artifacts=["git:abc123"],
+            ),
+        )
+        self.assertIsNotNone(sample)
+        attribution, reasons = classify_attribution(sample)
+        self.assertEqual(attribution, "model")
+        self.assertIn("legacy_reviewer_terminal", reasons)
+        self.assertGreaterEqual(score_model_groups([sample])[0]["project_model_score"], 90.0)
+
+from scripts.project_model_score import load_benchmarks
+
+
+class ModelDialNativeBenchmarkTests(unittest.TestCase):
+    def test_loads_native_modeldial_radar_and_aligns_capability_axis(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "latest.json"
+            path.write_text(json.dumps({
+                "schemaVersion": "1.1",
+                "generatedAt": "2026-09-16T06:28:03.946Z",
+                "overallRankings": [
+                    {
+                        "provider": "cloudflare-reference", "model": "gpt-5.6-sol", "reasoningEffort": "high",
+                        "route": "custom_endpoint", "overallScore": 75.7, "backendScore": 73, "frontendScore": 90,
+                        "knowledgeScore": 65, "rank": 15, "elapsedMs": 816286,
+                    },
+                    {
+                        "provider": "kimi", "model": "k3", "reasoningEffort": "high",
+                        "route": "custom_endpoint", "overallScore": 72.5, "backendScore": 65, "frontendScore": 85,
+                        "knowledgeScore": 70, "rank": 18, "elapsedMs": 2276292,
+                    },
+                    {
+                        "provider": "grok-api", "model": "grok-4.6", "reasoningEffort": "high",
+                        "route": "custom_endpoint", "overallScore": 73.6, "backendScore": 67, "frontendScore": 76,
+                        "knowledgeScore": 80, "rank": 17, "elapsedMs": 1291162,
+                    },
+                ],
+            }), encoding="utf-8")
+            benchmarks = load_benchmarks(path)
+
+        backend = attach_benchmarks([decision_group(model="gpt-5.6-sol", provider="codex-native", auth="host", transport="codex_native_subagent", effort="high", policy="backend")], benchmarks)[0]
+        self.assertEqual(backend["benchmark"]["score"], 73)
+        self.assertEqual(backend["benchmark"]["capability"], "backend")
+        self.assertEqual(backend["benchmark"]["match"], "partial")
+
+        frontend = attach_benchmarks([decision_group(model="kimi-k3", provider="kimi-code", auth="api", effort="high", policy="frontend")], benchmarks)[0]
+        self.assertEqual(frontend["benchmark"]["model"], "kimi-k3")
+        self.assertEqual(frontend["benchmark"]["score"], 85)
+        self.assertEqual(frontend["benchmark"]["capability"], "frontend")
+
+        general = attach_benchmarks([decision_group(model="grok-4.6", provider="grok-build", auth="oauth", effort="high", policy="general")], benchmarks)[0]
+        self.assertEqual(general["benchmark"]["score"], 73.6)
+        self.assertEqual(general["benchmark"]["capability"], "overall")
+
+        unknown_effort = attach_benchmarks([decision_group(model="gpt-5.6-sol", provider="codex-native", auth="host", effort="unknown", policy="backend")], benchmarks)[0]
+        self.assertEqual(unknown_effort["benchmark"]["match"], "none")
+        self.assertIsNone(unknown_effort["benchmark"].get("score"))
+
+
+class ProjectModelDirectCliTests(unittest.TestCase):
+    def test_dashboard_subcommand_runs_when_script_is_invoked_directly(self):
+        import subprocess, sys
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init", "-b", "main"], check=True, capture_output=True)
+            output = Path(td) / "dashboard.html"
+            result = subprocess.run([
+                sys.executable, str(Path(__file__).resolve().parents[1] / "scripts" / "project_model_score.py"),
+                "dashboard", "--repo", str(repo), "--output", str(output),
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(output.exists())
+            self.assertIn("<!doctype html>", output.read_text(encoding="utf-8").lower())
