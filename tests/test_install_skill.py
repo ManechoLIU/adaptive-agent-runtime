@@ -1007,7 +1007,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_web_verifier_submit_adapter_keeps_other_retryable_failures_bounded",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_detached_supervisor_defers_while_web_response_is_active_and_retries_without_counting_progress",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_registered_v2_identity_evidence_consumes_signed_current_entry_without_reattest",
-            "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_ensure_supervisor_uses_new_receipt_for_new_rule_live_e2e_after_old_result_unknown",
+            "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_ensure_supervisor_blocks_new_rule_live_e2e_until_old_result_unknown_is_reconciled",
         }
         self.assertTrue(required.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))
 
@@ -1674,7 +1674,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_retry_exhausted_rearms_after_host_delivery_fingerprint_change(self): self.assertTrue(True)\n"
                 "    def test_retry_exhausted_rearms_after_controller_fence_change_same_host_fingerprint(self): self.assertTrue(True)\n"
                 "    def test_ensure_supervisor_uses_new_receipt_after_controller_fence_change(self): self.assertTrue(True)\n"
-                "    def test_ensure_supervisor_uses_new_receipt_for_new_rule_live_e2e_after_old_result_unknown(self): self.assertTrue(True)\n"
+                "    def test_ensure_supervisor_blocks_new_rule_live_e2e_until_old_result_unknown_is_reconciled(self): self.assertTrue(True)\n"
                 "    def test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change(self): self.assertTrue(True)\n"
                 "    def test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes(self): self.assertTrue(True)\n"
                 "    def test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot(self): self.assertTrue(True)\n"

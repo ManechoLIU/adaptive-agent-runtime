@@ -253,7 +253,7 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_ensure_supervisor_uses_new_receipt_after_controller_fence_change",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
-    "test_ensure_supervisor_uses_new_receipt_for_new_rule_live_e2e_after_old_result_unknown",
+    "test_ensure_supervisor_blocks_new_rule_live_e2e_until_old_result_unknown_is_reconciled",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_retry_exhausted_persists_host_delivery_fingerprint",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
