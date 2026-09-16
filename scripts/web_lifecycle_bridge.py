@@ -5760,35 +5760,42 @@ def _persist_host_reentry_reconciliation(
     successor_receipt_id: str | None = None,
     error: str | None = None,
 ) -> None:
-    state = load_json(state_path)
-    existing_original = state.get("original_reentry_receipt")
-    if not _is_durable_result_unknown_receipt(existing_original) and _is_durable_result_unknown_receipt(original):
-        state["original_reentry_receipt"] = _copied_json_object(original)
-    existing = _persisted_reconciliation_record(state)
-    if (
-        existing is not None
-        and existing.get("reconciliation_class") == "CONFIRMED_NOT_DELIVERED"
-        and existing.get("successor_authorized") is True
-        and str(existing.get("successor_receipt_id") or "").strip()
-    ):
-        write_auto_stop_state(state_path, state)
-        return
-    record: dict[str, Any] = {
-        "reconciliation_class": receipt.get("reconciliation_class"),
-        "reconciliation_receipt": _copied_json_object(receipt) if receipt else {},
-        "conversation_id": conversation_id,
-        "target_generation": target_generation,
-        "ownership_generation": ownership_generation,
-        "original_receipt_id": original.get("receipt_id"),
-        "original_wake_id": original.get("wake_id"),
-    }
-    if successor_receipt_id:
-        record["successor_receipt_id"] = successor_receipt_id
-        record["successor_authorized"] = True
-    if error:
-        record["error"] = bounded_tail(error)
-    state["host_reentry_reconciliation"] = record
-    write_auto_stop_state(state_path, state)
+    lock_path = auto_stop_supervisor_lock_path(state_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_json(state_path)
+            existing_original = state.get("original_reentry_receipt")
+            if not _is_durable_result_unknown_receipt(existing_original) and _is_durable_result_unknown_receipt(original):
+                state["original_reentry_receipt"] = _copied_json_object(original)
+            existing = _persisted_reconciliation_record(state)
+            if (
+                existing is not None
+                and existing.get("reconciliation_class") == "CONFIRMED_NOT_DELIVERED"
+                and existing.get("successor_authorized") is True
+                and str(existing.get("successor_receipt_id") or "").strip()
+            ):
+                write_auto_stop_state(state_path, state)
+                return
+            record: dict[str, Any] = {
+                "reconciliation_class": receipt.get("reconciliation_class"),
+                "reconciliation_receipt": _copied_json_object(receipt) if receipt else {},
+                "conversation_id": conversation_id,
+                "target_generation": target_generation,
+                "ownership_generation": ownership_generation,
+                "original_receipt_id": original.get("receipt_id"),
+                "original_wake_id": original.get("wake_id"),
+            }
+            if successor_receipt_id:
+                record["successor_receipt_id"] = successor_receipt_id
+                record["successor_authorized"] = True
+            if error:
+                record["error"] = bounded_tail(error)
+            state["host_reentry_reconciliation"] = record
+            write_auto_stop_state(state_path, state)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _mark_result_unknown_successor_scheduled(

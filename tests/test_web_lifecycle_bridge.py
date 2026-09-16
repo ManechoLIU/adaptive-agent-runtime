@@ -14529,3 +14529,61 @@ class RuntimeWebTurnWatcherSpawnTests(unittest.TestCase):
             )
         self.assertEqual(pid, 4242)
         self.assertEqual(len(calls), 1)
+
+
+def _persist_reconciliation_state_write_requires_supervisor_lock(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        original = _signed_result_unknown_reentry_receipt()
+        receipt = _signed_reconciliation_receipt(original)
+        state_path.write_text(json.dumps({
+            "receipt_id": "worker-terminal",
+            "state": "CONTINUATION_CLOSED",
+            "delivery_terminal_outcome": "submit_confirmed",
+            "original_reentry_receipt": original,
+        }), encoding="utf-8")
+        real_load = web_bridge.load_json
+        real_write = web_bridge.write_auto_stop_state
+        lock_held = False
+        events = []
+
+        def traced_flock(_fd, operation):
+            nonlocal lock_held
+            events.append(("flock", operation))
+            if operation == web_bridge.fcntl.LOCK_EX:
+                lock_held = True
+            elif operation == web_bridge.fcntl.LOCK_UN:
+                lock_held = False
+
+        def guarded_load(path):
+            self.assertTrue(lock_held, "reconciliation state must be read under supervisor lock")
+            events.append("load")
+            return real_load(path)
+
+        def guarded_write(path, value):
+            self.assertTrue(lock_held, "reconciliation state must be written under supervisor lock")
+            events.append("write")
+            return real_write(path, value)
+
+        with patch.object(web_bridge.fcntl, "flock", side_effect=traced_flock), patch.object(
+            web_bridge, "load_json", side_effect=guarded_load
+        ), patch.object(web_bridge, "write_auto_stop_state", side_effect=guarded_write):
+            web_bridge._persist_host_reentry_reconciliation(
+                state_path,
+                receipt=receipt,
+                original=original,
+                conversation_id=original["conversation_id"],
+                target_generation=original["target_generation"],
+                ownership_generation=original["ownership_generation"],
+                successor_receipt_id=web_bridge._result_unknown_successor_receipt_id(original=original),
+            )
+
+        self.assertEqual(events[0], ("flock", web_bridge.fcntl.LOCK_EX))
+        self.assertEqual(events[-1], ("flock", web_bridge.fcntl.LOCK_UN))
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["state"], "CONTINUATION_CLOSED")
+        self.assertEqual(saved["delivery_terminal_outcome"], "submit_confirmed")
+
+
+WebLocalReentryIntegrationTests.test_persist_reconciliation_state_write_requires_supervisor_lock = _persist_reconciliation_state_write_requires_supervisor_lock
