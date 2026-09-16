@@ -725,7 +725,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "web_agent_events.py", "route_contract.py", "reviewer_supervisor.py",
             "control_event_guard.py", "event_scope_guard.py", "controller_state.py", "controller_target_guard.py", "agent_target_resolution.py", "assignment_lease_guard.py", "assignment_runtime.py",
             "controller_scoring_guard.py", "project_context_guard.py", "rule_handshake.py", "evaluation_transaction.py",
-            "provider_health.py", "project_model_score.py", "model_score_dashboard.py",
+            "provider_health.py", "project_model_score.py", "model_score_dashboard.py", "global_model_intelligence.py",
         ):
             script = source / "scripts" / name
             if name == "controller_target_guard.py":
@@ -1227,6 +1227,12 @@ class InstallMigrationContractTests(unittest.TestCase):
         self.assertIn("scripts/provider_health.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("scripts/project_model_score.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("scripts/model_score_dashboard.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("scripts/global_model_intelligence.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn("tests/test_global_model_intelligence.py", RUNTIME_RELEASE_REQUIRED_FILES)
+        self.assertIn(
+            "tests.test_global_model_intelligence.GlobalReportTests.test_global_report_contains_project_reports_and_global_groups",
+            RUNTIME_RELEASE_REGRESSION_TESTS,
+        )
         self.assertIn("tests/test_provider_health.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("tests/test_project_model_score.py", RUNTIME_RELEASE_REQUIRED_FILES)
         self.assertIn("tests/test_model_score_dashboard.py", RUNTIME_RELEASE_REQUIRED_FILES)
@@ -1276,6 +1282,12 @@ class InstallMigrationContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (tests_dir / "test_model_score_dashboard.py").write_text("import unittest\n", encoding="utf-8")
+            (tests_dir / "test_global_model_intelligence.py").write_text(
+                "import unittest\n"
+                "class GlobalReportTests(unittest.TestCase):\n"
+                "    def test_global_report_contains_project_reports_and_global_groups(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "external-agent-routing.test.mjs").write_text(
                 "import test from 'node:test';\n"
                 "import assert from 'node:assert/strict';\n"
@@ -1901,6 +1913,12 @@ class InstallMigrationContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (tests_dir / "test_model_score_dashboard.py").write_text("import unittest\n", encoding="utf-8")
+            (tests_dir / "test_global_model_intelligence.py").write_text(
+                "import unittest\n"
+                "class GlobalReportTests(unittest.TestCase):\n"
+                "    def test_global_report_contains_project_reports_and_global_groups(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (tests_dir / "external-agent-routing.test.mjs").write_text(
                 "import test from 'node:test';\n"
                 "import assert from 'node:assert/strict';\n"

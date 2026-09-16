@@ -283,3 +283,56 @@ class GlobalDecisionTests(unittest.TestCase):
         grok = next(item for item in report["model_summaries"] if item["identity"]["model"] == "grok-4.6")
         self.assertEqual(grok["recommended_action"], "SWITCH_MODEL")
         self.assertEqual(grok["suggested_target"]["model"], "gpt-5.6-sol")
+
+class GlobalCliTests(unittest.TestCase):
+    def test_report_cli_discovers_registry_and_explicit_repos_writes_json_and_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            home.mkdir()
+            repo_a = make_repo(root, "alpha")
+            repo_b = make_repo(root, "beta")
+            write_runtime(repo_a, {"a": terminal_lease("a")})
+            write_runtime(repo_b, {"b": terminal_lease("b", model="gpt-5.6-sol", provider="codex-native")})
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({"controller-a": str(repo_a)}), encoding="utf-8")
+            output = root / "global.json"
+            env = {**__import__("os").environ, "HOME": str(home)}
+
+            result = subprocess.run([
+                "python3", "scripts/global_model_intelligence.py", "report",
+                "--registry", str(registry), "--repo", str(repo_b),
+                "--window-days", "30", "--json", str(output),
+                "--now", "2026-09-16T12:00:00+00:00",
+            ], cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, env=env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["scope"], "global")
+            self.assertEqual([row["project_name"] for row in report["projects"]], ["alpha", "beta"])
+            self.assertEqual([row["identity"]["model"] for row in report["model_summaries"]], ["gpt-5.6-sol", "grok-4.6"])
+            cached = home / ".codex" / "adaptive-delivery" / "model-intelligence" / "latest.json"
+            self.assertTrue(cached.exists())
+            self.assertEqual(json.loads(cached.read_text(encoding="utf-8"))["scope"], "global")
+
+    def test_invalid_repo_is_reported_and_does_not_fail_valid_global_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root, "alpha")
+            write_runtime(repo, {"a": terminal_lease("a")})
+            registry = root / "registry.json"
+            registry.write_text("{}", encoding="utf-8")
+            output = root / "global.json"
+            env = {**__import__("os").environ, "HOME": str(root / "home")}
+
+            result = subprocess.run([
+                "python3", "scripts/global_model_intelligence.py", "report",
+                "--registry", str(registry), "--repo", str(repo), "--repo", str(root / "missing"),
+                "--json", str(output), "--now", "2026-09-16T12:00:00+00:00",
+            ], cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, env=env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["summary"]["projects_observed"], 1)
+            self.assertEqual(len(report["diagnostics"]), 1)
+            self.assertIn("missing", report["diagnostics"][0]["repo"])

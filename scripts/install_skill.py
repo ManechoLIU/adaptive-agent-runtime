@@ -794,6 +794,7 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_provider_health.ProviderHealthProjectionTests.test_result_unknown_is_diagnostic_but_does_not_globally_block_unrelated_new_assignments",
     "tests.test_project_model_score.ModelDialNativeBenchmarkTests.test_loads_native_modeldial_radar_and_aligns_capability_axis",
     "tests.test_project_model_score.ProjectModelDashboardCliTests.test_dashboard_cli_writes_self_contained_html_from_same_report_builder",
+    "tests.test_global_model_intelligence.GlobalReportTests.test_global_report_contains_project_reports_and_global_groups",
 )
 RUNTIME_RELEASE_NODE_REGRESSION_TESTS = (
     "external provider health gate blocks OPEN route before provider spawn",
@@ -918,6 +919,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "scripts/provider_health.py",
     "scripts/project_model_score.py",
     "scripts/model_score_dashboard.py",
+    "scripts/global_model_intelligence.py",
     "scripts/runtime_host_tool_hook.py",
     "scripts/terminal_continuation.py",
     "tests/test_web_agent_execution.py",
@@ -941,6 +943,7 @@ RUNTIME_RELEASE_REQUIRED_FILES = (
     "tests/test_provider_health.py",
     "tests/test_project_model_score.py",
     "tests/test_model_score_dashboard.py",
+    "tests/test_global_model_intelligence.py",
     "tests/test_runtime_host_tool_hook.py",
     "tests/external-agent-routing.test.mjs",
 )

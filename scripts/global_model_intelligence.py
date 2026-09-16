@@ -3,22 +3,25 @@
 
 from __future__ import annotations
 
+import argparse
 import copy
 import hashlib
 import json
+import os
+import tempfile
 import statistics
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 try:
     from scripts.project_model_score import (
-        attach_benchmarks, build_decisions, classify_attribution, load_project_samples, score_model_groups, score_route_groups,
+        attach_benchmarks, build_decisions, classify_attribution, load_benchmarks, load_project_samples, score_model_groups, score_route_groups,
     )
     from scripts.project_state import git_common_dir, repository_root
 except ModuleNotFoundError:  # direct script execution from scripts/
     from project_model_score import (
-        attach_benchmarks, build_decisions, classify_attribution, load_project_samples, score_model_groups, score_route_groups,
+        attach_benchmarks, build_decisions, classify_attribution, load_benchmarks, load_project_samples, score_model_groups, score_route_groups,
     )
     from project_state import git_common_dir, repository_root
 
@@ -333,6 +336,7 @@ def build_global_report_from_samples(
         "schema_version": 1,
         "scope": "global",
         "window_days": window_days,
+        "generated_at": (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
         "projects": list(repositories),
         "summary": {
             "projects_observed": len(repositories),
@@ -476,3 +480,103 @@ def apply_global_recommendations(
     report["decisions"] = decisions
     report["route_health"] = route_health
     return report
+
+DEFAULT_REGISTRY = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    target = Path(path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def cache_global_report(report: dict[str, Any], *, cache_dir: Path | None = None) -> dict[str, str]:
+    root = (cache_dir or (Path.home() / ".codex" / "adaptive-delivery" / "model-intelligence")).expanduser().resolve()
+    rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    latest = root / "latest.json"
+    _atomic_write_text(latest, rendered)
+    generated = str(report.get("generated_at") or datetime.now(timezone.utc).isoformat())
+    try:
+        stamp = datetime.fromisoformat(generated.replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    except ValueError:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    snapshot = root / "snapshots" / f"{stamp}.json"
+    _atomic_write_text(snapshot, rendered)
+    return {"latest": str(latest), "snapshot": str(snapshot)}
+
+
+def _parse_now(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _build_cli_report(args: argparse.Namespace) -> dict[str, Any]:
+    repositories, discovery_diagnostics = discover_repositories(
+        Path(args.registry).expanduser(),
+        [Path(value).expanduser() for value in (args.repo or [])],
+    )
+    benchmarks = load_benchmarks(Path(args.benchmark_json)) if args.benchmark_json else []
+    return build_global_report(
+        repositories,
+        window_days=args.window_days,
+        benchmarks=benchmarks,
+        now=_parse_now(args.now),
+        diagnostics=discovery_diagnostics,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Aggregate model performance across Runtime-enabled projects.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name, help_text in (
+        ("report", "Build a machine-readable global model intelligence report"),
+        ("dashboard", "Render the global/project model intelligence dashboard"),
+    ):
+        command = sub.add_parser(name, help=help_text)
+        command.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+        command.add_argument("--repo", action="append", default=[])
+        command.add_argument("--window-days", type=int, default=30)
+        command.add_argument("--benchmark-json")
+        command.add_argument("--now", help=argparse.SUPPRESS)
+        if name == "report":
+            command.add_argument("--json", dest="json_output")
+        else:
+            command.add_argument("--output", required=True)
+
+    args = parser.parse_args(argv)
+    report = _build_cli_report(args)
+    cache_global_report(report)
+    if args.command == "report":
+        rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        if args.json_output:
+            _atomic_write_text(Path(args.json_output), rendered)
+        else:
+            print(rendered, end="")
+        return 0
+
+    try:
+        from scripts.model_score_dashboard import render_dashboard
+    except ModuleNotFoundError:  # direct script execution from scripts/
+        from model_score_dashboard import render_dashboard
+    _atomic_write_text(Path(args.output), render_dashboard(report))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
