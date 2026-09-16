@@ -131,3 +131,96 @@ class GlobalSampleCollectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+from scripts.project_model_score import normalize_lease_sample
+
+
+def normalized_global_sample(project: str, project_id: str, assignment_id: str, **overrides) -> dict:
+    lease = terminal_lease(assignment_id, model=overrides.pop("model", "grok-4.6"), provider=overrides.pop("provider", "grok-build"))
+    lease.update(overrides)
+    sample = normalize_lease_sample(project, assignment_id, lease)
+    assert sample is not None
+    sample["project_id"] = project_id
+    sample["project_root"] = f"/tmp/{project}"
+    sample["project_common_dir"] = f"/tmp/{project}/.git"
+    return sample
+
+
+class GlobalModelSummaryTests(unittest.TestCase):
+    def test_one_model_across_projects_is_one_summary_with_capped_project_contribution(self):
+        from scripts.global_model_intelligence import score_global_model_summaries
+
+        samples = []
+        # A high-volume project has many semantic failures; a second project has one strong pass.
+        for idx in range(10):
+            samples.append(normalized_global_sample(
+                "Alpha", "alpha", f"bad-{idx}", delivery_outcome="fail", evidence=["test-log:red"], artifacts=[]
+            ))
+        samples.append(normalized_global_sample("Beta", "beta", "good"))
+
+        summaries = score_global_model_summaries(samples)
+
+        self.assertEqual(len(summaries), 1)
+        summary = summaries[0]
+        self.assertEqual(summary["identity"]["model"], "grok-4.6")
+        self.assertEqual(summary["projects_observed"], 2)
+        self.assertEqual(summary["raw_quality_sample_count"], 11)
+        self.assertLess(summary["quality_sample_count"], 11)  # project cap applied
+        self.assertEqual({row["project"] for row in summary["project_breakdown"]}, {"Alpha", "Beta"})
+        self.assertIsNotNone(summary["project_model_score"])
+
+    def test_model_with_only_infrastructure_history_has_no_global_quality_score(self):
+        from scripts.global_model_intelligence import score_global_model_summaries
+
+        samples = [normalized_global_sample(
+            "SelfAlone", "self", "timeout", terminal_state="failed", transport_outcome="failed",
+            delivery_outcome="unresolved", failure_class="provider_timeout", evidence=[], artifacts=[]
+        )]
+        summary = score_global_model_summaries(samples)[0]
+        self.assertIsNone(summary["project_model_score"])
+        self.assertEqual(summary["quality_sample_count"], 0)
+        self.assertEqual(summary["excluded_infrastructure_count"], 1)
+
+
+class GlobalConfigurationCohortTests(unittest.TestCase):
+    def test_same_config_combines_across_projects_but_effort_role_and_route_stay_separate(self):
+        from scripts.global_model_intelligence import score_global_configuration_groups
+
+        samples = [
+            normalized_global_sample("Alpha", "a", "a-high"),
+            normalized_global_sample("Beta", "b", "b-high"),
+            normalized_global_sample("Beta", "b", "b-xhigh", reasoning_effort="xhigh", strategy="provider=grok-build;model=grok-4.6;auth_mode=oauth;reasoning_effort=xhigh"),
+            normalized_global_sample("Beta", "b", "b-review", execution_role="reviewer"),
+            normalized_global_sample("Gamma", "c", "c-api", auth_mode="api", strategy="provider=grok-build;model=grok-4.6;auth_mode=api;reasoning_effort=high"),
+        ]
+
+        groups = score_global_configuration_groups(samples, benchmarks=[])
+
+        self.assertEqual(len(groups), 4)
+        high_writer_oauth = next(g for g in groups if g["identity"]["reasoning_effort"] == "high" and g["identity"]["execution_role"] == "writer" and g["identity"]["auth_mode"] == "oauth")
+        self.assertEqual(high_writer_oauth["projects_observed"], 2)
+        self.assertEqual(high_writer_oauth["quality_sample_count"], 2)
+        self.assertEqual({row["project"] for row in high_writer_oauth["project_breakdown"]}, {"Alpha", "Beta"})
+
+
+class GlobalReportTests(unittest.TestCase):
+    def test_global_report_contains_project_reports_and_global_groups(self):
+        from scripts.global_model_intelligence import build_global_report_from_samples
+
+        repositories = [
+            {"project_id": "a", "project_name": "Alpha", "project_root": "/tmp/Alpha", "project_common_dir": "/tmp/Alpha/.git", "source": "explicit"},
+            {"project_id": "b", "project_name": "Beta", "project_root": "/tmp/Beta", "project_common_dir": "/tmp/Beta/.git", "source": "explicit"},
+        ]
+        samples = [
+            normalized_global_sample("Alpha", "a", "a"),
+            normalized_global_sample("Beta", "b", "b", model="gpt-5.6-sol", provider="codex-native"),
+        ]
+
+        report = build_global_report_from_samples(repositories, samples, window_days=30, benchmarks=[], diagnostics=[])
+
+        self.assertEqual(report["scope"], "global")
+        self.assertEqual(report["summary"]["projects_observed"], 2)
+        self.assertEqual(len(report["model_summaries"]), 2)
+        self.assertEqual(len(report["configuration_groups"]), 2)
+        self.assertEqual(len(report["route_groups"]), 2)
+        self.assertEqual(set(report["project_reports"]), {"Alpha", "Beta"})
