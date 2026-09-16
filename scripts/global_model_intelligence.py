@@ -16,12 +16,12 @@ from typing import Any, Sequence
 
 try:
     from scripts.project_model_score import (
-        attach_benchmarks, build_decisions, classify_attribution, load_benchmarks, load_project_samples, score_model_groups, score_route_groups,
+        attach_benchmarks, build_decisions, classify_attribution, load_benchmarks, load_project_samples, score_model_groups, score_route_groups, _MODEL_DIMENSION_WEIGHTS, _sample_dimensions,
     )
     from scripts.project_state import git_common_dir, repository_root
 except ModuleNotFoundError:  # direct script execution from scripts/
     from project_model_score import (
-        attach_benchmarks, build_decisions, classify_attribution, load_benchmarks, load_project_samples, score_model_groups, score_route_groups,
+        attach_benchmarks, build_decisions, classify_attribution, load_benchmarks, load_project_samples, score_model_groups, score_route_groups, _MODEL_DIMENSION_WEIGHTS, _sample_dimensions,
     )
     from project_state import git_common_dir, repository_root
 
@@ -145,31 +145,47 @@ def _clone_with_project(sample: dict[str, Any], project: str) -> dict[str, Any]:
 
 
 def _family_score(samples: Sequence[dict[str, Any]], model: str) -> dict[str, Any]:
-    clones: list[dict[str, Any]] = []
+    """Score a model family from raw samples without erasing role semantics."""
+    dimension_values: dict[str, list[tuple[float, float]]] = {name: [] for name in _MODEL_DIMENSION_WEIGHTS}
+    quality_sample_count = 0
     for sample in samples:
-        cloned = copy.deepcopy(sample)
-        identity = dict(cloned.get("identity") or {})
-        identity.update({
-            "project": "GLOBAL",
-            "provider": "mixed",
-            "model": model,
-            "auth_mode": "mixed",
-            "reasoning_effort": "mixed",
-            "execution_role": "mixed",
-            "policy_class": "mixed",
-            "execution_transport": "mixed",
-        })
-        cloned["identity"] = identity
-        clones.append(cloned)
-    if not clones:
-        return {
-            "project_model_score": None,
-            "dimension_scores": {},
-            "dimension_coverage": 0.0,
-            "quality_sample_count": 0,
-            "confidence": "low",
-        }
-    return score_model_groups(clones)[0]
+        attribution, _ = classify_attribution(sample)
+        if attribution not in {"model", "mixed"}:
+            continue
+        quality_sample_count += 1
+        sample_weight = 0.5 if attribution == "mixed" else 1.0
+        for dimension, value in _sample_dimensions(sample, attribution).items():
+            if value is not None:
+                dimension_values[dimension].append((float(value), sample_weight))
+
+    dimensions: dict[str, float | None] = {}
+    for dimension, values in dimension_values.items():
+        if not values:
+            dimensions[dimension] = None
+            continue
+        total_weight = sum(weight for _, weight in values)
+        dimensions[dimension] = round(sum(value * weight for value, weight in values) / total_weight, 1)
+
+    available = [(name, value) for name, value in dimensions.items() if value is not None]
+    available_weight = sum(_MODEL_DIMENSION_WEIGHTS[name] for name, _ in available)
+    score = None
+    if available and available_weight:
+        score = round(sum(float(value) * _MODEL_DIMENSION_WEIGHTS[name] for name, value in available) / available_weight, 1)
+    coverage = round(available_weight / sum(_MODEL_DIMENSION_WEIGHTS.values()), 2)
+    if quality_sample_count >= 5 and coverage >= 0.5:
+        confidence = "high"
+    elif quality_sample_count >= 3:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    return {
+        "identity": {"model": model},
+        "project_model_score": score,
+        "dimension_scores": dimensions,
+        "dimension_coverage": coverage,
+        "quality_sample_count": quality_sample_count,
+        "confidence": confidence,
+    }
 
 
 def _project_breakdown_for_model(samples: Sequence[dict[str, Any]], model: str) -> list[dict[str, Any]]:
@@ -292,6 +308,7 @@ def _project_report_from_samples(project: str, project_samples: list[dict[str, A
     model_groups = score_model_groups([copy.deepcopy(sample) for sample in project_samples])
     model_groups = attach_benchmarks(model_groups, benchmarks) if benchmarks else model_groups
     route_groups = score_route_groups([copy.deepcopy(sample) for sample in project_samples])
+    decisions = build_decisions(model_groups, route_groups, benchmarks or [])
     attribution_counts = {name: 0 for name in ("model", "infrastructure", "external", "mixed", "unknown")}
     for sample in project_samples:
         attribution_counts[classify_attribution(sample)[0]] += 1
@@ -308,6 +325,7 @@ def _project_report_from_samples(project: str, project_samples: list[dict[str, A
         },
         "model_groups": model_groups,
         "route_groups": route_groups,
+        "decisions": decisions,
     }
 
 

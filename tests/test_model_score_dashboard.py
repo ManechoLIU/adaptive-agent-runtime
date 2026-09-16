@@ -123,3 +123,110 @@ class DashboardRenderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def global_sample_report():
+    return {
+        "schema_version": 1,
+        "scope": "global",
+        "window_days": 30,
+        "generated_at": "2026-09-16T12:00:00+00:00",
+        "projects": [
+            {"project_id": "self", "project_name": "SelfAlone", "project_root": "/tmp/SelfAlone", "project_common_dir": "/tmp/SelfAlone/.git", "source": "registry"},
+            {"project_id": "runtime", "project_name": "adaptive-delivery", "project_root": "/tmp/adaptive-delivery", "project_common_dir": "/tmp/adaptive-delivery/.git", "source": "explicit"},
+        ],
+        "summary": {
+            "projects_observed": 2,
+            "terminal_samples": 24,
+            "quality_scored_samples": 12,
+            "models_observed": 2,
+            "infrastructure_failures_excluded_from_model_score": 5,
+            "external_failures_excluded_from_model_score": 0,
+            "unknown_samples": 7,
+        },
+        "model_summaries": [
+            {
+                "identity": {"model": "gpt-5.6-sol"},
+                "project_model_score": 91.0,
+                "quality_sample_count": 8,
+                "raw_quality_sample_count": 8,
+                "total_sample_count": 10,
+                "projects_observed": 2,
+                "confidence": "medium",
+                "route_health_state": "HEALTHY",
+                "route_status": "稳定",
+                "preferred_roles": ["reviewer", "writer"],
+                "recommended_action": "KEEP",
+                "recommended_reason": "跨项目实战证据支持继续使用当前模型。",
+                "suggested_target": None,
+                "project_breakdown": [
+                    {"project": "SelfAlone", "project_model_score": 92.0, "quality_sample_count": 5, "total_sample_count": 6},
+                    {"project": "adaptive-delivery", "project_model_score": 89.0, "quality_sample_count": 3, "total_sample_count": 4},
+                ],
+            },
+            {
+                "identity": {"model": "grok-4.6"},
+                "project_model_score": None,
+                "quality_sample_count": 0,
+                "raw_quality_sample_count": 0,
+                "total_sample_count": 5,
+                "projects_observed": 1,
+                "confidence": "low",
+                "route_health_state": "PROBE_REQUIRED",
+                "route_status": "修复后待复测",
+                "preferred_roles": [],
+                "recommended_action": "INSUFFICIENT_EVIDENCE",
+                "recommended_reason": "跨项目有效质量样本不足，继续积累后再判断是否换模。",
+                "suggested_target": None,
+                "project_breakdown": [
+                    {"project": "SelfAlone", "project_model_score": None, "quality_sample_count": 0, "total_sample_count": 5},
+                ],
+            },
+        ],
+        "configuration_groups": [
+            {"identity": {"project": "GLOBAL", "provider": "codex-native", "model": "gpt-5.6-sol", "auth_mode": "host", "reasoning_effort": "high", "execution_role": "reviewer", "policy_class": "backend", "execution_transport": "codex_native_subagent"}, "project_model_score": 91.0, "quality_sample_count": 8, "benchmark": {"score": 84, "match": "partial"}},
+            {"identity": {"project": "GLOBAL", "provider": "grok-build", "model": "grok-4.6", "auth_mode": "oauth", "reasoning_effort": "high", "execution_role": "writer", "policy_class": "backend", "execution_transport": "external_process"}, "project_model_score": None, "quality_sample_count": 0, "benchmark": {"score": 67, "match": "partial"}},
+        ],
+        "route_groups": [
+            {"route": {"provider": "codex-native", "model": "gpt-5.6-sol", "auth_mode": "host", "execution_transport": "codex_native_subagent"}, "route_reliability_score": 100.0, "eligible_attempts": 10},
+            {"route": {"provider": "grok-build", "model": "grok-4.6", "auth_mode": "oauth", "execution_transport": "external_process"}, "route_reliability_score": 0.0, "eligible_attempts": 3},
+        ],
+        "route_health": [
+            {"route": {"provider": "codex-native", "model": "gpt-5.6-sol", "auth_mode": "host", "execution_transport": "codex_native_subagent"}, "state": "HEALTHY"},
+            {"route": {"provider": "grok-build", "model": "grok-4.6", "auth_mode": "oauth", "execution_transport": "external_process"}, "state": "PROBE_REQUIRED"},
+        ],
+        "decisions": [],
+        "project_reports": {
+            "SelfAlone": sample_report(),
+        },
+        "diagnostics": [],
+    }
+
+
+class GlobalDashboardRenderTests(unittest.TestCase):
+    def test_global_dashboard_has_global_project_controls_and_concise_sections(self):
+        html = render_dashboard(global_sample_report())
+        self.assertIn("全局视角", html)
+        self.assertIn("当前项目", html)
+        self.assertIn("模型表现对比", html)
+        self.assertIn("能力对比", html)
+        self.assertIn("最佳岗位", html)
+        self.assertIn("智能建议", html)
+        self.assertIn("SelfAlone", html)
+        self.assertNotIn("<table", html)
+
+    def test_global_dashboard_renders_one_card_per_model_with_project_and_sample_counts(self):
+        html = render_dashboard(global_sample_report())
+        self.assertEqual(html.count('data-model="gpt-5.6-sol"'), 1)
+        self.assertEqual(html.count('data-model="grok-4.6"'), 1)
+        self.assertIn("2 项目", html)
+        self.assertIn("8 样本", html)
+
+    def test_missing_quality_and_probe_route_use_explicit_chinese_states(self):
+        html = render_dashboard(global_sample_report())
+        start = html.index('data-model="grok-4.6"')
+        end = html.index("</article>", start)
+        card = html[start:end]
+        self.assertIn("待积累", card)
+        self.assertIn("修复后待复测", card)
+        self.assertNotIn(">0.0</strong><span>/100<br>全局实战", card)

@@ -336,3 +336,56 @@ class GlobalCliTests(unittest.TestCase):
             self.assertEqual(report["summary"]["projects_observed"], 1)
             self.assertEqual(len(report["diagnostics"]), 1)
             self.assertIn("missing", report["diagnostics"][0]["repo"])
+
+class GlobalDashboardCliTests(unittest.TestCase):
+    def test_dashboard_cli_renders_global_and_project_views(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            home.mkdir()
+            repo_a = make_repo(root, "alpha")
+            repo_b = make_repo(root, "beta")
+            write_runtime(repo_a, {"a": terminal_lease("a")})
+            write_runtime(repo_b, {"b": terminal_lease("b", model="gpt-5.6-sol", provider="codex-native")})
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({"controller-a": str(repo_a)}), encoding="utf-8")
+            output = root / "global.html"
+            env = {**__import__("os").environ, "HOME": str(home)}
+
+            result = subprocess.run([
+                "python3", "scripts/global_model_intelligence.py", "dashboard",
+                "--registry", str(registry), "--repo", str(repo_b),
+                "--window-days", "30", "--output", str(output),
+                "--now", "2026-09-16T12:00:00+00:00",
+            ], cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, env=env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            html = output.read_text(encoding="utf-8")
+            self.assertIn("全局视角", html)
+            self.assertIn("当前项目", html)
+            self.assertIn("模型表现对比", html)
+            self.assertIn("alpha", html)
+            self.assertIn("beta", html)
+            self.assertNotIn("<table", html)
+
+class GlobalReviewerSemanticsTests(unittest.TestCase):
+    def test_global_family_scoring_preserves_reviewer_findings_as_successful_review_work(self):
+        from scripts.global_model_intelligence import score_global_model_summaries
+
+        sample = normalized_global_sample(
+            "Runtime", "runtime", "review-findings",
+            execution_role="reviewer",
+            terminal_state="completed",
+            transport_outcome="completed",
+            delivery_outcome="fail",
+            failure_class="review_findings",
+            retry_class="review_findings",
+            evidence=["git:abc123"],
+            artifacts=["git:abc123"],
+        )
+        summary = score_global_model_summaries([sample])[0]
+
+        self.assertEqual(summary["quality_sample_count"], 1)
+        self.assertGreaterEqual(summary["project_model_score"], 85.0)
+        self.assertEqual(summary["project_breakdown"][0]["project"], "Runtime")
+        self.assertGreaterEqual(summary["project_breakdown"][0]["project_model_score"], 85.0)
