@@ -14643,3 +14643,127 @@ def _result_unknown_reconcile_exception_state_write_requires_supervisor_lock(sel
 
 
 WebLocalReentryIntegrationTests.test_result_unknown_reconcile_exception_state_write_requires_supervisor_lock = _result_unknown_reconcile_exception_state_write_requires_supervisor_lock
+
+
+
+def _result_unknown_reconcile_exception_preserves_concurrent_terminal_state(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, _lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        stale = json.loads(state_path.read_text(encoding="utf-8"))
+        terminal = json.loads(json.dumps(stale))
+        terminal.update({
+            "receipt_id": "worker-terminal",
+            "state": "CONTINUATION_CLOSED",
+            "pending_control_event": False,
+            "delivery_terminal_receipt_id": "worker-terminal",
+            "delivery_terminal_outcome": "submit_confirmed",
+        })
+        state_path.write_text(json.dumps(terminal), encoding="utf-8")
+        with patch.object(
+            web_bridge,
+            "_execute_registered_web_host_reconcile",
+            side_effect=PermissionError("synthetic reconcile failure"),
+        ):
+            successor = web_bridge._clear_result_unknown_via_registered_host_reconcile(
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                state_path=state_path,
+                supervisor_state=stale,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertIsNone(successor)
+    self.assertEqual(saved["receipt_id"], "worker-terminal")
+    self.assertEqual(saved["state"], "CONTINUATION_CLOSED")
+    self.assertFalse(saved["pending_control_event"])
+    self.assertEqual(saved["delivery_terminal_outcome"], "submit_confirmed")
+    self.assertEqual(saved["host_reentry_reconcile_attempts"], 1)
+
+
+def _result_unknown_concurrent_authorization_survives_reconcile_exception(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        successor_id = web_bridge._result_unknown_successor_receipt_id(original=original)
+        receipt = _signed_reconciliation_receipt(original)
+
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+
+        def reconcile(**_kwargs):
+            concurrent = json.loads(state_path.read_text(encoding="utf-8"))
+            concurrent["host_reentry_reconcile_attempts"] = web_bridge.WEB_REENTRY_RECONCILE_RETRY_LIMIT - 1
+            concurrent["host_reentry_reconciliation"] = {
+                "reconciliation_class": "CONFIRMED_NOT_DELIVERED",
+                "reconciliation_receipt": receipt,
+                "conversation_id": original["conversation_id"],
+                "target_generation": original["target_generation"],
+                "ownership_generation": original["ownership_generation"],
+                "original_receipt_id": original["receipt_id"],
+                "original_wake_id": original["wake_id"],
+                "successor_receipt_id": successor_id,
+                "successor_authorized": True,
+            }
+            state_path.write_text(json.dumps(concurrent), encoding="utf-8")
+            raise PermissionError("synthetic concurrent reconcile failure")
+
+        verifier.reconcile_reentry_result = reconcile
+        schedule_calls = []
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "schedule_auto_native_stop", side_effect=lambda **kwargs: schedule_calls.append(kwargs) or True
+        ):
+            scheduled = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex="codex",
+                delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertFalse(scheduled)
+    self.assertEqual(schedule_calls, [])
+    persisted = saved["host_reentry_reconciliation"]
+    self.assertEqual(persisted["reconciliation_class"], "CONFIRMED_NOT_DELIVERED")
+    self.assertTrue(persisted["successor_authorized"])
+    self.assertEqual(persisted["successor_receipt_id"], successor_id)
+    self.assertNotEqual(persisted.get("reconciliation_class"), "UNRESOLVED")
+
+
+def _result_unknown_exact_original_error_does_not_consume_reconcile_retry(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, _lifecycle, _original = _result_unknown_host_attested_fixture(self, tmp)
+        before = json.loads(state_path.read_text(encoding="utf-8"))
+        before["host_reentry_reconcile_attempts"] = web_bridge.WEB_REENTRY_RECONCILE_RETRY_LIMIT - 1
+        state_path.write_text(json.dumps(before), encoding="utf-8")
+        with patch.object(
+            web_bridge,
+            "_execute_registered_web_host_reconcile",
+            side_effect=PermissionError(
+                "registered Host reentry reconciliation requires the exact original signed receipt"
+            ),
+        ):
+            successor = web_bridge._clear_result_unknown_via_registered_host_reconcile(
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                state_path=state_path,
+                supervisor_state=before,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertIsNone(successor)
+    self.assertEqual(
+        saved["host_reentry_reconcile_attempts"],
+        web_bridge.WEB_REENTRY_RECONCILE_RETRY_LIMIT - 1,
+    )
+    self.assertNotIn("host_reentry_reconciliation", saved)
+    self.assertIn("exact original signed receipt", saved["stderr_tail"])
+
+
+WebLocalReentryIntegrationTests.test_result_unknown_reconcile_exception_preserves_concurrent_terminal_state = _result_unknown_reconcile_exception_preserves_concurrent_terminal_state
+WebLocalReentryIntegrationTests.test_result_unknown_concurrent_authorization_survives_reconcile_exception = _result_unknown_concurrent_authorization_survives_reconcile_exception
+WebLocalReentryIntegrationTests.test_result_unknown_exact_original_error_does_not_consume_reconcile_retry = _result_unknown_exact_original_error_does_not_consume_reconcile_retry
