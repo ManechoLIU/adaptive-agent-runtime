@@ -122,6 +122,13 @@ AUTHORITATIVE_DOCUMENT_NAMES = ("SKILL.md", "SPEC.md", "DESIGN.md", "TECHNICAL.m
 RESTORE_DOCUMENT_LIMIT = 32768
 AUTO_CONTINUATION_STALL_LIMIT = 3
 WEB_REENTRY_TRANSIENT_RETRY_LIMIT = 6
+WEB_REENTRY_RECONCILE_RETRY_LIMIT = 1
+RESULT_UNKNOWN_JOURNAL_PHASE = "result_unknown"
+RESULT_UNKNOWN_RECONCILE_TERMINAL_CLASSES = {
+    "CONFIRMED_NOT_DELIVERED",
+    "NOT_CLEARABLE",
+    "UNRESOLVED",
+}
 RUNTIME_WEB_TURN_WATCH_POLL_SECONDS = 0.5
 RUNTIME_WEB_TURN_WATCH_MAX_SECONDS = 35 * 60
 _RUNTIME_WEB_TURN_END_UNAVAILABLE_MARKERS = (
@@ -4450,6 +4457,83 @@ def _pinned_verifier_path_identity(path: Path) -> tuple[int, int, int, int]:
     return metadata.st_dev, metadata.st_ino, stat.S_IMODE(metadata.st_mode), metadata.st_uid
 
 
+def _positive_generation(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _is_durable_result_unknown_receipt(
+    value: Any,
+    *,
+    conversation_id: Any = None,
+    target_generation: Any = None,
+    ownership_generation: Any = None,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    receipt_conversation = str(value.get("conversation_id") or "").strip()
+    if (
+        value.get("provenance") != "browser_host_reentry_receipt_v1"
+        or value.get("result_class") != "RESULT_UNKNOWN"
+        or value.get("dispatch_attempted") is not True
+        or value.get("submit_confirmed") is not False
+        or value.get("retryable") is not False
+        or value.get("auto_retry_allowed") is not False
+        or not str(value.get("receipt_id") or "").strip()
+        or not str(value.get("wake_id") or "").strip()
+        or not receipt_conversation
+        or not _positive_generation(value.get("target_generation"))
+        or not _positive_generation(value.get("ownership_generation"))
+    ):
+        return False
+    if conversation_id is not None and value.get("conversation_id") != conversation_id:
+        return False
+    if target_generation is not None and value.get("target_generation") != target_generation:
+        return False
+    if ownership_generation is not None and value.get("ownership_generation") != ownership_generation:
+        return False
+    return True
+
+
+def _confirmed_not_delivered_evidence_is_complete(
+    receipt: Any,
+    *,
+    original: dict[str, Any],
+    conversation_id: str,
+    target_generation: int,
+    ownership_generation: int,
+) -> bool:
+    if not isinstance(receipt, dict):
+        return False
+    if (
+        receipt.get("reconciliation_class") != "CONFIRMED_NOT_DELIVERED"
+        or receipt.get("exact_user_message_present") is not False
+        or receipt.get("composer_exact_payload") is not True
+        or receipt.get("original_result_class") != "RESULT_UNKNOWN"
+        or receipt.get("journal_phase") != RESULT_UNKNOWN_JOURNAL_PHASE
+        or receipt.get("original_receipt_id") != original.get("receipt_id")
+        or receipt.get("wake_id") != original.get("wake_id")
+        or receipt.get("conversation_id") != conversation_id
+        or original.get("conversation_id") != conversation_id
+        or receipt.get("target_generation") != target_generation
+        or original.get("target_generation") != target_generation
+        or receipt.get("ownership_generation") != ownership_generation
+        or original.get("ownership_generation") != ownership_generation
+    ):
+        return False
+    for key in ("wake_nonce_sha256", "continuation_payload_sha256"):
+        expected = original.get(key)
+        if expected not in (None, "") and receipt.get(key) != expected:
+            return False
+    return True
+
+
+def _copied_json_object(value: dict[str, Any]) -> dict[str, Any]:
+    copied = json.loads(json.dumps(value, ensure_ascii=False))
+    if not isinstance(copied, dict):
+        raise PermissionError("signed Host receipt copy is invalid")
+    return copied
+
+
 def _loaded_external_peer_attestation_verifier(
     host: str, *, config_path: Path | None = None,
     deadline_monotonic: float | None = None,
@@ -4931,6 +5015,8 @@ def _loaded_external_peer_attestation_verifier(
         ):
             raise PermissionError("registered Host submit adapter returned mismatched receipt")
         result_class = receipt.get("result_class")
+        if result_class == "RESULT_UNKNOWN" and receipt.get("wake_id") != wake_id:
+            raise PermissionError("registered Host RESULT_UNKNOWN receipt is missing or mismatches wake_id")
         dispatch_attempted = receipt.get("dispatch_attempted")
         submit_confirmed = receipt.get("submit_confirmed")
         retryable = receipt.get("retryable")
@@ -4984,10 +5070,76 @@ def _loaded_external_peer_attestation_verifier(
             }
         raise PermissionError("registered Host submit adapter returned inconsistent result semantics")
 
+    def reconcile_reentry_result(**kwargs: Any) -> dict[str, Any]:
+        if host != "web":
+            raise PermissionError("registered Host reentry reconciliation is Web-only")
+        original = kwargs.get("original_reentry_receipt")
+        conversation_id = str(kwargs.get("expected_conversation_id") or "").strip()
+        target_generation = kwargs.get("expected_target_generation")
+        ownership_generation = kwargs.get("expected_ownership_generation")
+        if not conversation_id:
+            raise PermissionError("registered Host reentry reconciliation requires exact conversation")
+        for value, name in (
+            (target_generation, "target generation"),
+            (ownership_generation, "ownership generation"),
+        ):
+            if not _positive_generation(value):
+                raise PermissionError(f"registered Host reentry reconciliation requires positive {name}")
+        if not _is_durable_result_unknown_receipt(
+            original,
+            conversation_id=conversation_id,
+            target_generation=target_generation,
+            ownership_generation=ownership_generation,
+        ):
+            raise PermissionError("registered Host reentry reconciliation requires the exact original signed receipt")
+        payload = run_cli({
+            "operation": "reconcile_reentry_result",
+            "original_reentry_receipt": original,
+            "expected_conversation_id": conversation_id,
+            "expected_target_generation": target_generation,
+            "expected_ownership_generation": ownership_generation,
+        }, deadline_monotonic=kwargs.get("deadline_monotonic"))
+        if payload.get("operation") != "reconcile_reentry_result":
+            raise PermissionError("registered Host reentry reconciliation returned wrong operation")
+        receipt = payload.get("reconciliation_receipt")
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("provenance") != "browser_host_reentry_reconciliation_v1"
+            or receipt.get("conversation_id") != conversation_id
+            or receipt.get("target_generation") != target_generation
+            or receipt.get("ownership_generation") != ownership_generation
+            or receipt.get("original_receipt_id") != original.get("receipt_id")
+            or receipt.get("wake_id") != original.get("wake_id")
+            or receipt.get("original_result_class") != "RESULT_UNKNOWN"
+            or receipt.get("dispatch_attempted") is not True
+            or receipt.get("submit_confirmed") is not False
+            or receipt.get("retryable") is not False
+            or receipt.get("auto_retry_allowed") is not False
+        ):
+            raise PermissionError("registered Host reentry reconciliation returned mismatched receipt")
+        reconciliation_class = receipt.get("reconciliation_class")
+        if reconciliation_class not in RESULT_UNKNOWN_RECONCILE_TERMINAL_CLASSES:
+            raise PermissionError("registered Host reentry reconciliation returned invalid class")
+        if reconciliation_class == "CONFIRMED_NOT_DELIVERED" and not _confirmed_not_delivered_evidence_is_complete(
+            receipt,
+            original=original,
+            conversation_id=conversation_id,
+            target_generation=target_generation,
+            ownership_generation=ownership_generation,
+        ):
+            raise PermissionError(
+                "registered Host reentry reconciliation returned mismatched confirmed-not-delivered state"
+            )
+        return {
+            "operation": "reconcile_reentry_result",
+            "reconciliation_receipt": receipt,
+        }
+
     setattr(verify, "discover_current_entry", discover_current_entry)
     if verifier_protocol == "runtime_host_verifier_cli_v2":
         setattr(verify, "verify_current_entry", verify_current_entry)
     setattr(verify, "submit_reentry", submit_reentry)
+    setattr(verify, "reconcile_reentry_result", reconcile_reentry_result)
     setattr(verify, "delivery_fingerprint", delivery_fingerprint)
     setattr(verify, "manifest_identity", manifest_identity)
     setattr(verify, "verifier_protocol", verifier_protocol)
@@ -5074,6 +5226,7 @@ def _pinned_host_verifier_helper_main(argv: Sequence[str]) -> int:
                 raise PermissionError("registered Host verifier helper call is invalid")
             allowed_methods = {
                 "verify", "discover_current_entry", "verify_current_entry", "submit_reentry",
+                "reconcile_reentry_result",
                 "verify_tool_pre", "verify_tool_terminal",
             }
             method = verifier if method_name == "verify" else getattr(verifier, method_name, None)
@@ -5265,7 +5418,22 @@ def _external_peer_attestation_verifier(
         }
         return call("submit_reentry", **forwarded)
 
+    def reconcile_reentry_result(**kwargs: Any) -> Any:
+        forwarded = {
+            key: kwargs[key]
+            for key in (
+                "original_reentry_receipt",
+                "expected_conversation_id",
+                "expected_target_generation",
+                "expected_ownership_generation",
+                "deadline_monotonic",
+            )
+            if key in kwargs
+        }
+        return call("reconcile_reentry_result", **forwarded)
+
     setattr(verify, "submit_reentry", submit_reentry)
+    setattr(verify, "reconcile_reentry_result", reconcile_reentry_result)
     setattr(verify, "delivery_fingerprint", fingerprint)
     setattr(verify, "verifier_protocol", protocol)
     if protocol == "runtime_host_verifier_cli_v2":
@@ -5423,6 +5591,392 @@ def _execute_registered_web_host_reentry(
                 "registered Host submit receipt does not match canonical target, ownership, and Host call receipt"
             )
         return attempt
+
+
+def _durable_original_reentry_receipt(
+    supervisor_state: dict[str, Any],
+    *,
+    conversation_id: Any = None,
+    target_generation: Any = None,
+    ownership_generation: Any = None,
+) -> dict[str, Any] | None:
+    original = supervisor_state.get("original_reentry_receipt")
+    if not _is_durable_result_unknown_receipt(
+        original,
+        conversation_id=conversation_id,
+        target_generation=target_generation,
+        ownership_generation=ownership_generation,
+    ):
+        return None
+    return original
+
+
+def _result_unknown_terminal_state(supervisor_state: dict[str, Any]) -> bool:
+    return (
+        str(supervisor_state.get("delivery_terminal_outcome") or "") == "result_unknown"
+        or str(supervisor_state.get("state") or "") == "WEB_REENTRY_RESULT_UNKNOWN"
+        or str(supervisor_state.get("failure_class") or "") == "web_reentry_result_unknown"
+    )
+
+
+def _result_unknown_successor_receipt_id(
+    *, original: dict[str, Any], lifecycle_state: dict[str, Any] | None = None
+) -> str:
+    del lifecycle_state
+    host_receipt_id = str(original.get("receipt_id") or "").strip()
+    wake_id = str(original.get("wake_id") or "").strip()
+    digest = hashlib.sha256(f"{host_receipt_id}\0{wake_id}".encode("utf-8")).hexdigest()[:16]
+    return f"bootstrap:reconcile-{digest}"
+
+
+def _persisted_reconciliation_record(supervisor_state: dict[str, Any]) -> dict[str, Any] | None:
+    record = supervisor_state.get("host_reentry_reconciliation")
+    return record if isinstance(record, dict) else None
+
+
+def _authorized_result_unknown_successor_id(supervisor_state: dict[str, Any]) -> str:
+    record = _persisted_reconciliation_record(supervisor_state)
+    original = _durable_original_reentry_receipt(supervisor_state)
+    if (
+        record is None
+        or original is None
+        or record.get("reconciliation_class") != "CONFIRMED_NOT_DELIVERED"
+        or record.get("successor_authorized") is not True
+    ):
+        return ""
+    conversation_id = str(record.get("conversation_id") or "").strip()
+    target_generation = record.get("target_generation")
+    ownership_generation = record.get("ownership_generation")
+    receipt = record.get("reconciliation_receipt")
+    successor_id = str(record.get("successor_receipt_id") or "").strip()
+    if (
+        successor_id
+        and str(supervisor_state.get("delivery_terminal_receipt_id") or "").strip() == successor_id
+        and str(supervisor_state.get("delivery_terminal_outcome") or "").strip() == "submit_confirmed"
+    ):
+        return ""
+    if (
+        not conversation_id
+        or not _positive_generation(target_generation)
+        or not _positive_generation(ownership_generation)
+        or not successor_id
+        or successor_id != _result_unknown_successor_receipt_id(original=original)
+        or not _persisted_reconciliation_matches_fence(
+            record,
+            conversation_id=conversation_id,
+            target_generation=target_generation,
+            ownership_generation=ownership_generation,
+            original=original,
+        )
+        or not _confirmed_not_delivered_evidence_is_complete(
+            receipt,
+            original=original,
+            conversation_id=conversation_id,
+            target_generation=target_generation,
+            ownership_generation=ownership_generation,
+        )
+    ):
+        return ""
+    return successor_id
+
+
+def _web_conversation_fence_from_registry(
+    registry: Path, *, session_id: str
+) -> tuple[str, int, int] | None:
+    registry_data = load_json(registry)
+    target = target_guard.target_record(
+        registry_data, controller_id=session_id, host="web"
+    )
+    ownership = target_guard.execution_ownership_record(
+        registry_data, controller_id=session_id
+    )
+    if target is None or ownership is None:
+        return None
+    status, target_session, target_generation = target_guard.validate_target_record(
+        target, host="web"
+    )
+    ownership_host, ownership_target, ownership_generation = (
+        target_guard.validate_execution_ownership_record(ownership)
+    )
+    if (
+        status != "active"
+        or ownership_host != "web"
+        or target_session != ownership_target
+        or not str(target_session or "").strip()
+        or not _positive_generation(target_generation)
+        or not _positive_generation(ownership_generation)
+    ):
+        return None
+    return str(target_session), int(target_generation), int(ownership_generation)
+
+
+def _persisted_reconciliation_matches_fence(
+    record: dict[str, Any],
+    *,
+    conversation_id: str,
+    target_generation: int,
+    ownership_generation: int,
+    original: dict[str, Any],
+) -> bool:
+    return (
+        record.get("conversation_id") == conversation_id
+        and record.get("target_generation") == target_generation
+        and record.get("ownership_generation") == ownership_generation
+        and record.get("original_receipt_id") == original.get("receipt_id")
+        and record.get("original_wake_id") == original.get("wake_id")
+    )
+
+
+def _result_unknown_successor_expected_fence(
+    *, record: dict[str, Any], original: dict[str, Any]
+) -> dict[str, Any] | None:
+    conversation_id = str(record.get("conversation_id") or "").strip()
+    target_generation = record.get("target_generation")
+    ownership_generation = record.get("ownership_generation")
+    if not _persisted_reconciliation_matches_fence(
+        record,
+        conversation_id=conversation_id,
+        target_generation=target_generation,
+        ownership_generation=ownership_generation,
+        original=original,
+    ):
+        return None
+    fence = {
+        "execution_target_session_id": conversation_id,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+    }
+    return fence if _controller_delivery_fence_identity(fence) is not None else None
+
+
+def _persist_host_reentry_reconciliation(
+    state_path: Path,
+    *,
+    receipt: dict[str, Any],
+    original: dict[str, Any],
+    conversation_id: str,
+    target_generation: int,
+    ownership_generation: int,
+    successor_receipt_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    state = load_json(state_path)
+    existing_original = state.get("original_reentry_receipt")
+    if not _is_durable_result_unknown_receipt(existing_original) and _is_durable_result_unknown_receipt(original):
+        state["original_reentry_receipt"] = _copied_json_object(original)
+    existing = _persisted_reconciliation_record(state)
+    if (
+        existing is not None
+        and existing.get("reconciliation_class") == "CONFIRMED_NOT_DELIVERED"
+        and existing.get("successor_authorized") is True
+        and str(existing.get("successor_receipt_id") or "").strip()
+    ):
+        write_auto_stop_state(state_path, state)
+        return
+    record: dict[str, Any] = {
+        "reconciliation_class": receipt.get("reconciliation_class"),
+        "reconciliation_receipt": _copied_json_object(receipt) if receipt else {},
+        "conversation_id": conversation_id,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+        "original_receipt_id": original.get("receipt_id"),
+        "original_wake_id": original.get("wake_id"),
+    }
+    if successor_receipt_id:
+        record["successor_receipt_id"] = successor_receipt_id
+        record["successor_authorized"] = True
+    if error:
+        record["error"] = bounded_tail(error)
+    state["host_reentry_reconciliation"] = record
+    write_auto_stop_state(state_path, state)
+
+
+def _mark_result_unknown_successor_scheduled(
+    state_path: Path, *, successor_receipt_id: str
+) -> None:
+    lock_path = auto_stop_supervisor_lock_path(state_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_json(state_path)
+            record = _persisted_reconciliation_record(state)
+            if (
+                record is None
+                or record.get("reconciliation_class") != "CONFIRMED_NOT_DELIVERED"
+                or record.get("successor_authorized") is not True
+                or str(record.get("successor_receipt_id") or "").strip() != successor_receipt_id
+            ):
+                return
+            record = _copied_json_object(record)
+            record["successor_scheduled"] = True
+            record["successor_scheduled_at_unix_ms"] = int(time.time() * 1000)
+            state["host_reentry_reconciliation"] = record
+            write_auto_stop_state(state_path, state)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _execute_registered_web_host_reconcile(
+    *,
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    original: dict[str, Any],
+    verifier: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    verifier = verifier or _registered_peer_attestation_verifier("web")
+    adapter = getattr(verifier, "reconcile_reentry_result", None) if callable(verifier) else None
+    if not callable(verifier) or not callable(adapter):
+        raise PermissionError("registered Host reentry reconciliation adapter is unavailable")
+    with target_guard.locked_execution_target(
+        repo=repo,
+        host="web",
+        registry_path=registry,
+    ) as current_target:
+        if current_target.get("controller_id") != session_id:
+            raise PermissionError("Web target does not belong to the registered Controller")
+        expected_target = str(current_target.get("execution_target_session_id") or "").strip()
+        expected_generation = current_target.get("generation")
+        ownership = target_guard.execution_ownership_record(
+            load_json(registry), controller_id=session_id
+        )
+        if ownership is None:
+            raise PermissionError("canonical Web execution ownership is missing")
+        ownership_host, ownership_target, ownership_generation = (
+            target_guard.validate_execution_ownership_record(ownership)
+        )
+        if (
+            not expected_target
+            or ownership_host != "web"
+            or ownership_target != expected_target
+            or not _positive_generation(expected_generation)
+            or not _positive_generation(ownership_generation)
+        ):
+            raise PermissionError("canonical Web execution ownership is missing or mismatched")
+        if not _is_durable_result_unknown_receipt(
+            original,
+            conversation_id=expected_target,
+            target_generation=expected_generation,
+            ownership_generation=ownership_generation,
+        ):
+            raise PermissionError(
+                "registered Host reentry reconciliation requires the exact original signed receipt"
+            )
+        outcome = adapter(
+            original_reentry_receipt=_copied_json_object(original),
+            expected_conversation_id=expected_target,
+            expected_target_generation=expected_generation,
+            expected_ownership_generation=ownership_generation,
+        )
+        if not isinstance(outcome, dict):
+            raise PermissionError("registered Host reentry reconciliation returned a non-object receipt")
+        receipt = outcome.get("reconciliation_receipt")
+        if not isinstance(receipt, dict):
+            raise PermissionError("registered Host reentry reconciliation returned no signed outcome")
+        reconciliation_class = receipt.get("reconciliation_class")
+        if reconciliation_class not in RESULT_UNKNOWN_RECONCILE_TERMINAL_CLASSES:
+            raise PermissionError("registered Host reentry reconciliation returned invalid class")
+        if reconciliation_class == "CONFIRMED_NOT_DELIVERED" and not _confirmed_not_delivered_evidence_is_complete(
+            receipt,
+            original=original,
+            conversation_id=expected_target,
+            target_generation=expected_generation,
+            ownership_generation=ownership_generation,
+        ):
+            raise PermissionError(
+                "registered Host reentry reconciliation returned mismatched confirmed-not-delivered state"
+            )
+        return {
+            "operation": outcome.get("operation") or "reconcile_reentry_result",
+            "reconciliation_receipt": receipt,
+            "expected_conversation_id": expected_target,
+            "expected_target_generation": expected_generation,
+            "expected_ownership_generation": ownership_generation,
+        }
+
+
+def _clear_result_unknown_via_registered_host_reconcile(
+    *,
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    state_path: Path,
+    supervisor_state: dict[str, Any],
+) -> str | None:
+    original = _durable_original_reentry_receipt(supervisor_state)
+    if original is None:
+        return None
+    fence = _web_conversation_fence_from_registry(registry, session_id=session_id)
+    if fence is None:
+        return None
+    conversation_id, target_generation, ownership_generation = fence
+    persisted = _persisted_reconciliation_record(supervisor_state)
+    persisted_class = str((persisted or {}).get("reconciliation_class") or "").strip()
+    if persisted_class in {"NOT_CLEARABLE", "UNRESOLVED"}:
+        return None
+    if persisted_class == "CONFIRMED_NOT_DELIVERED":
+        if persisted is None or not _persisted_reconciliation_matches_fence(
+            persisted,
+            conversation_id=conversation_id,
+            target_generation=target_generation,
+            ownership_generation=ownership_generation,
+            original=original,
+        ):
+            return None
+        return None
+    if not _is_durable_result_unknown_receipt(
+        original,
+        conversation_id=conversation_id,
+        target_generation=target_generation,
+        ownership_generation=ownership_generation,
+    ):
+        return None
+    try:
+        outcome = _execute_registered_web_host_reconcile(
+            session_id=session_id,
+            repo=repo,
+            registry=registry,
+            original=original,
+        )
+        receipt = outcome.get("reconciliation_receipt")
+        if not isinstance(receipt, dict):
+            raise PermissionError("registered Host reentry reconciliation returned no signed outcome")
+        reconciliation_class = receipt.get("reconciliation_class")
+        successor_id = None
+        if reconciliation_class == "CONFIRMED_NOT_DELIVERED":
+            successor_id = _result_unknown_successor_receipt_id(original=original)
+        _persist_host_reentry_reconciliation(
+            state_path,
+            receipt=receipt,
+            original=original,
+            conversation_id=conversation_id,
+            target_generation=target_generation,
+            ownership_generation=ownership_generation,
+            successor_receipt_id=successor_id,
+        )
+        return successor_id
+    except (PermissionError, PeerHostTransientUnavailable, OSError, ValueError, TypeError) as exc:
+        message = str(exc)
+        state = load_json(state_path)
+        state["stderr_tail"] = bounded_tail(message)
+        if "exact original signed receipt" in message:
+            write_auto_stop_state(state_path, state)
+            return None
+        attempts = int(state.get("host_reentry_reconcile_attempts", 0) or 0) + 1
+        state["host_reentry_reconcile_attempts"] = attempts
+        write_auto_stop_state(state_path, state)
+        if attempts >= WEB_REENTRY_RECONCILE_RETRY_LIMIT:
+            _persist_host_reentry_reconciliation(
+                state_path,
+                receipt={"reconciliation_class": "UNRESOLVED"},
+                original=original,
+                conversation_id=conversation_id,
+                target_generation=target_generation,
+                ownership_generation=ownership_generation,
+                error=message,
+            )
+        return None
 
 
 def _wake_receipt(
@@ -7574,14 +8128,124 @@ def ensure_continuation_supervisor(
         if str(lifecycle_state.get("controller_host") or "").strip() == "web"
         else None
     )
-    if not continuation_supervisor_needs_bootstrap(
+    authorized_successor = _authorized_result_unknown_successor_id(supervisor_state)
+    needs_bootstrap = continuation_supervisor_needs_bootstrap(
         lifecycle_state,
         supervisor_state,
         current_registry_sha256=_file_sha256(registry),
         current_controller_wait_fence=current_controller_wait_fence,
         current_host_delivery_fingerprint=current_host_delivery_fingerprint,
-    ):
+    )
+    if authorized_successor and _result_unknown_terminal_state(supervisor_state):
+        # Crash-recovery window: reconciliation may be durably authorized before
+        # the successor supervisor is scheduled. Resume only the same deterministic
+        # successor, and only against the exact fence that was reconciled.
+        fence = _web_conversation_fence_from_registry(registry, session_id=session_id)
+        original = _durable_original_reentry_receipt(supervisor_state)
+        persisted = _persisted_reconciliation_record(supervisor_state)
+        expected_fence = (
+            _result_unknown_successor_expected_fence(record=persisted, original=original)
+            if persisted is not None and original is not None
+            else None
+        )
+        if (
+            fence is None
+            or original is None
+            or persisted is None
+            or expected_fence is None
+            or _controller_delivery_fence_identity(expected_fence) != fence
+            or str(supervisor_state.get("receipt_id") or "") == authorized_successor
+            or persisted.get("successor_scheduled") is True
+        ):
+            return False
+        scheduled = bool(schedule_auto_native_stop(
+            session_id=session_id,
+            repo=repo,
+            receipt_id=authorized_successor,
+            registry=registry,
+            codex=codex,
+            delay_seconds=delay_seconds,
+            state_path=state_path,
+            runtime_path=runtime_path,
+            expected_controller_fence=expected_fence,
+        ))
+        if scheduled:
+            _mark_result_unknown_successor_scheduled(
+                state_path, successor_receipt_id=authorized_successor
+            )
+        return scheduled
+    if _result_unknown_terminal_state(supervisor_state):
+        successor_receipt_id = _clear_result_unknown_via_registered_host_reconcile(
+            session_id=session_id,
+            repo=repo,
+            registry=registry,
+            state_path=state_path,
+            supervisor_state=load_json(state_path) or supervisor_state,
+        )
+        if not successor_receipt_id:
+            return False
+        supervisor_state = load_json(state_path)
+        original = _durable_original_reentry_receipt(supervisor_state)
+        persisted = _persisted_reconciliation_record(supervisor_state)
+        expected_fence = (
+            _result_unknown_successor_expected_fence(record=persisted, original=original)
+            if persisted is not None and original is not None
+            else None
+        )
+        if original is None or persisted is None or expected_fence is None:
+            return False
+        scheduled = bool(schedule_auto_native_stop(
+            session_id=session_id,
+            repo=repo,
+            receipt_id=successor_receipt_id,
+            registry=registry,
+            codex=codex,
+            delay_seconds=delay_seconds,
+            state_path=state_path,
+            runtime_path=runtime_path,
+            expected_controller_fence=expected_fence,
+        ))
+        if scheduled:
+            _mark_result_unknown_successor_scheduled(
+                state_path, successor_receipt_id=successor_receipt_id
+            )
+        return scheduled
+    if not needs_bootstrap:
         return False
+    if authorized_successor:
+        fence = _web_conversation_fence_from_registry(registry, session_id=session_id)
+        original = _durable_original_reentry_receipt(supervisor_state)
+        persisted = _persisted_reconciliation_record(supervisor_state)
+        expected_fence = (
+            _result_unknown_successor_expected_fence(record=persisted, original=original)
+            if persisted is not None and original is not None
+            else None
+        )
+        if (
+            fence is None
+            or original is None
+            or persisted is None
+            or expected_fence is None
+            or _controller_delivery_fence_identity(expected_fence) != fence
+            or str(supervisor_state.get("receipt_id") or "") != authorized_successor
+        ):
+            return False
+        scheduled = bool(schedule_auto_native_stop(
+            session_id=session_id,
+            repo=repo,
+            receipt_id=authorized_successor,
+            registry=registry,
+            codex=codex,
+            delay_seconds=delay_seconds,
+            state_path=state_path,
+            runtime_path=runtime_path,
+            expected_controller_fence=expected_fence,
+        ))
+        if scheduled:
+            _mark_result_unknown_successor_scheduled(
+                state_path, successor_receipt_id=authorized_successor
+            )
+        return scheduled
     generation = int(lifecycle_state.get("wake_generation", 0) or 0)
     receipt_id = f"bootstrap:{generation}"
     current_delivery_key = _lifecycle_delivery_key(
@@ -7673,6 +8337,7 @@ def _schedule_auto_native_stop_locked(
     runtime_path: str | None = None,
     force_rearm: bool = False,
     replace_supervisor_token: str | None = None,
+    expected_controller_fence: dict[str, Any] | None = None,
 ) -> bool:
     """Schedule while the caller holds the supervisor lock."""
     prior = load_json(state_path)
@@ -7685,6 +8350,10 @@ def _schedule_auto_native_stop_locked(
         current_fence = None
     prior_fence = _controller_delivery_fence_identity(prior)
     current_fence_identity = _controller_delivery_fence_identity(current_fence)
+    if expected_controller_fence is not None:
+        expected_fence_identity = _controller_delivery_fence_identity(expected_controller_fence)
+        if expected_fence_identity is None or current_fence_identity != expected_fence_identity:
+            return False
     stale_pre_dispatch_target = (
         same_receipt
         and str(prior.get("state") or "")
@@ -7773,6 +8442,16 @@ def _schedule_auto_native_stop_locked(
         value["failure_class"] = "web_reentry_unavailable"
         value["error_code"] = str(prior.get("error_code") or "WEB_REENTRY_UNAVAILABLE")
         value["stderr_tail"] = bounded_tail(str(prior.get("stderr_tail", "")))
+    existing_original = prior.get("original_reentry_receipt")
+    if _is_durable_result_unknown_receipt(existing_original):
+        value["original_reentry_receipt"] = _copied_json_object(existing_original)
+    existing_reconciliation = prior.get("host_reentry_reconciliation")
+    if isinstance(existing_reconciliation, dict):
+        value["host_reentry_reconciliation"] = _copied_json_object(existing_reconciliation)
+    if "wake_nonce" in prior:
+        value["wake_nonce"] = prior.get("wake_nonce")
+    if "continuation_payload" in prior:
+        value["continuation_payload"] = prior.get("continuation_payload")
 
     command = [
         sys.executable,
@@ -7832,6 +8511,7 @@ def schedule_auto_native_stop(
     runtime_path: str | None = None,
     force_rearm: bool = False,
     replace_supervisor_token: str | None = None,
+    expected_controller_fence: dict[str, Any] | None = None,
 ) -> bool:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = auto_stop_supervisor_lock_path(state_path)
@@ -7851,6 +8531,7 @@ def schedule_auto_native_stop(
                 runtime_path=runtime_path,
                 force_rearm=force_rearm,
                 replace_supervisor_token=replace_supervisor_token,
+                expected_controller_fence=expected_controller_fence,
             )
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -8335,6 +9016,24 @@ def _run_auto_native_stop_impl(
                         current["delivery_host_fingerprint"] = host_delivery_fingerprint
                     else:
                         current.pop("delivery_host_fingerprint", None)
+                    original_receipt = None
+                    host_execution_receipt = attempt.get("host_execution_receipt")
+                    if isinstance(host_execution_receipt, dict):
+                        candidate = host_execution_receipt.get("reentry_receipt")
+                        if _is_durable_result_unknown_receipt(
+                            candidate,
+                            conversation_id=attempt.get("execution_target_session_id"),
+                            target_generation=attempt.get("target_generation"),
+                            ownership_generation=attempt.get("ownership_generation"),
+                        ):
+                            original_receipt = _copied_json_object(candidate)
+                    existing_original = current.get("original_reentry_receipt")
+                    if _is_durable_result_unknown_receipt(existing_original):
+                        current["original_reentry_receipt"] = _copied_json_object(existing_original)
+                    elif original_receipt is not None:
+                        current["original_reentry_receipt"] = original_receipt
+                    current.pop("wake_nonce", None)
+                    current.pop("continuation_payload", None)
                 try:
                     blocked_controller_fence = _controller_web_wait_fence(
                         registry=registry, controller_id=session_id

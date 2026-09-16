@@ -38,6 +38,64 @@ _SPEC.loader.exec_module(web_bridge)
 
 
 
+def _signed_result_unknown_reentry_receipt(**overrides: object) -> dict:
+    receipt = {
+        "schema_version": 1,
+        "receipt_id": "wr_unknown",
+        "wake_id": "runtime_web_oldwake",
+        "wake_nonce_sha256": "a" * 64,
+        "conversation_id": "web-current",
+        "browser_target_id": "browser-current",
+        "target_generation": 4,
+        "ownership_generation": 8,
+        "continuation_payload_sha256": "b" * 64,
+        "dispatch_attempted": True,
+        "submit_confirmed": False,
+        "retryable": False,
+        "auto_retry_allowed": False,
+        "result_class": "RESULT_UNKNOWN",
+        "status": "result_unknown",
+        "host_submit_receipt": "chrome_submit_unknown",
+        "submit_diagnostics": None,
+        "observed_at_ms": 1800000000200,
+        "provenance": "browser_host_reentry_receipt_v1",
+        "host_mac_sha256": "c" * 64,
+    }
+    receipt.update(overrides)
+    return receipt
+
+
+def _signed_reconciliation_receipt(original: dict, **overrides: object) -> dict:
+    receipt = {
+        "schema_version": 1,
+        "receipt_id": "wrr_1",
+        "original_receipt_id": original.get("receipt_id"),
+        "wake_id": original.get("wake_id"),
+        "wake_nonce_sha256": original.get("wake_nonce_sha256"),
+        "continuation_payload_sha256": original.get("continuation_payload_sha256"),
+        "conversation_id": original.get("conversation_id"),
+        "browser_target_id": original.get("browser_target_id"),
+        "target_generation": original.get("target_generation"),
+        "ownership_generation": original.get("ownership_generation"),
+        "dispatch_attempted": True,
+        "submit_confirmed": False,
+        "retryable": False,
+        "auto_retry_allowed": False,
+        "original_result_class": "RESULT_UNKNOWN",
+        "reconciliation_class": "CONFIRMED_NOT_DELIVERED",
+        "status": "confirmed_not_delivered",
+        "journal_phase": "result_unknown",
+        "exact_user_message_present": False,
+        "composer_exact_payload": True,
+        "composer_empty": False,
+        "observed_at_ms": 1800000000300,
+        "provenance": "browser_host_reentry_reconciliation_v1",
+        "host_mac_sha256": "d" * 64,
+    }
+    receipt.update(overrides)
+    return receipt
+
+
 def _provision_verified_current_web_target(
     registry: Path, *, controller_id: str = "controller-1",
     web_session_id: str = "web-session-1", target_generation: int = 1,
@@ -1640,6 +1698,231 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 self.assertEqual(attempt["failure_class"], "web_reentry_unavailable")
                 self.assertEqual(attempt["error_code"], "WEB_REENTRY_UNAVAILABLE")
                 self.assertEqual(attempt["returncode"], 78)
+
+    def test_registered_web_verifier_rejects_result_unknown_without_wake_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = (
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "request=json.loads(sys.stdin.read())\n"
+                "if request['operation']=='attest_and_verify':\n"
+                " print(json.dumps({'ok': True, 'operation':'attest_and_verify', 'host_receipt_id':'hr_unknown_missing_wake', 'verified_target': {'provenance':'runtime_host_verifier_v1','conversation_id':request['conversation_id'],'target_generation':request['target_generation'],'ownership_generation':request['ownership_generation']}}))\n"
+                "else:\n"
+                " print(json.dumps({'ok': True, 'operation':'submit_reentry', 'reentry_receipt': {'provenance':'browser_host_reentry_receipt_v1','conversation_id':request['conversation_id'],'target_generation':request['expected_target_generation'],'ownership_generation':request['expected_ownership_generation'],'dispatch_attempted':True,'submit_confirmed':False,'retryable':False,'auto_retry_allowed':False,'result_class':'RESULT_UNKNOWN','status':'result_unknown','receipt_id':'wr_unknown_missing_wake'}}))\n"
+            )
+            with self._pinned_web_verifier(root, script):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                origin = verifier(
+                    phase="pre_delivery", controller_id="controller-1", host="web",
+                    expected_target_session_id="web-new", expected_target_generation=4,
+                    expected_ownership_generation=9,
+                )
+                with self.assertRaisesRegex(PermissionError, "wake|mismatched receipt"):
+                    verifier.submit_reentry(
+                        controller_id="controller-1", execution_target_session_id="web-new",
+                        target_generation=4, ownership_generation=9, target_mode="explicit_current",
+                        lifecycle_state={"wake_generation": 7, "next_action": "continue"},
+                        host_origin_attestation=origin,
+                    )
+
+    def _pinned_web_verifier(self, root: Path, script: str):
+        from unittest.mock import patch
+        executable = root / "runtime-verifier"
+        executable.write_text(script, encoding="utf-8")
+        executable.chmod(0o700)
+        digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+        config = root / "host-verifiers.json"
+        config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+            "protocol":"runtime_host_verifier_cli_v1","executable":str(executable),"sha256":digest,
+            "bundle_sha256":{str(executable):digest},
+        }}}), encoding="utf-8")
+        config.chmod(0o600)
+        return patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True)
+
+    def test_registered_web_verifier_exposes_pinned_host_reconcile_adapter(self) -> None:
+        original = _signed_result_unknown_reentry_receipt(
+            conversation_id="web-new", target_generation=4, ownership_generation=9,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = (
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "request=json.loads(sys.stdin.read())\n"
+                "if request['operation']=='attest_and_verify':\n"
+                " print(json.dumps({'ok': True, 'operation':'attest_and_verify', 'host_receipt_id':'hr_rec', 'verified_target': {'provenance':'runtime_host_verifier_v1','conversation_id':request['conversation_id'],'target_generation':request['target_generation'],'ownership_generation':request['ownership_generation']}}))\n"
+                "else:\n"
+                " original=request['original_reentry_receipt']\n"
+                " print(json.dumps({'ok': True, 'operation':'reconcile_reentry_result', 'reconciliation_receipt': {'schema_version':1,'receipt_id':'wrr_runtime','original_receipt_id':original['receipt_id'],'wake_id':original['wake_id'],'wake_nonce_sha256':original['wake_nonce_sha256'],'continuation_payload_sha256':original['continuation_payload_sha256'],'conversation_id':request['expected_conversation_id'],'browser_target_id':original['browser_target_id'],'target_generation':request['expected_target_generation'],'ownership_generation':request['expected_ownership_generation'],'dispatch_attempted':True,'submit_confirmed':False,'retryable':False,'auto_retry_allowed':False,'original_result_class':'RESULT_UNKNOWN','reconciliation_class':'CONFIRMED_NOT_DELIVERED','status':'confirmed_not_delivered','journal_phase':'result_unknown','exact_user_message_present':False,'composer_exact_payload':True,'composer_empty':False,'observed_at_ms':1800000000300,'provenance':'browser_host_reentry_reconciliation_v1','host_mac_sha256':'d'*64}}))\n"
+            )
+            with self._pinned_web_verifier(root, script):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                adapter = getattr(verifier, "reconcile_reentry_result")
+                outcome = adapter(
+                    original_reentry_receipt=original,
+                    expected_conversation_id="web-new",
+                    expected_target_generation=4,
+                    expected_ownership_generation=9,
+                    wake_nonce="raw-nonce-must-not-be-forwarded",
+                    continuation_payload="raw-prompt-must-not-be-forwarded",
+                    repo=root / "repo",
+                    registry=root / "registry.json",
+                )
+                self.assertEqual(outcome["operation"], "reconcile_reentry_result")
+                self.assertEqual(
+                    outcome["reconciliation_receipt"]["reconciliation_class"],
+                    "CONFIRMED_NOT_DELIVERED",
+                )
+                self.assertEqual(outcome["reconciliation_receipt"]["original_receipt_id"], "wr_unknown")
+                self.assertEqual(outcome["reconciliation_receipt"]["wake_id"], "runtime_web_oldwake")
+
+    def test_registered_web_verifier_reconcile_adapter_sends_only_original_receipt_and_fence(self) -> None:
+        original = _signed_result_unknown_reentry_receipt(
+            conversation_id="web-new", target_generation=4, ownership_generation=9,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = (
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "request=json.loads(sys.stdin.read())\n"
+                "keys=sorted(request)\n"
+                "if keys!=['expected_conversation_id','expected_ownership_generation','expected_target_generation','operation','original_reentry_receipt']:\n"
+                " print(json.dumps({'ok': False, 'error': 'unexpected keys:'+str(keys)})); sys.exit(1)\n"
+                "if 'wake_nonce' in request or 'continuation_payload' in request or 'wake_id' in request:\n"
+                " print(json.dumps({'ok': False, 'error': 'raw wake material forwarded'})); sys.exit(1)\n"
+                "if request['original_reentry_receipt']!=json.loads(json.dumps(request['original_reentry_receipt'])):\n"
+                " print(json.dumps({'ok': False, 'error': 'receipt not exact'})); sys.exit(1)\n"
+                "original=request['original_reentry_receipt']\n"
+                "print(json.dumps({'ok': True, 'operation':'reconcile_reentry_result', 'reconciliation_receipt': {'schema_version':1,'receipt_id':'wrr_keys','original_receipt_id':original['receipt_id'],'wake_id':original['wake_id'],'wake_nonce_sha256':original['wake_nonce_sha256'],'continuation_payload_sha256':original['continuation_payload_sha256'],'conversation_id':request['expected_conversation_id'],'browser_target_id':original['browser_target_id'],'target_generation':request['expected_target_generation'],'ownership_generation':request['expected_ownership_generation'],'dispatch_attempted':True,'submit_confirmed':False,'retryable':False,'auto_retry_allowed':False,'original_result_class':'RESULT_UNKNOWN','reconciliation_class':'CONFIRMED_NOT_DELIVERED','status':'confirmed_not_delivered','journal_phase':'result_unknown','exact_user_message_present':False,'composer_exact_payload':True,'composer_empty':False,'observed_at_ms':1800000000300,'provenance':'browser_host_reentry_reconciliation_v1','host_mac_sha256':'d'*64}}))\n"
+            )
+            with self._pinned_web_verifier(root, script):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                outcome = verifier.reconcile_reentry_result(
+                    original_reentry_receipt=original,
+                    expected_conversation_id="web-new",
+                    expected_target_generation=4,
+                    expected_ownership_generation=9,
+                    wake_nonce="nonce-cli-reconcile",
+                    continuation_payload="cli reconcile body",
+                    controller_id="controller-1",
+                )
+                self.assertEqual(
+                    outcome["reconciliation_receipt"]["reconciliation_class"],
+                    "CONFIRMED_NOT_DELIVERED",
+                )
+
+    def test_registered_web_verifier_reconcile_adapter_keeps_not_clearable_and_unresolved_blocked(self) -> None:
+        original = _signed_result_unknown_reentry_receipt(
+            conversation_id="web-new", target_generation=4, ownership_generation=9,
+        )
+        for reconciliation_class, status in (
+            ("NOT_CLEARABLE", "journal_submit_confirmed"),
+            ("UNRESOLVED", "observation_unresolved"),
+        ):
+            with self.subTest(reconciliation_class=reconciliation_class):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    script = (
+                        "#!/usr/bin/env python3\n"
+                        "import json,sys\n"
+                        "request=json.loads(sys.stdin.read())\n"
+                        "original=request['original_reentry_receipt']\n"
+                        f"cls={reconciliation_class!r}\n"
+                        f"status={status!r}\n"
+                        "print(json.dumps({'ok': True, 'operation':'reconcile_reentry_result', 'reconciliation_receipt': {'schema_version':1,'receipt_id':'wrr_blocked','original_receipt_id':original['receipt_id'],'wake_id':original['wake_id'],'wake_nonce_sha256':original['wake_nonce_sha256'],'continuation_payload_sha256':original['continuation_payload_sha256'],'conversation_id':request['expected_conversation_id'],'browser_target_id':original['browser_target_id'],'target_generation':request['expected_target_generation'],'ownership_generation':request['expected_ownership_generation'],'dispatch_attempted':True,'submit_confirmed':False,'retryable':False,'auto_retry_allowed':False,'original_result_class':'RESULT_UNKNOWN','reconciliation_class':cls,'status':status,'journal_phase':'submit_confirmed' if cls=='NOT_CLEARABLE' else None,'exact_user_message_present': True if cls=='NOT_CLEARABLE' else False,'composer_exact_payload': False if cls=='UNRESOLVED' else True,'composer_empty': None,'observed_at_ms':1800000000300,'provenance':'browser_host_reentry_reconciliation_v1','host_mac_sha256':'d'*64}}))\n"
+                    )
+                    with self._pinned_web_verifier(root, script):
+                        verifier = web_bridge._registered_peer_attestation_verifier("web")
+                        outcome = verifier.reconcile_reentry_result(
+                            original_reentry_receipt=original,
+                            expected_conversation_id="web-new",
+                            expected_target_generation=4,
+                            expected_ownership_generation=9,
+                        )
+                        self.assertEqual(
+                            outcome["reconciliation_receipt"]["reconciliation_class"],
+                            reconciliation_class,
+                        )
+                        self.assertNotEqual(outcome.get("result"), "CONFIRMED")
+
+    def test_registered_web_verifier_reconcile_adapter_rejects_stale_or_mismatched_outcome(self) -> None:
+        original = _signed_result_unknown_reentry_receipt(
+            conversation_id="web-new", target_generation=4, ownership_generation=9,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = (
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "request=json.loads(sys.stdin.read())\n"
+                "original=request['original_reentry_receipt']\n"
+                "print(json.dumps({'ok': True, 'operation':'reconcile_reentry_result', 'reconciliation_receipt': {'schema_version':1,'receipt_id':'wrr_stale','original_receipt_id':original['receipt_id'],'wake_id':'other-wake','wake_nonce_sha256':original['wake_nonce_sha256'],'continuation_payload_sha256':original['continuation_payload_sha256'],'conversation_id':request['expected_conversation_id'],'browser_target_id':original['browser_target_id'],'target_generation':request['expected_target_generation']+1,'ownership_generation':request['expected_ownership_generation'],'dispatch_attempted':True,'submit_confirmed':False,'retryable':False,'auto_retry_allowed':False,'original_result_class':'RESULT_UNKNOWN','reconciliation_class':'CONFIRMED_NOT_DELIVERED','status':'confirmed_not_delivered','journal_phase':'result_unknown','exact_user_message_present':False,'composer_exact_payload':True,'composer_empty':False,'observed_at_ms':1800000000300,'provenance':'browser_host_reentry_reconciliation_v1','host_mac_sha256':'d'*64}}))\n"
+            )
+            with self._pinned_web_verifier(root, script):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                with self.assertRaisesRegex(PermissionError, "mismatched"):
+                    verifier.reconcile_reentry_result(
+                        original_reentry_receipt=original,
+                        expected_conversation_id="web-new",
+                        expected_target_generation=4,
+                        expected_ownership_generation=9,
+                    )
+
+    def test_registered_web_verifier_reconcile_adapter_rejects_missing_confirmed_evidence(self) -> None:
+        original = _signed_result_unknown_reentry_receipt(
+            conversation_id="web-new", target_generation=4, ownership_generation=9,
+        )
+        for field, value in (
+            ("exact_user_message_present", None),
+            ("composer_exact_payload", None),
+            ("original_result_class", None),
+            ("journal_phase", None),
+            ("journal_phase", "submit_confirmed"),
+        ):
+            with self.subTest(field=field, value=value):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    recon = _signed_reconciliation_receipt(original)
+                    recon[field] = value
+                    script = (
+                        "#!/usr/bin/env python3\n"
+                        "import json,sys\n"
+                        f"receipt=json.loads({json.dumps(json.dumps(recon))})\n"
+                        "print(json.dumps({'ok': True, 'operation':'reconcile_reentry_result', 'reconciliation_receipt': receipt}))\n"
+                    )
+                    with self._pinned_web_verifier(root, script):
+                        verifier = web_bridge._registered_peer_attestation_verifier("web")
+                        with self.assertRaises(PermissionError):
+                            verifier.reconcile_reentry_result(
+                                original_reentry_receipt=original,
+                                expected_conversation_id="web-new",
+                                expected_target_generation=4,
+                                expected_ownership_generation=9,
+                            )
+
+    def test_registered_web_verifier_reconcile_adapter_rejects_original_fence_mismatch_before_host(self) -> None:
+        original = _signed_result_unknown_reentry_receipt(
+            conversation_id="web-old", target_generation=3, ownership_generation=7,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = (
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "print(json.dumps({'ok': False, 'error': 'host must not be invoked'}))\n"
+                "raise SystemExit(1)\n"
+            )
+            with self._pinned_web_verifier(root, script):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                with self.assertRaisesRegex(PermissionError, "exact original signed receipt"):
+                    verifier.reconcile_reentry_result(
+                        original_reentry_receipt=original,
+                        expected_conversation_id="web-new",
+                        expected_target_generation=4,
+                        expected_ownership_generation=9,
+                    )
 
     def test_registered_web_verifier_rechecks_bundle_before_each_execution(self) -> None:
         from unittest.mock import patch
@@ -6381,7 +6664,7 @@ class WebContinuationSupervisorBootstrapTests(unittest.TestCase):
                 ))
 
 
-    def test_ensure_supervisor_uses_new_receipt_for_new_rule_live_e2e_after_old_result_unknown(self) -> None:
+    def test_ensure_supervisor_blocks_new_rule_live_e2e_until_old_result_unknown_is_reconciled(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); repo = root / "repo"; repo.mkdir()
@@ -6412,16 +6695,18 @@ class WebContinuationSupervisorBootstrapTests(unittest.TestCase):
                 "pending_control_event": True, "requires_user": False, "controller_host": "web",
                 "wake_generation": 1, "triggers": ["rule_live_e2e_pending:rev-new"],
             }
-            captured = {}
             with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state), \
                  patch.object(web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64), \
-                 patch.object(web_bridge, "schedule_auto_native_stop", side_effect=lambda **kwargs: captured.update(kwargs) or True):
-                self.assertTrue(web_bridge.ensure_continuation_supervisor(
+                 patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                self.assertFalse(web_bridge.ensure_continuation_supervisor(
                     lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
                     registry=registry, codex="codex", delay_seconds=1.0,
                 ))
-            self.assertNotEqual(captured["receipt_id"], "bootstrap:1")
-            self.assertTrue(captured["receipt_id"].startswith("bootstrap:1:delivery-"))
+            schedule.assert_not_called()
+            saved = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(saved["receipt_id"], "bootstrap:1")
+            self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+            self.assertEqual(saved["delivery_terminal_outcome"], "result_unknown")
 
     def test_ensure_supervisor_uses_new_receipt_after_controller_fence_change(self) -> None:
         from unittest.mock import patch
@@ -11959,6 +12244,7 @@ def _registered_host_result_unknown_persists_quiet_fence(self):
             "wake_generation": 13, "triggers": ["terminal_receipt_pending"],
             "snapshot": {"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
         }
+        original = _signed_result_unknown_reentry_receipt()
         attempt = {
             "operation":"web_reentry", "result":"BLOCKED",
             "state":"WEB_REENTRY_RESULT_UNKNOWN", "returncode":78,
@@ -11969,6 +12255,10 @@ def _registered_host_result_unknown_persists_quiet_fence(self):
             "ownership_generation":8, "target_mode":"explicit_current",
             "delivery_authorization":"host_attested", "host_attested":True,
             "strong_web_identity_established":True,
+            "host_execution_receipt": {
+                "call_receipt": "host-call",
+                "reentry_receipt": original,
+            },
         }
         def verifier(**_kwargs):
             return {"call_receipt":"host-call"}
@@ -11992,12 +12282,1034 @@ def _registered_host_result_unknown_persists_quiet_fence(self):
     self.assertEqual(saved["failure_class"], "web_reentry_result_unknown")
     self.assertEqual(saved["last_lifecycle_fingerprint"], web_bridge._wake_event_fingerprint(lifecycle))
     self.assertEqual(saved["blocked_controller_fence"], current_fence)
+    self.assertEqual(saved["original_reentry_receipt"], original)
+    self.assertNotIn("wake_nonce", saved)
+    self.assertNotIn("continuation_payload", saved)
     self.assertFalse(web_bridge.continuation_supervisor_needs_bootstrap(
         lifecycle, saved, current_controller_wait_fence=current_fence
     ))
 
 
 WebLocalReentryIntegrationTests.test_registered_host_result_unknown_persists_quiet_fence = _registered_host_result_unknown_persists_quiet_fence
+
+
+def _result_unknown_host_attested_fixture(self, tmp):
+    repo, registry, state_path = self.make_repo(Path(tmp))
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["__controller_targets__"] = {"controller-1": {"web": {
+        "status": "active", "session_id": "web-current", "generation": 4,
+        "provenance": "host_attested_same_controller_recovery",
+        "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+    }}}
+    payload["__controller_execution_ownership__"] = {"controller-1": {
+        "active_host": "web", "execution_target_session_id": "web-current",
+        "generation": 8, "provenance": "web_entry",
+    }}
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+    original = _signed_result_unknown_reentry_receipt()
+    lifecycle = {
+        "pending_control_event": True, "requires_user": False, "controller_host": "web",
+        "wake_generation": 13, "triggers": ["terminal_receipt_pending"],
+        "snapshot": {"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+    }
+    fingerprint = web_bridge._wake_event_fingerprint(lifecycle)
+    fence = web_bridge._controller_web_wait_fence(registry=registry, controller_id="controller-1")
+    state_path.write_text(json.dumps({
+        "receipt_id": "host-unknown", "session_id": "controller-1",
+        "repo": str(repo.resolve()), "state": "WEB_REENTRY_RESULT_UNKNOWN",
+        "pending_control_event": True, "failure_class": "web_reentry_result_unknown",
+        "error_code": "WEB_REENTRY_RESULT_UNKNOWN",
+        "delivery_terminal_receipt_id": "host-unknown",
+        "delivery_terminal_key": "wake-generation:13",
+        "delivery_terminal_outcome": "result_unknown",
+        "last_lifecycle_fingerprint": fingerprint,
+        "blocked_controller_fence": fence,
+        "original_reentry_receipt": original,
+        "retry_count": 0,
+    }), encoding="utf-8")
+    return repo, registry, state_path, lifecycle, original
+
+
+def _result_unknown_confirmed_not_delivered_clears_and_schedules_new_wake(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        recon = _signed_reconciliation_receipt(original)
+        calls = []
+        def reconcile(**kwargs):
+            calls.append(kwargs)
+            return {
+                "operation": "reconcile_reentry_result",
+                "reconciliation_receipt": recon,
+            }
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        verifier.reconcile_reentry_result = reconcile
+        verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("CONFIRMED_NOT_DELIVERED must not replay the old wake")
+        )
+        captured = {}
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64
+        ), patch.object(
+            web_bridge, "schedule_auto_native_stop", side_effect=lambda **kwargs: captured.update(kwargs) or True
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry",
+            side_effect=AssertionError("CONFIRMED_NOT_DELIVERED must not submit the old wake"),
+        ):
+            scheduled = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertTrue(scheduled)
+    self.assertEqual(len(calls), 1)
+    self.assertEqual(calls[0]["original_reentry_receipt"], original)
+    self.assertEqual(calls[0]["expected_conversation_id"], "web-current")
+    self.assertEqual(calls[0]["expected_target_generation"], 4)
+    self.assertEqual(calls[0]["expected_ownership_generation"], 8)
+    self.assertNotIn("wake_nonce", calls[0])
+    self.assertNotIn("continuation_payload", calls[0])
+    self.assertNotIn("wake_id", calls[0])
+    self.assertNotEqual(captured["receipt_id"], "host-unknown")
+    self.assertNotEqual(captured["receipt_id"], original["receipt_id"])
+    self.assertNotEqual(captured["receipt_id"], original["wake_id"])
+    self.assertIn(":reconcile-", captured["receipt_id"])
+    self.assertNotIn(original["wake_id"], captured["receipt_id"])
+    self.assertEqual(
+        web_bridge._controller_delivery_fence_identity(captured.get("expected_controller_fence")),
+        ("web-current", 4, 8),
+    )
+    self.assertEqual(
+        saved["host_reentry_reconciliation"]["reconciliation_class"],
+        "CONFIRMED_NOT_DELIVERED",
+    )
+    self.assertEqual(
+        saved["host_reentry_reconciliation"]["successor_receipt_id"],
+        captured["receipt_id"],
+    )
+    self.assertTrue(saved["host_reentry_reconciliation"]["successor_authorized"])
+    self.assertEqual(saved["original_reentry_receipt"], original)
+
+
+def _result_unknown_not_clearable_or_unresolved_stays_blocked(self):
+    from unittest.mock import patch
+    for reconciliation_class in ("NOT_CLEARABLE", "UNRESOLVED"):
+        with self.subTest(reconciliation_class=reconciliation_class):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+                recon = _signed_reconciliation_receipt(
+                    original, reconciliation_class=reconciliation_class,
+                    status="journal_submit_confirmed" if reconciliation_class == "NOT_CLEARABLE" else "observation_unresolved",
+                    exact_user_message_present=reconciliation_class == "NOT_CLEARABLE",
+                    composer_exact_payload=reconciliation_class != "UNRESOLVED",
+                    journal_phase="submit_confirmed" if reconciliation_class == "NOT_CLEARABLE" else None,
+                )
+                def verifier(**_kwargs):
+                    return {"call_receipt": "host-call"}
+                verifier.reconcile_reentry_result = lambda **_kwargs: {
+                    "operation": "reconcile_reentry_result",
+                    "reconciliation_receipt": recon,
+                }
+                verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("blocked reconciliation must not submit")
+                )
+                with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+                    web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+                ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule, patch.object(
+                    web_bridge, "_execute_registered_web_host_reentry",
+                    side_effect=AssertionError("blocked reconciliation must not submit"),
+                ):
+                    scheduled = web_bridge.ensure_continuation_supervisor(
+                        lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                        registry=registry, codex="codex", delay_seconds=1.0,
+                    )
+                saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertFalse(scheduled)
+            schedule.assert_not_called()
+            self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+            self.assertEqual(saved["delivery_terminal_outcome"], "result_unknown")
+            self.assertEqual(saved["original_reentry_receipt"], original)
+            self.assertEqual(
+                saved["host_reentry_reconciliation"]["reconciliation_class"],
+                reconciliation_class,
+            )
+
+
+def _result_unknown_missing_receipt_or_stale_generation_fails_closed(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, _original = _result_unknown_host_attested_fixture(self, tmp)
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        payload.pop("original_reentry_receipt", None)
+        state_path.write_text(json.dumps(payload), encoding="utf-8")
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        verifier.reconcile_reentry_result = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("missing durable receipt must not call Host reconcile")
+        )
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            scheduled = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertFalse(scheduled)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        def reconcile(**kwargs):
+            raise PermissionError("stale target generation before re-entry reconciliation")
+        verifier.reconcile_reentry_result = reconcile
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            scheduled = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertFalse(scheduled)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+    self.assertEqual(saved["original_reentry_receipt"], original)
+    self.assertEqual(saved["delivery_terminal_outcome"], "result_unknown")
+
+
+def _result_unknown_reconcile_restart_is_idempotent_without_duplicate_submit(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        recon = _signed_reconciliation_receipt(original)
+        calls = []
+        def reconcile(**kwargs):
+            calls.append(kwargs)
+            return {
+                "operation": "reconcile_reentry_result",
+                "reconciliation_receipt": recon,
+            }
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        verifier.reconcile_reentry_result = reconcile
+        verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("restart reconcile must not submit the old wake")
+        )
+        captured = []
+        def schedule(**kwargs):
+            captured.append(dict(kwargs))
+            return True
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64
+        ), patch.object(web_bridge, "schedule_auto_native_stop", side_effect=schedule), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry",
+            side_effect=AssertionError("restart reconcile must not submit the old wake"),
+        ):
+            first = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+            second = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+            bumped = json.loads(json.dumps(lifecycle))
+            bumped["wake_generation"] = 99
+            third = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=bumped, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertTrue(first)
+    self.assertFalse(second)
+    self.assertFalse(third)
+    self.assertEqual(len(calls), 1)
+    self.assertEqual(len(captured), 1)
+    self.assertIn(":reconcile-", captured[0]["receipt_id"])
+    self.assertNotEqual(captured[0]["receipt_id"], "host-unknown")
+    self.assertNotEqual(captured[0]["receipt_id"], original["wake_id"])
+    self.assertEqual(saved["original_reentry_receipt"], original)
+    self.assertEqual(
+        saved["host_reentry_reconciliation"]["successor_receipt_id"],
+        captured[0]["receipt_id"],
+    )
+
+
+def _result_unknown_original_receipt_fence_mismatch_rejects_before_reconcile(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        mutated = json.loads(json.dumps(original))
+        mutated["conversation_id"] = "web-foreign"
+        mutated["target_generation"] = 99
+        mutated["ownership_generation"] = 1
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        payload["original_reentry_receipt"] = mutated
+        state_path.write_text(json.dumps(payload), encoding="utf-8")
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        verifier.reconcile_reentry_result = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("foreign original receipt must not call Host reconcile")
+        )
+        verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("foreign original receipt must not submit")
+        )
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            scheduled = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertFalse(scheduled)
+    schedule.assert_not_called()
+    self.assertEqual(saved["original_reentry_receipt"], mutated)
+    self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+    self.assertNotIn("host_reentry_reconciliation", saved)
+
+
+def _result_unknown_persisted_confirmed_rejected_after_retarget_or_generation_drift(self):
+    from unittest.mock import patch
+    for drift in ("retarget", "target_generation", "ownership_generation"):
+        with self.subTest(drift=drift):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+                recon = _signed_reconciliation_receipt(original)
+                successor_id = web_bridge._result_unknown_successor_receipt_id(original=original)
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+                payload["host_reentry_reconciliation"] = {
+                    "reconciliation_class": "CONFIRMED_NOT_DELIVERED",
+                    "reconciliation_receipt": recon,
+                    "conversation_id": "web-current",
+                    "target_generation": 4,
+                    "ownership_generation": 8,
+                    "original_receipt_id": original["receipt_id"],
+                    "original_wake_id": original["wake_id"],
+                    "successor_receipt_id": successor_id,
+                    "successor_authorized": True,
+                }
+                state_path.write_text(json.dumps(payload), encoding="utf-8")
+                registry_payload = json.loads(registry.read_text(encoding="utf-8"))
+                target = registry_payload["__controller_targets__"]["controller-1"]["web"]
+                ownership = registry_payload["__controller_execution_ownership__"]["controller-1"]
+                if drift == "retarget":
+                    target["session_id"] = "web-rotated"
+                    ownership["execution_target_session_id"] = "web-rotated"
+                    registry_payload["__controller_sessions__"]["controller-1"]["web"].append("web-rotated")
+                elif drift == "target_generation":
+                    target["generation"] = 5
+                else:
+                    ownership["generation"] = 9
+                registry.write_text(json.dumps(registry_payload), encoding="utf-8")
+                def verifier(**_kwargs):
+                    return {"call_receipt": "host-call"}
+                verifier.reconcile_reentry_result = lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("drifted fence must not reconcile again")
+                )
+                verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("drifted fence must not submit")
+                )
+                with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+                    web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+                ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                    scheduled = web_bridge.ensure_continuation_supervisor(
+                        lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                        registry=registry, codex="codex", delay_seconds=1.0,
+                    )
+                saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertFalse(scheduled)
+            schedule.assert_not_called()
+            self.assertEqual(saved["original_reentry_receipt"], original)
+            self.assertEqual(
+                saved["host_reentry_reconciliation"]["successor_receipt_id"],
+                successor_id,
+            )
+
+
+def _result_unknown_missing_evidence_fields_reject_without_schedule(self):
+    from unittest.mock import patch
+    for field, value in (
+        ("exact_user_message_present", None),
+        ("composer_exact_payload", None),
+        ("original_result_class", None),
+        ("journal_phase", None),
+    ):
+        with self.subTest(field=field, value=value):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+                recon = _signed_reconciliation_receipt(original, **{field: value})
+                def verifier(**_kwargs):
+                    return {"call_receipt": "host-call"}
+                verifier.reconcile_reentry_result = lambda **_kwargs: {
+                    "operation": "reconcile_reentry_result",
+                    "reconciliation_receipt": recon,
+                }
+                with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+                    web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+                ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule, patch.object(
+                    web_bridge, "_execute_registered_web_host_reentry",
+                    side_effect=AssertionError("missing evidence must not submit"),
+                ):
+                    scheduled = web_bridge.ensure_continuation_supervisor(
+                        lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                        registry=registry, codex="codex", delay_seconds=1.0,
+                    )
+                saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertFalse(scheduled)
+            schedule.assert_not_called()
+            self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+            self.assertEqual(saved["original_reentry_receipt"], original)
+            persisted = saved.get("host_reentry_reconciliation") or {}
+            self.assertNotEqual(persisted.get("reconciliation_class"), "CONFIRMED_NOT_DELIVERED")
+
+
+def _result_unknown_unresolved_and_verifier_error_are_bounded_and_never_schedule(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        recon = _signed_reconciliation_receipt(
+            original, reconciliation_class="UNRESOLVED", status="observation_unresolved",
+            composer_exact_payload=False, journal_phase=None,
+        )
+        calls = []
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        def reconcile(**kwargs):
+            calls.append(kwargs)
+            return {
+                "operation": "reconcile_reentry_result",
+                "reconciliation_receipt": recon,
+            }
+        verifier.reconcile_reentry_result = reconcile
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            first = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+            second = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertFalse(first)
+    self.assertFalse(second)
+    self.assertEqual(len(calls), 1)
+    schedule.assert_not_called()
+    self.assertEqual(saved["original_reentry_receipt"], original)
+    self.assertEqual(saved["host_reentry_reconciliation"]["reconciliation_class"], "UNRESOLVED")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        errors = []
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        def reconcile(**kwargs):
+            errors.append(kwargs)
+            raise PermissionError("verifier reconcile exploded")
+        verifier.reconcile_reentry_result = reconcile
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            first = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+            second = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertFalse(first)
+    self.assertFalse(second)
+    self.assertEqual(len(errors), 1)
+    schedule.assert_not_called()
+    self.assertEqual(saved["original_reentry_receipt"], original)
+    self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+    self.assertNotEqual(
+        (saved.get("host_reentry_reconciliation") or {}).get("reconciliation_class"),
+        "CONFIRMED_NOT_DELIVERED",
+    )
+
+
+def _result_unknown_verifier_without_reconcile_operation_stays_fail_closed(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("verifier without reconcile must not submit")
+        )
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            first = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+            second = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertFalse(first)
+    self.assertFalse(second)
+    schedule.assert_not_called()
+    self.assertEqual(saved["original_reentry_receipt"], original)
+    self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+
+
+def _result_unknown_original_signed_receipt_write_once_across_restart_and_nonmatching_attempt(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "host_attested_same_controller_recovery",
+            "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 8, "provenance": "web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        original = _signed_result_unknown_reentry_receipt()
+        foreign = _signed_result_unknown_reentry_receipt(
+            receipt_id="wr_foreign", wake_id="runtime_web_foreign",
+        )
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 13, "triggers": ["terminal_receipt_pending"],
+            "snapshot": {"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+        }
+        state_path.write_text(json.dumps({
+            "receipt_id": "host-unknown-retry", "session_id": "controller-1",
+            "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+            "pending_control_event": True, "retry_count": 0,
+            "original_reentry_receipt": original,
+            "wake_nonce": "legacy-nonce",
+            "continuation_payload": "legacy-payload",
+        }), encoding="utf-8")
+        attempt = {
+            "operation": "web_reentry", "result": "BLOCKED",
+            "state": "WEB_REENTRY_RESULT_UNKNOWN", "returncode": 78,
+            "failure_class": "web_reentry_result_unknown",
+            "error_code": "WEB_REENTRY_RESULT_UNKNOWN",
+            "execution_target_session_id": "web-current", "target_generation": 4,
+            "ownership_generation": 8, "target_mode": "explicit_current",
+            "delivery_authorization": "host_attested", "host_attested": True,
+            "strong_web_identity_established": True,
+            "host_execution_receipt": {
+                "call_receipt": "host-call",
+                "reentry_receipt": foreign,
+            },
+        }
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry", return_value=attempt
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="host-unknown-retry",
+                registry=registry, codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 78)
+    schedule.assert_not_called()
+    self.assertEqual(saved["original_reentry_receipt"], original)
+    self.assertNotEqual(saved["original_reentry_receipt"], foreign)
+
+
+def _non_result_unknown_legacy_paths_preserve_wake_nonce_and_payload(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "host_attested_same_controller_recovery",
+            "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 8, "provenance": "web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        original = _signed_result_unknown_reentry_receipt()
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 14, "triggers": ["NEW_EVENT"],
+            "snapshot": {"head":"h2","ledger_sha256":"l2","worktree_status_sha256":"w2","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+        }
+        state_path.write_text(json.dumps({
+            "receipt_id": "legacy-nonce-path", "session_id": "controller-1",
+            "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+            "pending_control_event": True, "retry_count": 0,
+            "original_reentry_receipt": original,
+            "wake_nonce": "legacy-nonce",
+            "continuation_payload": "legacy-payload",
+        }), encoding="utf-8")
+        attempt = {
+            "operation": "web_reentry", "result": "FAILED",
+            "state": "WEB_REENTRY_FAILED_BEFORE_DISPATCH", "returncode": 1,
+            "failure_class": "web_reentry_failed_before_dispatch",
+            "error_code": "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+            "execution_target_session_id": "web-current", "target_generation": 4,
+            "ownership_generation": 8, "target_mode": "explicit_current",
+            "delivery_authorization": "host_attested", "host_attested": True,
+            "strong_web_identity_established": True,
+        }
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry", return_value=attempt
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="legacy-nonce-path",
+                registry=registry, codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 1)
+    schedule.assert_not_called()
+    self.assertEqual(saved["wake_nonce"], "legacy-nonce")
+    self.assertEqual(saved["continuation_payload"], "legacy-payload")
+    self.assertEqual(saved["original_reentry_receipt"], original)
+
+
+def _result_unknown_successor_identity_is_stable_across_generation_and_preserved_on_schedule(self):
+    from unittest.mock import patch
+    original = _signed_result_unknown_reentry_receipt()
+    first = web_bridge._result_unknown_successor_receipt_id(original=original)
+    second = web_bridge._result_unknown_successor_receipt_id(
+        original=original, lifecycle_state={"wake_generation": 99}
+    )
+    self.assertEqual(first, second)
+    self.assertNotEqual(first, original["receipt_id"])
+    self.assertNotEqual(first, original["wake_id"])
+    self.assertIn(":reconcile-", first)
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        recon = _signed_reconciliation_receipt(original)
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        payload["host_reentry_reconciliation"] = {
+            "reconciliation_class": "CONFIRMED_NOT_DELIVERED",
+            "reconciliation_receipt": recon,
+            "conversation_id": "web-current",
+            "target_generation": 4,
+            "ownership_generation": 8,
+            "original_receipt_id": original["receipt_id"],
+            "original_wake_id": original["wake_id"],
+            "successor_receipt_id": first,
+            "successor_authorized": True,
+        }
+        state_path.write_text(json.dumps(payload), encoding="utf-8")
+        capture = Path(tmp) / "capture.json"
+        scheduled = web_bridge.schedule_auto_native_stop(
+            session_id="controller-1", repo=repo, receipt_id=first,
+            registry=registry, codex="codex", delay_seconds=0,
+            state_path=state_path, capture_path=capture,
+        )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertTrue(scheduled)
+    self.assertEqual(saved["original_reentry_receipt"], original)
+    self.assertEqual(saved["host_reentry_reconciliation"]["successor_receipt_id"], first)
+    self.assertEqual(saved["receipt_id"], first)
+    self.assertNotEqual(saved["receipt_id"], original["wake_id"])
+
+
+def _confirmed_not_delivered_new_wake_preserves_controller_active_defer(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path = self.make_repo(Path(tmp))
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        payload["__controller_targets__"] = {"controller-1": {"web": {
+            "status": "active", "session_id": "web-current", "generation": 4,
+            "provenance": "host_attested_same_controller_recovery",
+            "binding_mode": "resume_only", "identity_proof": "host_attested_origin",
+        }}}
+        payload["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 8, "provenance": "web_entry",
+        }}
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        state_path.write_text(json.dumps({
+            "receipt_id": "host-unknown:reconcile-aaaa", "session_id": "controller-1",
+            "repo": str(repo.resolve()), "state": "RESUME_PENDING",
+            "pending_control_event": True, "retry_count": 0,
+        }), encoding="utf-8")
+        lifecycle = {
+            "pending_control_event": True, "requires_user": False, "controller_host": "web",
+            "wake_generation": 13, "triggers": ["terminal_receipt_pending"],
+            "snapshot": {"head":"h","ledger_sha256":"l","worktree_status_sha256":"w","ready_ids":[],"runnable_ids":[],"candidate_revisions":[]},
+        }
+        deferred = {
+            "operation": "web_reentry", "result": "DEFERRED",
+            "state": "WEB_REENTRY_DEFERRED_ACTIVE", "returncode": 0,
+            "failure_class": "web_host_active",
+            "execution_target_session_id": "web-current", "target_generation": 4,
+            "ownership_generation": 8, "target_mode": "explicit_current",
+            "delivery_authorization": "host_attested", "host_attested": True,
+            "strong_web_identity_established": True,
+            "host_execution_receipt": {
+                "call_receipt": "host-call",
+                "reentry_receipt": _signed_result_unknown_reentry_receipt(
+                    result_class="CONFIRMED_FAILURE_BEFORE_DISPATCH",
+                    status="controller_active",
+                    dispatch_attempted=False,
+                    retryable=True,
+                    auto_retry_allowed=True,
+                    receipt_id="wr_active_new",
+                    wake_id="runtime_web_newwake",
+                ),
+            },
+        }
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry", return_value=deferred
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id="host-unknown:reconcile-aaaa",
+                registry=registry, codex="codex", delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 0)
+    schedule.assert_called_once()
+    self.assertEqual(saved["state"], "WEB_REENTRY_DEFERRED_ACTIVE")
+    self.assertEqual(saved["failure_class"], "web_host_active")
+    self.assertEqual(saved["retry_count"], 0)
+
+
+
+def _result_unknown_persisted_authorization_crash_window_recovers_same_successor(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        recon = _signed_reconciliation_receipt(original)
+        successor_id = web_bridge._result_unknown_successor_receipt_id(original=original)
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        payload["host_reentry_reconciliation"] = {
+            "reconciliation_class": "CONFIRMED_NOT_DELIVERED",
+            "reconciliation_receipt": recon,
+            "conversation_id": "web-current",
+            "target_generation": 4,
+            "ownership_generation": 8,
+            "original_receipt_id": original["receipt_id"],
+            "original_wake_id": original["wake_id"],
+            "successor_receipt_id": successor_id,
+            "successor_authorized": True,
+        }
+        # Simulate crash after reconciliation persistence but before successor scheduling:
+        # terminal RESULT_UNKNOWN and the old receipt_id are still present.
+        state_path.write_text(json.dumps(payload), encoding="utf-8")
+        captured = []
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        verifier.reconcile_reentry_result = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("persisted confirmed reconciliation must not call Host again")
+        )
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "schedule_auto_native_stop",
+            side_effect=lambda **kwargs: captured.append(dict(kwargs)) or True,
+        ):
+            scheduled = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+    self.assertTrue(scheduled)
+    self.assertEqual(len(captured), 1)
+    self.assertEqual(captured[0]["receipt_id"], successor_id)
+    self.assertEqual(
+        web_bridge._controller_delivery_fence_identity(captured[0].get("expected_controller_fence")),
+        ("web-current", 4, 8),
+    )
+
+
+def _result_unknown_successor_schedule_rechecks_expected_fence_inside_scheduler(self):
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, _lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        prior = json.loads(state_path.read_text(encoding="utf-8"))
+        successor_id = web_bridge._result_unknown_successor_receipt_id(original=original)
+        prior["host_reentry_reconciliation"] = {
+            "reconciliation_class": "CONFIRMED_NOT_DELIVERED",
+            "reconciliation_receipt": _signed_reconciliation_receipt(original),
+            "conversation_id": "web-current",
+            "target_generation": 4,
+            "ownership_generation": 8,
+            "original_receipt_id": original["receipt_id"],
+            "original_wake_id": original["wake_id"],
+            "successor_receipt_id": successor_id,
+            "successor_authorized": True,
+        }
+        state_path.write_text(json.dumps(prior), encoding="utf-8")
+        expected_fence = {
+            "execution_target_session_id": "web-current",
+            "target_generation": 4,
+            "ownership_generation": 8,
+        }
+        # Retarget after reconciliation was confirmed, before scheduling.
+        registry_payload = json.loads(registry.read_text(encoding="utf-8"))
+        registry_payload["__controller_targets__"]["controller-1"]["web"]["session_id"] = "web-rotated"
+        registry_payload["__controller_targets__"]["controller-1"]["web"]["generation"] = 5
+        registry_payload["__controller_execution_ownership__"]["controller-1"]["execution_target_session_id"] = "web-rotated"
+        registry_payload["__controller_execution_ownership__"]["controller-1"]["generation"] = 9
+        registry_payload["__controller_sessions__"]["controller-1"]["web"].append("web-rotated")
+        registry.write_text(json.dumps(registry_payload), encoding="utf-8")
+        capture = Path(tmp) / "capture.json"
+        scheduled = web_bridge.schedule_auto_native_stop(
+            session_id="controller-1", repo=repo, receipt_id=successor_id,
+            registry=registry, codex="codex", delay_seconds=0,
+            state_path=state_path, capture_path=capture,
+            expected_controller_fence=expected_fence,
+        )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertFalse(scheduled)
+    self.assertFalse(capture.exists())
+    self.assertEqual(saved["receipt_id"], "host-unknown")
+    self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+
+
+
+
+
+def _result_unknown_new_lifecycle_generation_still_reconciles_before_bootstrap(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        lifecycle = json.loads(json.dumps(lifecycle))
+        lifecycle["wake_generation"] = 14
+        lifecycle["triggers"] = ["NEW_EVENT"]
+        recon = _signed_reconciliation_receipt(
+            original,
+            reconciliation_class="UNRESOLVED",
+            status="observation_unresolved",
+            exact_user_message_present=False,
+            composer_exact_payload=False,
+            journal_phase=None,
+        )
+        calls = []
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        def reconcile(**kwargs):
+            calls.append(kwargs)
+            return {
+                "operation": "reconcile_reentry_result",
+                "reconciliation_receipt": recon,
+            }
+        verifier.reconcile_reentry_result = reconcile
+        verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unresolved RESULT_UNKNOWN must not submit a new bootstrap wake")
+        )
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            scheduled = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertFalse(scheduled)
+    self.assertEqual(len(calls), 1)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+    self.assertEqual(saved["original_reentry_receipt"], original)
+    self.assertEqual(
+        saved["host_reentry_reconciliation"]["reconciliation_class"],
+        "UNRESOLVED",
+    )
+
+
+
+def _completed_reconciled_successor_does_not_capture_later_lifecycle_event(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        successor_id = web_bridge._result_unknown_successor_receipt_id(original=original)
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        payload.update({
+            "receipt_id": successor_id,
+            "state": "WAITING_FOR_CONTROLLER_PROGRESS",
+            "delivery_terminal_receipt_id": successor_id,
+            "delivery_terminal_key": "wake-generation:13",
+            "delivery_terminal_outcome": "submit_confirmed",
+        })
+        payload.pop("failure_class", None)
+        payload.pop("error_code", None)
+        payload.pop("blocked_controller_fence", None)
+        payload["host_reentry_reconciliation"] = {
+            "reconciliation_class": "CONFIRMED_NOT_DELIVERED",
+            "reconciliation_receipt": _signed_reconciliation_receipt(original),
+            "conversation_id": "web-current",
+            "target_generation": 4,
+            "ownership_generation": 8,
+            "original_receipt_id": original["receipt_id"],
+            "original_wake_id": original["wake_id"],
+            "successor_receipt_id": successor_id,
+            "successor_authorized": True,
+            "successor_scheduled": True,
+        }
+        state_path.write_text(json.dumps(payload), encoding="utf-8")
+        next_lifecycle = json.loads(json.dumps(lifecycle))
+        next_lifecycle["wake_generation"] = 14
+        next_lifecycle["triggers"] = ["NEW_EVENT"]
+        captured = []
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_web_host_delivery_fingerprint", return_value=None
+        ), patch.object(
+            web_bridge, "schedule_auto_native_stop",
+            side_effect=lambda **kwargs: captured.append(dict(kwargs)) or True,
+        ):
+            scheduled = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=next_lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+    self.assertTrue(scheduled)
+    self.assertEqual(len(captured), 1)
+    self.assertNotEqual(captured[0]["receipt_id"], successor_id)
+    self.assertTrue(captured[0]["receipt_id"].startswith("bootstrap:14"))
+
+
+def _result_unknown_persisted_authorization_requires_complete_reconciliation_evidence(self):
+    original = _signed_result_unknown_reentry_receipt()
+    successor_id = web_bridge._result_unknown_successor_receipt_id(original=original)
+    base_record = {
+        "reconciliation_class": "CONFIRMED_NOT_DELIVERED",
+        "conversation_id": original["conversation_id"],
+        "target_generation": original["target_generation"],
+        "ownership_generation": original["ownership_generation"],
+        "original_receipt_id": original["receipt_id"],
+        "original_wake_id": original["wake_id"],
+        "successor_receipt_id": successor_id,
+        "successor_authorized": True,
+    }
+    minimal_state = {
+        "original_reentry_receipt": original,
+        "host_reentry_reconciliation": dict(base_record),
+    }
+    self.assertEqual(
+        web_bridge._authorized_result_unknown_successor_id(minimal_state),
+        "",
+    )
+
+    malformed = dict(base_record)
+    malformed["reconciliation_receipt"] = _signed_reconciliation_receipt(
+        original, exact_user_message_present=True
+    )
+    self.assertEqual(
+        web_bridge._authorized_result_unknown_successor_id({
+            "original_reentry_receipt": original,
+            "host_reentry_reconciliation": malformed,
+        }),
+        "",
+    )
+
+    valid = dict(base_record)
+    valid["reconciliation_receipt"] = _signed_reconciliation_receipt(original)
+    self.assertEqual(
+        web_bridge._authorized_result_unknown_successor_id({
+            "original_reentry_receipt": original,
+            "host_reentry_reconciliation": valid,
+        }),
+        successor_id,
+    )
+
+
+def _result_unknown_successor_scheduled_marker_uses_supervisor_lock(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        original = _signed_result_unknown_reentry_receipt()
+        successor_id = web_bridge._result_unknown_successor_receipt_id(original=original)
+        record = {
+            "reconciliation_class": "CONFIRMED_NOT_DELIVERED",
+            "reconciliation_receipt": _signed_reconciliation_receipt(original),
+            "conversation_id": original["conversation_id"],
+            "target_generation": original["target_generation"],
+            "ownership_generation": original["ownership_generation"],
+            "original_receipt_id": original["receipt_id"],
+            "original_wake_id": original["wake_id"],
+            "successor_receipt_id": successor_id,
+            "successor_authorized": True,
+        }
+        state_path.write_text(json.dumps({
+            "state": "CONTINUATION_CLOSED",
+            "delivery_terminal_outcome": "submit_confirmed",
+            "original_reentry_receipt": original,
+            "host_reentry_reconciliation": record,
+        }), encoding="utf-8")
+        events = []
+        real_load = web_bridge.load_json
+        real_write = web_bridge.write_auto_stop_state
+
+        def traced_load(path):
+            events.append("load")
+            return real_load(path)
+
+        def traced_write(path, value):
+            events.append("write")
+            return real_write(path, value)
+
+        def traced_flock(_fd, operation):
+            events.append(("flock", operation))
+
+        with patch.object(web_bridge.fcntl, "flock", side_effect=traced_flock), patch.object(
+            web_bridge, "load_json", side_effect=traced_load
+        ), patch.object(web_bridge, "write_auto_stop_state", side_effect=traced_write):
+            web_bridge._mark_result_unknown_successor_scheduled(
+                state_path, successor_receipt_id=successor_id
+            )
+
+        self.assertEqual(events[0], ("flock", web_bridge.fcntl.LOCK_EX))
+        self.assertEqual(events[-1], ("flock", web_bridge.fcntl.LOCK_UN))
+        self.assertLess(events.index("load"), events.index("write"))
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["state"], "CONTINUATION_CLOSED")
+        self.assertEqual(saved["delivery_terminal_outcome"], "submit_confirmed")
+        self.assertTrue(saved["host_reentry_reconciliation"]["successor_scheduled"])
+
+WebLocalReentryIntegrationTests.test_result_unknown_new_lifecycle_generation_still_reconciles_before_bootstrap = _result_unknown_new_lifecycle_generation_still_reconciles_before_bootstrap
+WebLocalReentryIntegrationTests.test_completed_reconciled_successor_does_not_capture_later_lifecycle_event = _completed_reconciled_successor_does_not_capture_later_lifecycle_event
+WebLocalReentryIntegrationTests.test_result_unknown_persisted_authorization_requires_complete_reconciliation_evidence = _result_unknown_persisted_authorization_requires_complete_reconciliation_evidence
+WebLocalReentryIntegrationTests.test_result_unknown_successor_scheduled_marker_uses_supervisor_lock = _result_unknown_successor_scheduled_marker_uses_supervisor_lock
+WebLocalReentryIntegrationTests.test_result_unknown_confirmed_not_delivered_clears_and_schedules_new_wake = _result_unknown_confirmed_not_delivered_clears_and_schedules_new_wake
+WebLocalReentryIntegrationTests.test_result_unknown_persisted_authorization_crash_window_recovers_same_successor = _result_unknown_persisted_authorization_crash_window_recovers_same_successor
+WebLocalReentryIntegrationTests.test_result_unknown_successor_schedule_rechecks_expected_fence_inside_scheduler = _result_unknown_successor_schedule_rechecks_expected_fence_inside_scheduler
+WebLocalReentryIntegrationTests.test_result_unknown_not_clearable_or_unresolved_stays_blocked = _result_unknown_not_clearable_or_unresolved_stays_blocked
+WebLocalReentryIntegrationTests.test_result_unknown_missing_receipt_or_stale_generation_fails_closed = _result_unknown_missing_receipt_or_stale_generation_fails_closed
+WebLocalReentryIntegrationTests.test_result_unknown_reconcile_restart_is_idempotent_without_duplicate_submit = _result_unknown_reconcile_restart_is_idempotent_without_duplicate_submit
+WebLocalReentryIntegrationTests.test_result_unknown_original_receipt_fence_mismatch_rejects_before_reconcile = _result_unknown_original_receipt_fence_mismatch_rejects_before_reconcile
+WebLocalReentryIntegrationTests.test_result_unknown_persisted_confirmed_rejected_after_retarget_or_generation_drift = _result_unknown_persisted_confirmed_rejected_after_retarget_or_generation_drift
+WebLocalReentryIntegrationTests.test_result_unknown_missing_evidence_fields_reject_without_schedule = _result_unknown_missing_evidence_fields_reject_without_schedule
+WebLocalReentryIntegrationTests.test_result_unknown_unresolved_and_verifier_error_are_bounded_and_never_schedule = _result_unknown_unresolved_and_verifier_error_are_bounded_and_never_schedule
+WebLocalReentryIntegrationTests.test_result_unknown_verifier_without_reconcile_operation_stays_fail_closed = _result_unknown_verifier_without_reconcile_operation_stays_fail_closed
+WebLocalReentryIntegrationTests.test_result_unknown_original_signed_receipt_write_once_across_restart_and_nonmatching_attempt = _result_unknown_original_signed_receipt_write_once_across_restart_and_nonmatching_attempt
+WebLocalReentryIntegrationTests.test_non_result_unknown_legacy_paths_preserve_wake_nonce_and_payload = _non_result_unknown_legacy_paths_preserve_wake_nonce_and_payload
+WebLocalReentryIntegrationTests.test_result_unknown_successor_identity_is_stable_across_generation_and_preserved_on_schedule = _result_unknown_successor_identity_is_stable_across_generation_and_preserved_on_schedule
+WebLocalReentryIntegrationTests.test_confirmed_not_delivered_new_wake_preserves_controller_active_defer = _confirmed_not_delivered_new_wake_preserves_controller_active_defer
 
 
 def _confirmed_web_reentry_clears_stale_nonretryable_block_evidence(self):
