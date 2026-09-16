@@ -4480,6 +4480,8 @@ def _is_durable_result_unknown_receipt(
         or value.get("auto_retry_allowed") is not False
         or not str(value.get("receipt_id") or "").strip()
         or not str(value.get("wake_id") or "").strip()
+        or not _valid_sha256(value.get("wake_nonce_sha256"))
+        or not _valid_sha256(value.get("continuation_payload_sha256"))
         or not receipt_conversation
         or not _positive_generation(value.get("target_generation"))
         or not _positive_generation(value.get("ownership_generation"))
