@@ -65,18 +65,19 @@ def sample_report():
 
 
 class DashboardRenderTests(unittest.TestCase):
-    def test_dashboard_is_self_contained_and_has_required_sections(self):
+    def test_dashboard_is_self_contained_and_concise(self):
         html = render_dashboard(sample_report())
         self.assertTrue(html.startswith("<!doctype html>"))
         lowered = html.lower()
         self.assertNotIn('src="http', lowered)
         self.assertNotIn("src='http", lowered)
         self.assertNotIn('href="http', lowered)
-        for section in ["overview", "model-comparison", "decisions", "attribution", "route-health", "evidence"]:
+        for section in ["overview", "model-comparison", "decisions"]:
             self.assertIn(f'id="{section}"', html)
-        self.assertIn("<svg", html)
-        self.assertIn("model-orbit", html)
-        self.assertIn("energy-core", html)
+        self.assertNotIn('id="evidence"', html)
+        self.assertNotIn("<table", html)
+        self.assertNotIn("model-orbit", html)
+        self.assertIn("cosmic-hero", html)
 
     def test_dashboard_escapes_untrusted_text_and_script_embedding(self):
         html = render_dashboard(sample_report())
@@ -84,24 +85,40 @@ class DashboardRenderTests(unittest.TestCase):
         self.assertIn("SelfAlone &lt;script&gt;alert(1)&lt;/script&gt;", html)
         self.assertNotIn("</script><script>", html)
 
-    def test_dashboard_renders_project_route_and_external_scores_side_by_side(self):
+    def test_dashboard_renders_chinese_model_comparison_and_recommendations(self):
         html = render_dashboard(sample_report())
-        self.assertIn("Project score", html)
-        self.assertIn("Route reliability", html)
-        self.assertIn("External baseline", html)
+        self.assertIn("项目实战", html)
+        self.assertIn("执行稳定", html)
+        self.assertIn("外部基线", html)
+        self.assertIn("智能建议", html)
+        self.assertIn("保持使用", html)
+        self.assertIn("优化路由", html)
         self.assertIn("gpt-5.6-sol", html)
         self.assertIn("grok-4.6", html)
         self.assertIn("kimi-k3", html)
-        self.assertIn("CHANGE_ROUTE", html)
 
-    def test_dashboard_matches_bright_editorial_scifi_reference_language(self):
+    def test_dashboard_matches_dark_purple_neon_reference_language(self):
         html = render_dashboard(sample_report())
-        self.assertIn("--paper:", html)
-        self.assertIn("--ink:", html)
+        compact = html.replace(" ", "").lower()
+        self.assertIn("--bg:#0b0718", compact)
+        self.assertIn("--pink:#ff72d2", compact)
         self.assertIn("radial-gradient", html)
-        self.assertIn("letter-spacing", html)
-        self.assertIn("text-transform:uppercase", html.replace(" ", ""))
-        self.assertNotIn("background:#000", html.replace(" ", "").lower())
+        self.assertIn("backdrop-filter:blur", compact)
+        self.assertIn("linear-gradient", html)
+        self.assertIn("更好的模型组合", html)
+        self.assertIn("创造更大的可能", html)
+        self.assertNotIn("#f7f7f3", compact)
+
+    def test_dashboard_collapses_configuration_noise_to_one_card_per_model(self):
+        report = sample_report()
+        report["model_groups"].append({
+            "identity": {"provider": "codex-native", "model": "gpt-5.6-sol", "auth_mode": "host", "reasoning_effort": "medium", "execution_role": "reviewer", "policy_class": "frontend", "execution_transport": "codex_native_subagent", "project": "SelfAlone"},
+            "project_model_score": 89.0, "quality_sample_count": 3, "total_sample_count": 3,
+            "confidence": "medium", "benchmark": {"source": "modeldial", "score": 82, "match": "partial", "route": "custom-endpoint"},
+            "baseline_comparison": "NOT_COMPARABLE",
+        })
+        html = render_dashboard(report)
+        self.assertEqual(html.count('data-model="gpt-5.6-sol"'), 1)
 
 
 if __name__ == "__main__":

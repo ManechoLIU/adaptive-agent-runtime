@@ -1,10 +1,10 @@
-"""Self-contained HTML renderer for project model intelligence reports."""
+"""Self-contained Chinese HTML renderer for project model intelligence reports."""
 
 from __future__ import annotations
 
 import html
 import json
-import math
+from collections import defaultdict
 from typing import Any
 
 
@@ -24,290 +24,233 @@ def _pct(value: Any) -> float:
     return max(0.0, min(100.0, float(value)))
 
 
-def _benchmark_score(group: dict[str, Any]) -> Any:
-    benchmark = group.get("benchmark")
-    return benchmark.get("score") if isinstance(benchmark, dict) else None
+def _weighted(values: list[tuple[float, int]]) -> float | None:
+    total_weight = sum(max(1, int(weight)) for _, weight in values)
+    if not values or total_weight <= 0:
+        return None
+    return round(sum(float(value) * max(1, int(weight)) for value, weight in values) / total_weight, 1)
 
 
-def _route_lookup(report: dict[str, Any]) -> dict[tuple[str, str, str, str], dict[str, Any]]:
-    result: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    for item in report.get("route_groups", []):
-        if not isinstance(item, dict) or not isinstance(item.get("route"), dict):
-            continue
-        route = item["route"]
-        key = tuple(str(route.get(field) or "unknown") for field in ("provider", "model", "auth_mode", "execution_transport"))
-        result[key] = item
-    return result
+_ACTION_LABELS = {
+    "KEEP": "保持使用",
+    "TUNE_EFFORT": "调整推理强度",
+    "CHANGE_ROUTE": "优化路由",
+    "CHANGE_ROLE": "调整角色",
+    "SWITCH_MODEL": "考虑换模",
+    "INSUFFICIENT_EVIDENCE": "继续观察",
+}
+
+_ACTION_PRIORITY = {
+    "SWITCH_MODEL": 6,
+    "CHANGE_ROUTE": 5,
+    "CHANGE_ROLE": 4,
+    "TUNE_EFFORT": 3,
+    "KEEP": 2,
+    "INSUFFICIENT_EVIDENCE": 1,
+}
+
+_REASON_LABELS = {
+    "project_evidence_supports_current_route": "项目实战表现稳定，当前配置可继续使用。",
+    "route_reliability_degraded": "模型能力不是主要问题，优先修复执行链稳定性。",
+    "insufficient_project_samples": "有效样本不足，暂不建议换模型。",
+    "model_stronger_in_other_role": "同一模型在其他角色表现更好，优先调整分工。",
+    "project_quality_materially_weaker": "同类任务项目表现持续偏弱。",
+    "stronger_observed_alternative": "已有同类任务更强的替代模型。",
+    "effort_not_cost_effective": "更高推理强度没有带来足够质量增益。",
+    "lower_effort_similar_quality": "较低推理强度已达到接近质量，可降低耗时。",
+    "route_evidence_insufficient": "路由样本不足，继续积累真实执行证据。",
+}
 
 
-def _model_key(identity: dict[str, Any]) -> tuple[str, str, str, str]:
-    return tuple(str(identity.get(field) or "unknown") for field in ("provider", "model", "auth_mode", "execution_transport"))
+def _model_summaries(report: dict[str, Any]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = defaultdict(lambda: {
+        "project": [], "baseline": [], "route": [], "samples": 0, "decisions": [], "providers": set(), "efforts": set(),
+    })
 
-
-def _comparison_rows(report: dict[str, Any]) -> str:
-    routes = _route_lookup(report)
-    rows: list[str] = []
     for group in report.get("model_groups", []):
         if not isinstance(group, dict):
             continue
         identity = group.get("identity") if isinstance(group.get("identity"), dict) else {}
-        route = routes.get(_model_key(identity), {})
+        model = str(identity.get("model") or "unknown")
+        item = grouped[model]
+        item["providers"].add(str(identity.get("provider") or "unknown"))
+        effort = str(identity.get("reasoning_effort") or "unknown")
+        if effort != "unknown":
+            item["efforts"].add(effort)
+        n = max(0, int(group.get("quality_sample_count") or 0))
+        item["samples"] += n
         project = group.get("project_model_score")
-        reliability = route.get("route_reliability_score")
-        external = _benchmark_score(group)
-        match = (group.get("benchmark") or {}).get("match") if isinstance(group.get("benchmark"), dict) else "none"
-        route_note = f"{identity.get('provider','unknown')} · {identity.get('auth_mode','unknown')} · {identity.get('reasoning_effort','unknown')}"
-        rows.append(
-            f"""
-            <article class="score-row">
-              <div class="score-identity">
-                <span class="eyebrow">{_e(identity.get('execution_role','unknown'))} · {_e(identity.get('policy_class','unknown'))}</span>
-                <h3>{_e(identity.get('model','unknown'))}</h3>
-                <p>{_e(route_note)}</p>
-              </div>
-              <div class="score-tracks">
-                <div class="track-line"><span>Project score</span><strong>{_score(project)}</strong><i class="bar project" style="--v:{_pct(project)}%"></i></div>
-                <div class="track-line"><span>Route reliability</span><strong>{_score(reliability)}</strong><i class="bar route" style="--v:{_pct(reliability)}%"></i></div>
-                <div class="track-line"><span>External baseline</span><strong>{_score(external)}</strong><i class="bar external" style="--v:{_pct(external)}%"></i></div>
-              </div>
-              <div class="score-meta">
-                <span>{_e(group.get('confidence','low'))} confidence</span>
-                <span>{_e(group.get('quality_sample_count',0))} quality samples</span>
-                <span>baseline {_e(match)}</span>
-              </div>
-            </article>
-            """
-        )
-    if not rows:
-        return '<p class="empty">No scorable model evidence in this window.</p>'
-    return "\n".join(rows)
+        if isinstance(project, (int, float)) and n > 0:
+            item["project"].append((float(project), n))
+        benchmark = group.get("benchmark") if isinstance(group.get("benchmark"), dict) else {}
+        baseline = benchmark.get("score")
+        if benchmark.get("match") != "none" and isinstance(baseline, (int, float)):
+            item["baseline"].append((float(baseline), max(1, n)))
 
+    for route_group in report.get("route_groups", []):
+        if not isinstance(route_group, dict):
+            continue
+        route = route_group.get("route") if isinstance(route_group.get("route"), dict) else {}
+        model = str(route.get("model") or "unknown")
+        score = route_group.get("route_reliability_score")
+        attempts = max(1, int(route_group.get("eligible_attempts") or 0))
+        if isinstance(score, (int, float)):
+            grouped[model]["route"].append((float(score), attempts))
 
-def _orbit_svg(report: dict[str, Any]) -> str:
-    groups = [g for g in report.get("model_groups", []) if isinstance(g, dict)]
-    if not groups:
-        return '<svg class="model-orbit" viewBox="0 0 520 360" role="img" aria-label="No model orbit data"></svg>'
-    cx, cy = 260.0, 180.0
-    ring_radii = [72, 112, 150]
-    circles = "".join(f'<circle cx="{cx}" cy="{cy}" r="{r}" class="orbit-ring" />' for r in ring_radii)
-    nodes: list[str] = []
-    labels: list[str] = []
-    count = len(groups)
-    for idx, group in enumerate(groups):
-        identity = group.get("identity") if isinstance(group.get("identity"), dict) else {}
-        score = _pct(group.get("project_model_score"))
-        angle = (-math.pi / 2) + (2 * math.pi * idx / max(1, count))
-        radius = 78 + (score / 100.0) * 72
-        x = cx + math.cos(angle) * radius
-        y = cy + math.sin(angle) * radius
-        nodes.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="7" class="orbit-node" />')
-        labels.append(f'<text x="{x:.1f}" y="{y + 20:.1f}" text-anchor="middle" class="orbit-label">{_e(identity.get("model","unknown"))}</text>')
-    return f'''<svg class="model-orbit" viewBox="0 0 520 360" role="img" aria-label="Model project-score orbit">
-      <defs>
-        <radialGradient id="coreGlow" cx="40%" cy="35%">
-          <stop offset="0%" stop-color="#dbe4ff"/>
-          <stop offset="38%" stop-color="#4469ff"/>
-          <stop offset="76%" stop-color="#3a27d7"/>
-          <stop offset="100%" stop-color="#17164f"/>
-        </radialGradient>
-      </defs>
-      {circles}
-      <circle cx="{cx}" cy="{cy}" r="50" fill="url(#coreGlow)" class="orbit-core" />
-      {''.join(nodes)}
-      {''.join(labels)}
-    </svg>'''
-
-
-def _decision_cards(report: dict[str, Any]) -> str:
-    action_copy = {
-        "KEEP": "Keep current configuration",
-        "TUNE_EFFORT": "Tune reasoning effort",
-        "CHANGE_ROUTE": "Repair or change execution route",
-        "CHANGE_ROLE": "Use model in a different role",
-        "SWITCH_MODEL": "Consider switching model",
-        "INSUFFICIENT_EVIDENCE": "Collect more evidence",
-    }
-    cards: list[str] = []
     for decision in report.get("decisions", []):
         if not isinstance(decision, dict):
             continue
         identity = decision.get("identity") if isinstance(decision.get("identity"), dict) else {}
+        model = str(identity.get("model") or "unknown")
+        grouped[model]["decisions"].append(decision)
+
+    result: list[dict[str, Any]] = []
+    for model, raw in grouped.items():
+        decisions = sorted(
+            raw["decisions"],
+            key=lambda d: (
+                _ACTION_PRIORITY.get(str(d.get("action") or "INSUFFICIENT_EVIDENCE"), 0),
+                int(d.get("quality_sample_count") or 0),
+            ),
+            reverse=True,
+        )
+        decision = decisions[0] if decisions else {"action": "INSUFFICIENT_EVIDENCE", "reason_codes": ["insufficient_project_samples"]}
         action = str(decision.get("action") or "INSUFFICIENT_EVIDENCE")
         reasons = decision.get("reason_codes") if isinstance(decision.get("reason_codes"), list) else []
-        target = decision.get("suggested_target") if isinstance(decision.get("suggested_target"), dict) else None
-        target_html = ""
-        if target:
-            target_html = f'<p class="decision-target">Suggested → <b>{_e(target.get("model",""))}</b> · {_e(target.get("reasoning_effort",""))} · {_e(target.get("execution_role",""))}</p>'
-        cards.append(
-            f'''<article class="decision-card" data-action="{_e(action)}">
-              <div class="decision-top"><span class="action-pill">{_e(action)}</span><span>{_e(decision.get('confidence','low'))} confidence</span></div>
-              <h3>{_e(identity.get('model','unknown'))}</h3>
-              <p class="decision-title">{_e(action_copy.get(action, action))}</p>
-              <div class="decision-scores"><span>Project <b>{_score(decision.get('project_model_score'))}</b></span><span>Route <b>{_score(decision.get('route_reliability_score'))}</b></span><span>n <b>{_e(decision.get('quality_sample_count',0))}</b></span></div>
-              <p class="decision-reason">{_e(' · '.join(str(r) for r in reasons) or 'no machine reason')}</p>
-              {target_html}
-            </article>'''
-        )
-    return "\n".join(cards) or '<p class="empty">No decisions available.</p>'
+        reason = next((_REASON_LABELS.get(str(code)) for code in reasons if _REASON_LABELS.get(str(code))), None)
+        if not reason:
+            reason = "基于当前项目证据继续观察。"
+        result.append({
+            "model": model,
+            "project": _weighted(raw["project"]),
+            "baseline": _weighted(raw["baseline"]),
+            "route": _weighted(raw["route"]),
+            "samples": raw["samples"],
+            "action": action,
+            "action_label": _ACTION_LABELS.get(action, action),
+            "reason": reason,
+            "providers": sorted(raw["providers"]),
+            "efforts": sorted(raw["efforts"]),
+        })
+
+    result.sort(key=lambda item: (
+        -1 if item["project"] is None else -float(item["project"]),
+        item["model"],
+    ))
+    return result
 
 
-def _attribution_svg(report: dict[str, Any]) -> str:
-    counts = report.get("attribution_counts") if isinstance(report.get("attribution_counts"), dict) else {}
-    keys = ["model", "infrastructure", "external", "mixed", "unknown"]
-    values = [max(0, int(counts.get(key) or 0)) for key in keys]
-    total = sum(values) or 1
-    x = 0.0
-    parts: list[str] = []
-    labels: list[str] = []
-    classes = ["attr-model", "attr-infra", "attr-external", "attr-mixed", "attr-unknown"]
-    for key, value, cls in zip(keys, values, classes):
-        width = 600 * value / total
-        if width > 0:
-            parts.append(f'<rect x="{x:.2f}" y="22" width="{width:.2f}" height="24" rx="12" class="{cls}" />')
-        labels.append(f'<span><i class="legend-dot {cls}"></i>{_e(key)} <b>{value}</b></span>')
-        x += width
-    return f'''<div class="attribution-visual">
-      <svg viewBox="0 0 600 70" role="img" aria-label="Failure attribution distribution">{''.join(parts)}</svg>
-      <div class="legend">{''.join(labels)}</div>
-    </div>'''
+def _metric_card(label: str, value: Any, note: str) -> str:
+    return f'''<article class="metric-card"><span>{_e(label)}</span><strong>{_e(value)}</strong><small>{_e(note)}</small></article>'''
 
 
-def _route_health(report: dict[str, Any]) -> str:
+def _model_cards(summaries: list[dict[str, Any]]) -> str:
+    cards: list[str] = []
+    for idx, item in enumerate(summaries):
+        score = item["project"] if item["project"] is not None else item["baseline"]
+        secondary = "项目实战" if item["project"] is not None else "外部基线"
+        tags = []
+        if item["efforts"]:
+            tags.append("/".join(item["efforts"]))
+        if item["providers"]:
+            tags.append(item["providers"][0])
+        cards.append(f'''<article class="model-card tone-{idx % 4}" data-model="{_e(item['model'])}">
+          <div class="model-card-top"><div class="model-icon"></div><span class="status-pill status-{_e(item['action'].lower())}">{_e(item['action_label'])}</span></div>
+          <h3>{_e(item['model'])}</h3><p>{_e(' · '.join(tags) or '项目实战')}</p>
+          <div class="hero-score"><strong>{_score(score)}</strong><span>/100<br>{_e(secondary)}</span></div>
+          <div class="mini-stats"><span>基线 <b>{_score(item['baseline'])}</b></span><span>稳定 <b>{_score(item['route'])}</b></span><span>样本 <b>{_e(item['samples'])}</b></span></div>
+        </article>''')
+    return "\n".join(cards)
+
+
+def _comparison_chart(summaries: list[dict[str, Any]]) -> str:
     rows: list[str] = []
-    for group in report.get("route_groups", []):
-        if not isinstance(group, dict):
-            continue
-        route = group.get("route") if isinstance(group.get("route"), dict) else {}
-        score = group.get("route_reliability_score")
-        status = "healthy"
-        if isinstance(score, (int, float)) and float(score) < 75:
-            status = "degraded"
-        if int(group.get("result_unknown_count") or 0) > 0:
-            status += " · result unknown"
-        rows.append(
-            f'''<div class="route-row">
-              <div><span class="eyebrow">{_e(route.get('provider','unknown'))} · {_e(route.get('auth_mode','unknown'))}</span><h3>{_e(route.get('model','unknown'))}</h3></div>
-              <div class="route-score">{_score(score)}</div>
-              <div><span class="route-state {('bad' if 'degraded' in status else 'good')}">{_e(status)}</span><p>{_e(group.get('successful_transport_attempts',0))}/{_e(group.get('eligible_attempts',0))} clean attempts</p></div>
-            </div>'''
-        )
-    return "\n".join(rows) or '<p class="empty">No route evidence available.</p>'
+    for item in summaries:
+        rows.append(f'''<div class="chart-row">
+          <div class="chart-model">{_e(item['model'])}</div>
+          <div class="chart-bars">
+            <div class="chart-line"><span>项目实战</span><i><b class="bar-project" style="width:{_pct(item['project'])}%"></b></i><em>{_score(item['project'])}</em></div>
+            <div class="chart-line"><span>外部基线</span><i><b class="bar-baseline" style="width:{_pct(item['baseline'])}%"></b></i><em>{_score(item['baseline'])}</em></div>
+            <div class="chart-line"><span>执行稳定</span><i><b class="bar-route" style="width:{_pct(item['route'])}%"></b></i><em>{_score(item['route'])}</em></div>
+          </div>
+        </div>''')
+    return "\n".join(rows)
 
 
-def _evidence_rows(report: dict[str, Any]) -> str:
-    rows: list[str] = []
-    for sample in list(report.get("samples", []))[-40:]:
-        if not isinstance(sample, dict):
-            continue
-        identity = sample.get("identity") if isinstance(sample.get("identity"), dict) else {}
-        rows.append(
-            f'''<tr>
-              <td>{_e(sample.get('assignment_id',''))}</td>
-              <td>{_e(identity.get('model','unknown'))}<small>{_e(identity.get('reasoning_effort','unknown'))} · {_e(identity.get('execution_role','unknown'))}</small></td>
-              <td>{_e(sample.get('attribution','unknown'))}</td>
-              <td>{_e(sample.get('delivery_outcome','unknown'))}</td>
-              <td>{_e(sample.get('transport_outcome','unknown'))}</td>
-              <td>{_e(sample.get('terminal_at',''))}</td>
-            </tr>'''
-        )
-    return "\n".join(rows) or '<tr><td colspan="6">No terminal samples.</td></tr>'
+def _decision_cards(summaries: list[dict[str, Any]]) -> str:
+    cards: list[str] = []
+    for item in summaries:
+        cards.append(f'''<article class="advice-card">
+          <div class="advice-icon">✦</div><span class="advice-action">{_e(item['action_label'])}</span>
+          <h3>{_e(item['model'])}</h3><p>{_e(item['reason'])}</p>
+        </article>''')
+    return "\n".join(cards)
 
 
 def render_dashboard(report: dict[str, Any]) -> str:
-    """Render one offline HTML document from normalized report data."""
-
+    """Render a concise offline dashboard from normalized report data."""
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    summaries = _model_summaries(report)
     project = _e(report.get("project", "Project"))
-    generated = _e(report.get("generated_at", ""))
+    generated = _e(str(report.get("generated_at", "")).replace("T", " ").replace("+00:00", " UTC"))
     raw_json = json.dumps(report, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     safe_json = raw_json.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
     return f'''<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{project} · Model Intelligence</title>
+<title>{project} · 模型智能看板</title>
 <style>
-:root{{--paper:#f7f7f3;--paper-2:#efefeb;--ink:#101633;--muted:#75798d;--line:#d9dae2;--cobalt:#2949ff;--electric:#5576ff;--violet:#6639e6;--amber:#ef9e35;--good:#1e7d66;--bad:#b64b55;--radius:26px}}
+:root{{--bg:#0b0718;--bg2:#120b27;--panel:rgba(30,20,57,.76);--panel2:rgba(43,27,75,.68);--line:rgba(220,189,255,.16);--text:#f8f5ff;--muted:#aaa0c3;--pink:#ff72d2;--pink2:#ff9be2;--purple:#a868ff;--violet:#6b54ff;--blue:#5aa8ff;--cyan:#72d5ff;--gold:#ffb866;--good:#76e6bc;--warn:#ffc46c;--bad:#ff7f9f}}
 *{{box-sizing:border-box}}
-html{{scroll-behavior:smooth}}
-body{{margin:0;background:var(--paper);color:var(--ink);font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.45}}
-a{{color:inherit;text-decoration:none}}
-.shell{{max-width:1440px;margin:0 auto;padding:0 44px 80px}}
-.topbar{{height:78px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);font-size:11px;letter-spacing:.16em;text-transform:uppercase}}
-.brand{{font-weight:800}}.nav{{display:flex;gap:28px;color:#3c405a}}.nav a:hover{{color:var(--cobalt)}}
-.hero{{min-height:620px;padding:78px 0 42px;display:grid;grid-template-columns:minmax(0,1.25fr) minmax(310px,.75fr);gap:36px;position:relative;overflow:hidden}}
-.hero h1{{font-family:Georgia,"Times New Roman",serif;font-size:clamp(58px,8vw,118px);font-weight:500;letter-spacing:-.055em;line-height:.86;margin:0;max-width:900px}}
-.hero-copy{{align-self:start;padding-top:8px;max-width:390px}}.hero-copy p{{font-size:16px;color:#555a72;margin:14px 0 28px}}.hero-copy .stamp{{font-size:10px;letter-spacing:.17em;text-transform:uppercase;color:var(--muted)}}
-.energy-wrap{{position:absolute;right:5%;bottom:-118px;width:520px;height:420px;pointer-events:none}}
-.energy-core{{position:absolute;right:72px;bottom:36px;width:295px;height:295px;border-radius:50%;background:radial-gradient(circle at 31% 26%,#d9e1ff 0,#6681ff 17%,#3452ff 38%,#4829d1 66%,#151348 100%);box-shadow:0 24px 75px rgba(40,55,220,.27),0 0 110px rgba(84,84,255,.15)}}
-.energy-core:before{{content:"";position:absolute;inset:-27px;border:1px solid rgba(39,65,214,.24);border-radius:50%;transform:scaleY(.62) rotate(-17deg)}}
-.energy-core:after{{content:"";position:absolute;width:46px;height:46px;border-radius:50%;background:radial-gradient(circle at 30% 25%,#e9ecff,#5861ee 55%,#282359);top:-8px;right:-42px;box-shadow:0 10px 30px rgba(57,56,148,.24)}}
-.energy-grid{{position:absolute;inset:0;background:repeating-radial-gradient(ellipse at 73% 94%,transparent 0 17px,rgba(31,42,110,.09) 18px 19px);opacity:.8}}
-.hero-stats{{margin-top:34px;display:flex;gap:38px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;position:relative;z-index:2}}.hero-stats b{{display:block;font-family:Georgia,serif;font-size:28px;letter-spacing:-.02em;text-transform:none;margin-bottom:2px}}
-.section{{padding:92px 0;border-top:1px solid var(--line)}}
-.section-head{{display:grid;grid-template-columns:180px minmax(0,1fr);gap:34px;margin-bottom:48px}}.section-index{{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}}.section-head h2{{font-family:Georgia,serif;font-size:clamp(40px,5vw,72px);font-weight:500;letter-spacing:-.045em;line-height:.95;margin:0;max-width:920px}}
-.overview-grid{{display:grid;grid-template-columns:1.2fr .8fr;gap:54px;align-items:center}}
-.model-orbit{{width:100%;min-height:380px;overflow:visible}}.orbit-ring{{fill:none;stroke:#c8cad8;stroke-width:1}}.orbit-core{{filter:drop-shadow(0 20px 28px rgba(42,55,190,.23))}}.orbit-node{{fill:var(--ink);stroke:var(--paper);stroke-width:4}}.orbit-label{{font-size:11px;fill:#333852}} 
-.metric-stack{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line)}}.metric{{background:var(--paper);padding:26px 22px;min-height:126px}}.metric small{{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}}.metric strong{{display:block;font-family:Georgia,serif;font-size:48px;font-weight:500;letter-spacing:-.04em;margin-top:8px}}
-.score-row{{display:grid;grid-template-columns:260px 1fr 190px;gap:34px;padding:30px 0;border-top:1px solid var(--line);align-items:center}}.score-row:last-child{{border-bottom:1px solid var(--line)}}.score-identity h3,.route-row h3{{font-size:24px;margin:6px 0 2px;letter-spacing:-.03em}}.score-identity p,.route-row p{{font-size:12px;color:var(--muted);margin:0}}.eyebrow{{font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--muted)}}
-.score-tracks{{display:grid;gap:13px}}.track-line{{display:grid;grid-template-columns:128px 48px minmax(100px,1fr);align-items:center;gap:12px;font-size:12px}}.track-line strong{{font-size:13px}}.bar{{height:7px;border-radius:999px;background:linear-gradient(90deg,var(--cobalt) 0 var(--v),#dedfe6 var(--v) 100%);display:block}}.bar.route{{background:linear-gradient(90deg,#171d47 0 var(--v),#dedfe6 var(--v) 100%)}}.bar.external{{background:linear-gradient(90deg,var(--violet) 0 var(--v),#dedfe6 var(--v) 100%)}}.score-meta{{display:flex;flex-direction:column;gap:7px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}}
-.decision-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}}.decision-card{{border-top:2px solid var(--ink);padding:20px 0 28px;min-height:250px}}.decision-card[data-action="CHANGE_ROUTE"],.decision-card[data-action="SWITCH_MODEL"]{{border-color:var(--cobalt)}}.decision-top{{display:flex;justify-content:space-between;align-items:center;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}}.action-pill{{color:var(--ink);font-weight:800}}.decision-card h3{{font-family:Georgia,serif;font-size:33px;font-weight:500;margin:24px 0 3px}}.decision-title{{font-size:15px;margin:0 0 24px}}.decision-scores{{display:flex;gap:22px;padding:15px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:11px}}.decision-reason,.decision-target{{font-size:11px;color:var(--muted)}}
-.attribution-visual svg{{width:100%;height:auto}}.attr-model{{fill:var(--cobalt);background:var(--cobalt)}}.attr-infra{{fill:#1c2145;background:#1c2145}}.attr-external{{fill:var(--amber);background:var(--amber)}}.attr-mixed{{fill:var(--violet);background:var(--violet)}}.attr-unknown{{fill:#b6b8c4;background:#b6b8c4}}.legend{{display:flex;gap:24px;flex-wrap:wrap;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}}.legend span{{display:flex;align-items:center;gap:7px}}.legend-dot{{width:8px;height:8px;border-radius:50%;display:inline-block}}
-.route-row{{display:grid;grid-template-columns:1fr 130px 260px;gap:28px;padding:23px 0;border-top:1px solid var(--line);align-items:center}}.route-score{{font-family:Georgia,serif;font-size:52px;letter-spacing:-.04em}}.route-state{{font-size:10px;letter-spacing:.12em;text-transform:uppercase}}.route-state.good{{color:var(--good)}}.route-state.bad{{color:var(--bad)}}
-.table-wrap{{overflow:auto;border-top:1px solid var(--line)}}table{{width:100%;border-collapse:collapse;font-size:12px}}th{{text-align:left;padding:13px 10px 13px 0;color:var(--muted);font-size:9px;letter-spacing:.14em;text-transform:uppercase;border-bottom:1px solid var(--line)}}td{{padding:15px 10px 15px 0;border-bottom:1px solid #e2e2e7;vertical-align:top}}td small{{display:block;color:var(--muted);margin-top:3px}}.empty{{color:var(--muted);font-style:italic}}
-.footer{{padding-top:30px;border-top:1px solid var(--line);display:flex;justify-content:space-between;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}}
-@media(max-width:960px){{.shell{{padding:0 22px 55px}}.nav{{display:none}}.hero{{grid-template-columns:1fr;min-height:720px}}.hero h1{{font-size:68px}}.energy-wrap{{right:-110px}}.overview-grid{{grid-template-columns:1fr}}.score-row{{grid-template-columns:1fr}}.score-meta{{flex-direction:row;flex-wrap:wrap}}.decision-grid{{grid-template-columns:1fr 1fr}}.route-row{{grid-template-columns:1fr 90px}}.route-row>div:last-child{{grid-column:1/-1}}}}
-@media(max-width:620px){{.hero h1{{font-size:51px}}.section-head{{grid-template-columns:1fr}}.decision-grid{{grid-template-columns:1fr}}.metric-stack{{grid-template-columns:1fr}}.energy-core{{width:230px;height:230px}}.energy-wrap{{bottom:-40px}}}}
+html{{scroll-behavior:smooth;background:var(--bg)}}
+body{{margin:0;color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:radial-gradient(circle at 78% 8%,rgba(132,65,255,.17),transparent 28%),radial-gradient(circle at 12% 58%,rgba(255,72,193,.08),transparent 23%),linear-gradient(180deg,#090615 0%,#0f0820 48%,#0a0616 100%);line-height:1.5}}
+body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.34;background-image:radial-gradient(circle at 8% 20%,rgba(255,255,255,.45) 0 1px,transparent 1.4px),radial-gradient(circle at 68% 15%,rgba(255,255,255,.3) 0 1px,transparent 1.3px),radial-gradient(circle at 92% 63%,rgba(255,255,255,.22) 0 1px,transparent 1.2px);background-size:190px 180px,260px 240px,330px 310px}}
+a{{color:inherit;text-decoration:none}}.shell{{max-width:1420px;margin:0 auto;padding:0 26px 44px}}
+.topbar{{height:78px;display:flex;align-items:center;gap:42px;border-bottom:1px solid var(--line);position:relative;z-index:5}}.brand{{display:flex;align-items:center;gap:12px;font-weight:760;letter-spacing:.22em;font-size:14px}}.brand-mark{{width:32px;height:32px;border:1px solid var(--pink);border-radius:50% 50% 45% 45%;position:relative;box-shadow:0 0 22px rgba(255,114,210,.25)}}.brand-mark:before{{content:"";position:absolute;left:50%;top:-4px;width:1px;height:40px;background:var(--pink);transform:rotate(-20deg)}}.nav{{display:flex;gap:30px;margin-left:auto;font-size:13px;color:#c8bddb}}.nav a.active,.nav a:hover{{color:white}}.updated{{font-size:12px;color:#9085a8}}.live-pill{{border:1px solid rgba(255,114,210,.7);padding:9px 18px;border-radius:999px;font-size:12px;box-shadow:inset 0 0 20px rgba(255,114,210,.08)}}
+.cosmic-hero{{min-height:520px;display:grid;grid-template-columns:1.02fr .98fr;align-items:center;position:relative;padding:56px 0 34px;overflow:hidden}}.hero-copy{{position:relative;z-index:2;max-width:650px}}.eyebrow{{font-size:13px;color:#d49cd3;letter-spacing:.12em;margin-bottom:18px}}.hero-copy h1{{font-size:clamp(44px,5.4vw,76px);line-height:1.12;letter-spacing:-.04em;font-weight:540;margin:0 0 22px}}.hero-copy h1 em{{font-family:ui-serif,"Songti SC","STSong",serif;font-weight:500;font-style:italic;color:var(--pink);text-shadow:0 0 30px rgba(255,114,210,.28)}}.hero-copy p{{color:#b5abc8;font-size:17px;max-width:560px;margin:0 0 26px}}.hero-tags{{display:flex;gap:24px;color:#c6bad8;font-size:13px}}.hero-tags span:before{{content:"✦";color:var(--pink);margin-right:8px}}
+.cosmic-art{{height:430px;position:relative}}.planet{{position:absolute;width:310px;height:310px;border-radius:50%;right:16%;top:44px;background:radial-gradient(circle at 34% 28%,#f5c5ff 0,#d77cff 8%,#934eff 22%,#4f2daf 48%,#25145c 70%,#100928 100%);box-shadow:0 0 38px rgba(198,103,255,.55),0 0 120px rgba(124,66,255,.28),inset -35px -30px 50px rgba(10,5,25,.55)}}.planet:before{{content:"";position:absolute;inset:-26px;border:1px solid rgba(235,184,255,.35);border-radius:50%;transform:rotate(-14deg) scaleY(.58);box-shadow:0 0 22px rgba(255,114,210,.13)}}.planet:after{{content:"";position:absolute;left:-70px;top:34px;width:58px;height:58px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#e9b7ff,#8e4fff 52%,#25104d 100%);box-shadow:0 0 30px rgba(196,100,255,.35)}}.moon{{position:absolute;width:66px;height:66px;border-radius:50%;right:7%;bottom:80px;background:radial-gradient(circle at 35% 30%,#ffd7ef,#bc67ff 42%,#28104f 100%);box-shadow:0 0 28px rgba(255,124,216,.28)}}.orbit{{position:absolute;right:2%;top:84px;width:420px;height:250px;border:1px solid rgba(255,169,233,.24);border-radius:50%;transform:rotate(-11deg)}}.hero-note{{position:absolute;right:0;top:168px;color:#cba7da;font-family:ui-serif,"Songti SC",serif;font-style:italic;font-size:18px;line-height:1.7}}
+#overview{{margin-top:-4px}}.metric-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin:0 0 36px}}.metric-card,.model-card,.chart-panel,.advice-card,.footer-card{{background:linear-gradient(145deg,rgba(41,27,73,.84),rgba(20,13,43,.82));border:1px solid var(--line);box-shadow:inset 0 1px 0 rgba(255,255,255,.035),0 18px 50px rgba(2,0,12,.25);backdrop-filter:blur(18px)}}.metric-card{{border-radius:18px;padding:21px 22px;min-height:116px}}.metric-card span{{display:block;font-size:12px;color:#aaa0c3;letter-spacing:.07em}}.metric-card strong{{display:block;font-family:ui-serif,"Songti SC",serif;font-size:43px;font-weight:500;margin-top:8px}}.metric-card small{{color:#786e91;font-size:11px}}
+.section{{padding:38px 0 24px}}.section-head{{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:18px}}.section-head h2{{font-size:25px;margin:0;font-weight:620}}.section-head h2:before{{content:"";display:inline-block;width:3px;height:26px;background:linear-gradient(var(--pink),var(--purple));border-radius:999px;margin-right:12px;vertical-align:-5px;box-shadow:0 0 14px rgba(255,114,210,.45)}}.section-head p{{margin:0;color:#887d9e;font-size:12px}}.model-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}}.model-card{{border-radius:18px;padding:20px;min-height:235px;position:relative;overflow:hidden}}.model-card:after{{content:"";position:absolute;width:130px;height:130px;border-radius:50%;right:-50px;top:-52px;filter:blur(2px);opacity:.28;background:radial-gradient(circle,var(--pink),transparent 68%)}}.model-card-top{{display:flex;justify-content:space-between;align-items:center}}.model-icon{{width:46px;height:46px;border-radius:50%;background:radial-gradient(circle at 36% 30%,#bff2ff 0,#5ca8ff 20%,#6d4bff 48%,#21104c 100%);box-shadow:0 0 26px rgba(83,140,255,.4)}}.tone-1 .model-icon{{background:radial-gradient(circle at 36% 30%,#ffd2ff 0,#c468ff 24%,#7837d6 48%,#221044 100%)}}.tone-2 .model-icon{{background:radial-gradient(circle at 36% 30%,#d7c9ff 0,#795dff 25%,#4934c4 52%,#17103b 100%)}}.tone-3 .model-icon{{background:radial-gradient(circle at 36% 30%,#ffd8c6 0,#ff8a7c 25%,#a54d89 55%,#261039 100%)}}.status-pill{{font-size:11px;padding:5px 9px;border-radius:8px;background:rgba(153,99,255,.14);color:#dacdff;border:1px solid rgba(165,117,255,.2)}}.status-change_route,.status-switch_model{{color:#ffd4e6;background:rgba(255,107,184,.12)}}.model-card h3{{font-size:18px;margin:17px 0 2px}}.model-card>p{{margin:0;color:#897d9f;font-size:12px}}.hero-score{{display:flex;align-items:flex-end;gap:8px;margin:16px 0 15px}}.hero-score strong{{font-family:ui-serif,"Songti SC",serif;font-size:46px;font-weight:500;line-height:1}}.hero-score span{{font-size:10px;color:#7d7294;line-height:1.4}}.mini-stats{{display:flex;gap:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08);font-size:11px;color:#9186a9}}.mini-stats b{{color:#e5dcf5;font-weight:550}}
+.chart-panel{{border-radius:20px;padding:24px;margin-top:18px}}.chart-legend{{display:flex;gap:22px;color:#a397b9;font-size:11px;margin:4px 0 20px}}.chart-legend i{{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}}.lg-project{{background:var(--purple)}}.lg-baseline{{background:var(--blue)}}.lg-route{{background:var(--pink)}}.chart-row{{display:grid;grid-template-columns:150px 1fr;gap:22px;padding:14px 0;border-top:1px solid rgba(255,255,255,.055)}}.chart-row:first-of-type{{border-top:0}}.chart-model{{font-size:13px;color:#ddd3ea;padding-top:4px}}.chart-bars{{display:grid;gap:8px}}.chart-line{{display:grid;grid-template-columns:72px 1fr 42px;gap:9px;align-items:center;font-size:10px;color:#8f84a6}}.chart-line i{{height:7px;background:rgba(255,255,255,.07);border-radius:99px;overflow:hidden}}.chart-line b{{display:block;height:100%;border-radius:99px;box-shadow:0 0 13px currentColor}}.bar-project{{background:linear-gradient(90deg,#b26dff,#8e62ff)}}.bar-baseline{{background:linear-gradient(90deg,#5e8fff,#6fd4ff)}}.bar-route{{background:linear-gradient(90deg,#ff78c8,#ff9fe0)}}.chart-line em{{font-style:normal;color:#d7cde6;text-align:right}}
+.advice-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}}.advice-card{{border-radius:18px;padding:20px;min-height:190px}}.advice-icon{{font-size:24px;color:var(--pink);text-shadow:0 0 14px rgba(255,114,210,.5)}}.advice-action{{display:inline-block;margin:12px 0 8px;color:#f3e9ff;font-weight:700}}.advice-card h3{{margin:0 0 8px;font-size:16px}}.advice-card p{{margin:0;color:#9b90b0;font-size:12px;line-height:1.7}}
+.footer-card{{margin-top:34px;border-radius:24px;padding:30px 34px;display:grid;grid-template-columns:1fr auto;align-items:center;min-height:150px;position:relative;overflow:hidden}}.footer-card:after{{content:"";position:absolute;width:230px;height:230px;border-radius:50%;right:4%;top:-96px;background:radial-gradient(circle at 40% 30%,#f9cfff,#a95eff 28%,#4b2391 58%,transparent 71%);opacity:.5}}.footer-card h2{{font-family:ui-serif,"Songti SC",serif;font-weight:500;font-size:30px;margin:0 0 8px;color:#f0c7ec}}.footer-card p{{margin:0;color:#9d91b2;font-size:13px}}.footer-meta{{position:relative;z-index:2;text-align:right;color:#837793;font-size:11px}}
+@media(max-width:1050px){{.model-grid,.advice-grid{{grid-template-columns:repeat(2,1fr)}}.cosmic-hero{{grid-template-columns:1fr}}.cosmic-art{{height:360px}}.nav{{display:none}}}}
+@media(max-width:680px){{.shell{{padding:0 15px 30px}}.updated,.live-pill{{display:none}}.cosmic-hero{{padding-top:36px}}.hero-copy h1{{font-size:43px}}.metric-grid,.model-grid,.advice-grid{{grid-template-columns:1fr}}.hero-tags{{flex-direction:column;gap:8px}}.planet{{right:4%;width:250px;height:250px}}.chart-row{{grid-template-columns:1fr}}.footer-card{{grid-template-columns:1fr}}.footer-meta{{text-align:left;margin-top:20px}}}}
 </style>
 </head>
 <body>
 <div class="shell">
-  <header class="topbar"><a class="brand" href="#overview">MODEL ORBIT</a><nav class="nav"><a href="#model-comparison">Scores</a><a href="#decisions">Decisions</a><a href="#route-health">Routes</a><a href="#evidence">Evidence</a></nav><span>{_e(report.get('window_days',30))}D WINDOW</span></header>
-  <main>
-    <section class="hero">
-      <div><span class="eyebrow">Project intelligence / {project}</span><h1>SEE WHICH MODELS<br>ACTUALLY WORK<br>IN YOUR WORLD.</h1><div class="hero-stats"><span><b>{_e(summary.get('observed_model_configurations',0))}</b>configs</span><span><b>{_e(summary.get('terminal_samples',0))}</b>terminal samples</span><span><b>{_e(summary.get('quality_scored_samples',0))}</b>quality samples</span></div></div>
-      <div class="hero-copy"><span class="stamp">Generated {generated}</span><p>Project evidence is separated from execution-chain reliability, then compared with external baselines before any routing recommendation is made.</p><span class="eyebrow">Project truth first. Benchmark context second.</span></div>
-      <div class="energy-wrap"><div class="energy-grid"></div><div class="energy-core"></div></div>
-    </section>
+<header class="topbar"><a class="brand" href="#overview"><span class="brand-mark"></span><span>MODEL INTELLIGENCE</span></a><nav class="nav"><a class="active" href="#overview">总览</a><a href="#model-comparison">模型表现</a><a href="#decisions">建议方案</a></nav><span class="updated">更新于 {generated}</span><span class="live-pill">项目实战数据</span></header>
+<main>
+<section class="cosmic-hero">
+  <div class="hero-copy"><div class="eyebrow">让 AI 真正创造价值</div><h1 aria-label="更好的模型组合 创造更大的可能">更好的模型组合<br>创造<em>更大的可能</em></h1><p>基于项目真实任务表现与 ModelDial 外部基线，帮你判断模型强弱、执行链问题，以及是否需要调整调用策略。</p><div class="hero-tags"><span>真实项目数据</span><span>外部基线评测</span><span>智能决策建议</span></div></div>
+  <div class="cosmic-art"><div class="orbit"></div><div class="planet"></div><div class="moon"></div><div class="hero-note">找到更适合你的<br>AI 工作方式</div></div>
+</section>
 
-    <section id="overview" class="section">
-      <div class="section-head"><div class="section-index">01 / Overview</div><h2>One system, three truths: project quality, route reliability, external baseline.</h2></div>
-      <div class="overview-grid">{_orbit_svg(report)}<div class="metric-stack">
-        <div class="metric"><small>Model configurations</small><strong>{_e(summary.get('observed_model_configurations',0))}</strong></div>
-        <div class="metric"><small>Scored project samples</small><strong>{_e(summary.get('quality_scored_samples',0))}</strong></div>
-        <div class="metric"><small>Infra excluded</small><strong>{_e(summary.get('infrastructure_failures_excluded_from_model_score',0))}</strong></div>
-        <div class="metric"><small>Unknown evidence</small><strong>{_e(summary.get('unknown_samples',0))}</strong></div>
-      </div></div>
-    </section>
+<section id="overview">
+  <div class="metric-grid">
+    {_metric_card('已评估模型配置', summary.get('observed_model_configurations',0), '当前窗口')}
+    {_metric_card('有效项目样本', summary.get('quality_scored_samples',0), '进入能力评分')}
+    {_metric_card('基础设施剔除', summary.get('infrastructure_failures_excluded_from_model_score',0), '不误伤模型分')}
+    {_metric_card('未知证据', summary.get('unknown_samples',0), '暂不下结论')}
+  </div>
+</section>
 
-    <section id="model-comparison" class="section">
-      <div class="section-head"><div class="section-index">02 / Compare</div><h2>Compare model performance without blaming the model for a broken route.</h2></div>
-      {_comparison_rows(report)}
-    </section>
+<section id="model-comparison" class="section">
+  <div class="section-head"><div><h2>模型表现对比</h2><p>同一模型多配置已合并，避免重复信息。</p></div><p>项目实战 + ModelDial + 执行稳定性</p></div>
+  <div class="model-grid">{_model_cards(summaries)}</div>
+  <div class="chart-panel"><div class="chart-legend"><span><i class="lg-project"></i>项目实战</span><span><i class="lg-baseline"></i>外部基线</span><span><i class="lg-route"></i>执行稳定</span></div>{_comparison_chart(summaries)}</div>
+</section>
 
-    <section id="decisions" class="section">
-      <div class="section-head"><div class="section-index">03 / Decisions</div><h2>Keep, tune, reroute, change role, or switch — with machine reasons.</h2></div>
-      <div class="decision-grid">{_decision_cards(report)}</div>
-    </section>
-
-    <section id="attribution" class="section">
-      <div class="section-head"><div class="section-index">04 / Attribution</div><h2>Where performance was lost: model quality or the machinery around it.</h2></div>
-      {_attribution_svg(report)}
-    </section>
-
-    <section id="route-health" class="section">
-      <div class="section-head"><div class="section-index">05 / Routes</div><h2>Route reliability is its own score — OAuth, API, host, and transport stay visible.</h2></div>
-      {_route_health(report)}
-    </section>
-
-    <section id="evidence" class="section">
-      <div class="section-head"><div class="section-index">06 / Evidence</div><h2>Every recommendation can be traced back to terminal Runtime evidence.</h2></div>
-      <div class="table-wrap"><table><thead><tr><th>Assignment</th><th>Model config</th><th>Attribution</th><th>Delivery</th><th>Transport</th><th>Terminal</th></tr></thead><tbody>{_evidence_rows(report)}</tbody></table></div>
-    </section>
-  </main>
-  <footer class="footer"><span>Adaptive Agent Runtime · Model Intelligence</span><span>Read-only advisory surface</span></footer>
+<section id="decisions" class="section">
+  <div class="section-head"><div><h2>智能建议</h2><p>先区分“模型不行”还是“执行链不行”，再决定是否换模。</p></div></div>
+  <div class="advice-grid">{_decision_cards(summaries)}</div>
+</section>
+</main>
+<footer class="footer-card"><div><h2>让更好的模型，去做更适合它的工作。</h2><p>项目实战优先，外部基线辅助；样本不足时，不做激进换模。</p></div><div class="footer-meta"><b>{project}</b><br>Adaptive Agent Runtime · 模型智能看板</div></footer>
 </div>
 <script id="report-data" type="application/json">{safe_json}</script>
 </body>
