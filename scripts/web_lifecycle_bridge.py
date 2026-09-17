@@ -5761,6 +5761,7 @@ def _persist_host_reentry_reconciliation(
     ownership_generation: int,
     successor_receipt_id: str | None = None,
     error: str | None = None,
+    host_delivery_fingerprint: str | None = None,
 ) -> None:
     lock_path = auto_stop_supervisor_lock_path(state_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5789,6 +5790,9 @@ def _persist_host_reentry_reconciliation(
                 "original_receipt_id": original.get("receipt_id"),
                 "original_wake_id": original.get("wake_id"),
             }
+            fingerprint = str(host_delivery_fingerprint or "").strip().lower()
+            if len(fingerprint) == 64 and all(ch in "0123456789abcdef" for ch in fingerprint):
+                record["reconciliation_host_fingerprint"] = fingerprint
             if successor_receipt_id:
                 record["successor_receipt_id"] = successor_receipt_id
                 record["successor_authorized"] = True
@@ -5912,6 +5916,7 @@ def _clear_result_unknown_via_registered_host_reconcile(
     registry: Path,
     state_path: Path,
     supervisor_state: dict[str, Any],
+    current_host_delivery_fingerprint: str | None = None,
 ) -> str | None:
     original = _durable_original_reentry_receipt(supervisor_state)
     if original is None:
@@ -5922,8 +5927,23 @@ def _clear_result_unknown_via_registered_host_reconcile(
     conversation_id, target_generation, ownership_generation = fence
     persisted = _persisted_reconciliation_record(supervisor_state)
     persisted_class = str((persisted or {}).get("reconciliation_class") or "").strip()
-    if persisted_class in {"NOT_CLEARABLE", "UNRESOLVED"}:
+    if persisted_class == "NOT_CLEARABLE":
         return None
+    if persisted_class == "UNRESOLVED":
+        prior_fingerprint = str(
+            (persisted or {}).get("reconciliation_host_fingerprint")
+            or supervisor_state.get("delivery_host_fingerprint")
+            or ""
+        ).strip().lower()
+        current_fingerprint = str(current_host_delivery_fingerprint or "").strip().lower()
+        if (
+            len(prior_fingerprint) != 64
+            or any(ch not in "0123456789abcdef" for ch in prior_fingerprint)
+            or len(current_fingerprint) != 64
+            or any(ch not in "0123456789abcdef" for ch in current_fingerprint)
+            or prior_fingerprint == current_fingerprint
+        ):
+            return None
     if persisted_class == "CONFIRMED_NOT_DELIVERED":
         if persisted is None or not _persisted_reconciliation_matches_fence(
             persisted,
@@ -5963,6 +5983,7 @@ def _clear_result_unknown_via_registered_host_reconcile(
             target_generation=target_generation,
             ownership_generation=ownership_generation,
             successor_receipt_id=successor_id,
+            host_delivery_fingerprint=current_host_delivery_fingerprint,
         )
         return successor_id
     except (PermissionError, PeerHostTransientUnavailable, OSError, ValueError, TypeError) as exc:
@@ -5993,6 +6014,7 @@ def _clear_result_unknown_via_registered_host_reconcile(
                 target_generation=target_generation,
                 ownership_generation=ownership_generation,
                 error=message,
+                host_delivery_fingerprint=current_host_delivery_fingerprint,
             )
         return None
 
@@ -8199,6 +8221,7 @@ def ensure_continuation_supervisor(
             registry=registry,
             state_path=state_path,
             supervisor_state=load_json(state_path) or supervisor_state,
+            current_host_delivery_fingerprint=current_host_delivery_fingerprint,
         )
         if not successor_receipt_id:
             return False

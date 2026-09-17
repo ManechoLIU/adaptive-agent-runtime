@@ -258,6 +258,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_retry_exhausted_persists_host_delivery_fingerprint",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_result_unknown_unresolved_retries_reconciliation_only_after_host_fingerprint_change",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."

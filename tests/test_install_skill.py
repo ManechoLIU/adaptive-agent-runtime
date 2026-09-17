@@ -1118,6 +1118,7 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_ensure_supervisor_uses_new_receipt_after_controller_fence_change",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_retry_exhausted_persists_host_delivery_fingerprint",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_result_unknown_unresolved_retries_reconciliation_only_after_host_fingerprint_change",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_terminal_rule_delivery_blocks_bootstrap_across_fingerprint_changes",
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_non_rule_delivery_key_uses_wake_generation_with_current_rule_snapshot",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_transient_web_reentry_retry_budget_exhausts_without_rearm",

@@ -13368,6 +13368,194 @@ WebLocalReentryIntegrationTests.test_result_unknown_confirmed_not_delivered_clea
 WebLocalReentryIntegrationTests.test_result_unknown_persisted_authorization_crash_window_recovers_same_successor = _result_unknown_persisted_authorization_crash_window_recovers_same_successor
 WebLocalReentryIntegrationTests.test_result_unknown_successor_schedule_rechecks_expected_fence_inside_scheduler = _result_unknown_successor_schedule_rechecks_expected_fence_inside_scheduler
 WebLocalReentryIntegrationTests.test_result_unknown_not_clearable_or_unresolved_stays_blocked = _result_unknown_not_clearable_or_unresolved_stays_blocked
+
+
+
+def _result_unknown_unresolved_retries_reconciliation_only_after_host_fingerprint_change(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        unresolved = _signed_reconciliation_receipt(
+            original,
+            reconciliation_class="UNRESOLVED",
+            status="observation_unresolved",
+            composer_exact_payload=False,
+            journal_phase=None,
+        )
+        first_calls = []
+
+        def first_verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+
+        def first_reconcile(**kwargs):
+            first_calls.append(kwargs)
+            return {
+                "operation": "reconcile_reentry_result",
+                "reconciliation_receipt": unresolved,
+            }
+
+        first_verifier.reconcile_reentry_result = first_reconcile
+        first_verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("UNRESOLVED reconciliation must never submit the old wake")
+        )
+        first_verifier.delivery_fingerprint = "a" * 64
+        initial_state = json.loads(state_path.read_text(encoding="utf-8"))
+        initial_state["delivery_host_fingerprint"] = "a" * 64
+        state_path.write_text(json.dumps(initial_state), encoding="utf-8")
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=first_verifier
+        ), patch.object(
+            web_bridge, "_registered_web_host_delivery_fingerprint", return_value="a" * 64
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            first = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex="codex",
+                delay_seconds=1.0,
+            )
+            same_host = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex="codex",
+                delay_seconds=1.0,
+            )
+        self.assertFalse(first)
+        self.assertFalse(same_host)
+        self.assertEqual(len(first_calls), 1)
+        schedule.assert_not_called()
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["delivery_host_fingerprint"], "a" * 64)
+        self.assertEqual(
+            persisted["host_reentry_reconciliation"]["reconciliation_class"],
+            "UNRESOLVED",
+        )
+
+        confirmed = _signed_reconciliation_receipt(original)
+        upgraded_calls = []
+
+        def upgraded_verifier(**_kwargs):
+            return {"call_receipt": "host-call-upgraded"}
+
+        def upgraded_reconcile(**kwargs):
+            upgraded_calls.append(kwargs)
+            return {
+                "operation": "reconcile_reentry_result",
+                "reconciliation_receipt": confirmed,
+            }
+
+        upgraded_verifier.reconcile_reentry_result = upgraded_reconcile
+        upgraded_verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Host upgrade may retry reconciliation only; old wake must never replay")
+        )
+        upgraded_verifier.delivery_fingerprint = "b" * 64
+        captured = {}
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=upgraded_verifier
+        ), patch.object(
+            web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64
+        ), patch.object(
+            web_bridge, "schedule_auto_native_stop", side_effect=lambda **kwargs: captured.update(kwargs) or True
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry",
+            side_effect=AssertionError("fingerprint upgrade must not submit old wake"),
+        ):
+            upgraded = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex="codex",
+                delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+
+    self.assertTrue(upgraded)
+    self.assertEqual(len(upgraded_calls), 1)
+    self.assertEqual(upgraded_calls[0]["original_reentry_receipt"], original)
+    self.assertEqual(upgraded_calls[0]["expected_conversation_id"], "web-current")
+    self.assertEqual(upgraded_calls[0]["expected_target_generation"], 4)
+    self.assertEqual(upgraded_calls[0]["expected_ownership_generation"], 8)
+    self.assertIn(":reconcile-", captured["receipt_id"])
+    self.assertNotEqual(captured["receipt_id"], original["receipt_id"])
+    self.assertNotEqual(captured["receipt_id"], original["wake_id"])
+    self.assertEqual(
+        saved["host_reentry_reconciliation"]["reconciliation_class"],
+        "CONFIRMED_NOT_DELIVERED",
+    )
+    self.assertEqual(
+        saved["host_reentry_reconciliation"]["reconciliation_host_fingerprint"],
+        "b" * 64,
+    )
+
+
+def _result_unknown_not_clearable_does_not_retry_after_host_fingerprint_change(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        not_clearable = _signed_reconciliation_receipt(
+            original,
+            reconciliation_class="NOT_CLEARABLE",
+            status="journal_submit_confirmed",
+            exact_user_message_present=True,
+            composer_exact_payload=True,
+            journal_phase="submit_confirmed",
+        )
+        calls = []
+
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+
+        def reconcile(**kwargs):
+            calls.append(kwargs)
+            return {
+                "operation": "reconcile_reentry_result",
+                "reconciliation_receipt": not_clearable,
+            }
+
+        verifier.reconcile_reentry_result = reconcile
+        verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("NOT_CLEARABLE must never submit")
+        )
+        verifier.delivery_fingerprint = "a" * 64
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_registered_web_host_delivery_fingerprint", return_value="a" * 64
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            first = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        self.assertFalse(first)
+        self.assertEqual(len(calls), 1)
+        schedule.assert_not_called()
+
+        def upgraded_reconcile(**_kwargs):
+            raise AssertionError("NOT_CLEARABLE must remain terminal across Host upgrades")
+
+        verifier.reconcile_reentry_result = upgraded_reconcile
+        verifier.delivery_fingerprint = "b" * 64
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            second = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertFalse(second)
+    schedule.assert_not_called()
+    self.assertEqual(saved["host_reentry_reconciliation"]["reconciliation_class"], "NOT_CLEARABLE")
+
+
+WebLocalReentryIntegrationTests.test_result_unknown_unresolved_retries_reconciliation_only_after_host_fingerprint_change = _result_unknown_unresolved_retries_reconciliation_only_after_host_fingerprint_change
+WebLocalReentryIntegrationTests.test_result_unknown_not_clearable_does_not_retry_after_host_fingerprint_change = _result_unknown_not_clearable_does_not_retry_after_host_fingerprint_change
 WebLocalReentryIntegrationTests.test_result_unknown_missing_receipt_or_stale_generation_fails_closed = _result_unknown_missing_receipt_or_stale_generation_fails_closed
 WebLocalReentryIntegrationTests.test_result_unknown_reconcile_restart_is_idempotent_without_duplicate_submit = _result_unknown_reconcile_restart_is_idempotent_without_duplicate_submit
 WebLocalReentryIntegrationTests.test_result_unknown_original_receipt_fence_mismatch_rejects_before_reconcile = _result_unknown_original_receipt_fence_mismatch_rejects_before_reconcile
