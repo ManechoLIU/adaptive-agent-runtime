@@ -28,7 +28,8 @@ class ProjectContextGuardTests(unittest.TestCase):
             encoding="utf-8",
         )
         (self.repo / "TASK_LEDGER.md").write_text(
-            "# Task Ledger\n\n| Task | State |\n|---|---|\n| T-1 | READY |\n",
+            "# Task Ledger\n\nUNIQUE_LEDGER_SECRET_SHOULD_NOT_DUMP\n\n"
+            "| Task | State |\n|---|---|\n| T-1 | READY |\n",
             encoding="utf-8",
         )
         docs = self.repo / "docs"
@@ -83,8 +84,9 @@ class ProjectContextGuardTests(unittest.TestCase):
         self.assertEqual(receipt["sources"]["runtime_skill"]["status"], "verified")
         context = output["hookSpecificOutput"]["additionalContext"]
         self.assertIn("FACT_FIRST_V2", context)
-        self.assertIn("CURRENT_PROJECT_SKILL", context)
-        self.assertIn("RUNTIME_FACT_FIRST", context)
+        self.assertNotIn("CURRENT_PROJECT_SKILL", context)
+        self.assertNotIn("RUNTIME_FACT_FIRST", context)
+        self.assertNotIn("UNIQUE_LEDGER_SECRET_SHOULD_NOT_DUMP", context)
         self.assertIn("verified_facts=", context)
         self.assertIn("unknown_facts=", context)
 
@@ -473,6 +475,8 @@ class ProjectContextGuardTests(unittest.TestCase):
             (self.repo / "docs" / "current-score-model.md").resolve(),
         )
         self.assertIn("CURRENT_MODEL_V2", output["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("UNIQUE_LEDGER_SECRET_SHOULD_NOT_DUMP", output["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("CURRENT_PROJECT_SKILL", output["hookSpecificOutput"]["additionalContext"])
         self.assertNotIn("approximate", mechanism)
 
     def test_missing_existing_mechanism_is_not_found_and_stop_blocks_fabrication(self):
@@ -772,6 +776,95 @@ class ProjectContextGuardTests(unittest.TestCase):
         self.assertIn("FACT_FIRST_V3", blocked["reason"])
         self.assertTrue(state["correction_required"])
 
+
+
+    def test_session_start_injects_unique_active_item_not_full_ledger_or_runtime_skill(self):
+        hook = self.hook()
+        (self.repo / "TASK_LEDGER.md").write_text(
+            """# Task Ledger
+
+UNIQUE_LEDGER_SECRET_SHOULD_NOT_DUMP
+
+| ID | 状态 / 负责人 | 目标与边界 | 依赖 / 阻塞 | 验收与验证 | 证据 / 下一步 |
+| --- | --- | --- | --- | --- | --- |
+| T-ACTIVE | ACTIVE / 主Agent | 只改转派；不改通知渠道 | 无 | 转派可追溯 | 下一步：补权限测试 |
+| T-READY | READY / 主Agent | 报表页 | 依赖 T-ACTIVE | 报表可查 | 下一步：等转派完成 |
+""",
+            encoding="utf-8",
+        )
+        output, state = hook.evaluate_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "s-active",
+                "cwd": str(self.repo),
+            },
+            skill_root=self.skill,
+            prior_state={},
+        )
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("FACT_FIRST_V2", context)
+        self.assertIn("T-ACTIVE", context)
+        self.assertIn("不改通知渠道", context)
+        self.assertIn("补权限测试", context)
+        self.assertIn('"kind": "current_item"', context)
+        self.assertNotIn("UNIQUE_LEDGER_SECRET_SHOULD_NOT_DUMP", context)
+        self.assertNotIn("RUNTIME_FACT_FIRST", context)
+        self.assertNotIn("CURRENT_PROJECT_SKILL", context)
+        self.assertNotIn("[TRUNCATED_BY_PROJECT_CONTEXT_GUARD]", context)
+        self.assertNotIn("T-READY", context)
+        working = hook.opening_working_set(state["project_context_receipt"])
+        self.assertEqual(working["kind"], "current_item")
+        self.assertEqual(working["current_item_id"], "T-ACTIVE")
+        self.assertTrue(working["complete"])
+
+    def test_session_start_without_current_item_uses_open_item_projection(self):
+        hook = self.hook()
+        (self.repo / "TASK_LEDGER.md").write_text(
+            """# Task Ledger
+
+| ID | 状态 / 负责人 | 目标与边界 | 依赖 / 阻塞 | 验收与验证 | 证据 / 下一步 |
+| --- | --- | --- | --- | --- | --- |
+| T-READY | READY / 主Agent | 报表页 | 无 | 报表可查 | 下一步：开始报表 |
+""",
+            encoding="utf-8",
+        )
+        output, state = hook.evaluate_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "s-ready",
+                "cwd": str(self.repo),
+            },
+            skill_root=self.skill,
+            prior_state={},
+        )
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn('"kind": "open_items"', context)
+        self.assertIn("T-READY", context)
+        self.assertIn("开始报表", context)
+        working = hook.opening_working_set(state["project_context_receipt"])
+        self.assertEqual(working["kind"], "open_items")
+        self.assertEqual(working["open_items"][0]["id"], "T-READY")
+
+    def test_oversized_agents_body_is_omitted_not_truncated(self):
+        hook = self.hook()
+        (self.repo / "AGENTS.md").write_text(
+            "Current project rule: FACT_FIRST_V2.\n" + ("A" * (96 * 1024 + 8)),
+            encoding="utf-8",
+        )
+        output, _state = hook.evaluate_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "s-large",
+                "cwd": str(self.repo),
+            },
+            skill_root=self.skill,
+            prior_state={},
+        )
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("[TRUNCATED_BY_PROJECT_CONTEXT_GUARD]", context)
+        self.assertIn("agents_too_large", context)
+        self.assertIn('"complete": false', context)
+        self.assertNotIn("A" * 100, context)
 
 class ProjectContextRestoreTests(unittest.TestCase):
     def test_web_restore_payload_includes_project_and_runtime_rule_initialization(self):

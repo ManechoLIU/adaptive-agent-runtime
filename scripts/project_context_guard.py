@@ -15,8 +15,10 @@ from typing import Any
 
 try:
     import controller_target_guard as target_guard
+    from lint_governance import task_records
 except ModuleNotFoundError:
     from scripts import controller_target_guard as target_guard
+    from scripts.lint_governance import task_records
 
 STATE_ROOT = Path(
     os.environ.get(
@@ -24,6 +26,10 @@ STATE_ROOT = Path(
         str(Path.home() / ".codex" / "state" / "adaptive-agent-runtime-project-context"),
     )
 ).expanduser()
+
+CURRENT_ITEM_STATUSES = {"ACTIVE", "RECOVERING", "VERIFY"}
+OPEN_ITEM_STATUSES = {"PENDING", "READY", "ACTIVE", "RECOVERING", "VERIFY", "BLOCKED"}
+ATTACH_BODY_LIMIT = 96 * 1024
 
 PROJECT_FACT_REQUEST = re.compile(
     r"(?:"
@@ -550,16 +556,138 @@ def _receipt_source_changed(receipt: dict[str, Any]) -> bool:
     )
 
 
-def _bounded(content: str, limit: int = 96 * 1024) -> str:
-    if len(content) <= limit:
-        return content
-    return content[:limit] + chr(10) + "[TRUNCATED_BY_PROJECT_CONTEXT_GUARD]"
+def _work_item_fields(record: dict[str, str]) -> dict[str, str]:
+    return {
+        "id": str(record.get("id", "")).strip(),
+        "status": str(record.get("status", "")).strip(),
+        "owner": str(record.get("owner", "")).strip(),
+        "scope": str(record.get("scope", "")).strip(),
+        "dependencies_blockers": str(record.get("dependencies_blockers", "")).strip(),
+        "acceptance": str(record.get("acceptance", "")).strip(),
+        "evidence": str(record.get("evidence", "")).strip(),
+        "next_action": str(record.get("next_action", "")).strip(),
+    }
 
 
-def _context_text(receipt: dict[str, Any], *, mechanism: dict[str, Any] | None = None) -> str:
+def _ledger_records(receipt: dict[str, Any]) -> list[dict[str, str]]:
+    sources = receipt.get("sources")
+    if not isinstance(sources, dict):
+        return []
+    ledger = sources.get("ledger")
+    if not isinstance(ledger, dict) or ledger.get("status") != "verified":
+        return []
+    try:
+        return task_records(str(ledger.get("content") or ""))
+    except (TypeError, ValueError):
+        return []
+
+
+def opening_working_set(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Project the model-visible work set from the unique ledger. Not a second ledger."""
+    omissions: list[str] = []
+    sources = receipt.get("sources") if isinstance(receipt.get("sources"), dict) else {}
+    ledger = sources.get("ledger") if isinstance(sources, dict) else None
+    git = sources.get("git") if isinstance(sources, dict) else None
+    ledger_sha = ""
+    ledger_path = ""
+    if isinstance(ledger, dict):
+        ledger_sha = str(ledger.get("sha256") or "")
+        ledger_path = str(ledger.get("path") or "")
+        if ledger.get("status") != "verified":
+            omissions.append("ledger_unavailable")
+    else:
+        omissions.append("ledger_unavailable")
+    if not isinstance(git, dict) or git.get("status") != "verified":
+        omissions.append("git_unavailable")
+
+    records = [_work_item_fields(item) for item in _ledger_records(receipt)]
+    current = [item for item in records if item["status"] in CURRENT_ITEM_STATUSES]
+    open_items = [item for item in records if item["status"] in OPEN_ITEM_STATUSES]
+    if len(current) == 1:
+        item = current[0]
+        if not item["next_action"]:
+            omissions.append("next_action_missing")
+        if not item["scope"]:
+            omissions.append("boundary_unspecified")
+        working: dict[str, Any] = {
+            "kind": "current_item",
+            "current_item": item,
+            "open_items": [],
+            "current_item_id": item["id"],
+        }
+    else:
+        working = {
+            "kind": "open_items",
+            "current_item": None,
+            "open_items": open_items,
+            "current_item_id": None,
+        }
+        if not open_items and "ledger_unavailable" not in omissions:
+            omissions.append("no_parseable_open_items")
+    working.update(
+        {
+            "complete": not omissions,
+            "omissions": omissions,
+            "ledger_sha256": ledger_sha,
+            "ledger_path": ledger_path,
+        }
+    )
+    return working
+
+
+def _asked_attach(
+    prompt: str,
+    mechanism: dict[str, Any] | None,
+    event_name: str,
+) -> str:
+    if event_name == "SessionStart":
+        return "session"
+    if isinstance(mechanism, dict) and mechanism.get("state") in {"found", "not_found"}:
+        return "mechanism"
+    text = str(prompt or "")
+    if re.search(r"规则|治理|AGENTS", text, re.IGNORECASE):
+        return "agents"
+    if re.search(r"HEAD|分支|工作树|worktree", text, re.IGNORECASE) and not re.search(
+        r"规则|治理|进度|台账", text, re.IGNORECASE
+    ):
+        return "git"
+    if re.search(r"Runtime|runtime", text) and not re.search(
+        r"规则|治理|评分", text, re.IGNORECASE
+    ):
+        return "runtime"
+    return "working_set"
+
+
+def _append_source_body(
+    lines: list[str],
+    omissions: list[str],
+    *,
+    key: str,
+    content: str,
+) -> None:
+    payload = str(content or "")
+    if len(payload.encode("utf-8")) > ATTACH_BODY_LIMIT:
+        omissions.append(f"{key}_too_large")
+        lines.append(f"source_body[{key}] omitted: too_large")
+        return
+    lines.append(f"--- {key} ---")
+    lines.append(payload)
+
+
+def _context_text(
+    receipt: dict[str, Any],
+    *,
+    mechanism: dict[str, Any] | None = None,
+    prompt: str = "",
+    event_name: str = "SessionStart",
+) -> str:
+    working = opening_working_set(receipt)
+    omissions = list(working.get("omissions") or [])
+    attach = _asked_attach(prompt, mechanism, event_name)
     lines = [
         "Adaptive Agent Runtime project-context Fact-First gate is active.",
         "Current project/runtime facts below are authoritative for this turn; chat history, compact summaries, memory, and prior-session impressions are non-authoritative when they conflict.",
+        "Facts absent from this working set are unknown; do not reconstruct them from old chat.",
         f"project_context_state={receipt.get('state')}",
         f"project_root={receipt.get('project_root')}",
         "verified_facts=" + json.dumps(receipt.get("verified_facts", []), ensure_ascii=False),
@@ -604,7 +732,8 @@ def _context_text(receipt: dict[str, Any], *, mechanism: dict[str, Any] | None =
             + str(session_binding.get("recovery") or "NONE")
         )
         if (
-            project_controller.get("project_controller") == "EXISTING"
+            isinstance(project_controller, dict)
+            and project_controller.get("project_controller") == "EXISTING"
             and session_binding.get("verification") != "VERIFIED"
         ):
             lines.append(
@@ -615,6 +744,7 @@ def _context_text(receipt: dict[str, Any], *, mechanism: dict[str, Any] | None =
                 "session recovery succeeds."
             )
     sources = receipt.get("sources", {})
+    extra_bodies: list[str] = []
     if isinstance(sources, dict):
         for key in ("agents", "project_skill", "runtime_skill", "ledger"):
             source = sources.get(key)
@@ -623,9 +753,6 @@ def _context_text(receipt: dict[str, Any], *, mechanism: dict[str, Any] | None =
             lines.append(
                 f"source[{key}] status={source.get('status')} path={source.get('path', '')} sha256={source.get('sha256', '')}"
             )
-            if source.get("status") == "verified":
-                lines.append(f"--- {key} ---")
-                lines.append(_bounded(str(source.get("content", ""))))
         git = sources.get("git")
         if isinstance(git, dict) and git.get("status") == "verified":
             lines.append(
@@ -646,20 +773,48 @@ def _context_text(receipt: dict[str, Any], *, mechanism: dict[str, Any] | None =
             lines.append(
                 f"runtime_state status={runtime.get('status')} path={runtime.get('path', '')} sha256={runtime.get('sha256', '')}"
             )
+        if attach in {"session", "agents"}:
+            agents = sources.get("agents")
+            if isinstance(agents, dict) and agents.get("status") == "verified":
+                _append_source_body(
+                    extra_bodies, omissions, key="agents", content=str(agents.get("content") or "")
+                )
+            else:
+                omissions.append("agents_unavailable")
+
     if isinstance(mechanism, dict):
         lines.append("mechanism_resolution=" + json.dumps(
             {key: value for key, value in mechanism.items() if key != "content"},
             ensure_ascii=False,
             sort_keys=True,
         ))
-        if mechanism.get("state") == "found":
-            lines.append("--- resolved existing mechanism ---")
-            lines.append(_bounded(str(mechanism.get("content", ""))))
+        if attach == "mechanism" and mechanism.get("state") == "found":
+            _append_source_body(
+                extra_bodies,
+                omissions,
+                key="resolved existing mechanism",
+                content=str(mechanism.get("content") or ""),
+            )
         elif mechanism.get("state") == "not_found":
-            lines.append(
+            extra_bodies.append(
                 "Existing-mechanism request could not be resolved from current authoritative sources. "
                 "Output must explicitly say UNKNOWN / NOT FOUND and must not synthesize an approximate mechanism."
             )
+
+    include_rows = attach in {"session", "working_set"}
+    summary = {
+        "kind": working.get("kind"),
+        "complete": not omissions,
+        "omissions": omissions,
+        "ledger_sha256": working.get("ledger_sha256"),
+        "ledger_path": working.get("ledger_path"),
+        "current_item_id": working.get("current_item_id"),
+    }
+    if include_rows:
+        summary["current_item"] = working.get("current_item")
+        summary["open_items"] = working.get("open_items")
+    lines.append("working_set=" + json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    lines.extend(extra_bodies)
     return chr(10).join(lines)
 
 
@@ -901,7 +1056,7 @@ def _refresh_for_correction(
             else None
         ) or None,
     )
-    prompt = str(state.get("prompt", ""))
+    prompt = str(state.get("prompt") or event.get("last_assistant_message") or "")
     mechanism = resolve_existing_mechanism(prompt, receipt=receipt, skill_root=skill_root)
     state.update(
         {
@@ -918,7 +1073,12 @@ def _refresh_for_correction(
         + "correction_reason="
         + reason
         + chr(10)
-        + _context_text(receipt, mechanism=mechanism)
+        + _context_text(
+            receipt,
+            mechanism=mechanism,
+            prompt=prompt,
+            event_name="UserPromptSubmit",
+        )
     )
     return {"decision": "block", "reason": correction}, state
 
@@ -967,7 +1127,7 @@ def evaluate_event(
         return {
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": _context_text(receipt),
+                "additionalContext": _context_text(receipt, event_name="SessionStart"),
             }
         }, state
 
@@ -1034,6 +1194,8 @@ def evaluate_event(
                         "additionalContext": _context_text(
                             prior_receipt,
                             mechanism=mechanism,
+                            prompt=prompt,
+                            event_name="UserPromptSubmit",
                         ),
                     }
                 }, state
@@ -1063,13 +1225,23 @@ def evaluate_event(
                     "project-context gate blocked: required current project rules are incomplete. "
                     "Return UNKNOWN for unresolved facts; do not infer from history or memory."
                     + chr(10)
-                    + _context_text(receipt, mechanism=mechanism)
+                    + _context_text(
+                        receipt,
+                        mechanism=mechanism,
+                        prompt=prompt,
+                        event_name="UserPromptSubmit",
+                    )
                 ),
             }, state
         return {
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": _context_text(receipt, mechanism=mechanism),
+                "additionalContext": _context_text(
+                    receipt,
+                    mechanism=mechanism,
+                    prompt=prompt,
+                    event_name="UserPromptSubmit",
+                ),
             }
         }, state
 
@@ -1132,7 +1304,12 @@ def evaluate_event(
                     "and state only that the current authoritative sources do not establish the mechanism. "
                     "Do not append scores, dimensions, replacement rules, provider/model declarations, or other definitive claims."
                     + chr(10)
-                    + _context_text(receipt, mechanism=mechanism)
+                    + _context_text(
+                        receipt,
+                        mechanism=mechanism,
+                        prompt=str(state.get("prompt") or message),
+                        event_name="UserPromptSubmit",
+                    )
                 ),
             }, state
 

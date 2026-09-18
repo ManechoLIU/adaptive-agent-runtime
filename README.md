@@ -297,7 +297,7 @@ python3 scripts/control_event_guard.py \
 
 `scripts/lifecycle_hook.py` 把持续总控的控制事件接到 Codex 生命周期：
 
-- `SessionStart`：读取 canonical `main` 与唯一台账基线，并立即暴露台账一致性错误；
+- `SessionStart`：读取 canonical `main` 与唯一台账基线，并立即暴露台账一致性错误；项目上下文 Hook 注入本轮工作集，不预灌全文台账或完整 Skill；
 - `UserPromptSubmit`：建立新的 `turn_id`，解除上一回合的 yield 锁；
 - `PreToolUse`：成功控制收据后，同一回合的下一次工具调用在执行前被拒绝；
 - `PostToolUse`：主线、工作区、台账、`READY` 或任一 worktree 未合入候选改变后立即给总控追加控制上下文；
