@@ -61,6 +61,8 @@
 
 既有项目首次采用这套结构时，先运行非严格 lint 取得迁移警告，在不暂停无冲突实现的前提下完成一次范围单一的台账迁移；对账任务 ID、状态、依赖、授权门和证据无遗漏后再启用 `--strict`。不能把新结构直接作为既有项目的突然阻塞门，也不能因兼容旧格式而永久跳过迁移。
 
+机器读取唯一台账时优先使用 `scripts/ledger_access.py inspect <ledger>`，它只在内存中生成结构化投影，不创建 SQLite、缓存台账或第二事实源。执行者若要基于先前读取结果整体替换台账，必须携带该次读取的 `ledger_sha256`，通过 `ledger_access.py apply --expected-sha256 ...` 做 optimistic CAS；revision 已变化时直接 fail closed，fresh-read 后再 reconcile。Runtime 已有的 `ledger_sha256`、project-wide projection、control receipt 与本接口共享同一 canonical Markdown，不新增状态所有者。
+
 总控只使用五个主状态：`READY / ACTIVE / VERIFY / BLOCKED / CLOSED`。`READY` 表示开放但尚未执行；`ACTIVE` 表示正在真实执行，恢复动作也属于 ACTIVE；`VERIFY` 表示已有结果，正在等待已命名的审查、集成、回归、真实 Case 或发布门；`BLOCKED` 只表示内部恢复路径已穷尽且确实等待外部条件；`CLOSED` 表示承诺的交付边界已经满足或工作被正式替代。心跳、RED/GREEN、candidate、review PASS、integration、regression、recovery count 都是机器证据或门，不新增主状态。
 
 既有项目仍兼容旧台账词汇：`PENDING → READY(dispatchable=false)`、`RECOVERING → ACTIVE(health=recovering)`、`DONE → CLOSED(done)`、`SUPERSEDED → CLOSED(superseded)`；旧词只作为解析兼容，不再作为总控需要额外管理的状态。已有 `RECOVERING` 行仍须保留恢复负责人、当前根因假设、下一恢复动作和触发检查点，直到项目自然迁移；新规则不要求为了改名批量重写历史台账。一个执行波次可以包含多个彼此独立的 `ACTIVE` 工作包，但它们必须没有直接顺序依赖、负责人和文件所有权清楚、共享运行环境已隔离或登记。无法满足这些条件时顺序执行。同一工作包同一时刻只有一个负责人，同一文件同一时刻只有一个写入者。

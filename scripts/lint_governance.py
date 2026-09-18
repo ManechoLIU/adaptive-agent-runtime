@@ -87,20 +87,46 @@ def task_records(text: str) -> list[dict[str, str]]:
                         ),
                         "",
                     )
+                    scope = next(
+                        (
+                            value
+                            for key, value in values.items()
+                            if ("目标" in key or "边界" in key)
+                            and "状态" not in key
+                        ),
+                        "",
+                    )
+                    dependencies_blockers = next(
+                        (
+                            value
+                            for key, value in values.items()
+                            if "依赖" in key or "阻塞" in key
+                        ),
+                        "",
+                    )
+                    acceptance = next(
+                        (
+                            value
+                            for key, value in values.items()
+                            if "验收" in key or "验证" in key
+                        ),
+                        "",
+                    )
+                    evidence = next(
+                        (
+                            value
+                            for key, value in values.items()
+                            if "证据" in key
+                        ),
+                        "",
+                    )
                     next_action = next(
                         (
                             value
                             for key, value in values.items()
                             if "下一步" in key
                         ),
-                        next(
-                            (
-                                value
-                                for key, value in values.items()
-                                if "证据" in key
-                            ),
-                            cells[-1] if cells else "",
-                        ),
+                        evidence or (cells[-1] if cells else ""),
                     )
                     rows.append(
                         {
@@ -108,6 +134,10 @@ def task_records(text: str) -> list[dict[str, str]]:
                             "status": status.group(1),
                             "status_cell": cells[status_index],
                             "owner": owner,
+                            "scope": scope,
+                            "dependencies_blockers": dependencies_blockers,
+                            "acceptance": acceptance,
+                            "evidence": evidence,
                             "next_action": next_action,
                             "row": " | ".join(cells),
                         }
