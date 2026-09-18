@@ -12475,6 +12475,247 @@ def _legacy_result_unknown_quarantine_schedules_distinct_recompute_after_host_up
     self.assertEqual(saved["original_reentry_receipt"], original)
 
 
+
+def _legacy_recovery_predispatch_failure_rearms_same_successor_after_strong_handoff(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        legacy = _legacy_baseline_unavailable_receipt(original)
+        successor = web_bridge._legacy_result_unknown_recovery_receipt_id(
+            original=original,
+            original_host_fingerprint="a" * 64,
+            current_host_fingerprint="b" * 64,
+        )
+        old_fence = web_bridge._controller_web_wait_fence(
+            registry=registry, controller_id="controller-1"
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.update({
+            "receipt_id": successor,
+            "state": "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+            "pending_control_event": True,
+            "failure_class": "web_reentry_failed_before_dispatch",
+            "error_code": "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+            "returncode": 1,
+            "last_lifecycle_fingerprint": web_bridge._wake_event_fingerprint(lifecycle),
+            "blocked_controller_fence": old_fence,
+            "execution_target_session_id": "web-current",
+            "target_generation": 4,
+            "ownership_generation": 8,
+            "delivery_authorization": "host_attested",
+            "host_attested": True,
+            "strong_web_identity_established": True,
+            "original_reentry_receipt": original,
+            "host_reentry_reconciliation": {
+                "reconciliation_class": "LEGACY_BASELINE_UNAVAILABLE",
+                "reconciliation_receipt": legacy,
+                "conversation_id": "web-current",
+                "target_generation": 4,
+                "ownership_generation": 8,
+                "original_receipt_id": original["receipt_id"],
+                "original_wake_id": original["wake_id"],
+                "successor_receipt_id": successor,
+                "successor_authorized": True,
+                "successor_scheduled": True,
+                "recovery_mode": "legacy_ambiguous_recompute",
+                "original_delivery_host_fingerprint": "a" * 64,
+                "reconciliation_host_fingerprint": "b" * 64,
+            },
+        })
+        state.pop("delivery_terminal_receipt_id", None)
+        state.pop("delivery_terminal_outcome", None)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        _provision_verified_current_web_target(
+            registry,
+            controller_id="controller-1",
+            web_session_id="web-successor",
+            target_generation=5,
+            ownership_generation=9,
+        )
+        current_fence = web_bridge._controller_web_wait_fence(
+            registry=registry, controller_id="controller-1"
+        )
+        captured = []
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64
+        ), patch.object(
+            web_bridge, "schedule_auto_native_stop",
+            side_effect=lambda **kwargs: captured.append(dict(kwargs)) or True,
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry",
+            side_effect=AssertionError("rearm must not submit inline or replay the old wake"),
+        ):
+            scheduled = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=None,
+                delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertTrue(scheduled)
+    self.assertEqual(len(captured), 1)
+    self.assertEqual(captured[0]["receipt_id"], successor)
+    self.assertEqual(
+        web_bridge._controller_delivery_fence_identity(captured[0]["expected_controller_fence"]),
+        ("web-successor", 5, 9),
+    )
+    self.assertNotEqual(
+        web_bridge._controller_delivery_fence_identity(captured[0]["expected_controller_fence"]),
+        web_bridge._controller_delivery_fence_identity(old_fence),
+    )
+    self.assertEqual(current_fence["target_provenance"], "host_attested_same_controller_recovery")
+    record = saved["host_reentry_reconciliation"]
+    self.assertEqual(record["conversation_id"], "web-current")
+    self.assertEqual(record["target_generation"], 4)
+    self.assertEqual(record["ownership_generation"], 8)
+    self.assertEqual(record["successor_receipt_id"], successor)
+    self.assertTrue(record["successor_scheduled"])
+
+
+def _legacy_recovery_predispatch_failure_does_not_rearm_to_manual_handoff(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        legacy = _legacy_baseline_unavailable_receipt(original)
+        successor = web_bridge._legacy_result_unknown_recovery_receipt_id(
+            original=original,
+            original_host_fingerprint="a" * 64,
+            current_host_fingerprint="b" * 64,
+        )
+        old_fence = web_bridge._controller_web_wait_fence(
+            registry=registry, controller_id="controller-1"
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.update({
+            "receipt_id": successor,
+            "state": "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+            "pending_control_event": True,
+            "failure_class": "web_reentry_failed_before_dispatch",
+            "error_code": "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+            "last_lifecycle_fingerprint": web_bridge._wake_event_fingerprint(lifecycle),
+            "blocked_controller_fence": old_fence,
+            "original_reentry_receipt": original,
+            "host_reentry_reconciliation": {
+                "reconciliation_class": "LEGACY_BASELINE_UNAVAILABLE",
+                "reconciliation_receipt": legacy,
+                "conversation_id": "web-current",
+                "target_generation": 4,
+                "ownership_generation": 8,
+                "original_receipt_id": original["receipt_id"],
+                "original_wake_id": original["wake_id"],
+                "successor_receipt_id": successor,
+                "successor_authorized": True,
+                "successor_scheduled": True,
+                "recovery_mode": "legacy_ambiguous_recompute",
+                "original_delivery_host_fingerprint": "a" * 64,
+                "reconciliation_host_fingerprint": "b" * 64,
+            },
+        })
+        state.pop("delivery_terminal_receipt_id", None)
+        state.pop("delivery_terminal_outcome", None)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        _provision_manual_current_web_target(
+            registry,
+            controller_id="controller-1",
+            web_session_id="manual-successor",
+            generation=5,
+        )
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            scheduled = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=None,
+                delay_seconds=1.0,
+            )
+    self.assertFalse(scheduled)
+    schedule.assert_not_called()
+
+
+
+def _legacy_recovery_predispatch_handoff_rearm_requires_strong_unconsumed_boundary(self):
+    from unittest.mock import patch
+    for mode in ("same_fence", "missing_strong_evidence", "terminal_consumed"):
+        with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+            legacy = _legacy_baseline_unavailable_receipt(original)
+            successor = web_bridge._legacy_result_unknown_recovery_receipt_id(
+                original=original,
+                original_host_fingerprint="a" * 64,
+                current_host_fingerprint="b" * 64,
+            )
+            old_fence = web_bridge._controller_web_wait_fence(
+                registry=registry, controller_id="controller-1"
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "receipt_id": successor,
+                "state": "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+                "pending_control_event": True,
+                "failure_class": "web_reentry_failed_before_dispatch",
+                "error_code": "WEB_REENTRY_FAILED_BEFORE_DISPATCH",
+                "returncode": 1,
+                "last_lifecycle_fingerprint": web_bridge._wake_event_fingerprint(lifecycle),
+                "blocked_controller_fence": old_fence,
+                "execution_target_session_id": "web-current",
+                "target_generation": 4,
+                "ownership_generation": 8,
+                "delivery_authorization": "host_attested",
+                "host_attested": True,
+                "strong_web_identity_established": True,
+                "original_reentry_receipt": original,
+                "host_reentry_reconciliation": {
+                    "reconciliation_class": "LEGACY_BASELINE_UNAVAILABLE",
+                    "reconciliation_receipt": legacy,
+                    "conversation_id": "web-current",
+                    "target_generation": 4,
+                    "ownership_generation": 8,
+                    "original_receipt_id": original["receipt_id"],
+                    "original_wake_id": original["wake_id"],
+                    "successor_receipt_id": successor,
+                    "successor_authorized": True,
+                    "successor_scheduled": True,
+                    "recovery_mode": "legacy_ambiguous_recompute",
+                    "original_delivery_host_fingerprint": "a" * 64,
+                    "reconciliation_host_fingerprint": "b" * 64,
+                },
+            })
+            state.pop("delivery_terminal_receipt_id", None)
+            state.pop("delivery_terminal_outcome", None)
+            if mode == "missing_strong_evidence":
+                state["host_attested"] = False
+            if mode == "terminal_consumed":
+                state["delivery_terminal_receipt_id"] = successor
+                state["delivery_terminal_outcome"] = "submit_confirmed"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            if mode != "same_fence":
+                _provision_verified_current_web_target(
+                    registry,
+                    controller_id="controller-1",
+                    web_session_id="web-successor",
+                    target_generation=5,
+                    ownership_generation=9,
+                )
+            with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+                web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                scheduled = web_bridge.ensure_continuation_supervisor(
+                    lifecycle_state=lifecycle,
+                    session_id="controller-1",
+                    repo=repo,
+                    registry=registry,
+                    codex=None,
+                    delay_seconds=1.0,
+                )
+        self.assertFalse(scheduled)
+        schedule.assert_not_called()
+
+
 def _legacy_recovery_successor_injects_recompute_context_at_submit_boundary(self):
     from unittest.mock import patch
     with tempfile.TemporaryDirectory() as tmp:
@@ -13614,6 +13855,9 @@ WebLocalReentryIntegrationTests.test_result_unknown_persisted_authorization_requ
 WebLocalReentryIntegrationTests.test_result_unknown_successor_scheduled_marker_uses_supervisor_lock = _result_unknown_successor_scheduled_marker_uses_supervisor_lock
 WebLocalReentryIntegrationTests.test_result_unknown_confirmed_not_delivered_clears_and_schedules_new_wake = _result_unknown_confirmed_not_delivered_clears_and_schedules_new_wake
 WebLocalReentryIntegrationTests.test_legacy_result_unknown_quarantine_schedules_distinct_recompute_after_host_upgrade = _legacy_result_unknown_quarantine_schedules_distinct_recompute_after_host_upgrade
+WebLocalReentryIntegrationTests.test_legacy_recovery_predispatch_failure_rearms_same_successor_after_strong_handoff = _legacy_recovery_predispatch_failure_rearms_same_successor_after_strong_handoff
+WebLocalReentryIntegrationTests.test_legacy_recovery_predispatch_failure_does_not_rearm_to_manual_handoff = _legacy_recovery_predispatch_failure_does_not_rearm_to_manual_handoff
+WebLocalReentryIntegrationTests.test_legacy_recovery_predispatch_handoff_rearm_requires_strong_unconsumed_boundary = _legacy_recovery_predispatch_handoff_rearm_requires_strong_unconsumed_boundary
 WebLocalReentryIntegrationTests.test_legacy_recovery_successor_injects_recompute_context_at_submit_boundary = _legacy_recovery_successor_injects_recompute_context_at_submit_boundary
 WebLocalReentryIntegrationTests.test_tampered_legacy_recovery_successor_fails_before_host_submit = _tampered_legacy_recovery_successor_fails_before_host_submit
 WebLocalReentryIntegrationTests.test_legacy_result_unknown_quarantine_same_host_or_bad_evidence_stays_blocked = _legacy_result_unknown_quarantine_same_host_or_bad_evidence_stays_blocked

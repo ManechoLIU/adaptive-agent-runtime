@@ -5846,6 +5846,90 @@ def _result_unknown_successor_expected_fence(
     return fence if _controller_delivery_fence_identity(fence) is not None else None
 
 
+def _strong_current_web_handoff_fence(
+    *, registry: Path, session_id: str
+) -> dict[str, Any] | None:
+    registry_data = load_json(registry)
+    target = target_guard.target_record(
+        registry_data, controller_id=session_id, host="web"
+    )
+    ownership = target_guard.execution_ownership_record(
+        registry_data, controller_id=session_id
+    )
+    if not isinstance(target, dict) or ownership is None:
+        return None
+    try:
+        status, target_session, target_generation = target_guard.validate_target_record(
+            target, host="web"
+        )
+        ownership_host, ownership_target, ownership_generation = (
+            target_guard.validate_execution_ownership_record(ownership)
+        )
+    except (TypeError, ValueError):
+        return None
+    if (
+        status != "active"
+        or ownership_host != "web"
+        or target_session != ownership_target
+        or target.get("provenance") != "host_attested_same_controller_recovery"
+        or target.get("binding_mode") != "resume_only"
+        or target.get("identity_proof") != "host_attested_origin"
+    ):
+        return None
+    return {
+        "execution_target_session_id": target_session,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+        "target_provenance": target.get("provenance"),
+        "target_binding_mode": target.get("binding_mode"),
+        "target_host_attested": target.get("host_attested"),
+        "ownership_provenance": ownership.get("provenance"),
+    }
+
+
+def _legacy_recovery_predispatch_handoff_rearm_fence(
+    supervisor_state: dict[str, Any],
+    *,
+    authorized_successor: str,
+    persisted: dict[str, Any],
+    original: dict[str, Any],
+    registry: Path,
+    session_id: str,
+) -> dict[str, Any] | None:
+    if (
+        persisted.get("reconciliation_class") != "LEGACY_BASELINE_UNAVAILABLE"
+        or persisted.get("recovery_mode") != "legacy_ambiguous_recompute"
+        or persisted.get("successor_authorized") is not True
+        or persisted.get("successor_scheduled") is not True
+        or str(persisted.get("successor_receipt_id") or "").strip() != authorized_successor
+        or str(supervisor_state.get("receipt_id") or "").strip() != authorized_successor
+        or str(supervisor_state.get("state") or "").strip() != "WEB_REENTRY_FAILED_BEFORE_DISPATCH"
+        or str(supervisor_state.get("failure_class") or "").strip() != "web_reentry_failed_before_dispatch"
+        or str(supervisor_state.get("error_code") or "").strip() != "WEB_REENTRY_FAILED_BEFORE_DISPATCH"
+        or supervisor_state.get("delivery_authorization") != "host_attested"
+        or supervisor_state.get("host_attested") is not True
+        or supervisor_state.get("strong_web_identity_established") is not True
+        or str(supervisor_state.get("delivery_terminal_receipt_id") or "").strip()
+        or str(supervisor_state.get("delivery_terminal_outcome") or "").strip()
+    ):
+        return None
+    old_fence = _result_unknown_successor_expected_fence(
+        record=persisted, original=original
+    )
+    current_fence = _strong_current_web_handoff_fence(
+        registry=registry, session_id=session_id
+    )
+    old_identity = _controller_delivery_fence_identity(old_fence)
+    current_identity = _controller_delivery_fence_identity(current_fence)
+    if (
+        old_identity is None
+        or current_identity is None
+        or old_identity == current_identity
+    ):
+        return None
+    return current_fence
+
+
 def _persist_host_reentry_reconciliation(
     state_path: Path,
     *,
@@ -8418,10 +8502,21 @@ def ensure_continuation_supervisor(
             or original is None
             or persisted is None
             or expected_fence is None
-            or _controller_delivery_fence_identity(expected_fence) != fence
             or str(supervisor_state.get("receipt_id") or "") != authorized_successor
         ):
             return False
+        if _controller_delivery_fence_identity(expected_fence) != fence:
+            rearm_fence = _legacy_recovery_predispatch_handoff_rearm_fence(
+                supervisor_state,
+                authorized_successor=authorized_successor,
+                persisted=persisted,
+                original=original,
+                registry=registry,
+                session_id=session_id,
+            )
+            if rearm_fence is None:
+                return False
+            expected_fence = rearm_fence
         scheduled = bool(schedule_auto_native_stop(
             session_id=session_id,
             repo=repo,
