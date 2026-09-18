@@ -123,6 +123,7 @@ RESTORE_DOCUMENT_LIMIT = 32768
 AUTO_CONTINUATION_STALL_LIMIT = 3
 WEB_REENTRY_TRANSIENT_RETRY_LIMIT = 6
 WEB_REENTRY_RECONCILE_RETRY_LIMIT = 1
+RESULT_UNKNOWN_HISTORY_LIMIT = 8
 RESULT_UNKNOWN_JOURNAL_PHASE = "result_unknown"
 RESULT_UNKNOWN_RECONCILE_TERMINAL_CLASSES = {
     "CONFIRMED_NOT_DELIVERED",
@@ -5110,6 +5111,38 @@ def _loaded_external_peer_attestation_verifier(
             }
         raise PermissionError("registered Host submit adapter returned inconsistent result semantics")
 
+    def recover_reentry_result_unknown(**kwargs: Any) -> dict[str, Any]:
+        if host != "web":
+            raise PermissionError("registered Host RESULT_UNKNOWN recovery is Web-only")
+        conversation_id = str(kwargs.get("expected_conversation_id") or "").strip()
+        target_generation = kwargs.get("expected_target_generation")
+        ownership_generation = kwargs.get("expected_ownership_generation")
+        if not conversation_id:
+            raise PermissionError("registered Host RESULT_UNKNOWN recovery requires exact conversation")
+        for value, name in ((target_generation, "target generation"), (ownership_generation, "ownership generation")):
+            if not _positive_generation(value):
+                raise PermissionError(f"registered Host RESULT_UNKNOWN recovery requires positive {name}")
+        payload = run_cli({
+            "operation": "recover_reentry_result_unknown",
+            "expected_conversation_id": conversation_id,
+            "expected_target_generation": target_generation,
+            "expected_ownership_generation": ownership_generation,
+        }, deadline_monotonic=kwargs.get("deadline_monotonic"))
+        if payload.get("operation") != "recover_reentry_result_unknown":
+            raise PermissionError("registered Host RESULT_UNKNOWN recovery returned wrong operation")
+        receipt = payload.get("reentry_receipt")
+        if not _is_durable_result_unknown_receipt(
+            receipt,
+            conversation_id=conversation_id,
+            target_generation=target_generation,
+            ownership_generation=ownership_generation,
+        ):
+            raise PermissionError("registered Host RESULT_UNKNOWN recovery returned mismatched receipt")
+        return {
+            "operation": "recover_reentry_result_unknown",
+            "reentry_receipt": _copied_json_object(receipt),
+        }
+
     def reconcile_reentry_result(**kwargs: Any) -> dict[str, Any]:
         if host != "web":
             raise PermissionError("registered Host reentry reconciliation is Web-only")
@@ -5189,6 +5222,7 @@ def _loaded_external_peer_attestation_verifier(
     if verifier_protocol == "runtime_host_verifier_cli_v2":
         setattr(verify, "verify_current_entry", verify_current_entry)
     setattr(verify, "submit_reentry", submit_reentry)
+    setattr(verify, "recover_reentry_result_unknown", recover_reentry_result_unknown)
     setattr(verify, "reconcile_reentry_result", reconcile_reentry_result)
     setattr(verify, "delivery_fingerprint", delivery_fingerprint)
     setattr(verify, "manifest_identity", manifest_identity)
@@ -5276,7 +5310,7 @@ def _pinned_host_verifier_helper_main(argv: Sequence[str]) -> int:
                 raise PermissionError("registered Host verifier helper call is invalid")
             allowed_methods = {
                 "verify", "discover_current_entry", "verify_current_entry", "submit_reentry",
-                "reconcile_reentry_result",
+                "recover_reentry_result_unknown", "reconcile_reentry_result",
                 "verify_tool_pre", "verify_tool_terminal",
             }
             method = verifier if method_name == "verify" else getattr(verifier, method_name, None)
@@ -5468,6 +5502,19 @@ def _external_peer_attestation_verifier(
         }
         return call("submit_reentry", **forwarded)
 
+    def recover_reentry_result_unknown(**kwargs: Any) -> Any:
+        forwarded = {
+            key: kwargs[key]
+            for key in (
+                "expected_conversation_id",
+                "expected_target_generation",
+                "expected_ownership_generation",
+                "deadline_monotonic",
+            )
+            if key in kwargs
+        }
+        return call("recover_reentry_result_unknown", **forwarded)
+
     def reconcile_reentry_result(**kwargs: Any) -> Any:
         forwarded = {
             key: kwargs[key]
@@ -5483,6 +5530,7 @@ def _external_peer_attestation_verifier(
         return call("reconcile_reentry_result", **forwarded)
 
     setattr(verify, "submit_reentry", submit_reentry)
+    setattr(verify, "recover_reentry_result_unknown", recover_reentry_result_unknown)
     setattr(verify, "reconcile_reentry_result", reconcile_reentry_result)
     setattr(verify, "delivery_fingerprint", fingerprint)
     setattr(verify, "verifier_protocol", protocol)
@@ -5697,9 +5745,10 @@ def _persisted_reconciliation_record(supervisor_state: dict[str, Any]) -> dict[s
     return record if isinstance(record, dict) else None
 
 
-def _authorized_result_unknown_successor_id(
-    supervisor_state: dict[str, Any], *, current_host_delivery_fingerprint: str | None = None
+def _historically_authorized_result_unknown_successor_id(
+    supervisor_state: dict[str, Any],
 ) -> str:
+    """Return a previously authorized successor without granting fresh dispatch authority."""
     record = _persisted_reconciliation_record(supervisor_state)
     original = _durable_original_reentry_receipt(supervisor_state)
     if (
@@ -5752,18 +5801,17 @@ def _authorized_result_unknown_successor_id(
     if record.get("recovery_mode") != "legacy_ambiguous_recompute":
         return ""
     old_fingerprint = str(record.get("original_delivery_host_fingerprint") or "").strip().lower()
-    new_fingerprint = str(record.get("reconciliation_host_fingerprint") or "").strip().lower()
-    current_fingerprint = str(current_host_delivery_fingerprint or "").strip().lower()
+    reconciliation_fingerprint = str(
+        record.get("reconciliation_host_fingerprint") or ""
+    ).strip().lower()
     if (
         not _valid_sha256(old_fingerprint)
-        or not _valid_sha256(new_fingerprint)
-        or old_fingerprint == new_fingerprint
-        or not _valid_sha256(current_fingerprint)
-        or current_fingerprint != new_fingerprint
+        or not _valid_sha256(reconciliation_fingerprint)
+        or old_fingerprint == reconciliation_fingerprint
         or successor_id != _legacy_result_unknown_recovery_receipt_id(
             original=original,
             original_host_fingerprint=old_fingerprint,
-            current_host_fingerprint=new_fingerprint,
+            current_host_fingerprint=reconciliation_fingerprint,
         )
         or not _legacy_baseline_unavailable_evidence_is_complete(
             receipt,
@@ -5775,6 +5823,70 @@ def _authorized_result_unknown_successor_id(
     ):
         return ""
     return successor_id
+
+
+def _authorized_result_unknown_successor_id(
+    supervisor_state: dict[str, Any], *, current_host_delivery_fingerprint: str | None = None
+) -> str:
+    successor_id = _historically_authorized_result_unknown_successor_id(supervisor_state)
+    if not successor_id:
+        return ""
+    record = _persisted_reconciliation_record(supervisor_state)
+    if not isinstance(record, dict):
+        return ""
+    if str(record.get("reconciliation_class") or "").strip() != "LEGACY_BASELINE_UNAVAILABLE":
+        return successor_id
+    reconciliation_fingerprint = str(
+        record.get("reconciliation_host_fingerprint") or ""
+    ).strip().lower()
+    current_fingerprint = str(current_host_delivery_fingerprint or "").strip().lower()
+    if (
+        not _valid_sha256(current_fingerprint)
+        or current_fingerprint != reconciliation_fingerprint
+    ):
+        return ""
+    return successor_id
+
+
+def _promote_successor_result_unknown_receipt(
+    state: dict[str, Any],
+    *,
+    current_receipt_id: str,
+    new_receipt: dict[str, Any],
+    current_host_delivery_fingerprint: str | None,
+    superseded_at_unix_ms: int,
+) -> bool:
+    """Advance RESULT_UNKNOWN ownership when an authorized successor becomes unknown."""
+    del current_host_delivery_fingerprint
+    authorized_successor = _historically_authorized_result_unknown_successor_id(state)
+    if not authorized_successor or authorized_successor != str(current_receipt_id or "").strip():
+        return False
+    prior_original = _durable_original_reentry_receipt(state)
+    prior_reconciliation = _persisted_reconciliation_record(state)
+    if prior_original is None or prior_reconciliation is None:
+        return False
+    if (
+        new_receipt.get("receipt_id") == prior_original.get("receipt_id")
+        or new_receipt.get("wake_id") == prior_original.get("wake_id")
+    ):
+        return False
+
+    history = state.get("result_unknown_history")
+    if not isinstance(history, list):
+        history = []
+    history = [item for item in history if isinstance(item, dict)]
+    history.append({
+        "original_reentry_receipt": _copied_json_object(prior_original),
+        "host_reentry_reconciliation": _copied_json_object(prior_reconciliation),
+        "superseded_by_receipt_id": str(new_receipt.get("receipt_id") or ""),
+        "superseded_by_wake_id": str(new_receipt.get("wake_id") or ""),
+        "superseded_at_unix_ms": int(superseded_at_unix_ms),
+    })
+    state["result_unknown_history"] = history[-RESULT_UNKNOWN_HISTORY_LIMIT:]
+    state["original_reentry_receipt"] = _copied_json_object(new_receipt)
+    state.pop("host_reentry_reconciliation", None)
+    state.pop("host_reentry_reconcile_attempts", None)
+    return True
 
 
 def _web_conversation_fence_from_registry(
@@ -6020,6 +6132,149 @@ def _mark_result_unknown_successor_scheduled(
             record["successor_scheduled_at_unix_ms"] = int(time.time() * 1000)
             state["host_reentry_reconciliation"] = record
             write_auto_stop_state(state_path, state)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _execute_registered_web_host_result_unknown_recovery(
+    *,
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    verifier: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    verifier = verifier or _registered_peer_attestation_verifier("web")
+    adapter = getattr(verifier, "recover_reentry_result_unknown", None) if callable(verifier) else None
+    if not callable(verifier) or not callable(adapter):
+        raise PermissionError("registered Host RESULT_UNKNOWN recovery adapter is unavailable")
+    with target_guard.locked_execution_target(
+        repo=repo,
+        host="web",
+        registry_path=registry,
+    ) as current_target:
+        if current_target.get("controller_id") != session_id:
+            raise PermissionError("Web target does not belong to the registered Controller")
+        expected_target = str(current_target.get("execution_target_session_id") or "").strip()
+        expected_generation = current_target.get("generation")
+        ownership = target_guard.execution_ownership_record(
+            load_json(registry), controller_id=session_id
+        )
+        if ownership is None:
+            raise PermissionError("canonical Web execution ownership is missing")
+        ownership_host, ownership_target, ownership_generation = (
+            target_guard.validate_execution_ownership_record(ownership)
+        )
+        if (
+            not expected_target
+            or ownership_host != "web"
+            or ownership_target != expected_target
+            or not _positive_generation(expected_generation)
+            or not _positive_generation(ownership_generation)
+        ):
+            raise PermissionError("canonical Web execution ownership is missing or mismatched")
+        outcome = adapter(
+            expected_conversation_id=expected_target,
+            expected_target_generation=expected_generation,
+            expected_ownership_generation=ownership_generation,
+        )
+        if not isinstance(outcome, dict):
+            raise PermissionError("registered Host RESULT_UNKNOWN recovery returned a non-object receipt")
+        receipt = outcome.get("reentry_receipt")
+        if not _is_durable_result_unknown_receipt(
+            receipt,
+            conversation_id=expected_target,
+            target_generation=expected_generation,
+            ownership_generation=ownership_generation,
+        ):
+            raise PermissionError("registered Host RESULT_UNKNOWN recovery returned mismatched receipt")
+        return {
+            "operation": outcome.get("operation") or "recover_reentry_result_unknown",
+            "reentry_receipt": _copied_json_object(receipt),
+            "expected_conversation_id": expected_target,
+            "expected_target_generation": expected_generation,
+            "expected_ownership_generation": ownership_generation,
+        }
+
+
+def _recover_persisted_successor_result_unknown_from_registered_host(
+    *,
+    session_id: str,
+    repo: Path,
+    registry: Path,
+    state_path: Path,
+    supervisor_state: dict[str, Any],
+    current_host_delivery_fingerprint: str | None,
+) -> bool:
+    if (
+        str(supervisor_state.get("state") or "") != "WEB_REENTRY_RESULT_UNKNOWN"
+        or str(supervisor_state.get("delivery_terminal_outcome") or "") != "result_unknown"
+    ):
+        return False
+    receipt_id = str(supervisor_state.get("receipt_id") or "").strip()
+    if not receipt_id or _historically_authorized_result_unknown_successor_id(
+        supervisor_state
+    ) != receipt_id:
+        return False
+    current_fence = _web_conversation_fence_from_registry(registry, session_id=session_id)
+    if current_fence is None:
+        return False
+    current_conversation, current_target_generation, current_ownership_generation = current_fence
+    existing_original = _durable_original_reentry_receipt(supervisor_state)
+    if existing_original is None:
+        return False
+    if _is_durable_result_unknown_receipt(
+        existing_original,
+        conversation_id=current_conversation,
+        target_generation=current_target_generation,
+        ownership_generation=current_ownership_generation,
+    ):
+        return False
+    if (
+        str(supervisor_state.get("execution_target_session_id") or "") != current_conversation
+        or supervisor_state.get("target_generation") != current_target_generation
+        or supervisor_state.get("ownership_generation") != current_ownership_generation
+    ):
+        return False
+    try:
+        outcome = _execute_registered_web_host_result_unknown_recovery(
+            session_id=session_id,
+            repo=repo,
+            registry=registry,
+        )
+    except (PermissionError, PeerHostTransientUnavailable, OSError, ValueError, TypeError):
+        return False
+    recovered = outcome.get("reentry_receipt")
+    if not isinstance(recovered, dict):
+        return False
+
+    lock_path = auto_stop_supervisor_lock_path(state_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_json(state_path)
+            if (
+                str(state.get("state") or "") != "WEB_REENTRY_RESULT_UNKNOWN"
+                or str(state.get("receipt_id") or "").strip() != receipt_id
+                or str(state.get("delivery_terminal_outcome") or "") != "result_unknown"
+                or str(state.get("execution_target_session_id") or "") != current_conversation
+                or state.get("target_generation") != current_target_generation
+                or state.get("ownership_generation") != current_ownership_generation
+                or _historically_authorized_result_unknown_successor_id(state)
+                != receipt_id
+            ):
+                return False
+            promoted = _promote_successor_result_unknown_receipt(
+                state,
+                current_receipt_id=receipt_id,
+                new_receipt=recovered,
+                current_host_delivery_fingerprint=current_host_delivery_fingerprint,
+                superseded_at_unix_ms=int(time.time() * 1000),
+            )
+            if not promoted:
+                return False
+            write_auto_stop_state(state_path, state)
+            return True
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -8400,6 +8655,15 @@ def ensure_continuation_supervisor(
         if str(lifecycle_state.get("controller_host") or "").strip() == "web"
         else None
     )
+    if _recover_persisted_successor_result_unknown_from_registered_host(
+        session_id=session_id,
+        repo=repo,
+        registry=registry,
+        state_path=state_path,
+        supervisor_state=supervisor_state,
+        current_host_delivery_fingerprint=current_host_delivery_fingerprint,
+    ):
+        supervisor_state = load_json(state_path)
     authorized_successor = _authorized_result_unknown_successor_id(
         supervisor_state,
         current_host_delivery_fingerprint=current_host_delivery_fingerprint,
@@ -9351,10 +9615,20 @@ def _run_auto_native_stop_impl(
                         ):
                             original_receipt = _copied_json_object(candidate)
                     existing_original = current.get("original_reentry_receipt")
-                    if _is_durable_result_unknown_receipt(existing_original):
-                        current["original_reentry_receipt"] = _copied_json_object(existing_original)
-                    elif original_receipt is not None:
-                        current["original_reentry_receipt"] = original_receipt
+                    promoted_successor_unknown = False
+                    if original_receipt is not None:
+                        promoted_successor_unknown = _promote_successor_result_unknown_receipt(
+                            current,
+                            current_receipt_id=receipt_id,
+                            new_receipt=original_receipt,
+                            current_host_delivery_fingerprint=host_delivery_fingerprint,
+                            superseded_at_unix_ms=terminal_now_ms,
+                        )
+                    if not promoted_successor_unknown:
+                        if _is_durable_result_unknown_receipt(existing_original):
+                            current["original_reentry_receipt"] = _copied_json_object(existing_original)
+                        elif original_receipt is not None:
+                            current["original_reentry_receipt"] = original_receipt
                     current.pop("wake_nonce", None)
                     current.pop("continuation_payload", None)
                 try:

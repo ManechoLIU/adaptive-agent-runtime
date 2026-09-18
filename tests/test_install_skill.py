@@ -1010,6 +1010,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests.test_ensure_supervisor_blocks_new_rule_live_e2e_until_old_result_unknown_is_reconciled",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_legacy_result_unknown_quarantine_schedules_distinct_recompute_after_host_upgrade",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_legacy_recovery_predispatch_failure_rearms_same_successor_after_strong_handoff",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_persisted_successor_result_unknown_recovers_host_receipt_then_reconciles",
+            "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_result_unknown_successor_promotes_new_receipt_and_archives_prior_chain",
             "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests.test_tampered_legacy_recovery_successor_fails_before_host_submit",
         }
         self.assertTrue(required.issubset(set(RUNTIME_RELEASE_REGRESSION_TESTS)))

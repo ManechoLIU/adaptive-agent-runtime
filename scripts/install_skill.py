@@ -259,6 +259,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_legacy_recovery_predispatch_failure_rearms_same_successor_after_strong_handoff",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_persisted_successor_result_unknown_recovers_host_receipt_then_reconciles",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_result_unknown_successor_promotes_new_receipt_and_archives_prior_chain",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_tampered_legacy_recovery_successor_fails_before_host_submit",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_retry_exhausted_persists_host_delivery_fingerprint",

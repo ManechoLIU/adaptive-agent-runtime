@@ -1509,6 +1509,54 @@ class WebLifecycleBridgeTests(unittest.TestCase):
                 self.assertEqual(attempt["host_execution_receipt"]["call_receipt"], "hr_submit")
                 self.assertEqual(attempt["host_execution_receipt"]["reentry_receipt"]["receipt_id"], "wr_submit")
 
+    def test_registered_web_verifier_recovers_result_unknown_from_exact_fence_only(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "r=json.loads(sys.stdin.read())\n"
+                "expected=['expected_conversation_id','expected_ownership_generation','expected_target_generation','operation']\n"
+                "assert sorted(r)==expected, sorted(r)\n"
+                "assert r['operation']=='recover_reentry_result_unknown'\n"
+                "print(json.dumps({'ok':True,'operation':'recover_reentry_result_unknown','reentry_receipt':{"
+                "'schema_version':1,'receipt_id':'wr_recovered','wake_id':'runtime_web_recovered',"
+                "'wake_nonce_sha256':'a'*64,'continuation_payload_sha256':'b'*64,"
+                "'conversation_id':r['expected_conversation_id'],'browser_target_id':'browser-recovered',"
+                "'target_generation':r['expected_target_generation'],'ownership_generation':r['expected_ownership_generation'],"
+                "'dispatch_attempted':True,'submit_confirmed':False,'retryable':False,'auto_retry_allowed':False,"
+                "'result_class':'RESULT_UNKNOWN','status':'result_unknown','host_submit_receipt':'chrome-submit',"
+                "'submit_diagnostics':None,'observed_at_ms':1800000000400,"
+                "'provenance':'browser_host_reentry_receipt_v1','host_mac_sha256':'c'*64}}))\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+                "protocol":"runtime_host_verifier_cli_v2","executable":str(executable),"sha256":digest,
+                "bundle_sha256":{str(executable):digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                recovery = getattr(verifier, "recover_reentry_result_unknown")
+                result = recovery(
+                    expected_conversation_id="web-current",
+                    expected_target_generation=5,
+                    expected_ownership_generation=9,
+                    wake_id="caller-must-not-cross-boundary",
+                    runtime_path="/caller/must/not/cross",
+                )
+            self.assertEqual(result["operation"], "recover_reentry_result_unknown")
+            receipt = result["reentry_receipt"]
+            self.assertEqual(receipt["receipt_id"], "wr_recovered")
+            self.assertEqual(receipt["conversation_id"], "web-current")
+            self.assertEqual(receipt["target_generation"], 5)
+            self.assertEqual(receipt["ownership_generation"], 9)
+
     def test_registered_web_verifier_submit_adapter_ignores_runtime_local_path_kwargs(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
@@ -13384,6 +13432,259 @@ def _non_result_unknown_legacy_paths_preserve_wake_nonce_and_payload(self):
     self.assertEqual(saved["original_reentry_receipt"], original)
 
 
+def _persisted_successor_result_unknown_recovers_host_receipt_then_reconciles(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        legacy = _legacy_baseline_unavailable_receipt(original)
+        successor = web_bridge._legacy_result_unknown_recovery_receipt_id(
+            original=original,
+            original_host_fingerprint="a" * 64,
+            current_host_fingerprint="b" * 64,
+        )
+        _provision_verified_current_web_target(
+            registry,
+            controller_id="controller-1",
+            web_session_id="web-successor",
+            target_generation=5,
+            ownership_generation=9,
+        )
+        current_fence = web_bridge._controller_web_wait_fence(
+            registry=registry, controller_id="controller-1"
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.update({
+            "receipt_id": successor,
+            "state": "WEB_REENTRY_RESULT_UNKNOWN",
+            "pending_control_event": True,
+            "failure_class": "web_reentry_result_unknown",
+            "error_code": "WEB_REENTRY_RESULT_UNKNOWN",
+            "execution_target_session_id": "web-successor",
+            "target_generation": 5,
+            "ownership_generation": 9,
+            "delivery_terminal_receipt_id": successor,
+            "delivery_terminal_outcome": "result_unknown",
+            "delivery_authorization": "host_attested",
+            "host_attested": True,
+            "strong_web_identity_established": True,
+            "blocked_controller_fence": current_fence,
+            "original_reentry_receipt": original,
+            "host_reentry_reconciliation": {
+                "reconciliation_class": "LEGACY_BASELINE_UNAVAILABLE",
+                "reconciliation_receipt": legacy,
+                "conversation_id": "web-current",
+                "target_generation": 4,
+                "ownership_generation": 8,
+                "original_receipt_id": original["receipt_id"],
+                "original_wake_id": original["wake_id"],
+                "successor_receipt_id": successor,
+                "successor_authorized": True,
+                "successor_scheduled": True,
+                "recovery_mode": "legacy_ambiguous_recompute",
+                "original_delivery_host_fingerprint": "a" * 64,
+                "reconciliation_host_fingerprint": "b" * 64,
+            },
+        })
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        new_unknown = _signed_result_unknown_reentry_receipt(
+            receipt_id="wr_successor_unknown",
+            wake_id="runtime_web_successor_unknown",
+            conversation_id="web-successor",
+            browser_target_id="browser-successor",
+            target_generation=5,
+            ownership_generation=9,
+            wake_nonce_sha256="e" * 64,
+            continuation_payload_sha256="f" * 64,
+            observed_at_ms=1800000000400,
+        )
+        recon = _signed_reconciliation_receipt(
+            new_unknown,
+            receipt_id="wrr_successor_unknown",
+            conversation_id="web-successor",
+            browser_target_id="browser-successor",
+            target_generation=5,
+            ownership_generation=9,
+            wake_id=new_unknown["wake_id"],
+            wake_nonce_sha256=new_unknown["wake_nonce_sha256"],
+            continuation_payload_sha256=new_unknown["continuation_payload_sha256"],
+            original_receipt_id=new_unknown["receipt_id"],
+        )
+        recovered_calls = []
+        reconcile_calls = []
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call"}
+        def recover(**kwargs):
+            recovered_calls.append(dict(kwargs))
+            return {"operation": "recover_reentry_result_unknown", "reentry_receipt": new_unknown}
+        def reconcile(**kwargs):
+            reconcile_calls.append(dict(kwargs))
+            return {"operation": "reconcile_reentry_result", "reconciliation_receipt": recon}
+        verifier.recover_reentry_result_unknown = recover
+        verifier.reconcile_reentry_result = reconcile
+        verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("persisted successor RESULT_UNKNOWN recovery must never submit")
+        )
+        verifier.delivery_fingerprint = "c" * 64
+        captured = []
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_registered_web_host_delivery_fingerprint", return_value="c" * 64
+        ), patch.object(
+            web_bridge, "schedule_auto_native_stop",
+            side_effect=lambda **kwargs: captured.append(dict(kwargs)) or True,
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry",
+            side_effect=AssertionError("recovery must not submit inline"),
+        ):
+            scheduled = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle,
+                session_id="controller-1",
+                repo=repo,
+                registry=registry,
+                codex=None,
+                delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertTrue(scheduled)
+    self.assertEqual(recovered_calls, [{
+        "expected_conversation_id": "web-successor",
+        "expected_target_generation": 5,
+        "expected_ownership_generation": 9,
+    }])
+    self.assertEqual(len(reconcile_calls), 1)
+    self.assertEqual(reconcile_calls[0]["original_reentry_receipt"], new_unknown)
+    self.assertEqual(reconcile_calls[0]["expected_conversation_id"], "web-successor")
+    self.assertEqual(reconcile_calls[0]["expected_target_generation"], 5)
+    self.assertEqual(reconcile_calls[0]["expected_ownership_generation"], 9)
+    self.assertEqual(len(captured), 1)
+    self.assertEqual(
+        captured[0]["receipt_id"],
+        web_bridge._result_unknown_successor_receipt_id(original=new_unknown),
+    )
+    history = saved.get("result_unknown_history") or []
+    self.assertEqual(len(history), 1)
+    self.assertEqual(history[0]["original_reentry_receipt"], original)
+    self.assertEqual(saved["original_reentry_receipt"], new_unknown)
+    self.assertEqual(
+        saved["host_reentry_reconciliation"]["original_receipt_id"],
+        new_unknown["receipt_id"],
+    )
+
+
+def _result_unknown_successor_promotes_new_receipt_and_archives_prior_chain(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        legacy = _legacy_baseline_unavailable_receipt(original)
+        successor = web_bridge._legacy_result_unknown_recovery_receipt_id(
+            original=original,
+            original_host_fingerprint="a" * 64,
+            current_host_fingerprint="b" * 64,
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.update({
+            "receipt_id": successor,
+            "state": "RESUME_PENDING",
+            "pending_control_event": True,
+            "retry_count": 0,
+            "host_reentry_reconcile_attempts": 1,
+            "original_reentry_receipt": original,
+            "host_reentry_reconciliation": {
+                "reconciliation_class": "LEGACY_BASELINE_UNAVAILABLE",
+                "reconciliation_receipt": legacy,
+                "conversation_id": "web-current",
+                "target_generation": 4,
+                "ownership_generation": 8,
+                "original_receipt_id": original["receipt_id"],
+                "original_wake_id": original["wake_id"],
+                "successor_receipt_id": successor,
+                "successor_authorized": True,
+                "successor_scheduled": True,
+                "recovery_mode": "legacy_ambiguous_recompute",
+                "original_delivery_host_fingerprint": "a" * 64,
+                "reconciliation_host_fingerprint": "b" * 64,
+            },
+        })
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        _provision_verified_current_web_target(
+            registry,
+            controller_id="controller-1",
+            web_session_id="web-successor",
+            target_generation=5,
+            ownership_generation=9,
+        )
+        new_unknown = _signed_result_unknown_reentry_receipt(
+            receipt_id="wr_successor_unknown",
+            wake_id="runtime_web_successor_unknown",
+            conversation_id="web-successor",
+            browser_target_id="browser-successor",
+            target_generation=5,
+            ownership_generation=9,
+            wake_nonce_sha256="e" * 64,
+            continuation_payload_sha256="f" * 64,
+            observed_at_ms=1800000000400,
+        )
+        attempt = {
+            "operation": "web_reentry",
+            "result": "BLOCKED",
+            "state": "WEB_REENTRY_RESULT_UNKNOWN",
+            "returncode": 78,
+            "failure_class": "web_reentry_result_unknown",
+            "error_code": "WEB_REENTRY_RESULT_UNKNOWN",
+            "stderr_tail": "successor dispatch occurred but confirmation is unknown",
+            "execution_target_session_id": "web-successor",
+            "target_generation": 5,
+            "ownership_generation": 9,
+            "target_mode": "explicit_current",
+            "delivery_authorization": "host_attested",
+            "host_attested": True,
+            "strong_web_identity_established": True,
+            "host_execution_receipt": {
+                "call_receipt": "host-call-successor",
+                "reentry_receipt": new_unknown,
+            },
+        }
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call-successor"}
+        verifier.submit_reentry = lambda **_kwargs: None
+        verifier.delivery_fingerprint = "b" * 64
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry", return_value=attempt
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1",
+                repo=repo,
+                receipt_id=successor,
+                registry=registry,
+                codex=None,
+                delay_seconds=0,
+                state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 78)
+    schedule.assert_not_called()
+    self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+    self.assertEqual(saved["delivery_terminal_receipt_id"], successor)
+    self.assertEqual(saved["delivery_terminal_outcome"], "result_unknown")
+    self.assertEqual(saved["execution_target_session_id"], "web-successor")
+    self.assertEqual(saved["target_generation"], 5)
+    self.assertEqual(saved["ownership_generation"], 9)
+    self.assertEqual(saved["original_reentry_receipt"], new_unknown)
+    self.assertNotIn("host_reentry_reconciliation", saved)
+    self.assertNotIn("host_reentry_reconcile_attempts", saved)
+    history = saved.get("result_unknown_history") or []
+    self.assertEqual(len(history), 1)
+    self.assertEqual(history[0]["original_reentry_receipt"], original)
+    self.assertEqual(
+        history[0]["host_reentry_reconciliation"]["successor_receipt_id"], successor
+    )
+    self.assertEqual(history[0]["superseded_by_receipt_id"], new_unknown["receipt_id"])
+    self.assertEqual(history[0]["superseded_by_wake_id"], new_unknown["wake_id"])
+
+
 def _result_unknown_successor_identity_is_stable_across_generation_and_preserved_on_schedule(self):
     from unittest.mock import patch
     original = _signed_result_unknown_reentry_receipt()
@@ -14061,6 +14362,8 @@ WebLocalReentryIntegrationTests.test_result_unknown_unresolved_and_verifier_erro
 WebLocalReentryIntegrationTests.test_result_unknown_verifier_without_reconcile_operation_stays_fail_closed = _result_unknown_verifier_without_reconcile_operation_stays_fail_closed
 WebLocalReentryIntegrationTests.test_result_unknown_original_signed_receipt_write_once_across_restart_and_nonmatching_attempt = _result_unknown_original_signed_receipt_write_once_across_restart_and_nonmatching_attempt
 WebLocalReentryIntegrationTests.test_non_result_unknown_legacy_paths_preserve_wake_nonce_and_payload = _non_result_unknown_legacy_paths_preserve_wake_nonce_and_payload
+WebLocalReentryIntegrationTests.test_persisted_successor_result_unknown_recovers_host_receipt_then_reconciles = _persisted_successor_result_unknown_recovers_host_receipt_then_reconciles
+WebLocalReentryIntegrationTests.test_result_unknown_successor_promotes_new_receipt_and_archives_prior_chain = _result_unknown_successor_promotes_new_receipt_and_archives_prior_chain
 WebLocalReentryIntegrationTests.test_result_unknown_successor_identity_is_stable_across_generation_and_preserved_on_schedule = _result_unknown_successor_identity_is_stable_across_generation_and_preserved_on_schedule
 WebLocalReentryIntegrationTests.test_confirmed_not_delivered_new_wake_preserves_controller_active_defer = _confirmed_not_delivered_new_wake_preserves_controller_active_defer
 
