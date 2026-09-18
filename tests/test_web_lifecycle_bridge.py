@@ -96,6 +96,22 @@ def _signed_reconciliation_receipt(original: dict, **overrides: object) -> dict:
     return receipt
 
 
+def _legacy_baseline_unavailable_receipt(original: dict, **overrides: object) -> dict:
+    receipt = _signed_reconciliation_receipt(
+        original,
+        reconciliation_class="LEGACY_BASELINE_UNAVAILABLE",
+        status="legacy_baseline_unavailable",
+        journal_phase="result_unknown",
+        exact_user_message_present=None,
+        composer_exact_payload=None,
+        composer_empty=None,
+        stable_not_delivered=None,
+        legacy_baseline_missing=True,
+    )
+    receipt.update(overrides)
+    return receipt
+
+
 def _provision_verified_current_web_target(
     registry: Path, *, controller_id: str = "controller-1",
     web_session_id: str = "web-session-1", target_generation: int = 1,
@@ -12394,6 +12410,238 @@ def _result_unknown_confirmed_not_delivered_clears_and_schedules_new_wake(self):
     self.assertEqual(saved["original_reentry_receipt"], original)
 
 
+def _legacy_result_unknown_quarantine_schedules_distinct_recompute_after_host_upgrade(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["delivery_host_fingerprint"] = "a" * 64
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        legacy = _legacy_baseline_unavailable_receipt(original)
+        calls = []
+        def verifier(**_kwargs):
+            return {"call_receipt": "host-call-upgraded"}
+        def reconcile(**kwargs):
+            calls.append(kwargs)
+            return {"operation": "reconcile_reentry_result", "reconciliation_receipt": legacy}
+        verifier.reconcile_reentry_result = reconcile
+        verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy quarantine must never replay the old wake")
+        )
+        verifier.delivery_fingerprint = "b" * 64
+        captured = []
+        def schedule(**kwargs):
+            captured.append(dict(kwargs))
+            return True
+        with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(
+            web_bridge, "_registered_web_host_delivery_fingerprint", return_value="b" * 64
+        ), patch.object(
+            web_bridge, "schedule_auto_native_stop", side_effect=schedule
+        ), patch.object(
+            web_bridge, "_execute_registered_web_host_reentry",
+            side_effect=AssertionError("legacy quarantine must not submit the old wake"),
+        ):
+            first = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+            second = web_bridge.ensure_continuation_supervisor(
+                lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                registry=registry, codex="codex", delay_seconds=1.0,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertTrue(first)
+    self.assertFalse(second)
+    self.assertEqual(len(calls), 1)
+    self.assertEqual(len(captured), 1)
+    successor = captured[0]["receipt_id"]
+    self.assertIn(":legacy-recovery-", successor)
+    self.assertNotEqual(successor, original["receipt_id"])
+    self.assertNotEqual(successor, original["wake_id"])
+    self.assertEqual(
+        web_bridge._controller_delivery_fence_identity(captured[0].get("expected_controller_fence")),
+        ("web-current", 4, 8),
+    )
+    record = saved["host_reentry_reconciliation"]
+    self.assertEqual(record["reconciliation_class"], "LEGACY_BASELINE_UNAVAILABLE")
+    self.assertTrue(record["successor_authorized"])
+    self.assertEqual(record["successor_receipt_id"], successor)
+    self.assertEqual(record["recovery_mode"], "legacy_ambiguous_recompute")
+    self.assertEqual(record["original_delivery_host_fingerprint"], "a" * 64)
+    self.assertEqual(record["reconciliation_host_fingerprint"], "b" * 64)
+    self.assertTrue(record["successor_scheduled"])
+    self.assertEqual(saved["original_reentry_receipt"], original)
+
+
+def _legacy_recovery_successor_injects_recompute_context_at_submit_boundary(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        legacy = _legacy_baseline_unavailable_receipt(original)
+        successor = web_bridge._legacy_result_unknown_recovery_receipt_id(
+            original=original, original_host_fingerprint="a" * 64, current_host_fingerprint="b" * 64
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.update({
+            "receipt_id": successor,
+            "state": "RESUME_PENDING",
+            "pending_control_event": True,
+            "original_reentry_receipt": original,
+            "host_reentry_reconciliation": {
+                "reconciliation_class": "LEGACY_BASELINE_UNAVAILABLE",
+                "reconciliation_receipt": legacy,
+                "conversation_id": "web-current",
+                "target_generation": 4,
+                "ownership_generation": 8,
+                "original_receipt_id": original["receipt_id"],
+                "original_wake_id": original["wake_id"],
+                "successor_receipt_id": successor,
+                "successor_authorized": True,
+                "recovery_mode": "legacy_ambiguous_recompute",
+                "original_delivery_host_fingerprint": "a" * 64,
+                "reconciliation_host_fingerprint": "b" * 64,
+            },
+        })
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        calls = []
+        def verifier(**kwargs):
+            calls.append(("verify", kwargs))
+            return {
+                "origin_host": "chatgpt_web",
+                "origin_conversation_id": "web-current",
+                "origin_attested": True,
+                "call_receipt": "hr-legacy",
+            }
+        def submit_reentry(**kwargs):
+            calls.append(("submit", kwargs))
+            return {
+                "operation": "web_reentry",
+                "result": "CONFIRMED",
+                "state": "WEB_REENTRY_SUBMITTED",
+                "returncode": 0,
+                "execution_target_session_id": "web-current",
+                "target_generation": 4,
+                "ownership_generation": 8,
+                "target_mode": "explicit_current",
+                "delivery_authorization": "host_attested",
+                "host_attested": True,
+                "strong_web_identity_established": True,
+                "host_execution_receipt": {
+                    "call_receipt": "hr-legacy",
+                    "reentry_receipt": {"receipt_id": "wr-legacy-recovery"},
+                },
+            }
+        verifier.submit_reentry = submit_reentry
+        verifier.delivery_fingerprint = "b" * 64
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id=successor, registry=registry,
+                codex=None, delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 0)
+    self.assertEqual([kind for kind, _ in calls], ["verify", "submit"])
+    submitted_lifecycle = calls[1][1]["lifecycle_state"]
+    self.assertEqual(
+        submitted_lifecycle["legacy_ambiguous_recovery"]["original_receipt_id"], original["receipt_id"]
+    )
+    self.assertEqual(
+        submitted_lifecycle["legacy_ambiguous_recovery"]["original_wake_id"], original["wake_id"]
+    )
+    self.assertEqual(saved["delivery_terminal_receipt_id"], successor)
+    self.assertEqual(saved["delivery_terminal_outcome"], "submit_confirmed")
+    schedule.assert_not_called()
+
+
+def _tampered_legacy_recovery_successor_fails_before_host_submit(self):
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+        successor = "bootstrap:legacy-recovery-" + "1" * 16
+        legacy = _legacy_baseline_unavailable_receipt(original)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.update({
+            "receipt_id": successor,
+            "state": "RESUME_PENDING",
+            "pending_control_event": True,
+            "original_reentry_receipt": original,
+            "host_reentry_reconciliation": {
+                "reconciliation_class": "LEGACY_BASELINE_UNAVAILABLE",
+                "reconciliation_receipt": legacy,
+                "conversation_id": "web-current",
+                "target_generation": 4,
+                "ownership_generation": 8,
+                "original_receipt_id": original["receipt_id"],
+                "original_wake_id": original["wake_id"],
+                "successor_receipt_id": successor,
+                "successor_authorized": True,
+                "recovery_mode": "legacy_ambiguous_recompute",
+                "original_delivery_host_fingerprint": "a" * 64,
+                "reconciliation_host_fingerprint": "c" * 64,
+            },
+        })
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        def verifier(**_kwargs):
+            raise AssertionError("tampered legacy recovery must fail before Host verification")
+        verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("tampered legacy recovery must fail before Host submit")
+        )
+        verifier.delivery_fingerprint = "b" * 64
+        with patch.object(web_bridge, "_load_lifecycle_state", return_value=lifecycle), patch.object(
+            web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+        ):
+            code = web_bridge.run_auto_native_stop(
+                session_id="controller-1", repo=repo, receipt_id=successor, registry=registry,
+                codex=None, delay_seconds=0, state_path=state_path,
+            )
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    self.assertEqual(code, 78)
+    self.assertEqual(saved["state"], "WEB_REENTRY_IDENTITY_UNAVAILABLE")
+    self.assertEqual(saved["failure_class"], "legacy_ambiguous_recovery_invalid")
+
+
+def _legacy_result_unknown_quarantine_same_host_or_bad_evidence_stays_blocked(self):
+    from unittest.mock import patch
+    for mode in ("same_host", "bad_receipt"):
+        with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state_path, lifecycle, original = _result_unknown_host_attested_fixture(self, tmp)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["delivery_host_fingerprint"] = "a" * 64
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            legacy = _legacy_baseline_unavailable_receipt(original)
+            if mode == "bad_receipt":
+                legacy["legacy_baseline_missing"] = False
+            def verifier(**_kwargs):
+                return {"call_receipt": "host-call"}
+            verifier.reconcile_reentry_result = lambda **_kwargs: {
+                "operation": "reconcile_reentry_result", "reconciliation_receipt": legacy
+            }
+            verifier.submit_reentry = lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("blocked legacy quarantine must not submit")
+            )
+            current = "a" * 64 if mode == "same_host" else "b" * 64
+            verifier.delivery_fingerprint = current
+            with patch.object(web_bridge, "default_auto_stop_state_path", return_value=state_path), patch.object(
+                web_bridge, "_registered_peer_attestation_verifier", return_value=verifier
+            ), patch.object(
+                web_bridge, "_registered_web_host_delivery_fingerprint", return_value=current
+            ), patch.object(web_bridge, "schedule_auto_native_stop") as schedule:
+                scheduled = web_bridge.ensure_continuation_supervisor(
+                    lifecycle_state=lifecycle, session_id="controller-1", repo=repo,
+                    registry=registry, codex="codex", delay_seconds=1.0,
+                )
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertFalse(scheduled)
+        schedule.assert_not_called()
+        self.assertEqual(saved["state"], "WEB_REENTRY_RESULT_UNKNOWN")
+        self.assertEqual(saved["delivery_terminal_outcome"], "result_unknown")
+        self.assertFalse((saved.get("host_reentry_reconciliation") or {}).get("successor_authorized", False))
+
+
 def _result_unknown_not_clearable_or_unresolved_stays_blocked(self):
     from unittest.mock import patch
     for reconciliation_class in ("NOT_CLEARABLE", "UNRESOLVED"):
@@ -13365,6 +13613,10 @@ WebLocalReentryIntegrationTests.test_completed_reconciled_successor_does_not_cap
 WebLocalReentryIntegrationTests.test_result_unknown_persisted_authorization_requires_complete_reconciliation_evidence = _result_unknown_persisted_authorization_requires_complete_reconciliation_evidence
 WebLocalReentryIntegrationTests.test_result_unknown_successor_scheduled_marker_uses_supervisor_lock = _result_unknown_successor_scheduled_marker_uses_supervisor_lock
 WebLocalReentryIntegrationTests.test_result_unknown_confirmed_not_delivered_clears_and_schedules_new_wake = _result_unknown_confirmed_not_delivered_clears_and_schedules_new_wake
+WebLocalReentryIntegrationTests.test_legacy_result_unknown_quarantine_schedules_distinct_recompute_after_host_upgrade = _legacy_result_unknown_quarantine_schedules_distinct_recompute_after_host_upgrade
+WebLocalReentryIntegrationTests.test_legacy_recovery_successor_injects_recompute_context_at_submit_boundary = _legacy_recovery_successor_injects_recompute_context_at_submit_boundary
+WebLocalReentryIntegrationTests.test_tampered_legacy_recovery_successor_fails_before_host_submit = _tampered_legacy_recovery_successor_fails_before_host_submit
+WebLocalReentryIntegrationTests.test_legacy_result_unknown_quarantine_same_host_or_bad_evidence_stays_blocked = _legacy_result_unknown_quarantine_same_host_or_bad_evidence_stays_blocked
 WebLocalReentryIntegrationTests.test_result_unknown_persisted_authorization_crash_window_recovers_same_successor = _result_unknown_persisted_authorization_crash_window_recovers_same_successor
 WebLocalReentryIntegrationTests.test_result_unknown_successor_schedule_rechecks_expected_fence_inside_scheduler = _result_unknown_successor_schedule_rechecks_expected_fence_inside_scheduler
 WebLocalReentryIntegrationTests.test_result_unknown_not_clearable_or_unresolved_stays_blocked = _result_unknown_not_clearable_or_unresolved_stays_blocked

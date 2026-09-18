@@ -380,7 +380,17 @@ def build_reentry_prompt(
 ) -> str:
     generation = int(lifecycle_state.get("wake_generation", 0) or 0)
     next_action = str(lifecycle_state.get("next_action") or "").strip()
-    prompt = (
+    legacy_recovery = lifecycle_state.get("legacy_ambiguous_recovery")
+    legacy_prefix = ""
+    if isinstance(legacy_recovery, dict):
+        legacy_prefix = (
+            "Legacy ambiguous delivery recovery. A previous continuation has an authenticated RESULT_UNKNOWN "
+            "record from a pre-baseline Host journal, so its delivery outcome is intentionally not classified. "
+            "Do not assume the previous continuation failed, and do not repeat prior external side effects. "
+            "Recompute current authoritative machine facts and project state, then continue only from current "
+            "runnable work. "
+        )
+    prompt = legacy_prefix + (
         "Adaptive Agent Runtime Web re-entry checkpoint. Continue this existing registered Web Controller "
         f"only (controller_id={controller_id}); do not create or fork another controller and do not invoke "
         "desktop Codex merely to continue this Web-hosted controller. Read the current authoritative project "

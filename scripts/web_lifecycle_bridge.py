@@ -126,6 +126,7 @@ WEB_REENTRY_RECONCILE_RETRY_LIMIT = 1
 RESULT_UNKNOWN_JOURNAL_PHASE = "result_unknown"
 RESULT_UNKNOWN_RECONCILE_TERMINAL_CLASSES = {
     "CONFIRMED_NOT_DELIVERED",
+    "LEGACY_BASELINE_UNAVAILABLE",
     "NOT_CLEARABLE",
     "UNRESOLVED",
 }
@@ -4529,6 +4530,43 @@ def _confirmed_not_delivered_evidence_is_complete(
     return True
 
 
+def _legacy_baseline_unavailable_evidence_is_complete(
+    receipt: Any,
+    *,
+    original: dict[str, Any],
+    conversation_id: str,
+    target_generation: int,
+    ownership_generation: int,
+) -> bool:
+    if not isinstance(receipt, dict):
+        return False
+    if (
+        receipt.get("reconciliation_class") != "LEGACY_BASELINE_UNAVAILABLE"
+        or receipt.get("status") != "legacy_baseline_unavailable"
+        or receipt.get("legacy_baseline_missing") is not True
+        or receipt.get("exact_user_message_present") is not None
+        or receipt.get("composer_exact_payload") is not None
+        or receipt.get("composer_empty") is not None
+        or receipt.get("stable_not_delivered") is not None
+        or receipt.get("original_result_class") != "RESULT_UNKNOWN"
+        or receipt.get("journal_phase") != RESULT_UNKNOWN_JOURNAL_PHASE
+        or receipt.get("original_receipt_id") != original.get("receipt_id")
+        or receipt.get("wake_id") != original.get("wake_id")
+        or receipt.get("conversation_id") != conversation_id
+        or original.get("conversation_id") != conversation_id
+        or receipt.get("target_generation") != target_generation
+        or original.get("target_generation") != target_generation
+        or receipt.get("ownership_generation") != ownership_generation
+        or original.get("ownership_generation") != ownership_generation
+    ):
+        return False
+    for key in ("wake_nonce_sha256", "continuation_payload_sha256"):
+        expected = original.get(key)
+        if expected not in (None, "") and receipt.get(key) != expected:
+            return False
+    return True
+
+
 def _copied_json_object(value: dict[str, Any]) -> dict[str, Any]:
     copied = json.loads(json.dumps(value, ensure_ascii=False))
     if not isinstance(copied, dict):
@@ -5132,6 +5170,16 @@ def _loaded_external_peer_attestation_verifier(
             raise PermissionError(
                 "registered Host reentry reconciliation returned mismatched confirmed-not-delivered state"
             )
+        if reconciliation_class == "LEGACY_BASELINE_UNAVAILABLE" and not _legacy_baseline_unavailable_evidence_is_complete(
+            receipt,
+            original=original,
+            conversation_id=conversation_id,
+            target_generation=target_generation,
+            ownership_generation=ownership_generation,
+        ):
+            raise PermissionError(
+                "registered Host reentry reconciliation returned mismatched legacy-baseline state"
+            )
         return {
             "operation": "reconcile_reentry_result",
             "reconciliation_receipt": receipt,
@@ -5631,21 +5679,36 @@ def _result_unknown_successor_receipt_id(
     return f"bootstrap:reconcile-{digest}"
 
 
+def _legacy_result_unknown_recovery_receipt_id(
+    *, original: dict[str, Any], original_host_fingerprint: str, current_host_fingerprint: str
+) -> str:
+    host_receipt_id = str(original.get("receipt_id") or "").strip()
+    wake_id = str(original.get("wake_id") or "").strip()
+    old_fingerprint = str(original_host_fingerprint or "").strip().lower()
+    new_fingerprint = str(current_host_fingerprint or "").strip().lower()
+    digest = hashlib.sha256(
+        f"{host_receipt_id}\0{wake_id}\0{old_fingerprint}\0{new_fingerprint}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"bootstrap:legacy-recovery-{digest}"
+
+
 def _persisted_reconciliation_record(supervisor_state: dict[str, Any]) -> dict[str, Any] | None:
     record = supervisor_state.get("host_reentry_reconciliation")
     return record if isinstance(record, dict) else None
 
 
-def _authorized_result_unknown_successor_id(supervisor_state: dict[str, Any]) -> str:
+def _authorized_result_unknown_successor_id(
+    supervisor_state: dict[str, Any], *, current_host_delivery_fingerprint: str | None = None
+) -> str:
     record = _persisted_reconciliation_record(supervisor_state)
     original = _durable_original_reentry_receipt(supervisor_state)
     if (
         record is None
         or original is None
-        or record.get("reconciliation_class") != "CONFIRMED_NOT_DELIVERED"
         or record.get("successor_authorized") is not True
     ):
         return ""
+    reconciliation_class = str(record.get("reconciliation_class") or "").strip()
     conversation_id = str(record.get("conversation_id") or "").strip()
     target_generation = record.get("target_generation")
     ownership_generation = record.get("ownership_generation")
@@ -5662,7 +5725,6 @@ def _authorized_result_unknown_successor_id(supervisor_state: dict[str, Any]) ->
         or not _positive_generation(target_generation)
         or not _positive_generation(ownership_generation)
         or not successor_id
-        or successor_id != _result_unknown_successor_receipt_id(original=original)
         or not _persisted_reconciliation_matches_fence(
             record,
             conversation_id=conversation_id,
@@ -5670,7 +5732,40 @@ def _authorized_result_unknown_successor_id(supervisor_state: dict[str, Any]) ->
             ownership_generation=ownership_generation,
             original=original,
         )
-        or not _confirmed_not_delivered_evidence_is_complete(
+    ):
+        return ""
+    if reconciliation_class == "CONFIRMED_NOT_DELIVERED":
+        if (
+            successor_id != _result_unknown_successor_receipt_id(original=original)
+            or not _confirmed_not_delivered_evidence_is_complete(
+                receipt,
+                original=original,
+                conversation_id=conversation_id,
+                target_generation=target_generation,
+                ownership_generation=ownership_generation,
+            )
+        ):
+            return ""
+        return successor_id
+    if reconciliation_class != "LEGACY_BASELINE_UNAVAILABLE":
+        return ""
+    if record.get("recovery_mode") != "legacy_ambiguous_recompute":
+        return ""
+    old_fingerprint = str(record.get("original_delivery_host_fingerprint") or "").strip().lower()
+    new_fingerprint = str(record.get("reconciliation_host_fingerprint") or "").strip().lower()
+    current_fingerprint = str(current_host_delivery_fingerprint or "").strip().lower()
+    if (
+        not _valid_sha256(old_fingerprint)
+        or not _valid_sha256(new_fingerprint)
+        or old_fingerprint == new_fingerprint
+        or not _valid_sha256(current_fingerprint)
+        or current_fingerprint != new_fingerprint
+        or successor_id != _legacy_result_unknown_recovery_receipt_id(
+            original=original,
+            original_host_fingerprint=old_fingerprint,
+            current_host_fingerprint=new_fingerprint,
+        )
+        or not _legacy_baseline_unavailable_evidence_is_complete(
             receipt,
             original=original,
             conversation_id=conversation_id,
@@ -5762,6 +5857,8 @@ def _persist_host_reentry_reconciliation(
     successor_receipt_id: str | None = None,
     error: str | None = None,
     host_delivery_fingerprint: str | None = None,
+    recovery_mode: str | None = None,
+    original_delivery_host_fingerprint: str | None = None,
 ) -> None:
     lock_path = auto_stop_supervisor_lock_path(state_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5775,7 +5872,9 @@ def _persist_host_reentry_reconciliation(
             existing = _persisted_reconciliation_record(state)
             if (
                 existing is not None
-                and existing.get("reconciliation_class") == "CONFIRMED_NOT_DELIVERED"
+                and existing.get("reconciliation_class") in {
+                    "CONFIRMED_NOT_DELIVERED", "LEGACY_BASELINE_UNAVAILABLE"
+                }
                 and existing.get("successor_authorized") is True
                 and str(existing.get("successor_receipt_id") or "").strip()
             ):
@@ -5796,6 +5895,11 @@ def _persist_host_reentry_reconciliation(
             if successor_receipt_id:
                 record["successor_receipt_id"] = successor_receipt_id
                 record["successor_authorized"] = True
+            if recovery_mode:
+                record["recovery_mode"] = str(recovery_mode)
+            original_fingerprint = str(original_delivery_host_fingerprint or "").strip().lower()
+            if _valid_sha256(original_fingerprint):
+                record["original_delivery_host_fingerprint"] = original_fingerprint
             if error:
                 record["error"] = bounded_tail(error)
             state["host_reentry_reconciliation"] = record
@@ -5816,9 +5920,15 @@ def _mark_result_unknown_successor_scheduled(
             record = _persisted_reconciliation_record(state)
             if (
                 record is None
-                or record.get("reconciliation_class") != "CONFIRMED_NOT_DELIVERED"
+                or record.get("reconciliation_class") not in {
+                    "CONFIRMED_NOT_DELIVERED", "LEGACY_BASELINE_UNAVAILABLE"
+                }
                 or record.get("successor_authorized") is not True
                 or str(record.get("successor_receipt_id") or "").strip() != successor_receipt_id
+                or (
+                    record.get("reconciliation_class") == "LEGACY_BASELINE_UNAVAILABLE"
+                    and record.get("recovery_mode") != "legacy_ambiguous_recompute"
+                )
             ):
                 return
             record = _copied_json_object(record)
@@ -5900,6 +6010,16 @@ def _execute_registered_web_host_reconcile(
             raise PermissionError(
                 "registered Host reentry reconciliation returned mismatched confirmed-not-delivered state"
             )
+        if reconciliation_class == "LEGACY_BASELINE_UNAVAILABLE" and not _legacy_baseline_unavailable_evidence_is_complete(
+            receipt,
+            original=original,
+            conversation_id=expected_target,
+            target_generation=expected_generation,
+            ownership_generation=ownership_generation,
+        ):
+            raise PermissionError(
+                "registered Host reentry reconciliation returned mismatched legacy-baseline state"
+            )
         return {
             "operation": outcome.get("operation") or "reconcile_reentry_result",
             "reconciliation_receipt": receipt,
@@ -5944,6 +6064,8 @@ def _clear_result_unknown_via_registered_host_reconcile(
             or prior_fingerprint == current_fingerprint
         ):
             return None
+    if persisted_class == "LEGACY_BASELINE_UNAVAILABLE":
+        return None
     if persisted_class == "CONFIRMED_NOT_DELIVERED":
         if persisted is None or not _persisted_reconciliation_matches_fence(
             persisted,
@@ -5973,8 +6095,32 @@ def _clear_result_unknown_via_registered_host_reconcile(
             raise PermissionError("registered Host reentry reconciliation returned no signed outcome")
         reconciliation_class = receipt.get("reconciliation_class")
         successor_id = None
+        recovery_mode = None
+        original_delivery_host_fingerprint = None
         if reconciliation_class == "CONFIRMED_NOT_DELIVERED":
             successor_id = _result_unknown_successor_receipt_id(original=original)
+        elif reconciliation_class == "LEGACY_BASELINE_UNAVAILABLE":
+            old_fingerprint = str(supervisor_state.get("delivery_host_fingerprint") or "").strip().lower()
+            current_fingerprint = str(current_host_delivery_fingerprint or "").strip().lower()
+            if (
+                _valid_sha256(old_fingerprint)
+                and _valid_sha256(current_fingerprint)
+                and old_fingerprint != current_fingerprint
+                and _legacy_baseline_unavailable_evidence_is_complete(
+                    receipt,
+                    original=original,
+                    conversation_id=conversation_id,
+                    target_generation=target_generation,
+                    ownership_generation=ownership_generation,
+                )
+            ):
+                successor_id = _legacy_result_unknown_recovery_receipt_id(
+                    original=original,
+                    original_host_fingerprint=old_fingerprint,
+                    current_host_fingerprint=current_fingerprint,
+                )
+                recovery_mode = "legacy_ambiguous_recompute"
+                original_delivery_host_fingerprint = old_fingerprint
         _persist_host_reentry_reconciliation(
             state_path,
             receipt=receipt,
@@ -5984,6 +6130,8 @@ def _clear_result_unknown_via_registered_host_reconcile(
             ownership_generation=ownership_generation,
             successor_receipt_id=successor_id,
             host_delivery_fingerprint=current_host_delivery_fingerprint,
+            recovery_mode=recovery_mode,
+            original_delivery_host_fingerprint=original_delivery_host_fingerprint,
         )
         return successor_id
     except (PermissionError, PeerHostTransientUnavailable, OSError, ValueError, TypeError) as exc:
@@ -8168,7 +8316,10 @@ def ensure_continuation_supervisor(
         if str(lifecycle_state.get("controller_host") or "").strip() == "web"
         else None
     )
-    authorized_successor = _authorized_result_unknown_successor_id(supervisor_state)
+    authorized_successor = _authorized_result_unknown_successor_id(
+        supervisor_state,
+        current_host_delivery_fingerprint=current_host_delivery_fingerprint,
+    )
     needs_bootstrap = continuation_supervisor_needs_bootstrap(
         lifecycle_state,
         supervisor_state,
@@ -8794,6 +8945,42 @@ def _run_auto_native_stop_impl(
         fingerprint = _wake_event_fingerprint(lifecycle_state)
         verifier = _registered_peer_attestation_verifier("web")
         host_delivery_fingerprint = _verifier_delivery_fingerprint(verifier)
+        if receipt_id.startswith("bootstrap:legacy-recovery-"):
+            with _owned_supervisor_state(
+                state_path, receipt_id=receipt_id, supervisor_token=supervisor_token
+            ) as current:
+                if current is None:
+                    return 0
+                authorized = _authorized_result_unknown_successor_id(
+                    current,
+                    current_host_delivery_fingerprint=host_delivery_fingerprint,
+                )
+                record = _persisted_reconciliation_record(current)
+                original = _durable_original_reentry_receipt(current)
+                if (
+                    authorized != receipt_id
+                    or record is None
+                    or original is None
+                    or record.get("reconciliation_class") != "LEGACY_BASELINE_UNAVAILABLE"
+                    or record.get("recovery_mode") != "legacy_ambiguous_recompute"
+                ):
+                    current.update({
+                        "state": "WEB_REENTRY_IDENTITY_UNAVAILABLE",
+                        "pending_control_event": True,
+                        "failure_class": "legacy_ambiguous_recovery_invalid",
+                        "error_code": "LEGACY_AMBIGUOUS_RECOVERY_INVALID",
+                        "completed_at_unix_ms": int(time.time() * 1000),
+                    })
+                    write_auto_stop_state(state_path, current)
+                    return 78
+                lifecycle_state = dict(lifecycle_state)
+                lifecycle_state["legacy_ambiguous_recovery"] = {
+                    "original_receipt_id": original.get("receipt_id"),
+                    "original_wake_id": original.get("wake_id"),
+                    "reconciliation_receipt_id": (record.get("reconciliation_receipt") or {}).get("receipt_id"),
+                    "original_delivery_host_fingerprint": record.get("original_delivery_host_fingerprint"),
+                    "reconciliation_host_fingerprint": record.get("reconciliation_host_fingerprint"),
+                }
         registry_data_for_web = load_json(registry)
         current_web_record = target_guard.target_record(
             registry_data_for_web, controller_id=session_id, host="web"

@@ -255,6 +255,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_ensure_supervisor_blocks_new_rule_live_e2e_until_old_result_unknown_is_reconciled",
     "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_legacy_result_unknown_quarantine_schedules_distinct_recompute_after_host_upgrade",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
+    "test_tampered_legacy_recovery_successor_fails_before_host_submit",
+    "tests.test_web_lifecycle_bridge.WebLocalReentryIntegrationTests."
     "test_retry_exhausted_persists_host_delivery_fingerprint",
     "tests.test_web_lifecycle_bridge.WebContinuationSupervisorBootstrapTests."
     "test_confirmed_or_result_unknown_never_rearm_for_host_fingerprint_change",

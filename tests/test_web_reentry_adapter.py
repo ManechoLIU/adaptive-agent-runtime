@@ -347,6 +347,26 @@ class WebReentryAdapterTests(unittest.TestCase):
         self.assertIn("Do not create a new ChatGPT Web child", prompt)
         self.assertIn("RUNNABLE:T-NEXT", prompt)
 
+    def test_legacy_ambiguous_recovery_prompt_never_assumes_old_wake_failed(self) -> None:
+        prompt = web_reentry_adapter.build_reentry_prompt(
+            controller_id="controller-1",
+            lifecycle_state={
+                "pending_control_event": True,
+                "requires_user": False,
+                "wake_generation": 13,
+                "triggers": ["terminal_receipt_pending"],
+                "legacy_ambiguous_recovery": {
+                    "original_receipt_id": "wr-old",
+                    "original_wake_id": "runtime_web_oldwake",
+                },
+            },
+        )
+        self.assertIn("legacy ambiguous delivery", prompt.lower())
+        self.assertIn("do not assume the previous continuation failed", prompt.lower())
+        self.assertIn("do not repeat prior external side effects", prompt.lower())
+        self.assertIn("recompute", prompt.lower())
+        self.assertNotIn("CONFIRMED_NOT_DELIVERED", prompt)
+
     def test_existing_target_tab_is_focused_then_composer_submitted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, registry, lease = self.make_identity(Path(tmp))
