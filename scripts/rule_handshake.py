@@ -198,6 +198,21 @@ def _path_within(path: Path, parent: Path) -> bool:
         return False
 
 
+def _live_e2e_web_target_is_host_attested(record: dict[str, Any]) -> bool:
+    """Web-on-duty live E2E still requires Host-attested current target identity."""
+    if record.get("host_attested") is False:
+        return False
+    proof = str(record.get("identity_proof") or "").strip()
+    if proof == "host_attested_origin":
+        return True
+    if (
+        record.get("provenance") == "host_attested_same_controller_recovery"
+        and proof != "host_attested_origin"
+    ):
+        return False
+    return record.get("host_attested") is True
+
+
 def _live_e2e_acceptance_errors(
     repo: str | Path,
     acceptance: dict[str, Any],
@@ -267,24 +282,6 @@ def _live_e2e_acceptance_errors(
     if not same_repo:
         errors.append("live E2E acceptance Controller is not uniquely registered for this repository")
     if validate_current_target:
-        targets = registry.get("__controller_targets__")
-        controller_targets = targets.get(controller_session_id) if isinstance(targets, dict) else None
-        target_record = controller_targets.get(selected_host) if isinstance(controller_targets, dict) else None
-        if isinstance(target_record, dict):
-            if target_record.get("status") != "active":
-                errors.append("live E2E current target is not active")
-            if str(target_record.get("session_id") or "").strip() != wake_target:
-                errors.append("live E2E wake target does not match current target")
-            if target_record.get("generation") != wake_generation:
-                errors.append("live E2E wake generation does not match current target generation")
-        elif selected_host:
-            sessions = registry.get("__controller_sessions__")
-            controller_sessions = sessions.get(controller_session_id) if isinstance(sessions, dict) else None
-            aliases = controller_sessions.get(selected_host) if isinstance(controller_sessions, dict) else None
-            aliases = [aliases] if isinstance(aliases, str) else aliases
-            bound = [str(value).strip() for value in aliases or [] if isinstance(value, str) and value.strip()]
-            if bound or wake_target != controller_session_id or wake_generation != 0:
-                errors.append("live E2E wake lacks an explicit current target")
         ownerships = registry.get("__controller_execution_ownership__")
         ownership = (
             ownerships.get(controller_session_id)
@@ -293,8 +290,12 @@ def _live_e2e_acceptance_errors(
         )
         if not isinstance(ownership, dict):
             errors.append("live E2E current execution ownership is missing")
+            on_duty_host = ""
         else:
-            if str(ownership.get("active_host") or "").strip() != selected_host:
+            on_duty_host = str(ownership.get("active_host") or "").strip()
+            if on_duty_host not in {"web", "desktop_codex"}:
+                errors.append("live E2E current execution ownership host is invalid")
+            if on_duty_host and selected_host != on_duty_host:
                 errors.append("live E2E wake host does not match current execution ownership")
             if (
                 str(ownership.get("execution_target_session_id") or "").strip()
@@ -303,6 +304,30 @@ def _live_e2e_acceptance_errors(
                 errors.append("live E2E wake target does not match current execution ownership")
             if ownership.get("generation") != wake_ownership_generation:
                 errors.append("live E2E wake ownership generation does not match current ownership generation")
+        # On-duty host is canonical execution ownership. Desktop-on-duty live E2E
+        # consumes the current desktop target receipt only and must not fail closed
+        # merely because a web session or host_attested_origin proof is absent.
+        target_host = on_duty_host if on_duty_host in {"web", "desktop_codex"} else selected_host
+        targets = registry.get("__controller_targets__")
+        controller_targets = targets.get(controller_session_id) if isinstance(targets, dict) else None
+        target_record = controller_targets.get(target_host) if isinstance(controller_targets, dict) else None
+        if isinstance(target_record, dict):
+            if target_record.get("status") != "active":
+                errors.append("live E2E current target is not active")
+            if str(target_record.get("session_id") or "").strip() != wake_target:
+                errors.append("live E2E wake target does not match current target")
+            if target_record.get("generation") != wake_generation:
+                errors.append("live E2E wake generation does not match current target generation")
+            if target_host == "web" and not _live_e2e_web_target_is_host_attested(target_record):
+                errors.append("live E2E web wake requires host-attested current target")
+        elif target_host:
+            sessions = registry.get("__controller_sessions__")
+            controller_sessions = sessions.get(controller_session_id) if isinstance(sessions, dict) else None
+            aliases = controller_sessions.get(target_host) if isinstance(controller_sessions, dict) else None
+            aliases = [aliases] if isinstance(aliases, str) else aliases
+            bound = [str(value).strip() for value in aliases or [] if isinstance(value, str) and value.strip()]
+            if bound or wake_target != controller_session_id or wake_generation != 0:
+                errors.append("live E2E wake lacks an explicit current target")
 
     if cycle.get("record_kind") != "controller_cycle_evidence":
         errors.append("live E2E cycle evidence record kind is invalid")

@@ -100,6 +100,91 @@ def write_current_controller_registry(
 
 
 
+
+def prepare_pending_live_e2e(
+    base: Path,
+    *,
+    host: str,
+    source_session_id: str,
+    target_generation: int = 2,
+    ownership_generation: int = 7,
+    verified_web: bool = True,
+) -> tuple[Path, Path, Path, str]:
+    source, previous_revision = make_source(base)
+    (source / "scripts" / "web_lifecycle_bridge.py").write_text("VALUE = 2\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-m", "change live continuation")
+    revision = git(source, "rev-parse", "HEAD")
+    target = base / "installed"
+    install_skill(
+        source,
+        target,
+        summary="live continuation",
+        impact="live_assignments",
+        stop_condition="real continuation e2e",
+        previous_revision=previous_revision,
+        now=NOW,
+    )
+    repo = make_project(base)
+    registry = base / "controllers.json"
+    write_current_controller_registry(
+        registry,
+        repo,
+        host=host,
+        source_session_id=source_session_id,
+        target_generation=target_generation,
+        ownership_generation=ownership_generation,
+        verified_web=verified_web,
+    )
+    acknowledge_rule_revision(
+        repo, "controller-1", revision, skill_root=target, registry_path=registry, now=NOW
+    )
+    ledger = repo / "TASK_LEDGER.md"
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "adaptive-delivery@old", f"adaptive-delivery@{revision}"
+        ),
+        encoding="utf-8",
+    )
+    return repo, target, registry, revision
+
+
+def write_confirmed_wake_and_closed_cycle(
+    repo: Path,
+    *,
+    selected_host: str,
+    source_session_id: str,
+    target_generation: int,
+    ownership_generation: int,
+    result: str = "CONFIRMED",
+) -> None:
+    state_dir = rule_state_path(repo).parent
+    (state_dir / "controller-wake-receipt.json").write_text(json.dumps({
+        "schema_version": 1,
+        "controller_id": "controller-1",
+        "selected_host": selected_host,
+        "result": result,
+        "operation": (
+            "desktop_native_user_prompt"
+            if selected_host == "desktop_codex"
+            else "web_reentry"
+        ),
+        "execution_target_session_id": source_session_id,
+        "target_generation": target_generation,
+        "ownership_generation": ownership_generation,
+        "completed_at_unix_ms": int(NOW.timestamp() * 1000) + 1000,
+    }), encoding="utf-8")
+    cycle_dir = state_dir / "controller-cycle-evidence"
+    cycle_dir.mkdir(parents=True, exist_ok=True)
+    (cycle_dir / "closed.json").write_text(json.dumps({
+        "record_kind": "controller_cycle_evidence",
+        "controller_id": "controller-1",
+        "terminal_status": "CLOSED",
+        "validation_errors": [],
+        "recorded_at": "2026-08-30T01:00:02+00:00",
+    }), encoding="utf-8")
+
+
 def controller_action_kwargs(registry_path: Path, controller_id: str = "controller-1") -> dict[str, str]:
     registry = json.loads(Path(registry_path).read_text(encoding="utf-8"))
     ownership = (registry.get("__controller_execution_ownership__") or {}).get(controller_id)
@@ -739,6 +824,208 @@ class RuleHandshakeTests(unittest.TestCase):
                     repo, "controller-1", revision, skill_root=target, registry_path=registry,
                     **controller_action_kwargs(registry), now=NOW
                 )
+
+
+    def test_desktop_on_duty_live_e2e_does_not_require_web_session_or_host_attestation(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo, target, registry, revision = prepare_pending_live_e2e(
+                Path(d),
+                host="desktop_codex",
+                source_session_id="desktop-current",
+                target_generation=4,
+                ownership_generation=7,
+            )
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            payload["__controller_sessions__"]["controller-1"]["web"] = ["web-stale"]
+            payload["__controller_targets__"]["controller-1"]["web"] = {
+                "status": "active",
+                "session_id": "web-stale",
+                "generation": 9,
+                "provenance": "manual_user_authorized",
+                "binding_mode": "temporary",
+                "host_attested": False,
+            }
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertNotIn(
+                "host_attested_origin",
+                json.dumps(payload["__controller_targets__"]["controller-1"]["desktop_codex"]),
+            )
+            write_confirmed_wake_and_closed_cycle(
+                repo,
+                selected_host="desktop_codex",
+                source_session_id="desktop-current",
+                target_generation=4,
+                ownership_generation=7,
+            )
+
+            receipt = rule_handshake_module.accept_live_e2e(
+                repo,
+                "controller-1",
+                revision,
+                skill_root=target,
+                registry_path=registry,
+                **controller_action_kwargs(registry),
+                now=datetime(2026, 8, 30, 1, 0, 3, tzinfo=UTC),
+            )
+            current = evaluate_rule_handshake(repo, skill_root=target, registry_path=registry)
+
+            self.assertEqual(receipt["status"], "accepted")
+            self.assertEqual(receipt["execution_host"], "desktop_codex")
+            self.assertEqual(current["state"], "current")
+            self.assertFalse(current["blocking"])
+
+    def test_desktop_on_duty_live_e2e_rejects_web_wake(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo, target, registry, revision = prepare_pending_live_e2e(
+                Path(d),
+                host="desktop_codex",
+                source_session_id="desktop-current",
+                target_generation=4,
+                ownership_generation=7,
+            )
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            payload["__controller_sessions__"]["controller-1"]["web"] = ["web-current"]
+            payload["__controller_targets__"]["controller-1"]["web"] = {
+                "status": "active",
+                "session_id": "web-current",
+                "generation": 3,
+                "provenance": "host_attested_same_controller_recovery",
+                "binding_mode": "resume_only",
+                "host_attested": True,
+                "identity_proof": "host_attested_origin",
+            }
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            write_confirmed_wake_and_closed_cycle(
+                repo,
+                selected_host="web",
+                source_session_id="web-current",
+                target_generation=3,
+                ownership_generation=7,
+            )
+
+            with self.assertRaisesRegex(ValueError, "wake host does not match current execution ownership"):
+                rule_handshake_module.accept_live_e2e(
+                    repo,
+                    "controller-1",
+                    revision,
+                    skill_root=target,
+                    registry_path=registry,
+                    **controller_action_kwargs(registry),
+                    now=datetime(2026, 8, 30, 1, 0, 3, tzinfo=UTC),
+                )
+            self.assertFalse(live_e2e_acceptance_path(repo).exists())
+
+    def test_web_on_duty_live_e2e_requires_host_attested_web_wake(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo, target, registry, revision = prepare_pending_live_e2e(
+                Path(d),
+                host="web",
+                source_session_id="web-current",
+                target_generation=3,
+                ownership_generation=7,
+                verified_web=True,
+            )
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            payload["__controller_targets__"]["controller-1"]["web"] = {
+                "status": "active",
+                "session_id": "web-current",
+                "generation": 3,
+                "provenance": "manual_user_authorized",
+                "binding_mode": "temporary",
+                "host_attested": False,
+            }
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            write_confirmed_wake_and_closed_cycle(
+                repo,
+                selected_host="web",
+                source_session_id="web-current",
+                target_generation=3,
+                ownership_generation=7,
+            )
+
+            with self.assertRaisesRegex(ValueError, "not authorized for Controller actions"):
+                rule_handshake_module.accept_live_e2e(
+                    repo,
+                    "controller-1",
+                    revision,
+                    skill_root=target,
+                    registry_path=registry,
+                    **controller_action_kwargs(registry),
+                    now=datetime(2026, 8, 30, 1, 0, 3, tzinfo=UTC),
+                )
+            self.assertFalse(live_e2e_acceptance_path(repo).exists())
+
+    def test_web_on_duty_live_e2e_accepts_attested_web_wake(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo, target, registry, revision = prepare_pending_live_e2e(
+                Path(d),
+                host="web",
+                source_session_id="web-current",
+                target_generation=3,
+                ownership_generation=7,
+                verified_web=True,
+            )
+            write_confirmed_wake_and_closed_cycle(
+                repo,
+                selected_host="web",
+                source_session_id="web-current",
+                target_generation=3,
+                ownership_generation=7,
+            )
+
+            receipt = rule_handshake_module.accept_live_e2e(
+                repo,
+                "controller-1",
+                revision,
+                skill_root=target,
+                registry_path=registry,
+                **controller_action_kwargs(registry),
+                now=datetime(2026, 8, 30, 1, 0, 3, tzinfo=UTC),
+            )
+            current = evaluate_rule_handshake(repo, skill_root=target, registry_path=registry)
+
+            self.assertEqual(receipt["status"], "accepted")
+            self.assertEqual(receipt["execution_host"], "web")
+            self.assertEqual(current["state"], "current")
+            self.assertFalse(current["blocking"])
+
+    def test_web_on_duty_live_e2e_rejects_desktop_native_wake(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo, target, registry, revision = prepare_pending_live_e2e(
+                Path(d),
+                host="web",
+                source_session_id="web-current",
+                target_generation=3,
+                ownership_generation=7,
+                verified_web=True,
+            )
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            payload["__controller_sessions__"]["controller-1"]["desktop_codex"] = ["desktop-current"]
+            payload["__controller_targets__"]["controller-1"]["desktop_codex"] = {
+                "status": "active",
+                "session_id": "desktop-current",
+                "generation": 4,
+            }
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            write_confirmed_wake_and_closed_cycle(
+                repo,
+                selected_host="desktop_codex",
+                source_session_id="desktop-current",
+                target_generation=4,
+                ownership_generation=7,
+            )
+
+            with self.assertRaisesRegex(ValueError, "wake host does not match current execution ownership"):
+                rule_handshake_module.accept_live_e2e(
+                    repo,
+                    "controller-1",
+                    revision,
+                    skill_root=target,
+                    registry_path=registry,
+                    **controller_action_kwargs(registry),
+                    now=datetime(2026, 8, 30, 1, 0, 3, tzinfo=UTC),
+                )
+            self.assertFalse(live_e2e_acceptance_path(repo).exists())
 
     def test_later_nonimpacting_install_cannot_clear_unacked_live_impact_debt(self):
         with tempfile.TemporaryDirectory() as d:
