@@ -1606,6 +1606,28 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
 
         self.assertEqual(surface, explicit_surface.resolve())
 
+    def _desktop_registry(self, root: Path, repo: Path, **extra: object) -> Path:
+        payload = {
+            "controller-1": str(repo.resolve()),
+            "__controller_sessions__": {
+                "controller-1": {"desktop_codex": ["desktop-current"]},
+            },
+            "__controller_targets__": {
+                "controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                    **extra,
+                }},
+            },
+        }
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps(payload), encoding="utf-8")
+        return registry
+
+    def _managed_snapshot(self, repo: Path) -> dict[str, object]:
+        snapshot = self.snapshot(repo)
+        snapshot["git_common_dir"] = str(lifecycle_hook.git_common_dir(repo))
+        return snapshot
+
     def test_explicit_controller_surface_rejects_another_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1616,9 +1638,14 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
             subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
             explicit_surface = root / "controller-surface"
+            other_checkout = root / "other-checkout"
             subprocess.run([
                 "git", "-C", str(repo), "worktree", "add", "-qb", "controller",
                 str(explicit_surface),
+            ], check=True)
+            subprocess.run([
+                "git", "-C", str(repo), "worktree", "add", "-qb", "other",
+                str(other_checkout),
             ], check=True)
             registry = root / "controllers.json"
             registry.write_text(json.dumps({
@@ -1635,16 +1662,154 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
                     "controller-1": str(explicit_surface.resolve()),
                 },
             }), encoding="utf-8")
+            snapshot = self._managed_snapshot(repo)
             old_registry = lifecycle_hook.REGISTRY_PATH
             lifecycle_hook.REGISTRY_PATH = registry
             try:
-                managed = lifecycle_hook.controller_event_is_managed(
-                    {"session_id": "desktop-current"}, repo, repo
+                managed_other = lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "desktop-current"}, other_checkout, repo, snapshot=snapshot
+                )
+                managed_unrelated = lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "desktop-current"}, root, repo, snapshot=snapshot
+                )
+                managed_expected_root = lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "desktop-current"}, repo, repo, snapshot=snapshot
                 )
             finally:
                 lifecycle_hook.REGISTRY_PATH = old_registry
 
-        self.assertFalse(managed)
+        self.assertFalse(managed_other)
+        self.assertFalse(managed_unrelated)
+        self.assertTrue(managed_expected_root)
+
+    def test_missing_codex_alias_cwd_is_managed_only_for_current_desktop_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = self._desktop_registry(root, repo)
+            missing = root / "Local Agent Bridge"
+            snapshot = self._managed_snapshot(repo)
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                self.assertFalse(missing.exists())
+                managed_current = lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "desktop-current"}, missing, repo, snapshot=snapshot
+                )
+                managed_other_session = lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "controller-1"}, missing, repo, snapshot=snapshot
+                )
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertTrue(managed_current)
+        self.assertFalse(managed_other_session)
+
+    def test_run_hook_rotates_missing_codex_alias_cwd_for_current_desktop_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = self._desktop_registry(root, repo)
+            missing = root / "Local Agent Bridge"
+            snapshot = self._managed_snapshot(repo)
+            snapshot_calls: list[Path] = []
+
+            def project_snapshot(path, **_kwargs):
+                resolved = Path(path).resolve()
+                snapshot_calls.append(resolved)
+                if resolved == repo.resolve():
+                    return snapshot
+                return None
+
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                self.assertFalse(missing.exists())
+                with patch.object(
+                    lifecycle_hook, "project_snapshot", side_effect=project_snapshot
+                ), patch.object(
+                    lifecycle_hook, "persist_event_state", return_value=({}, {})
+                ) as persist:
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "SessionStart",
+                        "session_id": "desktop-current",
+                        "cwd": str(missing),
+                    })
+                    persist.assert_called_once()
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+        self.assertEqual(snapshot_calls, [missing.resolve(), repo.resolve()])
+
+    def test_stale_desktop_goal_rebind_does_not_deny_pretool_bash(self) -> None:
+        code, output = self._invoke_desktop_goal_rebind_bash(
+            ledger_goal="LAB-DESK-CLOSED 桌面 CLOSED cycle",
+            rebind_objective="并行推进 LAB-COMP-01 与 LAB-HOST-01 与现网验收",
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("Goal display sync", output)
+
+    def test_matching_desktop_goal_rebind_still_requires_get_goal(self) -> None:
+        code, output = self._invoke_desktop_goal_rebind_bash(
+            ledger_goal="LAB-DESK-CLOSED 桌面 CLOSED cycle",
+            rebind_objective="LAB-DESK-CLOSED 桌面 CLOSED cycle",
+        )
+        self.assertEqual(code, 0)
+        denial = json.loads(output)
+        self.assertEqual(denial["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn(
+            "get_goal initial target readback",
+            denial["hookSpecificOutput"]["permissionDecisionReason"],
+        )
+
+    def _invoke_desktop_goal_rebind_bash(
+        self, *, ledger_goal: str, rebind_objective: str
+    ) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            (repo / "TASK_LEDGER.md").write_text(
+                f"- 当前 Goal：`{ledger_goal}`\n",
+                encoding="utf-8",
+            )
+            registry = self._desktop_registry(
+                root,
+                repo,
+                goal_rebind={
+                    "schema_version": 1,
+                    "ledger_path": str((repo / "TASK_LEDGER.md").resolve()),
+                    "ledger_sha256": "stale-or-current",
+                    "objective": rebind_objective,
+                    "project_name": repo.name,
+                    "controller_id": "controller-1",
+                    "execution_target_session_id": "desktop-current",
+                    "host": "desktop_codex",
+                    "target_generation": 4,
+                },
+            )
+            snapshot = self._managed_snapshot(repo)
+            old_registry, old_state_root = (
+                lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
+            )
+            lifecycle_hook.REGISTRY_PATH = registry
+            lifecycle_hook.STATE_ROOT = root / "state"
+            try:
+                with patch.object(
+                    lifecycle_hook, "project_snapshot", return_value=snapshot
+                ):
+                    return self.invoke_hook({
+                        "hook_event_name": "PreToolUse",
+                        "session_id": "desktop-current",
+                        "cwd": str(repo),
+                        "tool_name": "Bash",
+                        "tool_use_id": "bash-1",
+                        "tool_input": {"command": "pwd"},
+                    })
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+                lifecycle_hook.STATE_ROOT = old_state_root
 
     def test_run_hook_reuses_one_project_snapshot_for_management_fence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

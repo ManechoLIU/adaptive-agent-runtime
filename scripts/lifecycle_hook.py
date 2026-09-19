@@ -4057,6 +4057,19 @@ def _reject_cross_controller_desktop_owner(
             )
 
 
+def _desktop_goal_rebind_contract_is_current(
+    contract: dict[str, Any], repo: Path
+) -> bool:
+    """True when a desktop target rebind still names the ledger's current Goal."""
+    objective = str(contract.get("objective") or "").strip()
+    if not objective:
+        return False
+    current = _current_goal_rebind_contract(repo)
+    if current is None:
+        return False
+    return objective == str(current.get("objective") or "").strip()
+
+
 def _current_goal_rebind_contract(repo: Path) -> dict[str, Any] | None:
     ledger = repo / "TASK_LEDGER.md"
     try:
@@ -4305,6 +4318,43 @@ def unbind_desktop_session(
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def _desktop_codex_entry_for_repo(session_id: str, expected_root: Path) -> bool:
+    """True when session_id is the current desktop_codex target for this repo."""
+    session_id = session_id.strip()
+    if not session_id:
+        return False
+    controller_id = registered_controller_id(session_id)
+    if controller_id is None or registered_root(session_id) != expected_root.resolve():
+        return False
+    registry = load_json(REGISTRY_PATH)
+    try:
+        aliases = target_guard.host_sessions(
+            registry, controller_id=controller_id, host=DESKTOP_SESSION_HOST
+        )
+        if session_id in aliases:
+            return True
+        record = target_guard.target_record(
+            registry, controller_id=controller_id, host=DESKTOP_SESSION_HOST
+        )
+        if record is None:
+            return False
+        status, target_session_id, _generation = target_guard.validate_target_record(
+            record, host=DESKTOP_SESSION_HOST
+        )
+    except (PermissionError, ValueError):
+        return False
+    return status == "active" and target_session_id == session_id
+
+
+def _snapshot_matches_expected_root(
+    snapshot: dict[str, Any] | None, expected_root: Path
+) -> bool:
+    expected = expected_root.resolve()
+    if snapshot is None or Path(snapshot["root"]).resolve() != expected:
+        return False
+    return snapshot.get("git_common_dir") == str(git_common_dir(expected))
+
+
 def controller_event_is_managed(
     event: dict[str, Any],
     cwd: Path,
@@ -4313,19 +4363,29 @@ def controller_event_is_managed(
     snapshot: dict[str, Any] | None = None,
 ) -> bool:
     session_id = str(event.get("session_id", "")).strip()
-    if not session_id or registered_root(session_id) != expected_root.resolve():
+    expected = expected_root.resolve()
+    if not session_id or registered_root(session_id) != expected:
         return False
     try:
         invocation_root = Path(run_git(cwd, "rev-parse", "--show-toplevel")).resolve()
     except (OSError, subprocess.CalledProcessError, ValueError):
-        return False
-    if registered_controller_surface(session_id, expected_root) != invocation_root:
+        invocation_root = None
+    desktop_entry = _desktop_codex_entry_for_repo(session_id, expected)
+    if invocation_root is None:
+        # Codex may report a space-alias cwd that does not exist on disk.
+        if cwd.exists() or not desktop_entry:
+            return False
+        if snapshot is None:
+            snapshot = project_snapshot(expected)
+        return _snapshot_matches_expected_root(snapshot, expected)
+    if not (
+        (desktop_entry and invocation_root == expected)
+        or registered_controller_surface(session_id, expected_root) == invocation_root
+    ):
         return False
     if snapshot is None:
         snapshot = project_snapshot(cwd)
-    if snapshot is None or Path(snapshot["root"]).resolve() != expected_root.resolve():
-        return False
-    return snapshot.get("git_common_dir") == str(git_common_dir(expected_root))
+    return _snapshot_matches_expected_root(snapshot, expected)
 
 
 def state_path(session_id: str) -> Path:
@@ -4729,6 +4789,12 @@ def run_hook() -> int:
             ), ensure_ascii=False))
             return 0
     snapshot = project_snapshot(cwd)
+    if (
+        snapshot is None
+        and not cwd.exists()
+        and _desktop_codex_entry_for_repo(source_session_id, expected_root)
+    ):
+        snapshot = project_snapshot(expected_root)
     if snapshot is None or not controller_event_is_managed(
         event, cwd, expected_root, snapshot=snapshot
     ):
@@ -4848,7 +4914,9 @@ def run_hook() -> int:
                 return 0
             normalized_event["controller_target_generation"] = target_generation
             goal_rebind_contract = target_record.get("goal_rebind")
-            if isinstance(goal_rebind_contract, dict):
+            if isinstance(goal_rebind_contract, dict) and _desktop_goal_rebind_contract_is_current(
+                goal_rebind_contract, expected_root
+            ):
                 normalized_event["goal_rebind_contract"] = goal_rebind_contract
         ownership_record = target_guard.execution_ownership_record(
             registry, controller_id=controller_id
