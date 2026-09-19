@@ -4372,8 +4372,12 @@ def controller_event_is_managed(
         invocation_root = None
     desktop_entry = _desktop_codex_entry_for_repo(session_id, expected)
     if invocation_root is None:
-        # Codex may report a space-alias cwd that does not exist on disk.
-        if cwd.exists() or not desktop_entry:
+        # Codex may report a space-alias cwd that does not exist, or a
+        # visualizations workspace named after the current desktop session.
+        if not desktop_entry:
+            return False
+        session_named_workspace = cwd.exists() and cwd.name == session_id
+        if cwd.exists() and not session_named_workspace:
             return False
         if snapshot is None:
             snapshot = project_snapshot(expected)

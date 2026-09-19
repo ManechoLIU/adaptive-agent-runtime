@@ -1705,6 +1705,30 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
         self.assertTrue(managed_current)
         self.assertFalse(managed_other_session)
 
+    def test_existing_nongit_cwd_is_managed_for_current_desktop_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = self._desktop_registry(root, repo)
+            extra = root / "desktop-current"
+            extra.mkdir()
+            snapshot = self._managed_snapshot(repo)
+            old_registry = lifecycle_hook.REGISTRY_PATH
+            lifecycle_hook.REGISTRY_PATH = registry
+            try:
+                self.assertTrue(extra.exists())
+                managed_current = lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "desktop-current"}, extra, repo, snapshot=snapshot
+                )
+                managed_other_session = lifecycle_hook.controller_event_is_managed(
+                    {"session_id": "controller-1"}, extra, repo, snapshot=snapshot
+                )
+            finally:
+                lifecycle_hook.REGISTRY_PATH = old_registry
+
+        self.assertTrue(managed_current)
+        self.assertFalse(managed_other_session)
+
     def test_run_hook_rotates_missing_codex_alias_cwd_for_current_desktop_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
