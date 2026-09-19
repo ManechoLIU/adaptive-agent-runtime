@@ -539,6 +539,13 @@ def _desktop_event_lacks_native_turn_id(event: dict[str, Any]) -> bool:
     return (not turn_id) or turn_id == "None" or turn_id.startswith("web-turn:")
 
 
+def _desktop_manual_placeholder_turn(turn_id: str) -> bool:
+    """Diagnostic desktop-turn:{source}:manual-* ids are not Codex-native turns."""
+    if not turn_id.startswith("desktop-turn:"):
+        return False
+    return turn_id.rsplit(":", 1)[-1].startswith("manual-")
+
+
 def _bind_desktop_empty_turn_id(state: dict[str, Any], event: dict[str, Any]) -> None:
     """Desktop hooks often omit turn_id or still carry a stale web-turn id; bind a stable id."""
     if event.get("controller_host") != DESKTOP_SESSION_HOST:
@@ -653,11 +660,16 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
         }
         return "Turn boundary rejected: prior Web turn still has inflight tool evidence."
     proof = None
+    native_codex_turn = not _desktop_event_lacks_native_turn_id(event)
     stale_web_on_desktop = (
         event.get("controller_host") == DESKTOP_SESSION_HOST
         and str(current_turn_id).startswith("web-turn:")
-        and bool(turn_id)
-        and not str(turn_id).startswith("web-turn:")
+        and native_codex_turn
+    )
+    stale_manual_on_desktop = (
+        event.get("controller_host") == DESKTOP_SESSION_HOST
+        and _desktop_manual_placeholder_turn(str(current_turn_id))
+        and native_codex_turn
     )
     if current_turn_id and event.get("hook_event_name") not in {"SessionStart", "UserPromptSubmit"}:
         if stale_web_on_desktop:
@@ -665,6 +677,12 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
                 "source": "desktop_replaces_stale_web_turn",
                 "turn_id": turn_id,
                 "replaced_web_turn_id": current_turn_id,
+            }
+        elif stale_manual_on_desktop:
+            proof = {
+                "source": "desktop_replaces_manual_turn",
+                "turn_id": turn_id,
+                "replaced_turn_id": current_turn_id,
             }
         else:
             proof = _desktop_turn_start(event)
@@ -2676,6 +2694,35 @@ def successful_control_receipt(
     return True
 
 
+def _desktop_recovered_post_event(
+    event: dict[str, Any],
+    *,
+    tool_use_id: str,
+    tool_name: str,
+    recovered_input: dict[str, Any],
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    recovered = {
+        key: event[key]
+        for key in (
+            "session_id", "controller_session_id", "source_session_id",
+            "controller_host", "controller_target_generation",
+            "controller_ownership_generation", "controller_registry_path",
+            "transcript_path", "cwd",
+        )
+        if key in event
+    }
+    recovered.update({
+        "hook_event_name": "PostToolUse",
+        "turn_id": _event_turn_id(event),
+        "tool_name": tool_name,
+        "tool_use_id": tool_use_id,
+        "tool_input": recovered_input,
+        "tool_response": _rollout_tool_response(item),
+    })
+    return recovered
+
+
 def _reconcile_desktop_rollout(
     state: dict[str, Any],
     event: dict[str, Any],
@@ -2688,11 +2735,17 @@ def _reconcile_desktop_rollout(
     inflight = {
         str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)
     }
-    if not inflight:
+    recover_untracked_commands = (
+        event.get("controller_host") == DESKTOP_SESSION_HOST
+        and event.get("hook_event_name") == "Stop"
+        and not inflight
+    )
+    if not inflight and not recover_untracked_commands:
         return state
     records = state.get("inflight_tool_records")
     records = records if isinstance(records, dict) else {}
-    for item in _desktop_rollout_completed_items(event, state):
+    completed_items = _desktop_rollout_completed_items(event, state)
+    for item in completed_items:
         tool_use_id = str(item.get("id") or "").strip()
         if tool_use_id not in inflight:
             continue
@@ -2723,28 +2776,17 @@ def _reconcile_desktop_rollout(
         is_control_receipt = (
             str(state.get("control_receipt_inflight") or "").strip() == tool_use_id
         )
-        recovered = {
-            key: event[key]
-            for key in (
-                "session_id", "controller_session_id", "source_session_id",
-                "controller_host", "controller_target_generation",
-                "controller_ownership_generation", "controller_registry_path",
-                "transcript_path", "cwd",
-            )
-            if key in event
-        }
-        recovered.update({
-            "hook_event_name": "PostToolUse",
-            "turn_id": _event_turn_id(event),
-            "tool_name": str(record.get("tool_name") or "Bash"),
+        recovered = _desktop_recovered_post_event(
+            event,
+            tool_use_id=tool_use_id,
+            tool_name=str(record.get("tool_name") or "Bash"),
+            recovered_input=recovered_input,
+            item=item,
+        )
+        recovered["rollout_recovery"] = {
+            "source": "codex_rollout_item_completed",
             "tool_use_id": tool_use_id,
-            "tool_input": recovered_input,
-            "tool_response": _rollout_tool_response(item),
-            "rollout_recovery": {
-                "source": "codex_rollout_item_completed",
-                "tool_use_id": tool_use_id,
-            },
-        })
+        }
         input_sha256 = str(record.get("input_sha256") or "").strip()
         if input_sha256:
             recovered["recovered_input_sha256"] = input_sha256
@@ -2762,6 +2804,46 @@ def _reconcile_desktop_rollout(
         }
         if is_control_receipt and state.get("must_yield") is not True:
             state.pop("control_receipt_proposal", None)
+    if not recover_untracked_commands:
+        return state
+    traced_ids = {
+        str(entry.get("tool_use_id") or "").strip()
+        for entry in state.get("tool_trace", [])
+        if isinstance(entry, dict)
+        and str(entry.get("turn_id") or "").strip() == _event_turn_id(event)
+        and str(entry.get("tool_use_id") or "").strip()
+    }
+    for item in completed_items:
+        if str(item.get("type") or "").strip() != "CommandExecution":
+            continue
+        tool_use_id = str(item.get("id") or "").strip()
+        if (
+            not tool_use_id
+            or tool_use_id in inflight
+            or tool_use_id in traced_ids
+        ):
+            continue
+        command = _rollout_command_text(item)
+        if command is None:
+            continue
+        recovered = _desktop_recovered_post_event(
+            event,
+            tool_use_id=tool_use_id,
+            tool_name="Bash",
+            recovered_input={"command": command},
+            item=item,
+        )
+        recovered_output, state = evaluate_event(
+            recovered, snapshot=snapshot, prior_state=state
+        )
+        if recovered_event_observer is not None:
+            recovered_event_observer(recovered, recovered_output, state)
+        inflight = {
+            str(value)
+            for value in state.get("inflight_tool_use_ids", [])
+            if str(value)
+        }
+        traced_ids.add(tool_use_id)
     return state
 
 

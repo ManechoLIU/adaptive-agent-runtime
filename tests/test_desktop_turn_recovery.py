@@ -1177,6 +1177,203 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         self.assertEqual(state["inflight_tool_use_ids"], [])
         self.assertTrue(state["must_yield"])
 
+    def placeholder_prior(self, active_turn_id):
+        return {
+            "active_turn_id": active_turn_id,
+            "must_yield": False,
+            "pending_control_event": True,
+            "triggers": ["ledger_changed"],
+            "tool_trace_overflow": False,
+            "tool_trace": [],
+            "inflight_tool_use_ids": [],
+            "controller_host": "desktop_codex",
+            "source_session_id": "source",
+            "snapshot": self.snapshot,
+        }
+
+    def test_stop_without_pretool_binds_codex_turn_and_recovers_command_execution(self):
+        codex_turn = "01a0b99f-159a-7c33-b650-ba77e32d0ab8"
+        call_id = "call-exec-1"
+        self.write_transcript(turn=codex_turn)
+        self.append_command_completion(tool_use_id=call_id, turn=codex_turn)
+        self.append_command_completion(
+            tool_use_id="call-old-turn", turn="old-turn", command="git diff",
+        )
+        self.append_file_change_completion(tool_use_id="call-file-1", turn=codex_turn)
+        stop = self.event("Stop", turn=codex_turn)
+        stop.pop("tool_use_id", None)
+        stop.pop("tool_input", None)
+        for prior_turn in (
+            "web-turn:dead",
+            "desktop-turn:source:manual-1",
+        ):
+            with self.subTest(prior_turn=prior_turn):
+                output, state = lifecycle_hook.evaluate_event(
+                    stop,
+                    snapshot=self.snapshot,
+                    prior_state=self.placeholder_prior(prior_turn),
+                )
+                self.assertNotEqual(output.get("continue"), False)
+                self.assertEqual(state["active_turn_id"], codex_turn)
+                traced = [item["tool_use_id"] for item in state["tool_trace"]]
+                self.assertIn(call_id, traced)
+                self.assertNotIn("call-old-turn", traced)
+                self.assertNotIn("call-file-1", traced)
+
+    def test_second_stop_same_codex_turn_does_not_reopen_or_duplicate_call(self):
+        codex_turn = "01a0b99f-159a-7c33-b650-ba77e32d0ab8"
+        call_id = "call-exec-1"
+        self.write_transcript(turn=codex_turn)
+        self.append_command_completion(tool_use_id=call_id, turn=codex_turn)
+        stop = self.event("Stop", turn=codex_turn)
+        stop.pop("tool_use_id", None)
+        first_output, first_state = lifecycle_hook.evaluate_event(
+            stop,
+            snapshot=self.snapshot,
+            prior_state=self.placeholder_prior("desktop-turn:source:manual-1"),
+        )
+        self.assertEqual(first_state["active_turn_id"], codex_turn)
+        self.assertEqual(
+            [item["tool_use_id"] for item in first_state["tool_trace"] if item["tool_use_id"] == call_id],
+            [call_id],
+        )
+        second_output, second_state = lifecycle_hook.evaluate_event(
+            stop, snapshot=self.snapshot, prior_state=first_state,
+        )
+        self.assertEqual(second_state["active_turn_id"], codex_turn)
+        self.assertEqual(
+            second_state.get("turn_start_evidence"),
+            first_state.get("turn_start_evidence"),
+        )
+        self.assertGreater(
+            int(second_state.get("stop_continuations") or 0),
+            int(first_state.get("stop_continuations") or 0),
+        )
+        self.assertEqual(
+            [item["tool_use_id"] for item in second_state["tool_trace"] if item["tool_use_id"] == call_id],
+            [call_id],
+        )
+
+    def test_recovered_guard_command_matches_native_post_receipt(self):
+        repo, _guard_snapshot, command, snapshot, _pre_event = self.make_guard_case()
+        snapshot = {
+            **snapshot,
+            "rule_handshake": {
+                "state": "pending_live_e2e",
+                "blocking": True,
+            },
+        }
+        codex_turn = "01a0b99f-159a-7c33-b650-ba77e32d0ab8"
+        call_id = "call-guard-1"
+        self.write_transcript(turn=codex_turn)
+        self.append_command_completion(
+            tool_use_id=call_id,
+            turn=codex_turn,
+            command=command,
+            output="control-event: allowed",
+        )
+        stop = self.event("Stop", turn=codex_turn)
+        stop["cwd"] = str(repo)
+        stop.pop("tool_use_id", None)
+        stop.pop("tool_input", None)
+        _stop_output, stop_state = lifecycle_hook.evaluate_event(
+            stop,
+            snapshot=snapshot,
+            prior_state=self.placeholder_prior("web-turn:dead"),
+        )
+        post = self.event("PostToolUse", turn=codex_turn)
+        post["cwd"] = str(repo)
+        post["tool_use_id"] = call_id
+        post["tool_input"] = {"command": command}
+        post["tool_response"] = {
+            "status": "completed",
+            "stdout": "control-event: allowed",
+            "aggregated_output": "control-event: allowed",
+            "formatted_output": "control-event: allowed",
+            "stderr": "",
+            "exit_code": 0,
+        }
+        _post_output, post_state = lifecycle_hook.evaluate_event(
+            post,
+            snapshot=snapshot,
+            prior_state={
+                **self.placeholder_prior(codex_turn),
+                "snapshot": snapshot,
+            },
+        )
+        self.assertEqual(stop_state["must_yield"], post_state["must_yield"])
+        self.assertEqual(stop_state.get("receipt_turn_id"), post_state.get("receipt_turn_id"))
+        self.assertTrue(stop_state["must_yield"])
+        self.assertEqual(stop_state["receipt_turn_id"], codex_turn)
+        self.assertIn(call_id, [item["tool_use_id"] for item in stop_state["tool_trace"]])
+
+    def test_untrusted_transcript_does_not_recover_command_execution(self):
+        codex_turn = "01a0b99f-159a-7c33-b650-ba77e32d0ab8"
+        call_id = "call-exec-1"
+        self.write_transcript(turn=codex_turn)
+        self.append_command_completion(tool_use_id=call_id, turn=codex_turn)
+        for case in ("missing_transcript", "session_mismatch"):
+            with self.subTest(case=case):
+                self.write_transcript(turn=codex_turn)
+                self.append_command_completion(tool_use_id=call_id, turn=codex_turn)
+                stop = self.event("Stop", turn=codex_turn)
+                stop.pop("tool_use_id", None)
+                stop.pop("tool_input", None)
+                prior = self.placeholder_prior(codex_turn)
+                if case == "missing_transcript":
+                    stop.pop("transcript_path")
+                else:
+                    self.write_transcript(session="other-session", turn=codex_turn)
+                    self.append_command_completion(tool_use_id=call_id, turn=codex_turn)
+                output, state = lifecycle_hook.evaluate_event(
+                    stop, snapshot=self.snapshot, prior_state=prior,
+                )
+                traced = [
+                    item["tool_use_id"]
+                    for item in state.get("tool_trace", [])
+                    if isinstance(item, dict)
+                ]
+                self.assertNotIn(call_id, traced)
+                self.assertEqual(state["active_turn_id"], codex_turn)
+
+    def test_inflight_stop_reconcile_still_recovers_recorded_command(self):
+        self.append_command_completion()
+        prior = {
+            **self.prior,
+            "active_turn_id": "new",
+            "tool_trace_overflow": False,
+            "tool_trace": [],
+            "inflight_tool_use_ids": ["new-call", "still-running"],
+            "inflight_tool_records": {
+                "new-call": self.inflight_record(),
+            },
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            self.event("Stop"), snapshot=self.snapshot, prior_state=prior,
+        )
+        self.assertEqual(state["inflight_tool_use_ids"], ["still-running"])
+        completed = next(
+            item for item in state["tool_trace"]
+            if item["tool_use_id"] == "new-call"
+        )
+        self.assertEqual(completed["response_status"], 0)
+
+    def test_user_prompt_submit_binds_native_codex_turn_over_placeholders(self):
+        codex_turn = "01a0b99f-159a-7c33-b650-ba77e32d0ab8"
+        self.write_transcript(turn=codex_turn)
+        event = self.event("UserPromptSubmit", turn=codex_turn)
+        event.pop("tool_use_id", None)
+        event.pop("tool_input", None)
+        for prior_turn in ("web-turn:dead", "desktop-turn:source:manual-1"):
+            with self.subTest(prior_turn=prior_turn):
+                output, state = lifecycle_hook.evaluate_event(
+                    event,
+                    snapshot=self.snapshot,
+                    prior_state=self.placeholder_prior(prior_turn),
+                )
+                self.assertEqual(state["active_turn_id"], codex_turn)
+
+
 
 if __name__ == "__main__":
     unittest.main()
