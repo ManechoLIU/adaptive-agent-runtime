@@ -3149,5 +3149,110 @@ class MachineTraceReceiptTests(unittest.TestCase):
         self.assertNotIn("host_turn_handoff", second_state)
 
 
+class SessionGoalRolloverTests(unittest.TestCase):
+    def _repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        (repo / "TASK_LEDGER.md").write_text(
+            "# 任务台账\n\n- 当前 Goal：LAB-HOST-01 保持 VERIFY\n",
+            encoding="utf-8",
+        )
+        return repo
+
+    def _snapshot(self, repo: Path) -> dict[str, object]:
+        return {
+            "root": str(repo),
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "task_states": {"LAB-HOST-01": "VERIFY"},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+
+    def test_goal_complete_with_verify_blocks_stop_until_create_goal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(Path(tmp))
+            snapshot = self._snapshot(repo)
+            prior = {
+                "active_turn_id": "turn-1",
+                "controller_host": "desktop_codex",
+                "source_session_id": "desktop-current",
+                "pending_control_event": True,
+                "triggers": ["VERIFY:LAB-HOST-01"],
+            }
+            _post, state = lifecycle_hook.evaluate_event(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "controller_host": "desktop_codex",
+                    "source_session_id": "desktop-current",
+                    "session_id": "controller-1",
+                    "turn_id": "turn-1",
+                    "tool_name": "update_goal",
+                    "tool_use_id": "goal-complete",
+                    "tool_input": {"status": "complete"},
+                    "tool_response": {"status": "complete"},
+                },
+                snapshot=snapshot,
+                prior_state=prior,
+            )
+            self.assertEqual(state.get("session_goal_rollover", {}).get("status"), "pending_create_goal")
+            self.assertEqual(
+                state.get("session_goal_rollover", {}).get("objective"),
+                "LAB-HOST-01 保持 VERIFY",
+            )
+            stop_out, stopped = lifecycle_hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "controller_host": "desktop_codex",
+                    "source_session_id": "desktop-current",
+                    "session_id": "controller-1",
+                    "turn_id": "turn-1",
+                },
+                snapshot=snapshot,
+                prior_state=state,
+            )
+            self.assertEqual(stop_out.get("decision"), "block")
+            self.assertIn("create_goal", str(stop_out.get("reason") or ""))
+            self.assertIn("LAB-HOST-01 保持 VERIFY", str(stop_out.get("reason") or ""))
+            denied, _ = lifecycle_hook.evaluate_event(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "controller_host": "desktop_codex",
+                    "source_session_id": "desktop-current",
+                    "session_id": "controller-1",
+                    "turn_id": "turn-1",
+                    "tool_name": "Bash",
+                    "tool_use_id": "nope",
+                    "tool_input": {"command": "true"},
+                },
+                snapshot=snapshot,
+                prior_state=stopped,
+            )
+            denial = json.dumps(denied, ensure_ascii=False)
+            self.assertIn("create_goal", denial)
+            _create, created = lifecycle_hook.evaluate_event(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "controller_host": "desktop_codex",
+                    "source_session_id": "desktop-current",
+                    "session_id": "controller-1",
+                    "turn_id": "turn-1",
+                    "tool_name": "create_goal",
+                    "tool_use_id": "new-goal",
+                    "tool_input": {"objective": "LAB-HOST-01 保持 VERIFY"},
+                    "tool_response": {"status": "active"},
+                },
+                snapshot=snapshot,
+                prior_state=stopped,
+            )
+            self.assertEqual(created.get("session_goal_rollover", {}).get("status"), "completed")
+            self.assertNotIn("session_goal_rollover:pending_create_goal", created.get("triggers", []))
+
 if __name__ == "__main__":
     unittest.main()

@@ -1126,6 +1126,75 @@ def _goal_block_request(event: dict[str, Any]) -> bool:
     )
 
 
+def _tool_kind_name(event: dict[str, Any]) -> str:
+    return str(event.get("tool_name", "")).strip().rsplit(".", 1)[-1]
+
+
+def _goal_complete_request(event: dict[str, Any]) -> bool:
+    tool_input = event.get("tool_input")
+    return (
+        _tool_kind_name(event) == "update_goal"
+        and isinstance(tool_input, dict)
+        and str(tool_input.get("status", "")).strip().lower() == "complete"
+    )
+
+
+def _create_goal_request(event: dict[str, Any]) -> bool:
+    return _tool_kind_name(event) == "create_goal"
+
+
+def _session_goal_rollover_pending(state: dict[str, Any]) -> dict[str, Any] | None:
+    record = state.get("session_goal_rollover")
+    if isinstance(record, dict) and str(record.get("status") or "") == "pending_create_goal":
+        return record
+    return None
+
+
+def _arm_session_goal_rollover(
+    state: dict[str, Any], snapshot: dict[str, Any]
+) -> None:
+    root = str(snapshot.get("root") or "").strip()
+    if not root:
+        return
+    contract = _current_goal_rebind_contract(Path(root))
+    if contract is None:
+        return
+    objective = str(contract.get("objective") or "").strip()
+    if not objective:
+        return
+    state["session_goal_rollover"] = {
+        "status": "pending_create_goal",
+        "objective": objective,
+        "ledger_sha256": contract.get("ledger_sha256"),
+    }
+    state["pending_control_event"] = True
+    triggers = {str(item) for item in state.get("triggers", []) if str(item).strip()}
+    triggers.add("session_goal_rollover:pending_create_goal")
+    state["triggers"] = sorted(triggers)
+
+
+def _session_goal_rollover_pretool_denial(
+    state: dict[str, Any], event: dict[str, Any]
+) -> str | None:
+    pending = _session_goal_rollover_pending(state)
+    if pending is None:
+        return None
+    if _tool_kind_name(event) == "get_goal":
+        return None
+    tool_input = event.get("tool_input")
+    if (
+        _create_goal_request(event)
+        and isinstance(tool_input, dict)
+        and str(tool_input.get("objective") or "").strip() == str(pending.get("objective") or "").strip()
+    ):
+        return None
+    objective = str(pending.get("objective") or "").strip()
+    return (
+        "Session Goal 已结束但台账未完成。下一步只能 create_goal，"
+        "objective 必须精确等于台账当前 Goal：" + objective
+    )
+
+
 def _control_guard_proposal(command: str, *, cwd: str | Path | None) -> dict[str, Any] | None:
     try:
         tokens = shlex.split(command)
@@ -3530,6 +3599,19 @@ def evaluate_event(
             snapshot,
             recovered_event_observer=recovered_event_observer,
         )
+        pending_rollover = _session_goal_rollover_pending(state)
+        if pending_rollover is not None:
+            objective = str(pending_rollover.get("objective") or "").strip()
+            state["pending_control_event"] = True
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": (
+                        "Session Goal 已结束但台账未完成。立即 create_goal，"
+                        "objective 必须精确等于台账当前 Goal：" + objective
+                    ),
+                }
+            }, state
     if _is_observation_status_query(event):
         state["observation_query_only"] = True
         state["observation_query_turn_id"] = _event_turn_id(event)
@@ -3617,6 +3699,9 @@ def evaluate_event(
         }
         return {"systemMessage": "Adaptive Agent Runtime: unmatched tool result; current turn evidence was not changed."}, state
     if event_name == "PreToolUse":
+        denial = _session_goal_rollover_pretool_denial(state, event)
+        if denial:
+            return _pre_tool_denial(denial), state
         pending_display_sync = state.get("goal_display_sync")
         if (
             isinstance(pending_display_sync, dict)
@@ -3739,6 +3824,29 @@ def evaluate_event(
                     records = dict(records)
                     records.pop(tool_use_id, None)
                     state["inflight_tool_records"] = records
+        if (
+            event.get("controller_host") == DESKTOP_SESSION_HOST
+            and _goal_complete_request(event)
+            and _has_unfinished_continuation_debt(snapshot, state.get("triggers"))
+        ):
+            _arm_session_goal_rollover(state, snapshot)
+        pending = _session_goal_rollover_pending(state)
+        if pending is not None and _create_goal_request(event):
+            tool_input = event.get("tool_input")
+            if (
+                isinstance(tool_input, dict)
+                and str(tool_input.get("objective") or "").strip() == str(pending.get("objective") or "").strip()
+            ):
+                state["session_goal_rollover"] = {
+                    **pending,
+                    "status": "completed",
+                }
+                triggers = {
+                    str(item)
+                    for item in state.get("triggers", [])
+                    if str(item).strip() and item != "session_goal_rollover:pending_create_goal"
+                }
+                state["triggers"] = sorted(triggers)
         pending_display_sync = state.get("goal_display_sync")
         if (
             isinstance(pending_display_sync, dict)
@@ -4075,6 +4183,15 @@ def evaluate_event(
             }
         }, state
 
+    pending_rollover = _session_goal_rollover_pending(state)
+    if event_name == "Stop" and pending_rollover is not None:
+        objective = str(pending_rollover.get("objective") or "").strip()
+        reason = (
+            "Session Goal 已结束但台账未完成。立即 create_goal，"
+            "objective 必须精确等于台账当前 Goal：" + objective
+        )
+        state["pending_control_event"] = True
+        return _pending_stop_output(state, event, reason=reason), state
     if event_name == "Stop" and pending:
         reason = continuation_reason(
             triggers,
