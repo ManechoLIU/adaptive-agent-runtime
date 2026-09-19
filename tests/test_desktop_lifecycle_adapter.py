@@ -2670,6 +2670,189 @@ class MachineTraceReceiptTests(unittest.TestCase):
         self.assertEqual(projection["turn_id"], "desktop-turn-1")
         self.assertIn("call-1", projection["tool_use_ids"])
 
+    def _desktop_empty_turn_event(
+        self,
+        hook_event_name: str,
+        *,
+        tool_use_id: str,
+        tool_response: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        event: dict[str, object] = {
+            "hook_event_name": hook_event_name,
+            "controller_host": "desktop_codex",
+            "session_id": "controller-1",
+            "source_session_id": "01a0b48e-desktop",
+            "tool_name": "Bash",
+            "tool_use_id": tool_use_id,
+            "tool_input": {"command": "true"},
+        }
+        if tool_response is not None:
+            event["tool_response"] = tool_response
+        return event
+
+    def test_desktop_pretool_without_turn_id_replaces_stale_web_turn_and_records_trace(self) -> None:
+        prior = {
+            "active_turn_id": "web-turn:dead",
+            "controller_host": "desktop_codex",
+            "source_session_id": "01a0b48e-desktop",
+            "tool_trace": [],
+            "pending_control_event": True,
+            "triggers": ["VERIFY:HOST-01"],
+        }
+        snapshot = {
+            "root": "/tmp/project",
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        _pre, state = lifecycle_hook.evaluate_event(
+            self._desktop_empty_turn_event("PreToolUse", tool_use_id="call-1"),
+            snapshot=snapshot,
+            prior_state=prior,
+        )
+        self.assertEqual(state["active_turn_id"], "desktop-turn:01a0b48e-desktop:call-1")
+        self.assertEqual(state["tool_trace"], [])
+        _post, state = lifecycle_hook.evaluate_event(
+            self._desktop_empty_turn_event(
+                "PostToolUse",
+                tool_use_id="call-1",
+                tool_response={"exit_code": 0},
+            ),
+            snapshot=snapshot,
+            prior_state=state,
+        )
+        projection = lifecycle_hook.machine_trace_projection(state)
+        self.assertEqual(projection["turn_id"], "desktop-turn:01a0b48e-desktop:call-1")
+        self.assertIn("call-1", projection["tool_use_ids"])
+
+    def test_desktop_second_pretool_without_turn_id_appends_same_turn_trace(self) -> None:
+        snapshot = {
+            "root": "/tmp/project",
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        prior = {
+            "active_turn_id": "web-turn:dead",
+            "controller_host": "desktop_codex",
+            "source_session_id": "01a0b48e-desktop",
+            "tool_trace": [],
+            "pending_control_event": True,
+            "triggers": ["VERIFY:HOST-01"],
+        }
+        _pre, state = lifecycle_hook.evaluate_event(
+            self._desktop_empty_turn_event("PreToolUse", tool_use_id="call-1"),
+            snapshot=snapshot,
+            prior_state=prior,
+        )
+        _post, state = lifecycle_hook.evaluate_event(
+            self._desktop_empty_turn_event(
+                "PostToolUse",
+                tool_use_id="call-1",
+                tool_response={"exit_code": 0},
+            ),
+            snapshot=snapshot,
+            prior_state=state,
+        )
+        turn_id = "desktop-turn:01a0b48e-desktop:call-1"
+        self.assertEqual(state["active_turn_id"], turn_id)
+        _pre2, state = lifecycle_hook.evaluate_event(
+            self._desktop_empty_turn_event("PreToolUse", tool_use_id="call-2"),
+            snapshot=snapshot,
+            prior_state=state,
+        )
+        self.assertEqual(state["active_turn_id"], turn_id)
+        _post2, state = lifecycle_hook.evaluate_event(
+            self._desktop_empty_turn_event(
+                "PostToolUse",
+                tool_use_id="call-2",
+                tool_response={"exit_code": 0},
+            ),
+            snapshot=snapshot,
+            prior_state=state,
+        )
+        self.assertEqual(state["active_turn_id"], turn_id)
+        projection = lifecycle_hook.machine_trace_projection(state)
+        self.assertEqual(projection["turn_id"], turn_id)
+        self.assertEqual(projection["tool_use_ids"], ["call-1", "call-2"])
+
+    def test_desktop_duty_stop_stays_blocked_after_confirmed_reentry(self) -> None:
+        snapshot = {
+            "root": "/tmp/project",
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "task_states": {"HOST-01": "VERIFY"},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        prior = {
+            "active_turn_id": "desktop-turn:01a0b48e-desktop:hook",
+            "controller_host": "desktop_codex",
+            "source_session_id": "01a0b48e-desktop",
+            "session_id": "controller-1",
+            "pending_control_event": True,
+            "triggers": ["VERIFY:HOST-01"],
+            "snapshot": snapshot,
+        }
+        stop_event = {
+            "hook_event_name": "Stop",
+            "controller_host": "desktop_codex",
+            "session_id": "controller-1",
+            "controller_session_id": "controller-1",
+            "source_session_id": "01a0b48e-desktop",
+        }
+        prior["desktop_reentry"] = {
+            "result": "CONFIRMED",
+            "state": "RESUME_SUCCEEDED",
+            "controller_id": "controller-1",
+            "execution_target_session_id": "01a0b48e-desktop",
+            "debt_fingerprint": lifecycle_hook.continuation_debt_fingerprint(prior),
+        }
+        first_output, first_state = lifecycle_hook.evaluate_event(
+            stop_event,
+            snapshot=snapshot,
+            prior_state=prior,
+        )
+        self.assertEqual(first_output.get("decision"), "block")
+        self.assertNotEqual(first_output.get("continue"), False)
+        self.assertTrue(first_state["pending_control_event"])
+        self.assertIn("VERIFY:HOST-01", first_state["triggers"])
+        first_state["desktop_reentry"] = {
+            "result": "CONFIRMED",
+            "state": "RESUME_SUCCEEDED",
+            "controller_id": "controller-1",
+            "execution_target_session_id": "01a0b48e-desktop",
+            "debt_fingerprint": lifecycle_hook.continuation_debt_fingerprint(first_state),
+        }
+        second_output, second_state = lifecycle_hook.evaluate_event(
+            stop_event,
+            snapshot=snapshot,
+            prior_state=first_state,
+        )
+        self.assertEqual(second_output.get("decision"), "block")
+        self.assertNotEqual(second_output.get("continue"), False)
+        self.assertNotIn("continue", second_output)
+        self.assertTrue(second_state["pending_control_event"])
+        self.assertIn("VERIFY:HOST-01", second_state["triggers"])
+        self.assertNotIn("host_turn_handoff", second_state)
+
 
 if __name__ == "__main__":
     unittest.main()

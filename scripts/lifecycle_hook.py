@@ -72,8 +72,9 @@ CONTROLLER_SESSIONS_KEY = "__controller_sessions__"
 CONTROLLER_TARGETS_KEY = "__controller_targets__"
 DESKTOP_SESSION_HOST = "desktop_codex"
 MAX_TOOL_TRACE_ENTRIES = 128
-# First Stop with Continuation Debt must block. A later Stop may end the
-# physical Host turn only after same-controller Desktop reentry is CONFIRMED.
+# First Stop with Continuation Debt must block. A later Stop on a non-duty
+# host may end the physical Host turn only after same-controller Desktop
+# reentry is CONFIRMED. Desktop on-duty never uses that escape hatch.
 MIN_STOPS_BEFORE_CONFIRMED_HOST_END = 2
 FORBIDDEN_REENTRY_HANDOFF_STATES = {"requested", "delegated", "degraded"}
 FORBIDDEN_REENTRY_DELIVERY_STATES = {
@@ -526,7 +527,27 @@ def _verified_web_turn_evidence(event: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _synthesize_desktop_turn_id(event: dict[str, Any], state: dict[str, Any]) -> str:
+    source = str(event.get("source_session_id") or state.get("source_session_id") or "").strip()
+    tool_use_id = str(event.get("tool_use_id") or "").strip()
+    suffix = tool_use_id or "hook"
+    return f"desktop-turn:{source}:{suffix}"
+
+
+def _bind_desktop_empty_turn_id(state: dict[str, Any], event: dict[str, Any]) -> None:
+    """Desktop hooks often omit turn_id; bind a stable id so later checks see it."""
+    if _event_turn_id(event) or event.get("controller_host") != DESKTOP_SESSION_HOST:
+        return
+    current = str(state.get("active_turn_id") or "").strip()
+    if current.startswith("desktop-turn:"):
+        event["turn_id"] = current
+        return
+    if current.startswith("web-turn:"):
+        event["turn_id"] = _synthesize_desktop_turn_id(event, state)
+
+
 def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
+    _bind_desktop_empty_turn_id(state, event)
     turn_id = _event_turn_id(event)
     web_turn: dict[str, Any] | None = None
     is_web_machine_event = (
@@ -671,7 +692,12 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
 def _turn_fault(state: dict[str, Any], event: dict[str, Any]) -> str | None:
     current = str(state.get("active_turn_id", ""))
     incoming = _event_turn_id(event)
-    if current and incoming != current:
+    same_desktop_turn = (
+        event.get("controller_host") == DESKTOP_SESSION_HOST
+        and current.startswith("desktop-turn:")
+        and not incoming
+    )
+    if current and incoming != current and not same_desktop_turn:
         return "unverified_turn_boundary"
     if state.get("tool_trace_overflow"):
         return "tool_trace_overflow"
@@ -779,10 +805,19 @@ def visible_same_controller_desktop_reentry_confirmed(
     return False
 
 
+def _desktop_on_duty_source(event: dict[str, Any], state: dict[str, Any]) -> bool:
+    """True when this event is the on-duty Desktop controller entry itself."""
+    if event.get("controller_host") != DESKTOP_SESSION_HOST:
+        return False
+    source_id = str(event.get("source_session_id") or "").strip()
+    duty_source = str(state.get("source_session_id") or "").strip()
+    return bool(source_id) and source_id == duty_source
+
+
 def _pending_stop_output(
     state: dict[str, Any], event: dict[str, Any], *, reason: str
 ) -> dict[str, Any]:
-    """Keep the Host turn alive until debt is cleared or a visible reentry is CONFIRMED."""
+    """Keep the Host turn alive until debt is cleared or a non-duty reentry is CONFIRMED."""
     turn_id = _event_turn_id(event) or str(state.get("active_turn_id", "")).strip()
     prior_turn_id = str(state.get("stop_continuation_turn_id", "")).strip()
     prior_count = int(state.get("stop_continuations", 0) or 0)
@@ -791,8 +826,11 @@ def _pending_stop_output(
     if turn_id:
         state["stop_continuation_turn_id"] = turn_id
     debt_fingerprint = continuation_debt_fingerprint(state)
+    # Web may end the physical turn after HMAC/desktop reentry CONFIRMED.
+    # Desktop on-duty already is that entry; CONFIRMED must not idle it.
     confirmed = (
-        bool(turn_id)
+        not _desktop_on_duty_source(event, state)
+        and bool(turn_id)
         and continuations >= MIN_STOPS_BEFORE_CONFIRMED_HOST_END
         and visible_same_controller_desktop_reentry_confirmed(
             state, event, debt_fingerprint=debt_fingerprint
