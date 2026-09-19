@@ -617,10 +617,23 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
         }
         return "Turn boundary rejected: prior Web turn still has inflight tool evidence."
     proof = None
+    stale_web_on_desktop = (
+        event.get("controller_host") == DESKTOP_SESSION_HOST
+        and str(current_turn_id).startswith("web-turn:")
+        and bool(turn_id)
+        and turn_id != current_turn_id
+    )
     if current_turn_id and event.get("hook_event_name") not in {"SessionStart", "UserPromptSubmit"}:
-        proof = _desktop_turn_start(event)
-        if proof is None and web_turn is None:
-            return None
+        if stale_web_on_desktop:
+            proof = {
+                "source": "desktop_replaces_stale_web_turn",
+                "turn_id": turn_id,
+                "replaced_web_turn_id": current_turn_id,
+            }
+        else:
+            proof = _desktop_turn_start(event)
+            if proof is None and web_turn is None:
+                return None
     prior_handoff = state.get("host_turn_handoff")
     if isinstance(prior_handoff, dict):
         state["last_host_turn_handoff"] = {

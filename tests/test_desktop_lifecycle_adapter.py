@@ -2615,6 +2615,61 @@ class MachineTraceReceiptTests(unittest.TestCase):
         self.assertIn('"turn_id": "turn-print"', output.getvalue())
         self.assertIn('"tool-print"', output.getvalue())
 
+    def test_desktop_pretool_replaces_stale_web_turn_and_records_trace(self) -> None:
+        prior = {
+            "active_turn_id": "web-turn:dead",
+            "controller_host": "desktop_codex",
+            "source_session_id": "01a0b48e-desktop",
+            "tool_trace": [],
+            "pending_control_event": True,
+            "triggers": ["VERIFY:HOST-01"],
+        }
+        snapshot = {
+            "root": "/tmp/project",
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+        _pre, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PreToolUse",
+                "controller_host": "desktop_codex",
+                "session_id": "controller-1",
+                "source_session_id": "01a0b48e-desktop",
+                "turn_id": "desktop-turn-1",
+                "tool_name": "Bash",
+                "tool_use_id": "call-1",
+                "tool_input": {"command": "true"},
+            },
+            snapshot=snapshot,
+            prior_state=prior,
+        )
+        self.assertEqual(state["active_turn_id"], "desktop-turn-1")
+        _post, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "controller_host": "desktop_codex",
+                "session_id": "controller-1",
+                "source_session_id": "01a0b48e-desktop",
+                "turn_id": "desktop-turn-1",
+                "tool_name": "Bash",
+                "tool_use_id": "call-1",
+                "tool_input": {"command": "true"},
+                "tool_response": {"exit_code": 0},
+            },
+            snapshot=snapshot,
+            prior_state=state,
+        )
+        projection = lifecycle_hook.machine_trace_projection(state)
+        self.assertEqual(projection["turn_id"], "desktop-turn-1")
+        self.assertIn("call-1", projection["tool_use_ids"])
+
 
 if __name__ == "__main__":
     unittest.main()
