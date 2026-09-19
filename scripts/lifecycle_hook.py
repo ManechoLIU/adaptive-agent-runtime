@@ -3891,13 +3891,31 @@ def replace_desktop_session(
             targets[controller_id] = controller_targets
             registry[CONTROLLER_TARGETS_KEY] = targets
             ownership_claim = None
-            if expected_ownership_generation is not None:
+            claim_generation = expected_ownership_generation
+            if claim_generation is None:
+                prior_ownership = target_guard.execution_ownership_record(
+                    registry, controller_id=controller_id
+                )
+                already_on_duty = (
+                    isinstance(prior_ownership, dict)
+                    and str(prior_ownership.get("active_host") or "") == DESKTOP_SESSION_HOST
+                    and str(prior_ownership.get("execution_target_session_id") or "").strip()
+                    == desktop_session_id
+                )
+                if not already_on_duty:
+                    if prior_ownership is None:
+                        claim_generation = 0
+                    else:
+                        _host, _target, claim_generation = (
+                            target_guard.validate_execution_ownership_record(prior_ownership)
+                        )
+            if claim_generation is not None:
                 ownership_claim = target_guard._claim_controller_host_in_registry(
                     registry,
                     controller_id=controller_id,
                     requested_host=DESKTOP_SESSION_HOST,
                     requested_target_session_id=desktop_session_id,
-                    expected_generation=expected_ownership_generation,
+                    expected_generation=claim_generation,
                     provenance="desktop_entry",
                 )
             write_json(registry_path, registry)

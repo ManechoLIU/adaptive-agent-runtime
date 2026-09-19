@@ -883,6 +883,65 @@ class GovernanceTests(unittest.TestCase):
             "provenance": "desktop_entry",
         })
 
+    def test_replace_desktop_session_auto_claims_ownership_when_generation_omitted(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+            lifecycle_hook.bind_desktop_session(
+                controller_id="controller-1", desktop_session_id="desktop-entry-2", repo=main
+            )
+            payload = lifecycle_hook.load_json(registry)
+            payload["__controller_execution_ownership__"] = {
+                "controller-1": {
+                    "active_host": "web",
+                    "execution_target_session_id": "web-current",
+                    "generation": 5,
+                }
+            }
+            lifecycle_hook.write_json(registry, payload)
+
+            receipt = lifecycle_hook.replace_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-2",
+                repo=main,
+                expected_generation=0,
+            )
+
+        self.assertEqual(receipt["ownership_generation"], 6)
+        saved = lifecycle_hook.load_json(registry)
+        self.assertEqual(saved["__controller_execution_ownership__"]["controller-1"], {
+            "active_host": "desktop_codex",
+            "execution_target_session_id": "desktop-entry-2",
+            "generation": 6,
+            "provenance": "desktop_entry",
+        })
+
+    def test_replace_desktop_session_skips_ownership_claim_when_already_on_duty(self) -> None:
+        from unittest.mock import patch
+
+        main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
+        with patch.object(lifecycle_hook, "REGISTRY_PATH", registry):
+            lifecycle_hook.register_controller("controller-1", main)
+            first = lifecycle_hook.replace_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-2",
+                repo=main,
+                expected_generation=0,
+            )
+            self.assertEqual(first["ownership_generation"], 1)
+            second = lifecycle_hook.replace_desktop_session(
+                controller_id="controller-1",
+                desktop_session_id="desktop-entry-2",
+                repo=main,
+                expected_generation=1,
+            )
+
+        self.assertNotIn("ownership_generation", second)
+        saved = lifecycle_hook.load_json(registry)
+        self.assertEqual(saved["__controller_execution_ownership__"]["controller-1"]["generation"], 1)
+
     def test_replacing_desktop_target_deactivates_old_alias_and_advances_generation(self) -> None:
         from unittest.mock import patch
 
