@@ -377,7 +377,7 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertTrue(state["must_yield"])
 
-    def test_normal_pending_stop_terminalizes_host_turn_without_closing_control_debt(self):
+    def test_normal_pending_stop_keeps_blocking_without_confirmed_reentry(self):
         prior = {**self.prior, "tool_trace_overflow": False, "inflight_tool_use_ids": []}
         first_output, first_state = lifecycle_hook.evaluate_event(
             self.event("Stop", turn="old"), snapshot=self.snapshot, prior_state=prior,
@@ -388,14 +388,39 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
             self.event("Stop", turn="old"), snapshot=self.snapshot, prior_state=first_state,
         )
 
-        self.assertIs(second_output.get("continue"), False)
-        self.assertNotEqual(second_output.get("decision"), "block")
+        self.assertEqual(second_output.get("decision"), "block")
+        self.assertNotEqual(second_output.get("continue"), False)
         self.assertTrue(second_state["pending_control_event"])
         self.assertEqual(second_state["triggers"], first_state["triggers"])
         self.assertEqual(second_state["pending_terminal_receipts"], ["/tmp/result.json"])
-        self.assertEqual(second_state["host_turn_handoff"]["state"], "requested")
+        self.assertNotIn("host_turn_handoff", second_state)
+        self.assertEqual(second_state["stop_continuations"], 2)
+
+    def test_pending_stop_terminalizes_only_after_confirmed_desktop_reentry(self):
+        prior = {**self.prior, "tool_trace_overflow": False, "inflight_tool_use_ids": []}
+        event = self.event("Stop", turn="old")
+        event["controller_session_id"] = "logical"
+        event["source_session_id"] = "desktop-current"
+        first_output, first_state = lifecycle_hook.evaluate_event(
+            event, snapshot=self.snapshot, prior_state=prior,
+        )
+        self.assertEqual(first_output.get("decision"), "block")
+        first_state["desktop_reentry"] = {
+            "result": "CONFIRMED",
+            "state": "RESUME_SUCCEEDED",
+            "controller_id": "logical",
+            "execution_target_session_id": "desktop-current",
+            "debt_fingerprint": lifecycle_hook.continuation_debt_fingerprint(first_state),
+        }
+        second_output, second_state = lifecycle_hook.evaluate_event(
+            event, snapshot=self.snapshot, prior_state=first_state,
+        )
+        self.assertIs(second_output.get("continue"), False)
+        self.assertNotEqual(second_output.get("decision"), "block")
+        self.assertTrue(second_state["pending_control_event"])
+        self.assertEqual(second_state["pending_terminal_receipts"], ["/tmp/result.json"])
+        self.assertEqual(second_state["host_turn_handoff"]["state"], "reentry_confirmed")
         self.assertEqual(second_state["host_turn_handoff"]["turn_id"], "old")
-        self.assertEqual(second_state["host_turn_handoff"]["wake_generation"], 1)
 
     def test_host_turn_handoff_arms_existing_same_controller_supervisor(self):
         state_path = self.root / "handoff-state.json"

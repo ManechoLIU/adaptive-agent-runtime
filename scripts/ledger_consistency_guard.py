@@ -10,8 +10,68 @@ from lint_governance import pointer_ids, task_records
 
 
 OPEN_STATES = {"PENDING", "READY", "ACTIVE", "RECOVERING", "VERIFY", "BLOCKED"}
+CLOSED_LEDGER_STATES = {"DONE", "SUPERSEDED", "CLOSED"}
+UNFINISHED_WORK_STATES = {"READY", "ACTIVE", "VERIFY", "RECOVERING"}
 WORK_IN_FLIGHT_STATES = {"ACTIVE", "RECOVERING"}
 NONE_VALUES = {"无", "none", "None"}
+
+
+def nearest_parent_task_id(task_id: str, declared_ids: set[str]) -> str | None:
+    nearest: str | None = None
+    for candidate in declared_ids:
+        if candidate == task_id or not task_id.startswith(candidate + "-"):
+            continue
+        if nearest is None or len(candidate) > len(nearest):
+            nearest = candidate
+    return nearest
+
+
+def parent_child_projection(task_states: dict[str, str]) -> dict[str, object]:
+    """Project unfinished children from declared ledger IDs. Prefix children only."""
+    states = {
+        str(task_id).strip(): str(status).strip().upper()
+        for task_id, status in task_states.items()
+        if str(task_id).strip()
+    }
+    declared_ids = set(states)
+    children_by_parent: dict[str, list[str]] = {}
+    parent_of: dict[str, str] = {}
+    for child_id in declared_ids:
+        parent_id = nearest_parent_task_id(child_id, declared_ids)
+        if parent_id is None:
+            continue
+        parent_of[child_id] = parent_id
+        children_by_parent.setdefault(parent_id, []).append(child_id)
+    unfinished_child_ids: list[str] = []
+    open_parent_ids: list[str] = []
+    closed_parents_with_unfinished_children: list[str] = []
+    for parent_id, children in children_by_parent.items():
+        unfinished = sorted(
+            child_id
+            for child_id in children
+            if states.get(child_id, "") not in CLOSED_LEDGER_STATES
+        )
+        if not unfinished:
+            continue
+        unfinished_child_ids.extend(unfinished)
+        if states.get(parent_id, "") in CLOSED_LEDGER_STATES:
+            closed_parents_with_unfinished_children.append(parent_id)
+        else:
+            open_parent_ids.append(parent_id)
+    return {
+        "children_by_parent": {
+            parent_id: sorted(children)
+            for parent_id, children in children_by_parent.items()
+            if children
+        },
+        "parent_of": parent_of,
+        "unfinished_child_ids": sorted(set(unfinished_child_ids)),
+        "open_parent_ids": sorted(open_parent_ids),
+        "closed_parents_with_unfinished_children": sorted(
+            closed_parents_with_unfinished_children
+        ),
+    }
+
 RUNTIME_CAPACITY_POINTER = re.compile(
     r"^-\s*(?:容量\s*/\s*READY|当前容量|实时容量|当前\s*Writer|当前\s*Reviewer)\s*：",
     re.MULTILINE | re.IGNORECASE,
@@ -117,6 +177,17 @@ def validate_ledger(text: str) -> list[str]:
     )
     if duplicate_ids:
         errors.append("duplicate task IDs: " + ", ".join(duplicate_ids))
+    task_states = {record["id"]: record["status"] for record in records}
+    parent_child = parent_child_projection(task_states)
+    for parent_id in parent_child["closed_parents_with_unfinished_children"]:
+        unfinished = ", ".join(
+            child_id
+            for child_id in parent_child["children_by_parent"].get(parent_id, [])
+            if task_states.get(child_id, "") not in CLOSED_LEDGER_STATES
+        )
+        errors.append(
+            f"{parent_id} cannot be CLOSED/DONE while unfinished children remain: {unfinished}"
+        )
     open_ids = {
         record["id"] for record in records if record["status"] in OPEN_STATES
     }

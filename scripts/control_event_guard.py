@@ -21,6 +21,16 @@ try:
 except ModuleNotFoundError:
     from controller_state import derive_runnable_tasks
 try:
+    from scripts.ledger_consistency_guard import (
+        UNFINISHED_WORK_STATES,
+        parent_child_projection,
+    )
+except ModuleNotFoundError:
+    from ledger_consistency_guard import (
+        UNFINISHED_WORK_STATES,
+        parent_child_projection,
+    )
+try:
     from scripts.route_contract import (
         ROUTE_DECISIONS,
         canonical_safe_fallback_errors,
@@ -126,6 +136,114 @@ def runtime_occupied_task_ids(repo: Path, work_in_flight: dict[str, str]) -> set
     return occupied
 
 
+def continuation_debt_projection(
+    *,
+    ready_ids: set[str] | None = None,
+    derived_runnable_ids: set[str] | None = None,
+    task_states: dict[str, str] | None = None,
+    unfinished_child_ids: set[str] | None = None,
+    open_parent_ids: set[str] | None = None,
+) -> dict[str, object]:
+    """Canonical Continuation Debt from the unique ledger projection.
+
+    READY, derived runnable, ACTIVE/VERIFY/RECOVERING, and unfinished children
+    under open parents all remain debt. Current Goal membership does not exclude
+    project-wide READY.
+    """
+    ready_ids = {str(item).strip() for item in (ready_ids or set()) if str(item).strip()}
+    derived_runnable_ids = {
+        str(item).strip() for item in (derived_runnable_ids or set()) if str(item).strip()
+    }
+    states = {
+        str(task_id).strip(): str(status).strip().upper()
+        for task_id, status in (task_states or {}).items()
+        if str(task_id).strip()
+    }
+    parent_child = parent_child_projection(states) if states else {
+        "unfinished_child_ids": [],
+        "open_parent_ids": [],
+        "parent_of": {},
+        "children_by_parent": {},
+    }
+    children = {
+        str(item).strip()
+        for item in (
+            unfinished_child_ids
+            if unfinished_child_ids is not None
+            else parent_child["unfinished_child_ids"]
+        )
+        if str(item).strip()
+    }
+    open_parents = {
+        str(item).strip()
+        for item in (
+            open_parent_ids
+            if open_parent_ids is not None
+            else parent_child["open_parent_ids"]
+        )
+        if str(item).strip()
+    }
+    labels: list[str] = []
+    debt_ids: set[str] = set()
+    for task_id in sorted(ready_ids):
+        labels.append(f"READY:{task_id}")
+        debt_ids.add(f"ready:{task_id}")
+    for task_id in sorted(derived_runnable_ids - ready_ids):
+        labels.append(f"RUNNABLE:{task_id}")
+        debt_ids.add(f"runnable:{task_id}")
+    for task_id, status in sorted(states.items()):
+        if status in {"ACTIVE", "VERIFY", "RECOVERING"}:
+            labels.append(f"{status}:{task_id}")
+            debt_ids.add(f"{status.lower()}:{task_id}")
+    for task_id in sorted(children):
+        labels.append(f"OPEN_CHILD:{task_id}")
+        debt_ids.add(f"open_child:{task_id}")
+    return {
+        "labels": labels,
+        "debt_ids": sorted(debt_ids),
+        "ready_ids": sorted(ready_ids),
+        "derived_runnable_ids": sorted(derived_runnable_ids),
+        "unfinished_child_ids": sorted(children),
+        "open_parent_ids": sorted(open_parents),
+        "unfinished_work_ids": sorted(
+            task_id for task_id, status in states.items() if status in UNFINISHED_WORK_STATES
+        ),
+    }
+
+
+def snapshot_continuation_debt_labels(snapshot: dict[str, Any] | None) -> list[str]:
+    if not isinstance(snapshot, dict):
+        return []
+    task_states = snapshot.get("task_states")
+    states = task_states if isinstance(task_states, dict) else {}
+    unfinished = snapshot.get("unfinished_child_ids")
+    open_parents = snapshot.get("open_parent_ids")
+    projection = continuation_debt_projection(
+        ready_ids={str(item).strip() for item in snapshot.get("ready_ids", []) if str(item).strip()},
+        derived_runnable_ids={
+            str(item).strip()
+            for item in snapshot.get("runnable_ids", snapshot.get("ready_ids", []))
+            if str(item).strip()
+        },
+        task_states={
+            str(task_id).strip(): str(status).strip().upper()
+            for task_id, status in states.items()
+            if str(task_id).strip()
+        },
+        unfinished_child_ids=(
+            {str(item).strip() for item in unfinished if str(item).strip()}
+            if isinstance(unfinished, list)
+            else None
+        ),
+        open_parent_ids=(
+            {str(item).strip() for item in open_parents if str(item).strip()}
+            if isinstance(open_parents, list)
+            else None
+        ),
+    )
+    return list(projection["labels"])
+
+
 def project_wide_dispatch_projection(ledger: Path) -> dict[str, Any]:
     """Derive one control-event scheduling view from the entire canonical TASK_LEDGER."""
     text = ledger.read_text(encoding="utf-8")
@@ -149,6 +267,21 @@ def project_wide_dispatch_projection(ledger: Path) -> dict[str, Any]:
         for identifier, status in rows
         if status in {"ACTIVE", "RECOVERING"}
     }
+    parent_child = parent_child_projection(task_states)
+    unfinished_work_ids = {
+        identifier
+        for identifier, status in task_states.items()
+        if status in UNFINISHED_WORK_STATES
+    }
+    # Project-wide runnable is not filtered by the current Goal. READY that does
+    # not serve the current Goal remains dispatchable Continuation Debt.
+    continuation_debt = continuation_debt_projection(
+        ready_ids=ready_ids,
+        derived_runnable_ids=derived_runnable_ids,
+        task_states=task_states,
+        unfinished_child_ids=set(parent_child["unfinished_child_ids"]),
+        open_parent_ids=set(parent_child["open_parent_ids"]),
+    )
     return {
         "ledger_text": text,
         "records": records,
@@ -160,6 +293,13 @@ def project_wide_dispatch_projection(ledger: Path) -> dict[str, Any]:
         "open_ids": open_ids,
         "goal_ids": current_goal_ledger_ids(ledger, open_ids),
         "work_in_flight": work_in_flight,
+        "unfinished_work_ids": unfinished_work_ids,
+        "unfinished_child_ids": set(parent_child["unfinished_child_ids"]),
+        "open_parent_ids": set(parent_child["open_parent_ids"]),
+        "parent_of": dict(parent_child["parent_of"]),
+        "children_by_parent": dict(parent_child["children_by_parent"]),
+        "continuation_debt_ids": set(continuation_debt["debt_ids"]),
+        "continuation_debt_labels": list(continuation_debt["labels"]),
     }
 
 
@@ -1393,6 +1533,17 @@ def mandatory_continuation_projection(
                 "task_id": task_id,
                 "reason": "FACT_PROJECTION_DRIFT",
             }
+    parent_child = parent_child_projection(ledger_task_states) if ledger_task_states else {}
+    for child_id in parent_child.get("unfinished_child_ids", []):
+        child_state = str(ledger_task_states.get(child_id, "")).upper()
+        parent_id = str(parent_child.get("parent_of", {}).get(child_id, "")).strip()
+        actions[f"open_child:{child_id}"] = {
+            "type": "open_child",
+            "task_id": child_id,
+            "parent_task_id": parent_id,
+            "state": child_state,
+            "reason": "unfinished_child",
+        }
     return actions
 
 

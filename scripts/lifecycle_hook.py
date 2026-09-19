@@ -25,6 +25,10 @@ try:
     from controller_state import derive_runnable_tasks, project_task_state
 except ModuleNotFoundError:
     from scripts.controller_state import derive_runnable_tasks, project_task_state
+try:
+    from control_event_guard import snapshot_continuation_debt_labels
+except ModuleNotFoundError:
+    from scripts.control_event_guard import snapshot_continuation_debt_labels
 
 try:
     from rule_handshake import derive_rule_wake_policy, evaluate_rule_handshake
@@ -68,7 +72,26 @@ CONTROLLER_SESSIONS_KEY = "__controller_sessions__"
 CONTROLLER_TARGETS_KEY = "__controller_targets__"
 DESKTOP_SESSION_HOST = "desktop_codex"
 MAX_TOOL_TRACE_ENTRIES = 128
-MAX_IN_TURN_STOP_CONTINUATIONS = 2
+# First Stop with Continuation Debt must block. A later Stop may end the
+# physical Host turn only after same-controller Desktop reentry is CONFIRMED.
+MIN_STOPS_BEFORE_CONFIRMED_HOST_END = 2
+FORBIDDEN_REENTRY_HANDOFF_STATES = {"requested", "delegated", "degraded"}
+FORBIDDEN_REENTRY_DELIVERY_STATES = {
+    "supervisor_already_managing_or_deferred",
+    "supervisor_arm_failed",
+}
+FORBIDDEN_REENTRY_RESUME_STATES = {
+    "RESUME_DEFERRED_ACTIVE_WRITER",
+    "RESUME_SUPERSEDED",
+    "RESUME_FAILED",
+    "DESKTOP_HOST_ADAPTER_UNAVAILABLE",
+}
+CONFIRMED_DESKTOP_REENTRY_RESULTS = {"CONFIRMED"}
+CONFIRMED_DESKTOP_REENTRY_STATES = {
+    "RESUME_SUCCEEDED",
+    "reentry_confirmed",
+    "CONFIRMED",
+}
 RUNTIME_WEB_TURN_LEASE_CONTRACT = "runtime_web_turn_lease_v1"
 LEGACY_WEB_TURN_IDS = {"web-ai-bridge"}
 DESKTOP_CANARY_PATH = Path(
@@ -659,21 +682,9 @@ def _adapter_fault_output(state: dict[str, Any], event: dict[str, Any], code: st
     return {"continue": False, "stopReason": reason, "systemMessage": reason}
 
 
-def _pending_stop_output(
-    state: dict[str, Any], event: dict[str, Any], *, reason: str
-) -> dict[str, Any]:
-    """Bound one Host turn without treating durable Controller debt as complete."""
-    turn_id = _event_turn_id(event) or str(state.get("active_turn_id", "")).strip()
-    prior_turn_id = str(state.get("stop_continuation_turn_id", "")).strip()
-    prior_count = int(state.get("stop_continuations", 0) or 0)
-    continuations = prior_count + 1 if turn_id and prior_turn_id == turn_id else 1
-    state["stop_continuations"] = continuations
-    if turn_id:
-        state["stop_continuation_turn_id"] = turn_id
-    if not turn_id or continuations < MAX_IN_TURN_STOP_CONTINUATIONS:
-        return {"decision": "block", "reason": reason}
-
-    debt_fingerprint = _json_sha256({
+def continuation_debt_fingerprint(state: dict[str, Any]) -> str:
+    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+    return _json_sha256({
         "wake_generation": int(state.get("wake_generation", 0) or 0),
         "triggers": sorted(str(item) for item in state.get("triggers", []) if str(item)),
         "next_action": str(state.get("next_action") or ""),
@@ -681,18 +692,115 @@ def _pending_stop_output(
         "pending_terminal_receipts": sorted(
             str(item) for item in state.get("pending_terminal_receipts", []) if str(item)
         ),
+        "debt_labels": snapshot_continuation_debt_labels(snapshot),
     })
+
+
+def _reentry_proofs(state: dict[str, Any]) -> list[dict[str, Any]]:
+    proofs: list[dict[str, Any]] = []
+    for key in (
+        "desktop_reentry",
+        "confirmed_desktop_reentry",
+        "last_confirmed_desktop_reentry",
+        "host_turn_handoff",
+    ):
+        value = state.get(key)
+        if isinstance(value, dict):
+            proofs.append(value)
+    return proofs
+
+
+def visible_same_controller_desktop_reentry_confirmed(
+    state: dict[str, Any], event: dict[str, Any], *, debt_fingerprint: str
+) -> bool:
+    """True only when a visible same-controller Desktop reentry is already CONFIRMED.
+
+    requested/delegated handoff, supervisor_already_managing_or_deferred, and
+    RESUME_DEFERRED_ACTIVE_WRITER are not visible continuation.
+    """
+    event_controller = str(
+        event.get("controller_session_id")
+        or state.get("logical_controller_id")
+        or state.get("session_id")
+        or ""
+    ).strip()
+    event_target = str(
+        event.get("source_session_id")
+        or state.get("source_session_id")
+        or event.get("session_id")
+        or ""
+    ).strip()
+    for proof in _reentry_proofs(state):
+        proof_state = str(proof.get("state") or "").strip()
+        result = str(proof.get("result") or "").strip()
+        delivery = str(proof.get("delivery_state") or "").strip()
+        if proof_state in FORBIDDEN_REENTRY_HANDOFF_STATES:
+            continue
+        if proof_state in FORBIDDEN_REENTRY_RESUME_STATES:
+            continue
+        if delivery in FORBIDDEN_REENTRY_DELIVERY_STATES:
+            continue
+        confirmed = (
+            result in CONFIRMED_DESKTOP_REENTRY_RESULTS
+            or proof_state in CONFIRMED_DESKTOP_REENTRY_STATES
+        )
+        if not confirmed:
+            continue
+        if str(proof.get("debt_fingerprint") or "").strip() != debt_fingerprint:
+            continue
+        controller = str(
+            proof.get("controller_id") or proof.get("logical_controller_id") or ""
+        ).strip()
+        target = str(
+            proof.get("execution_target_session_id")
+            or proof.get("desktop_current_target")
+            or ""
+        ).strip()
+        if not controller and not target:
+            continue
+        if controller and event_controller and controller != event_controller:
+            continue
+        if target and event_target and target != event_target:
+            continue
+        return True
+    return False
+
+
+def _pending_stop_output(
+    state: dict[str, Any], event: dict[str, Any], *, reason: str
+) -> dict[str, Any]:
+    """Keep the Host turn alive until debt is cleared or a visible reentry is CONFIRMED."""
+    turn_id = _event_turn_id(event) or str(state.get("active_turn_id", "")).strip()
+    prior_turn_id = str(state.get("stop_continuation_turn_id", "")).strip()
+    prior_count = int(state.get("stop_continuations", 0) or 0)
+    continuations = prior_count + 1 if turn_id and prior_turn_id == turn_id else 1
+    state["stop_continuations"] = continuations
+    if turn_id:
+        state["stop_continuation_turn_id"] = turn_id
+    debt_fingerprint = continuation_debt_fingerprint(state)
+    confirmed = (
+        bool(turn_id)
+        and continuations >= MIN_STOPS_BEFORE_CONFIRMED_HOST_END
+        and visible_same_controller_desktop_reentry_confirmed(
+            state, event, debt_fingerprint=debt_fingerprint
+        )
+    )
+    if not confirmed:
+        state.pop("host_turn_handoff", None)
+        return {"decision": "block", "reason": reason}
+
     state["host_turn_handoff"] = {
         "schema_version": 1,
-        "state": "requested",
+        "state": "reentry_confirmed",
+        "result": "CONFIRMED",
         "turn_id": turn_id,
         "wake_generation": int(state.get("wake_generation", 0) or 0),
         "debt_fingerprint": debt_fingerprint,
     }
     terminal_reason = (
         reason
-        + " 当前宿主回合已达到受控续作边界；Runtime 保留全部 Continuation Debt，"
-        "结束本回合并交由同一 logical Controller 的 continuation supervisor 接续。"
+        + " 同一 logical Controller 的 Desktop current target reentry 已 CONFIRMED，"
+        "且 Continuation Debt 指纹未变；结束当前物理回合，债务仍保留。"
     )
     return {
         "continue": False,
@@ -2325,14 +2433,21 @@ def project_snapshot(
         from scripts.ledger_consistency_guard import validate_ledger
 
     ledger_errors = validate_ledger(text)
+    ledger_rows = task_rows(text)
+    ledger_states = {identifier: status for identifier, status in ledger_rows}
     ready_ids = sorted(
         identifier
-        for identifier, status in task_rows(text)
+        for identifier, status in ledger_rows
         if status == "READY"
     )
     runnable_projection = derive_runnable_tasks(task_records(text))
     runnable_ids = list(runnable_projection["runnable_task_ids"])
     derived_slices = dict(runnable_projection.get("derived_slices", {}))
+    try:
+        from ledger_consistency_guard import parent_child_projection
+    except ModuleNotFoundError:
+        from scripts.ledger_consistency_guard import parent_child_projection
+    parent_child = parent_child_projection(ledger_states)
     status = _run_git_with_optional_deadline(
         root, "status", "--porcelain=v1", "--untracked-files=no",
         deadline_monotonic=deadline_monotonic,
@@ -2356,7 +2471,6 @@ def project_snapshot(
 
     runtime_state = load_runtime_state(root)
     leases = runtime_state.get("leases", {}) if isinstance(runtime_state, dict) else {}
-    ledger_states = {identifier: status for identifier, status in task_rows(text)}
     assignment_liveness: dict[str, dict[str, Any]] = {}
     for task_id, ledger_state in ledger_states.items():
         if ledger_state not in {"ACTIVE", "RECOVERING"}:
@@ -2422,6 +2536,9 @@ def project_snapshot(
         "runnable_ids": runnable_ids,
         "runnable_exclusions": runnable_projection["exclusions"],
         "derived_slices": derived_slices,
+        "task_states": ledger_states,
+        "unfinished_child_ids": list(parent_child["unfinished_child_ids"]),
+        "open_parent_ids": list(parent_child["open_parent_ids"]),
         "candidate_revisions": sorted(candidates.values()),
         "ledger_errors": ledger_errors,
         "assignment_liveness": assignment_liveness,
@@ -2772,6 +2889,10 @@ def continuation_reason(
         actions.append("处理候选审查、集成、验收")
     if runnable_ids:
         actions.append("处理可执行工作派发与 ACK；若客观上无法派发，必须把对应任务明确转为 BLOCKED 并记录可验证原因")
+    if any(str(item).startswith("OPEN_CHILD:") for item in triggers):
+        actions.append("处理开放父行下的未完成子项；父行不得在子项未 CLOSED/DONE 时结束")
+    if any(str(item).startswith(("ACTIVE:", "VERIFY:", "RECOVERING:")) for item in triggers):
+        actions.append("处理仍处于 ACTIVE/VERIFY/RECOVERING 的未完成工作，不得 idle/Yield")
     actions.append("随后用 control_event_guard.py 生成通过收据")
     lifecycle = (
         "Adaptive Agent Runtime 生命周期门检测到尚未闭合的控制事件。"
@@ -2801,6 +2922,8 @@ KNOWN_NEXT_ACTION_MESSAGE = re.compile(
 
 
 def _snapshot_has_immediate_controller_work(snapshot: dict[str, Any]) -> bool:
+    if snapshot_continuation_debt_labels(snapshot):
+        return True
     if snapshot.get("runnable_ids") or snapshot.get("candidate_revisions"):
         return True
     corrections = snapshot.get("controller_corrections")
@@ -3191,6 +3314,7 @@ def evaluate_event(
 
     if event_name == "SessionStart":
         triggers = lifecycle_triggers(snapshot, None)
+        triggers = sorted(set(triggers) | set(snapshot_continuation_debt_labels(snapshot)))
         pending_terminal_receipts = [
             str(item) for item in state.get("pending_terminal_receipts", [])
             if isinstance(item, str) and item.strip()
@@ -3403,6 +3527,27 @@ def evaluate_event(
     current_ready = {str(item) for item in snapshot.get("ready_ids", [])}
     current_runnable = {str(item) for item in snapshot.get("runnable_ids", snapshot.get("ready_ids", []))}
     current_candidates = {str(item) for item in snapshot.get("candidate_revisions", [])}
+    current_debt = set(snapshot_continuation_debt_labels(snapshot))
+    current_unfinished = {
+        item.removeprefix("OPEN_CHILD:")
+        for item in current_debt
+        if item.startswith("OPEN_CHILD:")
+    }
+    current_active = {
+        item.removeprefix("ACTIVE:")
+        for item in current_debt
+        if item.startswith("ACTIVE:")
+    }
+    current_verify = {
+        item.removeprefix("VERIFY:")
+        for item in current_debt
+        if item.startswith("VERIFY:")
+    }
+    current_recovering = {
+        item.removeprefix("RECOVERING:")
+        for item in current_debt
+        if item.startswith("RECOVERING:")
+    }
     current_corrections = {
         str(item.get("fingerprint", "")).strip()
         for item in snapshot.get("controller_corrections", [])
@@ -3414,13 +3559,17 @@ def evaluate_event(
         and not (item.startswith("RUNNABLE:") and item.removeprefix("RUNNABLE:") not in current_runnable)
         and not (item.startswith("CANDIDATE:") and item.removeprefix("CANDIDATE:") not in current_candidates)
         and not (item.startswith("CORRECTION:") and item.removeprefix("CORRECTION:") not in current_corrections)
+        and not (item.startswith("OPEN_CHILD:") and item.removeprefix("OPEN_CHILD:") not in current_unfinished)
+        and not (item.startswith("ACTIVE:") and item.removeprefix("ACTIVE:") not in current_active)
+        and not (item.startswith("VERIFY:") and item.removeprefix("VERIFY:") not in current_verify)
+        and not (item.startswith("RECOVERING:") and item.removeprefix("RECOVERING:") not in current_recovering)
     }
-    triggers = sorted(prior_triggers | set(detected))
+    triggers = sorted(prior_triggers | set(detected) | current_debt)
     pending_next_action = str(state.get("next_action") or "").strip()
     continuation_pending = bool(pending_next_action) and state.get("requires_user") is False
     if continuation_pending and "next_action_pending" not in triggers:
         triggers = sorted(set(triggers) | {"next_action_pending"})
-    pending = bool(state.get("pending_control_event")) or bool(triggers) or continuation_pending
+    pending = bool(state.get("pending_control_event")) or bool(triggers) or continuation_pending or bool(current_debt)
     if wake_policy == "next_turn" and event_name != "SessionStart" and not _non_rule_triggers(triggers) and not continuation_pending:
         pending = False
     if wake_policy == "after_event" and prior_nonrule_pending:

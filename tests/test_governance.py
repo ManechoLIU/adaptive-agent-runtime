@@ -1179,7 +1179,7 @@ class GovernanceTests(unittest.TestCase):
         self.assertEqual(saved["source_session_id"], "desktop-entry-2")
         self.assertEqual(saved["controller_host"], "desktop_codex")
 
-    def test_lifecycle_desktop_stop_arms_handoff_before_terminalizing_host_turn(self) -> None:
+    def test_lifecycle_desktop_stop_keeps_blocking_when_handoff_is_not_confirmed(self) -> None:
         from unittest.mock import patch
 
         main, _controller_worktree, _writer_worktree, registry = self.lifecycle_worktree_fixture()
@@ -1216,11 +1216,9 @@ class GovernanceTests(unittest.TestCase):
                 self.assertEqual(lifecycle_hook.run_hook(), 0)
 
             response = json.loads(output.getvalue())
-            self.assertIs(response.get("continue"), False)
-            self.assertNotEqual(response.get("decision"), "block")
-            arm.assert_called_once()
-            self.assertEqual(arm.call_args.kwargs["controller_id"], "controller-1")
-            self.assertEqual(arm.call_args.kwargs["repo"], main.resolve())
+            self.assertEqual(response.get("decision"), "block")
+            self.assertNotEqual(response.get("continue"), False)
+            arm.assert_not_called()
 
     def test_lifecycle_pretool_rejects_message_or_navigation_to_retired_task(self) -> None:
         from unittest.mock import patch
@@ -2033,7 +2031,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertIn("WEB-READY", output["reason"])
         self.assertTrue(next_state["pending_control_event"])
 
-    def test_lifecycle_hook_repeated_stop_with_ready_hands_off_without_clearing_ready(self) -> None:
+    def test_lifecycle_hook_repeated_stop_with_ready_cannot_escape_via_second_stop(self) -> None:
         snapshot = {
             "head": "abc123",
             "ledger_sha256": "ledger-1",
@@ -2049,6 +2047,13 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             "stop_continuations": 1,
             "stop_continuation_turn_id": "turn-2",
             "snapshot": snapshot,
+            "session_id": "session-1",
+            "host_turn_handoff": {
+                "schema_version": 1,
+                "state": "requested",
+                "turn_id": "turn-2",
+                "debt_fingerprint": "stale",
+            },
         }
 
         output, next_state = lifecycle_hook.evaluate_event(
@@ -2062,14 +2067,15 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             prior_state=prior,
         )
 
-        self.assertIs(output.get("continue"), False)
-        self.assertNotEqual(output.get("decision"), "block")
-        self.assertIn("SERVER-GATE", output["stopReason"])
+        self.assertEqual(output["decision"], "block")
+        self.assertNotEqual(output.get("continue"), False)
+        self.assertIn("SERVER-GATE", output["reason"])
         self.assertTrue(next_state["pending_control_event"])
         self.assertIn("READY:SERVER-GATE", next_state["triggers"])
-        self.assertEqual(next_state["host_turn_handoff"]["state"], "requested")
+        self.assertNotIn("host_turn_handoff", next_state)
+        self.assertEqual(next_state["stop_continuations"], 2)
 
-    def test_lifecycle_hook_repeated_stop_without_progress_hands_off_while_pending(self) -> None:
+    def test_lifecycle_hook_repeated_stop_without_progress_still_blocks_while_pending(self) -> None:
         snapshot = {
             "head": "abc123",
             "ledger_sha256": "ledger-1",
@@ -2101,13 +2107,179 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             prior_state=first_state,
         )
 
-        self.assertIs(second_output.get("continue"), False)
-        self.assertNotEqual(second_output.get("decision"), "block")
-        self.assertIn("candidate-123", second_output["stopReason"])
+        self.assertEqual(second_output["decision"], "block")
+        self.assertNotEqual(second_output.get("continue"), False)
+        self.assertIn("candidate-123", second_output["reason"])
         self.assertEqual(second_state["stop_continuations"], 2)
         self.assertTrue(second_state["pending_control_event"])
         self.assertIn("CANDIDATE:candidate-123", second_state["triggers"])
-        self.assertEqual(second_state["host_turn_handoff"]["state"], "requested")
+        self.assertNotIn("host_turn_handoff", second_state)
+
+    def test_repeated_stop_allows_host_end_only_after_confirmed_desktop_reentry(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": ["SERVER-GATE"],
+            "candidate_revisions": [],
+        }
+        first_output, first_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "controller_session_id": "controller-1",
+                "source_session_id": "desktop-current",
+                "turn_id": "turn-2",
+            },
+            snapshot=snapshot,
+            prior_state={
+                "pending_control_event": True,
+                "triggers": ["READY:SERVER-GATE"],
+                "session_id": "controller-1",
+                "source_session_id": "desktop-current",
+            },
+        )
+        self.assertEqual(first_output["decision"], "block")
+        fingerprint = lifecycle_hook.continuation_debt_fingerprint(first_state)
+        first_state["desktop_reentry"] = {
+            "result": "CONFIRMED",
+            "state": "RESUME_SUCCEEDED",
+            "controller_id": "controller-1",
+            "execution_target_session_id": "desktop-current",
+            "debt_fingerprint": fingerprint,
+        }
+        second_output, second_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "controller_session_id": "controller-1",
+                "source_session_id": "desktop-current",
+                "turn_id": "turn-2",
+            },
+            snapshot=snapshot,
+            prior_state=first_state,
+        )
+        self.assertIs(second_output.get("continue"), False)
+        self.assertNotEqual(second_output.get("decision"), "block")
+        self.assertTrue(second_state["pending_control_event"])
+        self.assertIn("READY:SERVER-GATE", second_state["triggers"])
+        self.assertEqual(second_state["host_turn_handoff"]["state"], "reentry_confirmed")
+
+    def test_requested_delegated_or_deferred_reentry_cannot_end_host_turn(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": ["SERVER-GATE"],
+            "candidate_revisions": [],
+        }
+        for proof in (
+            {"state": "requested", "result": "CONFIRMED", "controller_id": "controller-1",
+             "execution_target_session_id": "desktop-current"},
+            {"state": "delegated", "delivery_state": "supervisor_started",
+             "controller_id": "controller-1", "execution_target_session_id": "desktop-current"},
+            {"state": "RESUME_DEFERRED_ACTIVE_WRITER", "result": "DEFERRED",
+             "delivery_state": "supervisor_already_managing_or_deferred",
+             "controller_id": "controller-1", "execution_target_session_id": "desktop-current"},
+        ):
+            with self.subTest(proof=proof["state"]):
+                first_output, first_state = lifecycle_hook.evaluate_event(
+                    {
+                        "hook_event_name": "Stop",
+                        "session_id": "controller-1",
+                        "controller_session_id": "controller-1",
+                        "source_session_id": "desktop-current",
+                        "turn_id": "turn-9",
+                    },
+                    snapshot=snapshot,
+                    prior_state={
+                        "pending_control_event": True,
+                        "triggers": ["READY:SERVER-GATE"],
+                    },
+                )
+                self.assertEqual(first_output["decision"], "block")
+                proof = {
+                    **proof,
+                    "debt_fingerprint": lifecycle_hook.continuation_debt_fingerprint(first_state),
+                }
+                first_state["desktop_reentry"] = proof
+                first_state["host_turn_handoff"] = proof
+                second_output, second_state = lifecycle_hook.evaluate_event(
+                    {
+                        "hook_event_name": "Stop",
+                        "session_id": "controller-1",
+                        "controller_session_id": "controller-1",
+                        "source_session_id": "desktop-current",
+                        "turn_id": "turn-9",
+                    },
+                    snapshot=snapshot,
+                    prior_state=first_state,
+                )
+                self.assertEqual(second_output["decision"], "block")
+                self.assertNotEqual(second_output.get("continue"), False)
+                self.assertTrue(second_state["pending_control_event"])
+
+    def test_open_parent_with_ready_or_active_child_blocks_stop(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": ["PARENT-CHILD"],
+            "runnable_ids": ["PARENT-CHILD"],
+            "candidate_revisions": [],
+            "task_states": {"PARENT": "PENDING", "PARENT-CHILD": "READY"},
+            "unfinished_child_ids": ["PARENT-CHILD"],
+            "open_parent_ids": ["PARENT"],
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "Stop", "session_id": "session-1", "turn_id": "turn-1"},
+            snapshot=snapshot,
+            prior_state={"pending_control_event": False, "triggers": []},
+        )
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("PARENT-CHILD", output["reason"])
+        self.assertTrue(state["pending_control_event"])
+        self.assertIn("OPEN_CHILD:PARENT-CHILD", state["triggers"])
+        self.assertIn("READY:PARENT-CHILD", state["triggers"])
+
+        active_snapshot = {
+            **snapshot,
+            "ready_ids": [],
+            "runnable_ids": [],
+            "task_states": {"PARENT": "ACTIVE", "PARENT-CHILD": "ACTIVE"},
+        }
+        active_output, active_state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "Stop", "session_id": "session-1", "turn_id": "turn-1"},
+            snapshot=active_snapshot,
+            prior_state={"pending_control_event": False, "triggers": []},
+        )
+        self.assertEqual(active_output["decision"], "block")
+        self.assertTrue(active_state["pending_control_event"])
+        self.assertIn("OPEN_CHILD:PARENT-CHILD", active_state["triggers"])
+        self.assertIn("ACTIVE:PARENT-CHILD", active_state["triggers"])
+
+    def test_unfinished_child_blocks_stop_even_without_ready(self) -> None:
+        snapshot = {
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "task_states": {"PARENT": "VERIFY", "PARENT-CHILD": "VERIFY"},
+            "unfinished_child_ids": ["PARENT-CHILD"],
+            "open_parent_ids": ["PARENT"],
+        }
+        output, state = lifecycle_hook.evaluate_event(
+            {"hook_event_name": "Stop", "session_id": "session-1", "turn_id": "turn-1"},
+            snapshot=snapshot,
+            prior_state={"pending_control_event": False, "triggers": []},
+        )
+        self.assertEqual(output["decision"], "block")
+        self.assertNotIn("READY:", " ".join(state["triggers"]))
+        self.assertIn("OPEN_CHILD:PARENT-CHILD", state["triggers"])
+        self.assertIn("VERIFY:PARENT-CHILD", state["triggers"])
+        self.assertTrue(state["pending_control_event"])
 
     def test_resolved_ledger_errors_do_not_remain_as_permanent_lifecycle_triggers(self) -> None:
         snapshot = {
@@ -6041,6 +6213,68 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
 """
 
         self.assertEqual(ledger_consistency_guard.validate_ledger(text), [])
+
+    def test_closed_parent_with_unfinished_child_is_ledger_error(self) -> None:
+        text = """# Ledger
+
+- 当前 Goal：`PARENT-CHILD` 完成子项
+- 下一可见检查点：`PARENT-CHILD` 验收
+- 当前阻塞：无
+- 规则版本：abc123
+
+| ID | 状态 / 负责人 | 证据 / 下一步 |
+| --- | --- | --- |
+| PARENT | `DONE` / 项目总控 | 父行已关闭 |
+| PARENT-CHILD | `READY` / 主 Agent | 子项仍可执行 |
+"""
+        errors = ledger_consistency_guard.validate_ledger(text)
+        self.assertTrue(
+            any(
+                "PARENT cannot be CLOSED/DONE while unfinished children remain" in error
+                and "PARENT-CHILD" in error
+                for error in errors
+            )
+        )
+
+    def test_project_wide_ready_outside_current_goal_remains_runnable_debt(self) -> None:
+        ledger = self._fairness_ledger([
+            ("GOAL-A", "BLOCKED", "waiting for GUI"),
+            ("P2-OTHER-END", "READY", "independent package"),
+        ])
+        # Rewrite Goal so it only names GOAL-A.
+        body = ledger.read_text(encoding="utf-8")
+        body = body.replace("- 当前 Goal：project-wide fairness", "- 当前 Goal：`GOAL-A` 当前里程碑")
+        body = body.replace("- 下一可见检查点：project-wide dispatch", "- 下一可见检查点：`GOAL-A` 下一检查点")
+        ledger.write_text(body, encoding="utf-8")
+        projection = control_event_guard.project_wide_dispatch_projection(ledger)
+        self.assertIn("P2-OTHER-END", projection["ready_ids"])
+        self.assertIn("P2-OTHER-END", projection["derived_runnable_ids"])
+        self.assertIn("READY:P2-OTHER-END", projection["continuation_debt_labels"])
+        ledger_access = load_module("ledger_access_projection", "scripts/ledger_access.py")
+        view = ledger_access.project_ledger(ledger)
+        self.assertIn("P2-OTHER-END", view["ready_ids"])
+        self.assertIn("P2-OTHER-END", view["runnable_ids"])
+        self.assertIn("READY:P2-OTHER-END", view["continuation_debt_labels"])
+
+    def test_parent_child_unfinished_projection_enters_continuation_debt(self) -> None:
+        ledger = self._fairness_ledger([
+            ("PARENT", "PENDING", "keep parent open"),
+            ("PARENT-CHILD", "ACTIVE", "child still running"),
+            ("PARENT-OTHER", "VERIFY", "child awaiting verification"),
+        ])
+        projection = control_event_guard.project_wide_dispatch_projection(ledger)
+        self.assertEqual(projection["open_parent_ids"], {"PARENT"})
+        self.assertEqual(projection["unfinished_child_ids"], {"PARENT-CHILD", "PARENT-OTHER"})
+        self.assertIn("OPEN_CHILD:PARENT-CHILD", projection["continuation_debt_labels"])
+        self.assertIn("ACTIVE:PARENT-CHILD", projection["continuation_debt_labels"])
+        self.assertIn("VERIFY:PARENT-OTHER", projection["continuation_debt_labels"])
+        self.assertNotIn("PARENT-CHILD", projection["ready_ids"])
+        actions = control_event_guard.mandatory_continuation_projection(
+            {},
+            ledger_task_states=dict(projection["task_states"]),
+        )
+        self.assertIn("open_child:PARENT-CHILD", actions)
+        self.assertEqual(actions["open_child:PARENT-CHILD"]["parent_task_id"], "PARENT")
 
     def test_ledger_consistency_assignment_exemption_requires_declared_parent(self) -> None:
         text = """# Ledger

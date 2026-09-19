@@ -107,6 +107,16 @@ def project_ledger(path: Path) -> dict[str, Any]:
         "runnable_ids": sorted(canonical["derived_runnable_ids"]),
         "runnable_exclusions": dict(canonical["runnable_exclusions"]),
         "derived_slices": dict(canonical["derived_slices"]),
+        "unfinished_work_ids": sorted(canonical["unfinished_work_ids"]),
+        "unfinished_child_ids": sorted(canonical["unfinished_child_ids"]),
+        "open_parent_ids": sorted(canonical["open_parent_ids"]),
+        "parent_of": dict(canonical["parent_of"]),
+        "children_by_parent": {
+            parent_id: list(children)
+            for parent_id, children in canonical["children_by_parent"].items()
+        },
+        "continuation_debt_ids": sorted(canonical["continuation_debt_ids"]),
+        "continuation_debt_labels": list(canonical["continuation_debt_labels"]),
     }
 
 
