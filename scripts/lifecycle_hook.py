@@ -2893,6 +2893,13 @@ def continuation_reason(
         actions.append("处理开放父行下的未完成子项；父行不得在子项未 CLOSED/DONE 时结束")
     if any(str(item).startswith(("ACTIVE:", "VERIFY:", "RECOVERING:")) for item in triggers):
         actions.append("处理仍处于 ACTIVE/VERIFY/RECOVERING 的未完成工作，不得 idle/Yield")
+    if runnable_ids or any(
+        str(item).startswith(
+            ("READY:", "RUNNABLE:", "OPEN_CHILD:", "ACTIVE:", "VERIFY:", "RECOVERING:")
+        )
+        for item in triggers
+    ):
+        actions.append(UNFINISHED_CONTINUATION_INSTRUCTION)
     actions.append("随后用 control_event_guard.py 生成通过收据")
     lifecycle = (
         "Adaptive Agent Runtime 生命周期门检测到尚未闭合的控制事件。"
@@ -2906,11 +2913,13 @@ def continuation_reason(
 OBSERVATION_STATUS_QUERY = re.compile(
     r"(?:"
     r"进度(?:怎么样|如何|情况)?|工作(?:怎么样|情况如何|情况怎么样)?|"
-    r"履职(?:情况)?(?:如何|怎么样)?|完成了吗|好了吗|卡住了吗|"
+    r"履职(?:情况)?(?:如何|怎么样)?|完成了(?:吗|什么)|好了吗|卡住了吗|"
+    r"台账.{0,20}任务|还有没有任务|"
     r"status(?:\s+update)?|progress(?:\s+update)?|how(?:'s| is) it going"
     r")",
     re.IGNORECASE,
 )
+UNFINISHED_CONTINUATION_INSTRUCTION = "未完成项仍在，继续派发/验收"
 
 
 KNOWN_NEXT_ACTION_MESSAGE = re.compile(
@@ -2961,6 +2970,47 @@ def _is_observation_status_query(event: dict[str, Any]) -> bool:
     if not prompt or len(prompt) > 160:
         return False
     return bool(OBSERVATION_STATUS_QUERY.search(prompt))
+
+
+def _unfinished_debt_labels(snapshot: dict[str, Any] | None) -> list[str]:
+    if not isinstance(snapshot, dict):
+        return []
+    return list(snapshot_continuation_debt_labels(snapshot))
+
+
+def _has_unfinished_continuation_debt(
+    snapshot: dict[str, Any] | None,
+    triggers: list[str] | set[str] | None = None,
+) -> bool:
+    if _unfinished_debt_labels(snapshot):
+        return True
+    return any(
+        str(item).startswith(
+            ("READY:", "RUNNABLE:", "OPEN_CHILD:", "ACTIVE:", "VERIFY:", "RECOVERING:")
+        )
+        for item in (triggers or [])
+    )
+
+
+def _observation_continuation_context(
+    event: dict[str, Any],
+    snapshot: dict[str, Any],
+    state: dict[str, Any],
+) -> str:
+    pending_next_action = str(state.get("next_action") or "").strip()
+    context = continuation_reason(
+        list(state.get("triggers", [])),
+        list(snapshot.get("ready_ids", [])),
+        list(snapshot.get("candidate_revisions", [])),
+        runnable_ids=list(snapshot.get("runnable_ids", snapshot.get("ready_ids", []))),
+        rule_handshake=snapshot.get("rule_handshake"),
+        root=snapshot.get("root"),
+        **_controller_action_context(event),
+        next_action=pending_next_action if pending_next_action and state.get("requires_user") is False else None,
+    )
+    if UNFINISHED_CONTINUATION_INSTRUCTION not in context:
+        context += " " + UNFINISHED_CONTINUATION_INSTRUCTION + "。"
+    return context
 
 
 def _mark_yield_rejected(
@@ -3079,6 +3129,28 @@ def evaluate_event(
     if _is_observation_status_query(event):
         state["observation_query_only"] = True
         state["observation_query_turn_id"] = _event_turn_id(event)
+        remaining_debt = _unfinished_debt_labels(snapshot)
+        triggers = {
+            str(item) for item in state.get("triggers", []) if str(item).strip()
+        } | set(remaining_debt)
+        keep_scheduling = bool(remaining_debt) or bool(state.get("pending_control_event")) or bool(triggers)
+        if keep_scheduling and _has_unfinished_continuation_debt(snapshot, triggers):
+            state["triggers"] = sorted(triggers)
+            state["pending_control_event"] = True
+            if state.get("requires_user") is not True:
+                state["requires_user"] = False
+            if not prior_pending:
+                state["wake_generation"] = prior_generation + 1
+            context = _observation_continuation_context(event, snapshot, state)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
+                }
+            }, state
+        if keep_scheduling:
+            state["triggers"] = sorted(triggers)
+            state["pending_control_event"] = True
         return {
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
@@ -3460,7 +3532,7 @@ def evaluate_event(
             )
             state.update({
                 "pending_control_event": True,
-                "triggers": [trigger],
+                "triggers": sorted({trigger} | set(_unfinished_debt_labels(snapshot))),
                 "stop_continuations": 0,
                 "pending_terminal_receipts": [],
                 "next_action": "",
@@ -3480,6 +3552,7 @@ def evaluate_event(
                 }
             }, state
         handshake_state = str(handshake.get("state", ""))
+        rule_triggers: list[str] = []
         if wake_policy == "after_event" and handshake_state in {"pending_ack", "pending_live_e2e"}:
             rule_prefix = (
                 "rule_update_pending:"
@@ -3490,28 +3563,20 @@ def evaluate_event(
                 item for item in lifecycle_triggers(snapshot, None)
                 if item.startswith(rule_prefix)
             ]
-            state.update({
-                "pending_control_event": bool(rule_triggers),
-                "triggers": rule_triggers,
-                "stop_continuations": 0,
-                "rule_wake_policy": "after_event",
-                "pending_terminal_receipts": [],
-                "next_action": "",
-                "requires_user": False,
-            })
-            if rule_triggers and not prior_pending:
-                state["wake_generation"] = prior_generation + 1
-        else:
-            state.update(
-                {
-                    "pending_control_event": False,
-                    "triggers": [],
-                    "stop_continuations": 0,
-                    "pending_terminal_receipts": [],
-                    "next_action": "",
-                    "requires_user": False,
-                }
-            )
+            state["rule_wake_policy"] = "after_event"
+        remaining_debt = _unfinished_debt_labels(snapshot)
+        triggers = sorted(set(remaining_debt) | set(rule_triggers))
+        pending = bool(triggers)
+        state.update({
+            "pending_control_event": pending,
+            "triggers": triggers,
+            "stop_continuations": 0,
+            "pending_terminal_receipts": [],
+            "next_action": "",
+            "requires_user": False,
+        })
+        if pending and not prior_pending:
+            state["wake_generation"] = prior_generation + 1
         return {}, state
 
     detected = lifecycle_triggers(snapshot, prior_state)

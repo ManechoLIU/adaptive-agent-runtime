@@ -2281,6 +2281,175 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertIn("VERIFY:PARENT-CHILD", state["triggers"])
         self.assertTrue(state["pending_control_event"])
 
+    def _verify_host01_snapshot(self) -> dict[str, object]:
+        return {
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "task_states": {"HOST-01": "VERIFY"},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+
+    def test_observation_status_query_with_verify_keeps_debt_and_forbids_idle(self) -> None:
+        snapshot = self._verify_host01_snapshot()
+        for prompt in ("完成了什么", "台账还有没有任务"):
+            with self.subTest(prompt=prompt):
+                output, state = lifecycle_hook.evaluate_event(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": "controller-1",
+                        "turn_id": "turn-status",
+                        "prompt": prompt,
+                    },
+                    snapshot=snapshot,
+                    prior_state={"pending_control_event": False, "triggers": []},
+                )
+                context = output["hookSpecificOutput"]["additionalContext"]
+                self.assertTrue(state["pending_control_event"])
+                self.assertIn("VERIFY:HOST-01", state["triggers"])
+                self.assertIn("未完成项仍在，继续派发/验收", context)
+                self.assertNotIn("continue/resume/scheduling", context)
+                self.assertNotIn("不要当成 continue", context)
+                self.assertNotIn("observation-only", context)
+
+                stop_output, stop_state = lifecycle_hook.evaluate_event(
+                    {
+                        "hook_event_name": "Stop",
+                        "session_id": "controller-1",
+                        "turn_id": "turn-status",
+                    },
+                    snapshot=snapshot,
+                    prior_state=state,
+                )
+                self.assertEqual(stop_output["decision"], "block")
+                self.assertTrue(stop_state["pending_control_event"])
+                self.assertIn("VERIFY:HOST-01", stop_state["triggers"])
+
+    def test_verify_host01_without_ready_blocks_first_and_repeated_stop(self) -> None:
+        snapshot = self._verify_host01_snapshot()
+        first_output, first_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "controller_session_id": "controller-1",
+                "source_session_id": "desktop-current",
+                "turn_id": "turn-verify",
+            },
+            snapshot=snapshot,
+            prior_state={"pending_control_event": False, "triggers": []},
+        )
+        self.assertEqual(first_output["decision"], "block")
+        self.assertNotIn("READY:", " ".join(first_state["triggers"]))
+        self.assertIn("VERIFY:HOST-01", first_state["triggers"])
+        self.assertTrue(first_state["pending_control_event"])
+
+        second_output, second_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "controller_session_id": "controller-1",
+                "source_session_id": "desktop-current",
+                "turn_id": "turn-verify",
+            },
+            snapshot=snapshot,
+            prior_state=first_state,
+        )
+        self.assertEqual(second_output["decision"], "block")
+        self.assertNotEqual(second_output.get("continue"), False)
+        self.assertTrue(second_state["pending_control_event"])
+        self.assertIn("VERIFY:HOST-01", second_state["triggers"])
+        self.assertNotIn("host_turn_handoff", second_state)
+
+        fingerprint = lifecycle_hook.continuation_debt_fingerprint(second_state)
+        second_state["desktop_reentry"] = {
+            "result": "CONFIRMED",
+            "state": "RESUME_SUCCEEDED",
+            "controller_id": "controller-1",
+            "execution_target_session_id": "desktop-current",
+            "debt_fingerprint": fingerprint,
+        }
+        third_output, third_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "controller_session_id": "controller-1",
+                "source_session_id": "desktop-current",
+                "turn_id": "turn-verify",
+            },
+            snapshot=snapshot,
+            prior_state=second_state,
+        )
+        self.assertIs(third_output.get("continue"), False)
+        self.assertNotEqual(third_output.get("decision"), "block")
+        self.assertTrue(third_state["pending_control_event"])
+        self.assertEqual(third_state["host_turn_handoff"]["state"], "reentry_confirmed")
+
+    def test_goal_rollover_or_complete_with_remaining_verify_keeps_pending_and_blocks_stop(self) -> None:
+        snapshot = self._verify_host01_snapshot()
+        receipt_event = {
+            "hook_event_name": "PostToolUse",
+            "session_id": "controller-1",
+            "turn_id": "turn-goal",
+            "tool_use_id": "guard-call",
+            "tool_input": {
+                "command": (
+                    f"{sys.executable} {SKILL_ROOT / 'scripts' / 'control_event_guard.py'} "
+                    "receipt.json --ledger TASK_LEDGER.md --repo ."
+                )
+            },
+            "tool_response": {"exit_code": 0, "output": "control-event: allowed"},
+        }
+        _, after_receipt = lifecycle_hook.evaluate_event(
+            receipt_event,
+            snapshot={**snapshot, "goal_rollover": {"status": "rolled"}},
+            prior_state={
+                "active_turn_id": "turn-goal",
+                "pending_control_event": True,
+                "triggers": ["READY:OLD-GOAL"],
+                "control_receipt_proposal": {
+                    "tool_use_id": "guard-call",
+                    "goal_rollover_status": "rolled",
+                },
+                "snapshot": snapshot,
+            },
+        )
+        self.assertTrue(after_receipt["pending_control_event"])
+        self.assertIn("VERIFY:HOST-01", after_receipt["triggers"])
+        self.assertTrue(after_receipt["must_yield"])
+
+        prompt_output, after_query = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "controller-1",
+                "turn_id": "turn-progress",
+                "prompt": "完成了什么",
+            },
+            snapshot=snapshot,
+            prior_state=after_receipt,
+        )
+        context = prompt_output["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(after_query["pending_control_event"])
+        self.assertIn("VERIFY:HOST-01", after_query["triggers"])
+        self.assertIn("未完成项仍在，继续派发/验收", context)
+        self.assertNotIn("continue/resume/scheduling", context)
+        self.assertNotIn("observation-only", context)
+
+        stop_output, stopped = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "turn_id": "turn-progress",
+            },
+            snapshot=snapshot,
+            prior_state=after_query,
+        )
+        self.assertEqual(stop_output["decision"], "block")
+        self.assertTrue(stopped["pending_control_event"])
+        self.assertIn("VERIFY:HOST-01", stopped["triggers"])
+
     def test_resolved_ledger_errors_do_not_remain_as_permanent_lifecycle_triggers(self) -> None:
         snapshot = {
             "head": "abc123",
@@ -5461,7 +5630,7 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertEqual(slices[0]["closed_dependencies"], ["WEB-BASE"])
         self.assertEqual(slices[0]["open_dependencies"], [])
 
-    def test_successful_control_receipt_closes_the_event_and_latches_yield(self) -> None:
+    def test_successful_control_receipt_latches_yield_but_keeps_remaining_runnable_debt(self) -> None:
         snapshot = {
             "head": "abc", "ledger_sha256": "ledger", "worktree_status_sha256": "status",
             "ready_ids": [], "runnable_ids": ["PENDING-RUNNABLE"], "candidate_revisions": [],
@@ -5476,10 +5645,10 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
             event, snapshot=snapshot,
             prior_state={"pending_control_event": True, "triggers": ["RUNNABLE:PENDING-RUNNABLE"], "snapshot": snapshot},
         )
-        self.assertFalse(state["pending_control_event"])
-        self.assertEqual(state["triggers"], [])
         self.assertTrue(state["must_yield"])
         self.assertEqual(state["receipt_turn_id"], "turn-1")
+        self.assertTrue(state["pending_control_event"])
+        self.assertIn("RUNNABLE:PENDING-RUNNABLE", state["triggers"])
 
     def test_web_stdout_marker_never_closes_without_private_terminal_commit(self) -> None:
         snapshot = {

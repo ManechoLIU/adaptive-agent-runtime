@@ -422,6 +422,54 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         self.assertEqual(second_state["host_turn_handoff"]["state"], "reentry_confirmed")
         self.assertEqual(second_state["host_turn_handoff"]["turn_id"], "old")
 
+    def test_verify_host01_blocks_stop_until_confirmed_desktop_reentry(self):
+        snapshot = {
+            **self.snapshot,
+            "ready_ids": [],
+            "runnable_ids": [],
+            "task_states": {"HOST-01": "VERIFY"},
+        }
+        prior = {
+            "active_turn_id": "old",
+            "must_yield": False,
+            "pending_control_event": False,
+            "triggers": [],
+            "tool_trace_overflow": False,
+            "inflight_tool_use_ids": [],
+            "snapshot": snapshot,
+        }
+        event = self.event("Stop", turn="old")
+        event["controller_session_id"] = "logical"
+        event["source_session_id"] = "desktop-current"
+        first_output, first_state = lifecycle_hook.evaluate_event(
+            event, snapshot=snapshot, prior_state=prior,
+        )
+        self.assertEqual(first_output.get("decision"), "block")
+        self.assertTrue(first_state["pending_control_event"])
+        self.assertIn("VERIFY:HOST-01", first_state["triggers"])
+
+        second_output, second_state = lifecycle_hook.evaluate_event(
+            event, snapshot=snapshot, prior_state=first_state,
+        )
+        self.assertEqual(second_output.get("decision"), "block")
+        self.assertNotEqual(second_output.get("continue"), False)
+        self.assertTrue(second_state["pending_control_event"])
+
+        second_state["desktop_reentry"] = {
+            "result": "CONFIRMED",
+            "state": "RESUME_SUCCEEDED",
+            "controller_id": "logical",
+            "execution_target_session_id": "desktop-current",
+            "debt_fingerprint": lifecycle_hook.continuation_debt_fingerprint(second_state),
+        }
+        third_output, third_state = lifecycle_hook.evaluate_event(
+            event, snapshot=snapshot, prior_state=second_state,
+        )
+        self.assertIs(third_output.get("continue"), False)
+        self.assertNotEqual(third_output.get("decision"), "block")
+        self.assertTrue(third_state["pending_control_event"])
+        self.assertEqual(third_state["host_turn_handoff"]["state"], "reentry_confirmed")
+
     def test_host_turn_handoff_arms_existing_same_controller_supervisor(self):
         state_path = self.root / "handoff-state.json"
         state = {
