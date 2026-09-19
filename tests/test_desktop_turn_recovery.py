@@ -280,6 +280,7 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
     def test_unverified_turn_stop_preserves_old_state_and_ends_loop(self):
         event = self.event("Stop")
         event.pop("transcript_path")
+        self.transcript.unlink()
         prior = {**self.prior, "tool_trace_overflow": False, "inflight_tool_use_ids": []}
         output, state = lifecycle_hook.evaluate_event(event, snapshot=self.snapshot, prior_state=prior)
         self.assertIs(output.get("continue"), False)
@@ -1322,6 +1323,7 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
                 prior = self.placeholder_prior(codex_turn)
                 if case == "missing_transcript":
                     stop.pop("transcript_path")
+                    self.transcript.unlink()
                 else:
                     self.write_transcript(session="other-session", turn=codex_turn)
                     self.append_command_completion(tool_use_id=call_id, turn=codex_turn)
@@ -1373,6 +1375,192 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
                 )
                 self.assertEqual(state["active_turn_id"], codex_turn)
 
+    def command_completion_row(
+        self,
+        *,
+        tool_use_id,
+        turn,
+        command="git status --short",
+        status="completed",
+    ):
+        return {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "turn_id": turn,
+                "item": {
+                    "type": "CommandExecution",
+                    "id": tool_use_id,
+                    "command": ["/bin/zsh", "-lc", command],
+                    "status": status,
+                    "stdout": "done",
+                    "aggregated_output": "done",
+                    "formatted_output": "done",
+                    "stderr": "",
+                    "exit_code": 0,
+                },
+            },
+        }
+
+    def write_rollout(self, path, session="source", rows=()):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = [{"type": "session_meta", "payload": {"id": session}}]
+        body.extend(rows)
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in body), encoding="utf-8"
+        )
+
+    def two_turn_rollout_rows(self, previous, current, previous_call, current_call):
+        return [
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": previous}},
+            self.command_completion_row(tool_use_id=previous_call, turn=previous),
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "turn_id": previous,
+                    "item": {"type": "FileChange", "id": "call-file-prev", "changes": []},
+                },
+            },
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": current}},
+            self.command_completion_row(
+                tool_use_id=current_call, turn=current, command="git diff"
+            ),
+        ]
+
+    def discovered_ups_event(self, **turn_kwargs):
+        event = self.event("UserPromptSubmit", **turn_kwargs)
+        event.pop("tool_use_id", None)
+        event.pop("tool_input", None)
+        event.pop("transcript_path", None)
+        if "turn" not in turn_kwargs and "turn_id" not in turn_kwargs:
+            event.pop("turn_id", None)
+        return event
+
+    def test_ups_discovers_rollout_turn_and_recovers_previous_command(self):
+        current = "01a0b9b8-254f-7400-ad0e-67fd40daf497"
+        previous = "01a0b99f-159a-7c33-b650-ba77e32d0ab8"
+        previous_call = "call-1734bf39-prev"
+        current_call = "call-current"
+        self.transcript.unlink()
+        nested = (
+            self.sessions / "2026" / "09" / "18"
+            / "rollout-2026-09-18T20-47-10-source.jsonl"
+        )
+        self.write_rollout(
+            nested,
+            rows=self.two_turn_rollout_rows(
+                previous, current, previous_call, current_call
+            ),
+        )
+        prior = self.placeholder_prior("desktop-turn:source:manual-1")
+        output, state = lifecycle_hook.evaluate_event(
+            self.discovered_ups_event(),
+            snapshot=self.snapshot,
+            prior_state=prior,
+        )
+        traced = [
+            item["tool_use_id"]
+            for item in state.get("tool_trace", [])
+            if isinstance(item, dict)
+        ]
+        self.assertEqual(state["active_turn_id"], current)
+        self.assertIn(previous_call, traced)
+        self.assertNotIn(current_call, traced)
+        self.assertNotIn("call-file-prev", traced)
+        self.assertNotEqual(output.get("continue"), False)
+
+    def test_event_turn_id_wins_over_discovered_rollout_turn(self):
+        current = "01a0b9b8-254f-7400-ad0e-67fd40daf497"
+        explicit = "01a0b99f-159a-7c33-b650-ba77e32d0ab8"
+        self.write_rollout(
+            self.transcript,
+            rows=self.two_turn_rollout_rows(
+                explicit, current, "call-1734bf39-prev", "call-current"
+            ),
+        )
+        event = self.discovered_ups_event(turn=explicit)
+        output, state = lifecycle_hook.evaluate_event(
+            event,
+            snapshot=self.snapshot,
+            prior_state=self.placeholder_prior("desktop-turn:source:manual-1"),
+        )
+        self.assertEqual(state["active_turn_id"], explicit)
+        self.assertNotEqual(state["active_turn_id"], current)
+
+    def test_missing_or_mismatched_rollout_does_not_rotate_or_recover(self):
+        current = "01a0b9b8-254f-7400-ad0e-67fd40daf497"
+        previous = "01a0b99f-159a-7c33-b650-ba77e32d0ab8"
+        previous_call = "call-1734bf39-prev"
+        prior_turn = "desktop-turn:source:manual-1"
+        rows = self.two_turn_rollout_rows(
+            previous, current, previous_call, "call-current"
+        )
+        for case in ("missing", "meta_mismatch", "path_mismatch"):
+            with self.subTest(case=case):
+                if self.transcript.exists():
+                    self.transcript.unlink()
+                event = self.discovered_ups_event()
+                if case == "missing":
+                    pass
+                elif case == "meta_mismatch":
+                    self.write_rollout(self.transcript, session="other-session", rows=rows)
+                else:
+                    self.write_rollout(self.transcript, session="other-session", rows=rows)
+                    event["transcript_path"] = str(self.transcript)
+                output, state = lifecycle_hook.evaluate_event(
+                    event,
+                    snapshot=self.snapshot,
+                    prior_state=self.placeholder_prior(prior_turn),
+                )
+                traced = [
+                    item["tool_use_id"]
+                    for item in state.get("tool_trace", [])
+                    if isinstance(item, dict)
+                ]
+                self.assertEqual(state["active_turn_id"], prior_turn)
+                self.assertNotIn(previous_call, traced)
+
+    def test_second_ups_same_current_turn_does_not_duplicate_previous_call(self):
+        current = "01a0b9b8-254f-7400-ad0e-67fd40daf497"
+        previous = "01a0b99f-159a-7c33-b650-ba77e32d0ab8"
+        previous_call = "call-1734bf39-prev"
+        self.write_rollout(
+            self.transcript,
+            rows=self.two_turn_rollout_rows(
+                previous, current, previous_call, "call-current"
+            ),
+        )
+        event = self.discovered_ups_event()
+        _first_output, first_state = lifecycle_hook.evaluate_event(
+            event,
+            snapshot=self.snapshot,
+            prior_state=self.placeholder_prior("desktop-turn:source:manual-1"),
+        )
+        self.assertEqual(first_state["active_turn_id"], current)
+        self.assertEqual(
+            [
+                item["tool_use_id"]
+                for item in first_state["tool_trace"]
+                if item["tool_use_id"] == previous_call
+            ],
+            [previous_call],
+        )
+        second_event = self.discovered_ups_event()
+        _second_output, second_state = lifecycle_hook.evaluate_event(
+            second_event,
+            snapshot=self.snapshot,
+            prior_state=first_state,
+        )
+        self.assertEqual(second_state["active_turn_id"], current)
+        self.assertEqual(
+            [
+                item["tool_use_id"]
+                for item in second_state["tool_trace"]
+                if item["tool_use_id"] == previous_call
+            ],
+            [previous_call],
+        )
 
 
 if __name__ == "__main__":

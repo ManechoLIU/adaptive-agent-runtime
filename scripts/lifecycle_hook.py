@@ -140,6 +140,155 @@ def _event_turn_id(event: dict[str, Any]) -> str:
     return str(event.get("turn_id", "")).strip()
 
 
+def _codex_sessions_root() -> Path:
+    return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
+
+
+def _path_in_codex_sessions(path: Path, sessions: Path | None = None) -> Path | None:
+    root = sessions or _codex_sessions_root()
+    try:
+        resolved = path.resolve(strict=True)
+        sessions_root = root.resolve()
+        if resolved.is_file() and resolved.is_relative_to(sessions_root):
+            return resolved
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _rollout_session_id(path: Path) -> str | None:
+    try:
+        with path.open("rb") as stream:
+            header = json.loads(stream.readline(65536))
+        if header.get("type") != "session_meta":
+            return None
+        payload = header.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        session_id = str(payload.get("id") or "").strip()
+        return session_id or None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _discover_desktop_transcript(source_id: str, sessions: Path | None = None) -> Path | None:
+    if not source_id or any(sep in source_id for sep in ("/", "\\")):
+        return None
+    root = sessions or _codex_sessions_root()
+    try:
+        sessions_root = root.resolve()
+    except OSError:
+        return None
+    if not sessions_root.is_dir():
+        return None
+    matches: list[tuple[float, Path]] = []
+    try:
+        for candidate in sessions_root.rglob(f"*{source_id}*.jsonl"):
+            path = _path_in_codex_sessions(candidate, sessions_root)
+            if path is None or source_id not in path.name:
+                continue
+            if _rollout_session_id(path) != source_id:
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            matches.append((mtime, path))
+    except OSError:
+        return None
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (item[0], str(item[1])))
+    return matches[-1][1]
+
+
+def _trusted_or_discovered_desktop_transcript(
+    event: dict[str, Any], source_id: str
+) -> Path | None:
+    if not source_id:
+        return None
+    sessions = _codex_sessions_root()
+    raw = str(event.get("transcript_path") or "").strip()
+    if raw:
+        path = _path_in_codex_sessions(Path(raw), sessions)
+        if path is None or _rollout_session_id(path) != source_id:
+            return None
+        return path
+    return _discover_desktop_transcript(source_id, sessions)
+
+
+def _iter_desktop_rollout_event_payloads(path: Path, source_id: str):
+    resolved = _path_in_codex_sessions(path)
+    if resolved is None or _rollout_session_id(resolved) != source_id:
+        return
+    try:
+        with resolved.open("rb") as stream:
+            header = json.loads(stream.readline(65536))
+            payload = header.get("payload")
+            if (
+                header.get("type") != "session_meta"
+                or not isinstance(payload, dict)
+                or str(payload.get("id") or "").strip() != source_id
+            ):
+                return
+            size = stream.seek(0, os.SEEK_END)
+            offset = max(0, size - 8 * 1024 * 1024)
+            stream.seek(offset)
+            if offset:
+                stream.readline()
+            raw = stream.read()
+    except (OSError, ValueError, TypeError, AttributeError):
+        return
+    for line in raw.splitlines():
+        try:
+            row = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if row.get("type") != "event_msg":
+            continue
+        event_payload = row.get("payload")
+        if isinstance(event_payload, dict):
+            yield event_payload
+
+
+def _desktop_in_progress_turn_id(path: Path, source_id: str) -> str | None:
+    latest = ""
+    ended = False
+    for payload in _iter_desktop_rollout_event_payloads(path, source_id):
+        kind = payload.get("type")
+        turn_id = str(payload.get("turn_id") or "").strip()
+        if kind == "task_started" and turn_id:
+            latest = turn_id
+            ended = False
+        elif kind in {"turn_aborted", "task_complete"} and turn_id and turn_id == latest:
+            ended = True
+    if latest and not ended:
+        return latest
+    return None
+
+
+def _desktop_previous_turn_id(
+    path: Path, source_id: str, current_turn_id: str
+) -> str | None:
+    if not current_turn_id:
+        return None
+    starts: list[str] = []
+    for payload in _iter_desktop_rollout_event_payloads(path, source_id):
+        if payload.get("type") != "task_started":
+            continue
+        turn_id = str(payload.get("turn_id") or "").strip()
+        if turn_id:
+            starts.append(turn_id)
+    last_index = None
+    for index, turn_id in enumerate(starts):
+        if turn_id == current_turn_id:
+            last_index = index
+    if last_index is None or last_index == 0:
+        return None
+    previous = starts[last_index - 1]
+    return previous if previous and previous != current_turn_id else None
+
+
 def _host_owned_desktop_subagent_event(event: dict[str, Any]) -> bool:
     """Keep Host-created worker turns out of the Controller turn ledger.
 
@@ -235,7 +384,7 @@ def _desktop_turn_start(event: dict[str, Any]) -> dict[str, str] | None:
 
 
 def _desktop_rollout_completed_items(
-    event: dict[str, Any], state: dict[str, Any]
+    event: dict[str, Any], state: dict[str, Any], *, closed_turn: bool = False
 ) -> list[dict[str, Any]]:
     """Return only current-turn terminal recoverable items from a trusted rollout."""
     if event.get("controller_host") != DESKTOP_SESSION_HOST:
@@ -286,7 +435,7 @@ def _desktop_rollout_completed_items(
                     # completion has appeared, another turn start is later
                     # evidence and closes this recovery window.
                     if started or completed:
-                        return []
+                        return completed if closed_turn else []
                     # Before the target boundary, an observed non-target start
                     # may be an older turn. Retain that bounded state until a
                     # target start can establish a fresh boundary.
@@ -301,6 +450,8 @@ def _desktop_rollout_completed_items(
             if payload_turn_id != turn_id:
                 continue
             if kind in {"turn_aborted", "task_complete"}:
+                if closed_turn:
+                    return completed if started else []
                 return []
             if kind != "item_completed":
                 continue
@@ -544,6 +695,26 @@ def _desktop_manual_placeholder_turn(turn_id: str) -> bool:
     if not turn_id.startswith("desktop-turn:"):
         return False
     return turn_id.rsplit(":", 1)[-1].startswith("manual-")
+
+
+def _attach_desktop_rollout_context(state: dict[str, Any], event: dict[str, Any]) -> None:
+    """Fill omitted desktop UPS/Stop transcript_path and Codex turn_id from rollout."""
+    if event.get("controller_host") != DESKTOP_SESSION_HOST:
+        return
+    if event.get("hook_event_name") not in {"UserPromptSubmit", "Stop"}:
+        return
+    source_id = str(event.get("source_session_id") or "").strip()
+    if not source_id:
+        return
+    path = _trusted_or_discovered_desktop_transcript(event, source_id)
+    if path is None:
+        return
+    event["transcript_path"] = str(path)
+    if not _desktop_event_lacks_native_turn_id(event):
+        return
+    current = _desktop_in_progress_turn_id(path, source_id)
+    if current:
+        event["turn_id"] = current
 
 
 def _bind_desktop_empty_turn_id(state: dict[str, Any], event: dict[str, Any]) -> None:
@@ -2731,6 +2902,7 @@ def _reconcile_desktop_rollout(
     recovered_event_observer: Callable[
         [dict[str, Any], dict[str, Any], dict[str, Any]], None
     ] | None = None,
+    closed_turn: bool = False,
 ) -> dict[str, Any]:
     inflight = {
         str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)
@@ -2744,7 +2916,9 @@ def _reconcile_desktop_rollout(
         return state
     records = state.get("inflight_tool_records")
     records = records if isinstance(records, dict) else {}
-    completed_items = _desktop_rollout_completed_items(event, state)
+    completed_items = _desktop_rollout_completed_items(
+        event, state, closed_turn=closed_turn
+    )
     for item in completed_items:
         tool_use_id = str(item.get("id") or "").strip()
         if tool_use_id not in inflight:
@@ -2844,6 +3018,80 @@ def _reconcile_desktop_rollout(
             if str(value)
         }
         traced_ids.add(tool_use_id)
+    return state
+
+
+_PREVIOUS_TURN_LOCAL_KEYS = (
+    "must_yield",
+    "receipt_turn_id",
+    "receipt_tool_use_id",
+    "control_receipt_inflight",
+    "control_receipt_proposal",
+    "adapter_fault",
+    "inflight_tool_use_ids",
+    "inflight_tool_records",
+    "turn_start_evidence",
+)
+
+
+def _recover_desktop_missed_previous_stop(
+    state: dict[str, Any],
+    event: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    recovered_event_observer: Callable[
+        [dict[str, Any], dict[str, Any], dict[str, Any]], None
+    ] | None = None,
+) -> dict[str, Any]:
+    """Recover the previous Codex turn's CommandExecution when UPS arrives without Stop."""
+    if event.get("controller_host") != DESKTOP_SESSION_HOST:
+        return state
+    if event.get("hook_event_name") != "UserPromptSubmit":
+        return state
+    source_id = str(event.get("source_session_id") or "").strip()
+    transcript = str(event.get("transcript_path") or "").strip()
+    current_turn = _event_turn_id(event)
+    if not source_id or not transcript or not current_turn:
+        return state
+    path = _path_in_codex_sessions(Path(transcript))
+    if path is None or _rollout_session_id(path) != source_id:
+        return state
+    previous = _desktop_previous_turn_id(path, source_id, current_turn)
+    if not previous:
+        return state
+    saved_active = str(state.get("active_turn_id") or "").strip()
+    if not saved_active:
+        return state
+    preserved: dict[str, Any] = {}
+    missing: list[str] = []
+    for key in _PREVIOUS_TURN_LOCAL_KEYS:
+        if key in state:
+            value = state[key]
+            if isinstance(value, list):
+                preserved[key] = list(value)
+            elif isinstance(value, dict):
+                preserved[key] = dict(value)
+            else:
+                preserved[key] = value
+        else:
+            missing.append(key)
+    recover_event = dict(event)
+    recover_event["hook_event_name"] = "Stop"
+    recover_event["turn_id"] = previous
+    state["active_turn_id"] = previous
+    try:
+        state = _reconcile_desktop_rollout(
+            state,
+            recover_event,
+            snapshot,
+            recovered_event_observer=recovered_event_observer,
+            closed_turn=True,
+        )
+    finally:
+        state["active_turn_id"] = saved_active
+        for key in missing:
+            state.pop(key, None)
+        state.update(preserved)
     return state
 
 
@@ -3260,6 +3508,7 @@ def evaluate_event(
                 triggers.add("target_goal_rebind:" + str(rebound.get("status") or "unknown"))
                 state["triggers"] = sorted(triggers)
     event_name = event.get("hook_event_name")
+    _attach_desktop_rollout_context(state, event)
     turn_boundary_fault = _begin_turn(state, event)
     if turn_boundary_fault:
         return {"decision": "block", "reason": turn_boundary_fault}, state
@@ -3269,6 +3518,13 @@ def evaluate_event(
         state["tool_trace"] = []
     if event_name in {"PreToolUse", "Stop"}:
         state = _reconcile_desktop_rollout(
+            state,
+            event,
+            snapshot,
+            recovered_event_observer=recovered_event_observer,
+        )
+    elif event_name == "UserPromptSubmit":
+        state = _recover_desktop_missed_previous_stop(
             state,
             event,
             snapshot,
