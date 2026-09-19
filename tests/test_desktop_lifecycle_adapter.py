@@ -2731,6 +2731,112 @@ class MachineTraceReceiptTests(unittest.TestCase):
         self.assertEqual(projection["turn_id"], "desktop-turn:01a0b48e-desktop:call-1")
         self.assertIn("call-1", projection["tool_use_ids"])
 
+    def _desktop_stale_web_snapshot(self) -> dict[str, object]:
+        return {
+            "root": "/tmp/project",
+            "head": "abc123",
+            "ledger_sha256": "ledger-1",
+            "worktree_status_sha256": "status-1",
+            "ready_ids": [],
+            "runnable_ids": [],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+
+    def _desktop_tool_event(
+        self,
+        hook_event_name: str,
+        *,
+        tool_use_id: str,
+        turn_id: object,
+        tool_response: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        event = self._desktop_empty_turn_event(
+            hook_event_name,
+            tool_use_id=tool_use_id,
+            tool_response=tool_response,
+        )
+        event["turn_id"] = turn_id
+        return event
+
+    def test_desktop_pretool_with_same_stale_web_turn_id_rotates_and_records_trace(self) -> None:
+        stale_web_turn = (
+            "web-turn:c43135219cee3a49ebf03ccfeeaa4f6a43851aa19b0f19a61f5fd030cd5ee1e9"
+        )
+        prior = {
+            "active_turn_id": stale_web_turn,
+            "controller_host": "desktop_codex",
+            "source_session_id": "01a0b48e-desktop",
+            "tool_trace": [],
+            "pending_control_event": True,
+            "triggers": ["VERIFY:HOST-01"],
+        }
+        snapshot = self._desktop_stale_web_snapshot()
+        _pre, state = lifecycle_hook.evaluate_event(
+            self._desktop_tool_event(
+                "PreToolUse",
+                tool_use_id="call-1",
+                turn_id=stale_web_turn,
+            ),
+            snapshot=snapshot,
+            prior_state=prior,
+        )
+        self.assertEqual(state["active_turn_id"], "desktop-turn:01a0b48e-desktop:call-1")
+        self.assertFalse(str(state["active_turn_id"]).startswith("web-turn:"))
+        _post, state = lifecycle_hook.evaluate_event(
+            self._desktop_tool_event(
+                "PostToolUse",
+                tool_use_id="call-1",
+                turn_id=stale_web_turn,
+                tool_response={"exit_code": 0},
+            ),
+            snapshot=snapshot,
+            prior_state=state,
+        )
+        projection = lifecycle_hook.machine_trace_projection(state)
+        self.assertEqual(projection["turn_id"], "desktop-turn:01a0b48e-desktop:call-1")
+        self.assertIn("call-1", projection["tool_use_ids"])
+
+    def test_desktop_pretool_with_other_web_turn_id_rotates_off_web_turn(self) -> None:
+        prior = {
+            "active_turn_id": (
+                "web-turn:c43135219cee3a49ebf03ccfeeaa4f6a43851aa19b0f19a61f5fd030cd5ee1e9"
+            ),
+            "controller_host": "desktop_codex",
+            "source_session_id": "01a0b48e-desktop",
+            "tool_trace": [],
+            "pending_control_event": True,
+            "triggers": ["VERIFY:HOST-01"],
+        }
+        snapshot = self._desktop_stale_web_snapshot()
+        _pre, state = lifecycle_hook.evaluate_event(
+            self._desktop_tool_event(
+                "PreToolUse",
+                tool_use_id="call-other",
+                turn_id="web-turn:other",
+            ),
+            snapshot=snapshot,
+            prior_state=prior,
+        )
+        self.assertEqual(state["active_turn_id"], "desktop-turn:01a0b48e-desktop:call-other")
+        self.assertFalse(str(state["active_turn_id"]).startswith("web-turn:"))
+        _post, state = lifecycle_hook.evaluate_event(
+            self._desktop_tool_event(
+                "PostToolUse",
+                tool_use_id="call-other",
+                turn_id="web-turn:other",
+                tool_response={"exit_code": 0},
+            ),
+            snapshot=snapshot,
+            prior_state=state,
+        )
+        projection = lifecycle_hook.machine_trace_projection(state)
+        self.assertEqual(projection["turn_id"], "desktop-turn:01a0b48e-desktop:call-other")
+        self.assertIn("call-other", projection["tool_use_ids"])
+        self.assertFalse(str(state["active_turn_id"]).startswith("web-turn:"))
+
     def test_desktop_second_pretool_without_turn_id_appends_same_turn_trace(self) -> None:
         snapshot = {
             "root": "/tmp/project",

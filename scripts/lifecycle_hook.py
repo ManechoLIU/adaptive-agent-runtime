@@ -534,9 +534,16 @@ def _synthesize_desktop_turn_id(event: dict[str, Any], state: dict[str, Any]) ->
     return f"desktop-turn:{source}:{suffix}"
 
 
+def _desktop_event_lacks_native_turn_id(event: dict[str, Any]) -> bool:
+    turn_id = _event_turn_id(event)
+    return (not turn_id) or turn_id == "None" or turn_id.startswith("web-turn:")
+
+
 def _bind_desktop_empty_turn_id(state: dict[str, Any], event: dict[str, Any]) -> None:
-    """Desktop hooks often omit turn_id; bind a stable id so later checks see it."""
-    if _event_turn_id(event) or event.get("controller_host") != DESKTOP_SESSION_HOST:
+    """Desktop hooks often omit turn_id or still carry a stale web-turn id; bind a stable id."""
+    if event.get("controller_host") != DESKTOP_SESSION_HOST:
+        return
+    if not _desktop_event_lacks_native_turn_id(event):
         return
     current = str(state.get("active_turn_id") or "").strip()
     if current.startswith("desktop-turn:"):
@@ -601,6 +608,14 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
             }
             return "Web turn boundary rejected: " + lease_error
     current_turn_id = str(state.get("active_turn_id", ""))
+    if (
+        current_turn_id == turn_id
+        and event.get("controller_host") == DESKTOP_SESSION_HOST
+        and str(current_turn_id).startswith("web-turn:")
+    ):
+        # Desktop events that still carry the stale web-turn id are a new physical turn.
+        turn_id = _synthesize_desktop_turn_id(event, state)
+        event["turn_id"] = turn_id
     if current_turn_id == turn_id:
         if web_turn is not None:
             state["turn_start_evidence"] = dict(web_turn)
@@ -642,7 +657,7 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
         event.get("controller_host") == DESKTOP_SESSION_HOST
         and str(current_turn_id).startswith("web-turn:")
         and bool(turn_id)
-        and turn_id != current_turn_id
+        and not str(turn_id).startswith("web-turn:")
     )
     if current_turn_id and event.get("hook_event_name") not in {"SessionStart", "UserPromptSubmit"}:
         if stale_web_on_desktop:
@@ -695,7 +710,7 @@ def _turn_fault(state: dict[str, Any], event: dict[str, Any]) -> str | None:
     same_desktop_turn = (
         event.get("controller_host") == DESKTOP_SESSION_HOST
         and current.startswith("desktop-turn:")
-        and not incoming
+        and _desktop_event_lacks_native_turn_id(event)
     )
     if current and incoming != current and not same_desktop_turn:
         return "unverified_turn_boundary"
