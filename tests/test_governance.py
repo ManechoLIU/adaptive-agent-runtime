@@ -2478,6 +2478,71 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
         self.assertIn("禁止强迫续跑", context)
         self.assertNotIn("未完成项仍在，继续派发/验收", context)
 
+    def test_user_halt_survives_unrelated_question_and_allows_stop(self) -> None:
+        snapshot = self._control_loop_snapshot()
+        _, halted = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "controller-1",
+                "controller_host": "desktop_codex",
+                "source_session_id": "desktop-current",
+                "turn_id": "turn-halt-feishu-1",
+                "prompt": "停手不许干了",
+            },
+            snapshot=snapshot,
+            prior_state={"pending_control_event": True, "triggers": ["READY:READY-1", "YIELD_GATE_REJECTED"]},
+        )
+        output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "controller-1",
+                "controller_host": "desktop_codex",
+                "source_session_id": "desktop-current",
+                "turn_id": "turn-halt-feishu-2",
+                "prompt": "你能看到接入的飞书工具吗",
+            },
+            snapshot=snapshot,
+            prior_state=halted,
+        )
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(state["user_halt"])
+        self.assertTrue(state["requires_user"])
+        self.assertIn("禁止强迫续跑", context)
+        self.assertNotIn("未完成项仍在，继续派发/验收", context)
+
+        allowed, allowed_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "controller-1",
+                "turn_id": "turn-halt-feishu-2",
+                "tool_name": "mcp__lark_cli__whoami",
+                "tool_input": {},
+            },
+            snapshot=snapshot,
+            prior_state=state,
+        )
+        self.assertNotEqual(
+            allowed.get("hookSpecificOutput", {}).get("permissionDecision"),
+            "deny",
+        )
+        self.assertTrue(allowed_state["user_halt"])
+
+        stop_output, stop_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "controller_host": "desktop_codex",
+                "source_session_id": "desktop-current",
+                "turn_id": "turn-halt-feishu-2",
+            },
+            snapshot=snapshot,
+            prior_state=allowed_state,
+        )
+        self.assertNotEqual(stop_output.get("decision"), "block")
+        self.assertTrue(stop_state["user_halt"])
+        self.assertTrue(stop_state["requires_user"])
+        self.assertIn("USER_HALT", stop_state["triggers"])
+
     def test_user_resume_clears_halt_and_stop_blocks_again(self) -> None:
         snapshot = self._control_loop_snapshot()
         _, halted = lifecycle_hook.evaluate_event(

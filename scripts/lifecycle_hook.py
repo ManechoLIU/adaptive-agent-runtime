@@ -3515,6 +3515,22 @@ def _user_halt_output(event_name: str) -> dict[str, Any]:
     }
 
 
+def _user_halt_forbids_tool(event: dict[str, Any]) -> bool:
+    """Block control-loop mutations while still allowing ordinary Q&A tools."""
+    if _create_goal_request(event) or _goal_complete_request(event) or _goal_block_request(event):
+        return True
+    tool_name = _tool_kind_name(event)
+    if "spawn_agent" in tool_name:
+        return True
+    tool_input = event.get("tool_input")
+    command = str(tool_input.get("command", "")) if isinstance(tool_input, dict) else ""
+    if "control_event_guard.py" in command:
+        return True
+    if command and _is_control_guard_command(command, cwd=event.get("cwd")):
+        return True
+    return False
+
+
 def _unfinished_debt_labels(snapshot: dict[str, Any] | None) -> list[str]:
     if not isinstance(snapshot, dict):
         return []
@@ -3683,11 +3699,12 @@ def evaluate_event(
             _latch_user_halt(state, event)
             return _user_halt_output("UserPromptSubmit"), state
         if _user_halt_active(state):
-            if _is_user_resume_command(event) or not _is_observation_status_query(event):
+            if _is_user_resume_command(event):
                 _clear_user_halt(state)
             else:
-                state["observation_query_only"] = True
-                state["observation_query_turn_id"] = _event_turn_id(event)
+                if _is_observation_status_query(event):
+                    state["observation_query_only"] = True
+                    state["observation_query_turn_id"] = _event_turn_id(event)
                 return _user_halt_output("UserPromptSubmit"), state
         pending_rollover = _session_goal_rollover_pending(state)
         if pending_rollover is not None:
@@ -3704,9 +3721,11 @@ def evaluate_event(
             }, state
     if _user_halt_active(state):
         if event_name == "PreToolUse":
-            return _pre_tool_denial(
-                "用户已明确禁止当前总控工作；在明确恢复前禁止工具调用，包括补控制收据。"
-            ), state
+            if _user_halt_forbids_tool(event):
+                return _pre_tool_denial(
+                    "用户已明确禁止当前总控工作；在明确恢复前禁止补控制收据、改 Goal 或派发。"
+                ), state
+            return {}, state
         if event_name == "Stop":
             return {}, state
         if event_name == "SessionStart":
