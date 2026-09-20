@@ -2328,6 +2328,193 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 self.assertTrue(stop_state["pending_control_event"])
                 self.assertIn("VERIFY:HOST-01", stop_state["triggers"])
 
+    def _control_loop_snapshot(self) -> dict[str, object]:
+        return {
+            "head": "abc",
+            "ledger_sha256": "ledger",
+            "worktree_status_sha256": "status",
+            "ready_ids": ["READY-1"],
+            "runnable_ids": ["READY-1"],
+            "candidate_revisions": [],
+            "ledger_errors": [],
+            "assignment_liveness": {},
+            "controller_corrections": [],
+            "control_loop_required": True,
+            "task_states": {"READY-1": "READY"},
+            "rule_handshake": {"state": "current", "blocking": False},
+        }
+
+    def test_user_halt_prompt_latches_requires_user_and_does_not_inject_continuation(self) -> None:
+        snapshot = self._control_loop_snapshot()
+        output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "controller-1",
+                "turn_id": "turn-halt",
+                "prompt": "停手不许干了；我没让你干活呢",
+            },
+            snapshot=snapshot,
+            prior_state={
+                "pending_control_event": True,
+                "triggers": ["READY:READY-1", "YIELD_GATE_REJECTED"],
+                "requires_user": False,
+            },
+        )
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(state["user_halt"])
+        self.assertTrue(state["requires_user"])
+        self.assertIn("USER_HALT", state["triggers"])
+        self.assertIn("READY:READY-1", state["triggers"])
+        self.assertTrue(state["pending_control_event"])
+        self.assertIn("requires_user=true", context)
+        self.assertIn("禁止强迫续跑", context)
+        self.assertNotIn("未完成项仍在，继续派发/验收", context)
+
+    def test_user_halt_allows_stop_without_control_loop_receipt(self) -> None:
+        snapshot = self._control_loop_snapshot()
+        _, halted = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "controller-1",
+                "controller_host": "desktop_codex",
+                "source_session_id": "desktop-current",
+                "turn_id": "turn-halt-stop",
+                "prompt": "停手不许干了",
+            },
+            snapshot=snapshot,
+            prior_state={"pending_control_event": True, "triggers": ["READY:READY-1"], "must_yield": False},
+        )
+        stop_output, stop_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "controller_host": "desktop_codex",
+                "source_session_id": "desktop-current",
+                "turn_id": "turn-halt-stop",
+                "last_assistant_message": "停了。下一步派发 Reviewer。",
+            },
+            snapshot=snapshot,
+            prior_state=halted,
+        )
+        self.assertNotEqual(stop_output.get("decision"), "block")
+        self.assertTrue(stop_state["user_halt"])
+        self.assertTrue(stop_state["requires_user"])
+        self.assertTrue(stop_state["pending_control_event"])
+        self.assertIn("USER_HALT", stop_state["triggers"])
+        self.assertIn("READY:READY-1", stop_state["triggers"])
+
+        second_output, second_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "controller_host": "desktop_codex",
+                "source_session_id": "desktop-current",
+                "turn_id": "turn-halt-stop",
+            },
+            snapshot=snapshot,
+            prior_state=stop_state,
+        )
+        self.assertNotEqual(second_output.get("decision"), "block")
+        self.assertTrue(second_state["user_halt"])
+        self.assertTrue(second_state["requires_user"])
+
+    def test_user_halt_denies_pretool_including_control_receipt(self) -> None:
+        snapshot = self._control_loop_snapshot()
+        _, halted = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "controller-1",
+                "turn_id": "turn-halt-tool",
+                "prompt": "暂时不要工作",
+            },
+            snapshot=snapshot,
+            prior_state={"pending_control_event": True, "triggers": ["READY:READY-1"]},
+        )
+        denied, denied_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "controller-1",
+                "turn_id": "turn-halt-tool",
+                "tool_name": "Bash",
+                "tool_input": {"command": "python3 control_event_guard.py --ledger TASK_LEDGER.md"},
+            },
+            snapshot=snapshot,
+            prior_state=halted,
+        )
+        self.assertEqual(
+            denied["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+        self.assertIn("禁止当前总控工作", denied["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertTrue(denied_state["user_halt"])
+        self.assertTrue(denied_state["requires_user"])
+
+    def test_user_halt_status_query_stays_halted_without_continuation(self) -> None:
+        snapshot = self._verify_host01_snapshot()
+        _, halted = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "controller-1",
+                "turn_id": "turn-halt-status-1",
+                "prompt": "就是让你看下项目，不要动手",
+            },
+            snapshot=snapshot,
+            prior_state={"pending_control_event": True, "triggers": ["VERIFY:HOST-01"]},
+        )
+        output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "controller-1",
+                "turn_id": "turn-halt-status-2",
+                "prompt": "完成了什么",
+            },
+            snapshot=snapshot,
+            prior_state=halted,
+        )
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(state["user_halt"])
+        self.assertTrue(state["requires_user"])
+        self.assertTrue(state.get("observation_query_only"))
+        self.assertIn("禁止强迫续跑", context)
+        self.assertNotIn("未完成项仍在，继续派发/验收", context)
+
+    def test_user_resume_clears_halt_and_stop_blocks_again(self) -> None:
+        snapshot = self._control_loop_snapshot()
+        _, halted = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "controller-1",
+                "turn_id": "turn-halt-resume-1",
+                "prompt": "stop working",
+            },
+            snapshot=snapshot,
+            prior_state={"pending_control_event": True, "triggers": ["READY:READY-1"]},
+        )
+        _, resumed = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "controller-1",
+                "turn_id": "turn-halt-resume-2",
+                "prompt": "继续干活",
+            },
+            snapshot=snapshot,
+            prior_state=halted,
+        )
+        self.assertFalse(resumed.get("user_halt"))
+        self.assertFalse(resumed.get("requires_user"))
+        self.assertNotIn("USER_HALT", resumed.get("triggers", []))
+        stop_output, stop_state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "controller-1",
+                "turn_id": "turn-halt-resume-2",
+            },
+            snapshot=snapshot,
+            prior_state=resumed,
+        )
+        self.assertEqual(stop_output.get("decision"), "block")
+        self.assertFalse(stop_state.get("user_halt"))
+
     def test_verify_host01_without_ready_blocks_first_and_repeated_stop(self) -> None:
         snapshot = self._verify_host01_snapshot()
         first_output, first_state = lifecycle_hook.evaluate_event(

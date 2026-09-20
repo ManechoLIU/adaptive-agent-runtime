@@ -3384,6 +3384,30 @@ OBSERVATION_STATUS_QUERY = re.compile(
     r")",
     re.IGNORECASE,
 )
+USER_HALT_COMMAND = re.compile(
+    r"(?:"
+    r"停手|不许干了|先别干|不要(?:再)?干活|别再(?:继续|干|做|改)|"
+    r"不要再(?:干|做|改|继续)|停止工作|暂停工作|先停(?:下|手|着)?|"
+    r"暂时不要(?:工作|干)|不要(?:再)?强迫|不要动手|别动手|"
+    r"没让你(?:干活|动手|做)|只是让你看|就是让你看|"
+    r"don't(?:\s+you)?\s+(?:work|continue)|do not(?:\s+work|\s+continue)|"
+    r"stop working|stop now|halt work|stand down|"
+    r"pause now|pause(?:\s+this)?\s+(?:goal|work)"
+    r")",
+    re.IGNORECASE,
+)
+USER_RESUME_COMMAND = re.compile(
+    r"(?:"
+    r"继续干|继续工作|继续推进|继续开发|恢复工作|可以干活了|开始干活|"
+    r"resume(?:\s+work)?|continue(?:\s+working)?"
+    r")",
+    re.IGNORECASE,
+)
+USER_HALT_INSTRUCTION = (
+    "用户已明确禁止当前总控工作。已写入 requires_user=true / user_halt=true。"
+    "不要派发、不要补 control-loop 收据、不要改项目或台账。"
+    "Continuation Debt 保留，但在用户明确恢复前禁止强迫续跑。"
+)
 UNFINISHED_CONTINUATION_INSTRUCTION = "未完成项仍在，继续派发/验收"
 
 
@@ -3437,6 +3461,60 @@ def _is_observation_status_query(event: dict[str, Any]) -> bool:
     return bool(OBSERVATION_STATUS_QUERY.search(prompt))
 
 
+def _event_user_prompt(event: dict[str, Any]) -> str:
+    return str(event.get("prompt", "")).strip()
+
+
+def _is_user_halt_command(event: dict[str, Any]) -> bool:
+    if event.get("hook_event_name") != "UserPromptSubmit":
+        return False
+    prompt = _event_user_prompt(event)
+    return bool(prompt) and bool(USER_HALT_COMMAND.search(prompt))
+
+
+def _is_user_resume_command(event: dict[str, Any]) -> bool:
+    if event.get("hook_event_name") != "UserPromptSubmit":
+        return False
+    prompt = _event_user_prompt(event)
+    return bool(prompt) and bool(USER_RESUME_COMMAND.search(prompt))
+
+
+def _user_halt_active(state: dict[str, Any]) -> bool:
+    return state.get("user_halt") is True and state.get("requires_user") is True
+
+
+def _latch_user_halt(state: dict[str, Any], event: dict[str, Any]) -> None:
+    """Persist an explicit user halt without clearing Continuation Debt."""
+    state["user_halt"] = True
+    state["requires_user"] = True
+    turn_id = _event_turn_id(event)
+    if turn_id:
+        state["user_halt_turn_id"] = turn_id
+    state["user_halt_reason"] = "explicit_user_halt"
+    triggers = {str(item) for item in state.get("triggers", []) if str(item).strip()}
+    triggers.add("USER_HALT")
+    triggers.discard("next_action_pending")
+    state["triggers"] = sorted(triggers)
+
+
+def _clear_user_halt(state: dict[str, Any]) -> None:
+    state["user_halt"] = False
+    state["requires_user"] = False
+    state.pop("user_halt_reason", None)
+    triggers = {str(item) for item in state.get("triggers", []) if str(item).strip()}
+    triggers.discard("USER_HALT")
+    state["triggers"] = sorted(triggers)
+
+
+def _user_halt_output(event_name: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": USER_HALT_INSTRUCTION,
+        }
+    }
+
+
 def _unfinished_debt_labels(snapshot: dict[str, Any] | None) -> list[str]:
     if not isinstance(snapshot, dict):
         return []
@@ -3483,7 +3561,9 @@ def _mark_yield_rejected(
 ) -> None:
     """Persist a rejected logical Yield so detached continuation cannot lose the edge."""
     state["pending_control_event"] = True
-    if state.get("requires_user") is not True:
+    if state.get("user_halt") is True:
+        state["requires_user"] = True
+    elif state.get("requires_user") is not True:
         state["requires_user"] = False
     triggers = {
         str(item) for item in state.get("triggers", []) if str(item).strip()
@@ -3599,6 +3679,16 @@ def evaluate_event(
             snapshot,
             recovered_event_observer=recovered_event_observer,
         )
+        if _is_user_halt_command(event):
+            _latch_user_halt(state, event)
+            return _user_halt_output("UserPromptSubmit"), state
+        if _user_halt_active(state):
+            if _is_user_resume_command(event) or not _is_observation_status_query(event):
+                _clear_user_halt(state)
+            else:
+                state["observation_query_only"] = True
+                state["observation_query_turn_id"] = _event_turn_id(event)
+                return _user_halt_output("UserPromptSubmit"), state
         pending_rollover = _session_goal_rollover_pending(state)
         if pending_rollover is not None:
             objective = str(pending_rollover.get("objective") or "").strip()
@@ -3612,6 +3702,17 @@ def evaluate_event(
                     ),
                 }
             }, state
+    if _user_halt_active(state):
+        if event_name == "PreToolUse":
+            return _pre_tool_denial(
+                "用户已明确禁止当前总控工作；在明确恢复前禁止工具调用，包括补控制收据。"
+            ), state
+        if event_name == "Stop":
+            return {}, state
+        if event_name == "SessionStart":
+            return _user_halt_output("SessionStart"), state
+        if event_name in {"PostToolUse", "SubagentStop"}:
+            return {}, state
     if _is_observation_status_query(event):
         state["observation_query_only"] = True
         state["observation_query_turn_id"] = _event_turn_id(event)
@@ -3623,7 +3724,9 @@ def evaluate_event(
         if keep_scheduling and _has_unfinished_continuation_debt(snapshot, triggers):
             state["triggers"] = sorted(triggers)
             state["pending_control_event"] = True
-            if state.get("requires_user") is not True:
+            if state.get("user_halt") is True:
+                state["requires_user"] = True
+            elif state.get("requires_user") is not True:
                 state["requires_user"] = False
             if not prior_pending:
                 state["wake_generation"] = prior_generation + 1
@@ -4042,13 +4145,14 @@ def evaluate_event(
             trigger = "goal_display_sync:" + str(
                 activated_display_sync.get("receipt_id", "pending")
             )
+            receipt_requires_user = True if state.get("user_halt") is True else False
             state.update({
                 "pending_control_event": True,
                 "triggers": sorted({trigger} | set(_unfinished_debt_labels(snapshot))),
                 "stop_continuations": 0,
                 "pending_terminal_receipts": [],
                 "next_action": "",
-                "requires_user": False,
+                "requires_user": receipt_requires_user,
             })
             return {
                 "hookSpecificOutput": {
@@ -4079,13 +4183,16 @@ def evaluate_event(
         remaining_debt = _unfinished_debt_labels(snapshot)
         triggers = sorted(set(remaining_debt) | set(rule_triggers))
         pending = bool(triggers)
+        receipt_requires_user = True if state.get("user_halt") is True else False
+        if receipt_requires_user and "USER_HALT" not in triggers:
+            triggers = sorted(set(triggers) | {"USER_HALT"})
         state.update({
             "pending_control_event": pending,
             "triggers": triggers,
             "stop_continuations": 0,
             "pending_terminal_receipts": [],
             "next_action": "",
-            "requires_user": False,
+            "requires_user": receipt_requires_user,
         })
         if pending and not prior_pending:
             state["wake_generation"] = prior_generation + 1
