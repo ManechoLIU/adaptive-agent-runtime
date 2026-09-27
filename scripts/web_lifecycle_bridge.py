@@ -92,6 +92,13 @@ def _peer_host_error_is_transient(value: Any) -> bool:
     return bool(text) and any(marker in text for marker in _PEER_HOST_TRANSIENT_ERROR_MARKERS)
 
 
+def _peer_host_error_is_exact_target_unavailable(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if not text or "exact chatgpt conversation target is ambiguous" in text:
+        return False
+    return "exact chatgpt conversation target is unavailable" in text
+
+
 DEFAULT_MANUAL_WEB_LEASE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_WEB_SUCCESSOR_AUTH_TTL_SECONDS = 5 * 60
 MAX_WEB_SUCCESSOR_AUTH_TTL_SECONDS = 15 * 60
@@ -823,10 +830,25 @@ def unbind_web_session(
             if isinstance(prior, dict):
                 status, current, _ = target_guard.validate_target_record(prior, host="web")
                 if status == "active" and _is_strong_web_target_record(prior):
-                    raise PermissionError(
-                        "manual Web session unbind cannot modify a Host-attested current target; "
-                        "use canonical Host-attested session recovery"
-                    )
+                    verifier = _registered_peer_attestation_verifier("web")
+                    unavailable = False
+                    if callable(verifier):
+                        try:
+                            verifier(
+                                phase="identity_evidence",
+                                controller_id=controller_id,
+                                host="web",
+                                expected_target_session_id=current,
+                                expected_target_generation=generation,
+                                expected_ownership_generation=ownership_generation,
+                            )
+                        except Exception as exc:
+                            unavailable = _peer_host_error_is_exact_target_unavailable(exc)
+                    if not unavailable:
+                        raise PermissionError(
+                            "manual Web session unbind cannot modify a Host-attested current target; "
+                            "use canonical Host-attested session recovery"
+                        )
                 if status != "active":
                     current = None
                 provenance = str(prior.get("provenance") or provenance)

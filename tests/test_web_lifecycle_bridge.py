@@ -2845,6 +2845,7 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             )
 
     def test_manual_web_mutations_cannot_downgrade_host_attested_current_target(self) -> None:
+        from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"; repo.mkdir()
@@ -2901,16 +2902,143 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(json.loads(registry.read_text()), original_registry)
             self.assertEqual(json.loads(lease.read_text()), original_lease)
 
-            unbind = self.run_bridge(
-                "unbind-web-session", "--repo", str(repo),
-                "--controller-id", "controller-1", "--web-session-id", "web-strong",
-                "--expected-generation", "4", "--expected-ownership-generation", "4",
-                "--registry", str(registry),
-            )
-            self.assertEqual(unbind.returncode, 78)
-            self.assertIn("Host-attested current target", unbind.stderr)
+            def live_verifier(**_kwargs):
+                return {"identity_attested": True}
+
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=live_verifier):
+                with self.assertRaises(PermissionError) as raised:
+                    web_bridge.unbind_web_session(
+                        repo=repo,
+                        controller_id="controller-1",
+                        web_session_id="web-strong",
+                        expected_generation=4,
+                        expected_ownership_generation=4,
+                        registry_path=registry,
+                    )
+            self.assertIn("Host-attested current target", str(raised.exception))
             self.assertEqual(json.loads(registry.read_text()), original_registry)
             self.assertEqual(json.loads(lease.read_text()), original_lease)
+
+    def _host_attested_unbind_registry(self, root: Path, *, session_id: str = "web-strong") -> tuple[Path, Path]:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        registry = root / "controllers.json"
+        registry.write_text(json.dumps({
+            "controller-1": str(repo),
+            "__controller_sessions__": {"controller-1": {"web": [session_id]}},
+            "__controller_targets__": {"controller-1": {"web": {
+                "status": "active",
+                "session_id": session_id,
+                "generation": 4,
+                "provenance": "host_attested_same_controller_recovery",
+                "binding_mode": "resume_only",
+                "identity_proof": "host_attested_origin",
+            }}},
+            "__controller_execution_ownership__": {"controller-1": {
+                "active_host": "web",
+                "execution_target_session_id": session_id,
+                "generation": 4,
+                "provenance": "web_entry",
+            }},
+        }), encoding="utf-8")
+        return repo, registry
+
+    def test_unbind_web_session_tombstones_host_attested_current_when_exact_target_unavailable(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self._host_attested_unbind_registry(Path(tmp))
+            calls: list[dict] = []
+
+            def verifier(**kwargs):
+                calls.append(kwargs)
+                raise web_bridge.PeerHostTransientUnavailable(
+                    "registered Host verifier temporarily unavailable: "
+                    "exact ChatGPT conversation target is unavailable"
+                )
+
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier):
+                result = web_bridge.unbind_web_session(
+                    repo=repo,
+                    controller_id="controller-1",
+                    web_session_id="web-strong",
+                    expected_generation=4,
+                    expected_ownership_generation=4,
+                    registry_path=registry,
+                )
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["phase"], "identity_evidence")
+            self.assertEqual(calls[0]["host"], "web")
+            self.assertEqual(calls[0]["expected_target_session_id"], "web-strong")
+            self.assertEqual(calls[0]["expected_target_generation"], 4)
+            self.assertEqual(calls[0]["expected_ownership_generation"], 4)
+            self.assertEqual(result["status"], "unbound")
+            self.assertIsNone(result["session_id"])
+            self.assertEqual(result["generation"], 5)
+            self.assertFalse(result["host_attested"])
+            self.assertFalse(result["idempotent"])
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(
+                saved["__controller_targets__"]["controller-1"]["web"],
+                {
+                    "status": "unbound",
+                    "session_id": None,
+                    "generation": 5,
+                    "provenance": "host_attested_same_controller_recovery",
+                    "binding_mode": "resume_only",
+                    "host_attested": False,
+                },
+            )
+
+    def test_unbind_web_session_rejects_host_attested_current_when_identity_attested(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self._host_attested_unbind_registry(Path(tmp))
+            original = json.loads(registry.read_text(encoding="utf-8"))
+
+            def verifier(**kwargs):
+                self.assertEqual(kwargs.get("phase"), "identity_evidence")
+                self.assertEqual(kwargs.get("expected_target_session_id"), "web-strong")
+                return {"identity_attested": True}
+
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier):
+                with self.assertRaises(PermissionError) as raised:
+                    web_bridge.unbind_web_session(
+                        repo=repo,
+                        controller_id="controller-1",
+                        web_session_id="web-strong",
+                        expected_generation=4,
+                        expected_ownership_generation=4,
+                        registry_path=registry,
+                    )
+            self.assertIn("Host-attested current target", str(raised.exception))
+            self.assertEqual(json.loads(registry.read_text(encoding="utf-8")), original)
+
+    def test_unbind_web_session_rejects_host_attested_current_when_exact_target_ambiguous(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self._host_attested_unbind_registry(Path(tmp))
+            original = json.loads(registry.read_text(encoding="utf-8"))
+
+            def verifier(**kwargs):
+                raise web_bridge.PeerHostTransientUnavailable(
+                    "registered Host verifier temporarily unavailable: "
+                    "exact ChatGPT conversation target is ambiguous"
+                )
+
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier):
+                with self.assertRaises(PermissionError) as raised:
+                    web_bridge.unbind_web_session(
+                        repo=repo,
+                        controller_id="controller-1",
+                        web_session_id="web-strong",
+                        expected_generation=4,
+                        expected_ownership_generation=4,
+                        registry_path=registry,
+                    )
+            self.assertIn("Host-attested current target", str(raised.exception))
+            self.assertEqual(json.loads(registry.read_text(encoding="utf-8")), original)
 
     def test_replace_web_session_rejects_foreign_session_repo_mismatch_and_active_outbound_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
