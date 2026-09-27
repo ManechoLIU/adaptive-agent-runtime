@@ -3254,5 +3254,36 @@ class SessionGoalRolloverTests(unittest.TestCase):
             self.assertEqual(created.get("session_goal_rollover", {}).get("status"), "completed")
             self.assertNotIn("session_goal_rollover:pending_create_goal", created.get("triggers", []))
 
+    def test_stop_blocks_unfinished_verify_without_update_goal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(Path(tmp))
+            snapshot = self._snapshot(repo)
+            prior = {
+                "active_turn_id": "turn-1",
+                "controller_host": "desktop_codex",
+                "source_session_id": "desktop-current",
+                "pending_control_event": False,
+                "triggers": [],
+                "must_yield": False,
+            }
+            stop_out, stopped = lifecycle_hook.evaluate_event(
+                {
+                    "hook_event_name": "Stop",
+                    "controller_host": "desktop_codex",
+                    "source_session_id": "desktop-current",
+                    "session_id": "controller-1",
+                    "turn_id": "turn-1",
+                    "last_assistant_message": "LAB-HOST-01 仍在 VERIFY，本回合先汇报结束。",
+                },
+                snapshot=snapshot,
+                prior_state=prior,
+            )
+            self.assertEqual(stop_out.get("decision"), "block")
+            reason = str(stop_out.get("reason") or "")
+            self.assertIn("LAB-HOST-01", reason)
+            self.assertIn("禁止 idle", reason)
+            self.assertTrue(stopped.get("pending_control_event"))
+            self.assertIn("VERIFY:LAB-HOST-01", stopped.get("triggers", []))
+
 if __name__ == "__main__":
     unittest.main()

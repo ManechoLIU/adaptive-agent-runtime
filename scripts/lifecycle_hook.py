@@ -3551,6 +3551,66 @@ def _has_unfinished_continuation_debt(
     )
 
 
+UNFINISHED_IDLE_STATES = {"READY", "ACTIVE", "VERIFY", "RECOVERING"}
+UNFINISHED_IDLE_PREFIXES = ("READY:", "ACTIVE:", "VERIFY:", "RECOVERING:")
+
+
+def _unfinished_idle_labels(
+    snapshot: dict[str, Any] | None,
+    triggers: list[str] | set[str] | None = None,
+) -> list[str]:
+    """READY/ACTIVE/VERIFY/RECOVERING debt that forbids on-duty Desktop idle."""
+    labels: list[str] = []
+    seen: set[str] = set()
+
+    def add(label: str) -> None:
+        text = str(label).strip()
+        if text and text not in seen:
+            seen.add(text)
+            labels.append(text)
+
+    if isinstance(snapshot, dict):
+        task_states = snapshot.get("task_states")
+        if isinstance(task_states, dict):
+            for task_id, status in task_states.items():
+                ident = str(task_id).strip()
+                state_name = str(status).strip().upper()
+                if ident and state_name in UNFINISHED_IDLE_STATES:
+                    add(f"{state_name}:{ident}")
+        for task_id in snapshot.get("ready_ids") or []:
+            ident = str(task_id).strip()
+            if ident:
+                add(f"READY:{ident}")
+        for task_id in snapshot.get("runnable_ids") or []:
+            ident = str(task_id).strip()
+            if ident:
+                add(f"RUNNABLE:{ident}")
+    for item in triggers or []:
+        text = str(item).strip()
+        if text.startswith(UNFINISHED_IDLE_PREFIXES):
+            add(text)
+    return labels
+
+
+def _on_duty_unfinished_idle_reason(
+    event: dict[str, Any],
+    state: dict[str, Any],
+    snapshot: dict[str, Any] | None,
+    *,
+    triggers: list[str] | set[str] | None = None,
+) -> str | None:
+    if event.get("hook_event_name") != "Stop":
+        return None
+    if not _desktop_on_duty_source(event, state):
+        return None
+    if _user_halt_active(state):
+        return None
+    labels = _unfinished_idle_labels(snapshot, triggers)
+    if not labels:
+        return None
+    return "台账仍有未完成项：" + ", ".join(labels) + "。禁止 idle。"
+
+
 def _observation_continuation_context(
     event: dict[str, Any],
     snapshot: dict[str, Any],
@@ -4218,7 +4278,8 @@ def evaluate_event(
         return {}, state
 
     detected = lifecycle_triggers(snapshot, prior_state)
-    prior_triggers = {str(item) for item in state.get("triggers", [])}
+    incoming_triggers = {str(item) for item in state.get("triggers", [])}
+    prior_triggers = set(incoming_triggers)
     transient_prefixes = (
         "rule_update_pending:", "rule_ledger_stale:", "rule_live_e2e_pending:",
         "rule_install_integrity_error:",
@@ -4318,6 +4379,19 @@ def evaluate_event(
         )
         state["pending_control_event"] = True
         return _pending_stop_output(state, event, reason=reason), state
+    idle_reason = _on_duty_unfinished_idle_reason(
+        event,
+        state,
+        snapshot,
+        triggers=incoming_triggers | set(triggers),
+    )
+    if idle_reason:
+        idle_labels = _unfinished_idle_labels(
+            snapshot, incoming_triggers | set(triggers)
+        )
+        state["pending_control_event"] = True
+        state["triggers"] = sorted(set(triggers) | set(idle_labels))
+        return _pending_stop_output(state, event, reason=idle_reason), state
     if event_name == "Stop" and pending:
         reason = continuation_reason(
             triggers,
