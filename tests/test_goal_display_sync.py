@@ -559,6 +559,46 @@ class GoalDisplaySyncTests(unittest.TestCase):
         self.assertTrue(sync["last_failure"]["explicit_host_error"])
         self.assertFalse(observed["must_yield"])
 
+    def test_matching_paused_goal_stops_without_recreating_or_authorizing_work(self) -> None:
+        receipt = self.start()
+        receipt["status"] = "pending_goal_readback"
+        paused = self.complete_step(receipt, self.event("get_goal", "paused-read", {}), response={
+            "goal": {"threadId": "desktop-current", "objective": receipt["objective"], "status": "paused"}})
+        self.assertEqual(paused["status"], "degraded")
+        self.assertEqual(goal_display_sync.external_block_reason(paused), "HOST_GOAL_PAUSED")
+        state = {"goal_display_sync": paused, "pending_control_event": True, "must_yield": False}
+        stop = lifecycle_hook._pending_stop_output(state, {}, reason="pending control receipt")
+        self.assertFalse(stop["continue"])
+        self.assertTrue(state["requires_user"])
+        for tool, args in [("create_goal", {"objective": receipt["objective"]}), ("exec_command", {"cmd": "touch demo"})]:
+            _, denial = goal_display_sync.authorize_goal_display_sync_tool(paused, self.event(tool, "mutation", args))
+            self.assertIsNotNone(denial)
+        for response in [{"goal": None}, {}, {"isError": True}, {"objective": receipt["objective"]},
+                         {"goal": {"objective": receipt["objective"], "status": "active", "threadId": "foreign"}},
+                         {"goal": {"objective": "foreign", "status": "active"}}]:
+            observed = self.complete_step(paused, self.event("get_goal", "paused-probe", {}), response=response)
+            self.assertEqual(observed["status"], "degraded")
+            self.assertEqual(observed["reason"], "HOST_GOAL_PAUSED")
+            self.assertEqual(goal_display_sync.external_block_reason(observed), "HOST_GOAL_PAUSED")
+            self.assertNotIn("goal_recovery_count", observed)
+            _, denial = goal_display_sync.authorize_goal_display_sync_tool(observed,
+                self.event("create_goal", "forbidden-create", {"objective": receipt["objective"]}))
+            self.assertIsNotNone(denial)
+        restored = self.complete_step(paused, self.event("get_goal", "resumed-read", {}), response={
+            "goal": {"threadId": "desktop-current", "objective": receipt["objective"], "status": "active"}})
+        self.assertEqual(restored["status"], "pending_title_readback")
+        self.assertNotIn("goal_recovery_count", restored)
+        self.assertNotIn("reason", restored)
+
+    def test_unrelated_paused_goal_cannot_authorize_stop(self) -> None:
+        for changes in [{"threadId": "other-thread"}, {"objective": "another goal"}]:
+            receipt = self.start()
+            receipt["status"] = "pending_goal_readback"
+            response = {"goal": {"threadId": "desktop-current", "objective": receipt["objective"], "status": "paused", **changes}}
+            observed = self.complete_step(receipt, self.event("get_goal", "unrelated-pause", {}), response=response)
+            self.assertIsNone(goal_display_sync.external_block_reason(observed))
+            self.assertEqual(observed["status"], "pending_goal_readback")
+
     def persistent_absence(self) -> dict[str, object]:
         receipt = self.start()
         receipt.update({"status": "pending_goal_readback", "goal_recovery_count": 1})

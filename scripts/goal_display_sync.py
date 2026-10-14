@@ -298,7 +298,7 @@ def _expected_tool_error(receipt: dict[str, Any], event: dict[str, Any]) -> str 
     status = str(receipt.get("status", ""))
     expected_step = STEP_BY_STATUS.get(status)
     if expected_step is None:
-        if (status == "degraded" and receipt.get("reason") == "HOST_GOAL_NOT_PERSISTENT"
+        if (status == "degraded" and receipt.get("reason") in {"HOST_GOAL_NOT_PERSISTENT", "HOST_GOAL_PAUSED"}
                 and _tool_kind(event.get("tool_name")) == "get_goal"
                 and isinstance(event.get("tool_input"), dict)):
             return None
@@ -354,6 +354,11 @@ def external_block_reason(receipt: Any) -> str | None:
     }:
         return str(reason)
     failure = receipt.get("last_failure")
+    if (receipt.get("status") == "degraded" and reason == "HOST_GOAL_PAUSED"
+            and isinstance(failure, dict) and failure.get("explicit_goal_paused") is True
+            and failure.get("step") in {"existing_goal_readback", "get_goal_readback"}
+            and failure.get("tool_use_id") and failure.get("response_sha256")):
+        return str(reason)
     if (receipt.get("status") == "degraded" and reason == "HOST_GOAL_NOT_PERSISTENT"
             and receipt.get("goal_recovery_count") == 1
             and any(isinstance(item, dict) and item.get("explicit_goal_absent") is True
@@ -437,7 +442,7 @@ def authorize_goal_display_sync_tool(
         return receipt, "Goal display sync already has an inflight host tool."
     step = STEP_BY_STATUS.get(str(receipt.get("status")))
     if (step is None and receipt.get("status") == "degraded"
-            and receipt.get("reason") == "HOST_GOAL_NOT_PERSISTENT"
+            and receipt.get("reason") in {"HOST_GOAL_NOT_PERSISTENT", "HOST_GOAL_PAUSED"}
             and _tool_kind(event.get("tool_name")) == "get_goal"):
         step = "get_goal_readback"
     if step is None:
@@ -474,6 +479,26 @@ def observe_goal_display_sync_result(
         response, ensure_ascii=False, sort_keys=True, default=str
     ).lower()
     step_name = str(inflight.get("step", ""))
+    if receipt.get("reason") == "HOST_GOAL_PAUSED" and step_name == "get_goal_readback":
+        explicit, goal = _explicit_goal_snapshot(response)
+        if not (success and explicit and isinstance(goal, dict) and goal.get("status") == "active"
+                and goal.get("objective") == receipt.get("objective")
+                and _goal_target_matches(goal, str(receipt.get("execution_target_session_id", "")))):
+            return next_receipt
+    if success and step_name in {"existing_goal_readback", "get_goal_readback"}:
+        explicit, goal = _explicit_goal_snapshot(response)
+        if (explicit and isinstance(goal, dict) and goal.get("status") == "paused"
+                and goal.get("objective") == next_receipt.get("objective")
+                and _goal_target_matches(goal, str(next_receipt.get("execution_target_session_id", "")))):
+            # The Host has paused this exact Goal. Preserve it and all debt;
+            # only a later real active readback can resume display sync.
+            next_receipt.update({"status": "degraded", "reason": "HOST_GOAL_PAUSED"})
+            next_receipt["last_failure"] = {
+                "step": step_name, "tool_use_id": tool_use_id,
+                "response_sha256": _json_sha256(response), "explicit_goal_paused": True,
+                "reason": "HOST_GOAL_PAUSED",
+            }
+            return next_receipt
     if success and step_name == "existing_goal_readback":
         explicit, goal = _explicit_goal_snapshot(response)
         if not explicit:
@@ -576,7 +601,7 @@ def observe_goal_display_sync_result(
     if step_name != "existing_goal_readback":
         next_receipt["status"] = NEXT_STATUS[str(step["step"])]
     next_receipt.pop("last_failure", None)
-    if receipt.get("reason") == "HOST_GOAL_NOT_PERSISTENT":
+    if receipt.get("reason") in {"HOST_GOAL_NOT_PERSISTENT", "HOST_GOAL_PAUSED"}:
         next_receipt.pop("reason", None)
     if next_receipt["status"] == "completed":
         next_receipt["completed_turn_id"] = str(event.get("turn_id", "")).strip()
