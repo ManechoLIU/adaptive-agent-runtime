@@ -231,7 +231,7 @@ class WebAgentMachineEventSourceTests(unittest.TestCase):
         self.assertEqual(len(host.calls), 1)
         self.assertEqual(host.calls[0]["receipt"]["event_paths"], ["/tmp/local-diagnostic.jsonl"])
 
-    def test_host_reject_and_stale_fail_closed_but_idempotent_replay_stays_ready(self):
+    def test_host_reject_stale_replay_and_missing_replay_fail_closed(self):
         from scripts.web_agent_events import machine_event_source_status
 
         reject_cases = [
@@ -249,6 +249,19 @@ class WebAgentMachineEventSourceTests(unittest.TestCase):
                 "source": "chatgpt_subagent_machine_events",
                 "event_paths": [HOST_PATH],
             }, "machine_event_source_provenance_rejected"),
+            ({
+                "verified": True,
+                "fresh": True,
+                "replay": True,
+                "source": "chatgpt_subagent_machine_events",
+                "event_paths": [HOST_PATH],
+            }, "machine_event_source_provenance_rejected"),
+            ({
+                "verified": True,
+                "fresh": True,
+                "source": "chatgpt_subagent_machine_events",
+                "event_paths": [HOST_PATH],
+            }, "machine_event_source_provenance_rejected"),
         ]
         for result, reason in reject_cases:
             with self.subTest(result=result):
@@ -262,23 +275,6 @@ class WebAgentMachineEventSourceTests(unittest.TestCase):
                     status = machine_event_source_status(path=receipt, now=T0)
                 self.assertFalse(status["ready"])
                 self.assertEqual(status["reason"], reason)
-
-        host = _HostMachineEventSource({
-            "verified": True,
-            "fresh": True,
-            "replay": True,
-            "source": "chatgpt_subagent_machine_events",
-            "event_paths": [HOST_PATH],
-        })
-        with tempfile.TemporaryDirectory() as tmp, patch(
-            "scripts.web_agent_events._try_registered_web_host_verifier",
-            return_value=host,
-        ):
-            receipt = Path(tmp) / "event-source.json"
-            receipt.write_text(json.dumps(_ready_receipt([HOST_PATH])), encoding="utf-8")
-            status = machine_event_source_status(path=receipt, now=T0)
-        self.assertTrue(status["ready"])
-        self.assertEqual(status["event_paths"], [str(Path(HOST_PATH).resolve())])
 
 
 if __name__ == "__main__":

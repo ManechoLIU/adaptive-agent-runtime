@@ -199,10 +199,11 @@ def machine_event_source_status(
         return {"ready": False, "reason": "machine_event_source_verifier_failed"}
     if not isinstance(verified, dict):
         return {"ready": False, "reason": "machine_event_source_verifier_failed"}
-    # Host replay of a verified+fresh attestation is idempotent (bind re-checks paths).
+    # Readiness requires an explicit fresh, non-replayed Host attestation.
     if (
         verified.get("verified") is not True
         or verified.get("fresh") is not True
+        or verified.get("replay") is not False
         or str(verified.get("source") or "") != source
     ):
         return {"ready": False, "reason": "machine_event_source_provenance_rejected"}
