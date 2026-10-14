@@ -1150,6 +1150,15 @@ def _is_trusted_receipt_python(token: str) -> bool:
     return any(Path(candidate).is_file() and resolved == Path(candidate).resolve() for candidate in known)
 
 
+def _receipt_python_tokens(command: str) -> list[str]:
+    tokens = shlex.split(command)
+    # Only this exact interpreter option is accepted: it disables usercustomize
+    # for the process, without allowing a shell, environment wrapper or -c code.
+    if len(tokens) > 1 and tokens[1] == "-s":
+        tokens = [tokens[0], *tokens[2:]]
+    return tokens
+
+
 def _is_control_guard_command(
     command: str,
     *,
@@ -1159,7 +1168,7 @@ def _is_control_guard_command(
     if any(character in command for character in "\n\r;&|><#$`()"):
         return False
     try:
-        tokens = shlex.split(command)
+        tokens = _receipt_python_tokens(command)
     except ValueError:
         return False
     if len(tokens) < 4:
@@ -1275,7 +1284,7 @@ def _session_goal_rollover_pretool_denial(
 
 def _control_guard_proposal(command: str, *, cwd: str | Path | None) -> dict[str, Any] | None:
     try:
-        tokens = shlex.split(command)
+        tokens = _receipt_python_tokens(command)
     except ValueError:
         return None
     if len(tokens) < 3 or tokens[2].startswith("-"):
@@ -1313,6 +1322,27 @@ def _control_guard_proposal(command: str, *, cwd: str | Path | None) -> dict[str
         proposal["repo_path"] = str(repo_path)
     except (ValueError, IndexError):
         pass
+    if "--bind-runtime-trace" in tokens:
+        try:
+            controller_index = tokens.index("--controller-session")
+            try:
+                from control_event_guard import (
+                    runtime_trace_bound_snapshot, validate_runtime_trace_binding_arguments,
+                )
+            except ModuleNotFoundError:
+                from scripts.control_event_guard import (
+                    runtime_trace_bound_snapshot, validate_runtime_trace_binding_arguments,
+                )
+            validate_runtime_trace_binding_arguments(tokens[2:])
+            effective = runtime_trace_bound_snapshot(
+                snapshot,
+                repo=Path(proposal["repo_path"]),
+                controller_session=tokens[controller_index + 1],
+            )
+            proposal["runtime_machine_trace"] = effective["machine_trace"]
+            proposal["cycle_snapshot_sha256"] = _json_sha256(effective)
+        except (OSError, ValueError, KeyError, IndexError):
+            return None
     if proposal["goal_rollover_status"] != "rolled":
         return proposal
     try:
@@ -1420,6 +1450,14 @@ def _verified_rollout_control_receipt(
         or not isinstance(snapshot, dict)
     ):
         return False
+    return _control_cycle_matches_proposal(
+        proposal, snapshot, str(event.get("controller_session_id") or "").strip()
+    )
+
+
+def _control_cycle_matches_proposal(
+    proposal: dict[str, Any], snapshot: dict[str, Any], controller_id: str
+) -> bool:
     root = Path(str(snapshot.get("root") or "")).expanduser()
     proposal_root = Path(str(proposal.get("repo_path") or "")).expanduser()
     try:
@@ -1431,11 +1469,11 @@ def _verified_rollout_control_receipt(
         except ModuleNotFoundError:
             from scripts.control_event_guard import controller_cycle_evidence_path
         evidence = json.loads(
-            controller_cycle_evidence_path(root, event_id).read_text(encoding="utf-8")
+            controller_cycle_evidence_path(root, str(proposal.get("event_id") or "").strip()).read_text(encoding="utf-8")
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
-    controller_id = str(event.get("controller_session_id") or "").strip()
+    event_id = str(proposal.get("event_id") or "").strip()
     return (
         isinstance(evidence, dict)
         and evidence.get("record_kind") == "controller_cycle_evidence"
@@ -1450,6 +1488,24 @@ def _verified_rollout_control_receipt(
         and str(evidence.get("ledger_sha256") or "").strip()
         == str(snapshot.get("ledger_sha256") or "").strip()
     )
+
+
+def _verified_bound_control_proposal(
+    proposal: object, *, tool_use_id: str, controller_id: str,
+    turn_id: str, snapshot: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(proposal, dict) or not isinstance(snapshot, dict):
+        return False
+    trace = proposal.get("runtime_machine_trace")
+    if (not tool_use_id or proposal.get("tool_use_id") != tool_use_id
+            or not turn_id or not isinstance(trace, dict) or trace.get("turn_id") != turn_id):
+        return False
+    try:
+        if sha256_bytes(Path(proposal["snapshot_path"]).read_bytes()) != proposal.get("snapshot_sha256"):
+            return False
+    except (OSError, KeyError, TypeError):
+        return False
+    return _control_cycle_matches_proposal(proposal, snapshot, controller_id)
 
 
 def _archive_completed_tool_trace(
@@ -2967,6 +3023,7 @@ def _tool_response_allows_control_receipt(response: Any) -> bool:
 def successful_control_receipt(
     event: dict[str, Any], snapshot: dict[str, Any] | None = None,
     *, trusted_host_terminal_commit: dict[str, Any] | None = None,
+    control_receipt_proposal: object = None,
 ) -> bool:
     handshake = snapshot.get("rule_handshake", {}) if isinstance(snapshot, dict) else {}
     if isinstance(handshake, dict) and handshake.get("blocking") is True:
@@ -3020,6 +3077,15 @@ def successful_control_receipt(
     response = event.get("tool_response")
     if not _tool_response_allows_control_receipt(response):
         return False
+    if "--bind-runtime-trace" in shlex.split(command):
+        proposal = control_receipt_proposal
+        if proposal is None and event.get("rollout_recovery") is not None:
+            proposal = event.get("rollout_control_receipt_proposal")
+        if not _verified_bound_control_proposal(
+            proposal, tool_use_id=_tool_use_id(event), controller_id=controller_session_id,
+            turn_id=_event_turn_id(event), snapshot=snapshot,
+        ):
+            return False
     if event.get("rollout_recovery") is not None:
         return _verified_rollout_control_receipt(event, snapshot)
     return True
@@ -4095,6 +4161,9 @@ def evaluate_event(
             return _pre_tool_denial(
                 "控制收据必须串行执行；当前仍有已放行工具尚未返回。"
             ), state
+        proposal = _control_guard_proposal(command, cwd=event.get("cwd")) if is_guard else None
+        if is_guard and "--bind-runtime-trace" in shlex.split(command) and proposal is None:
+            return _pre_tool_denial("Runtime trace binding requires a verified current control proposal."), state
         if not is_guard and state.get("control_receipt_inflight"):
             return _pre_tool_denial(
                 "控制收据正在执行；在其 PostToolUse 闭合前禁止并发放行其他工具。"
@@ -4116,7 +4185,6 @@ def evaluate_event(
             state["inflight_tool_records"] = records
         if is_guard:
             state["control_receipt_inflight"] = tool_use_id or "unknown"
-            proposal = _control_guard_proposal(command, cwd=event.get("cwd"))
             if proposal is not None and tool_use_id:
                 state["control_receipt_proposal"] = {
                     **proposal,
@@ -4287,6 +4355,7 @@ def evaluate_event(
     if successful_control_receipt(
         event, snapshot,
         trusted_host_terminal_commit=trusted_host_terminal_commit,
+        control_receipt_proposal=state.get("control_receipt_proposal"),
     ):
         receipt_turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
         control_receipt_proposal = state.get("control_receipt_proposal")

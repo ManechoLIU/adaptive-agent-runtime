@@ -2337,6 +2337,54 @@ def resolve_controller_trace_session(
     return owner
 
 
+def validate_runtime_trace_binding_arguments(arguments: Sequence[str]) -> None:
+    flags = ("--ledger", "--repo", "--controller-session", "--bind-runtime-trace")
+    if not arguments or arguments[0].startswith("-") or any(
+        arguments.count(flag) != 1 for flag in flags
+    ):
+        raise ValueError("runtime trace binding requires one snapshot file and exact unique binding flags")
+    for token in arguments:
+        option = token.split("=", 1)[0]
+        if option.startswith("--") and any(flag.startswith(option) for flag in flags):
+            if option not in flags or "=" in token:
+                raise ValueError("runtime trace binding rejects abbreviated or equal-form binding flags")
+
+
+def runtime_trace_bound_snapshot(
+    snapshot: dict[str, Any], *, repo: Path, controller_session: str
+) -> dict[str, Any]:
+    """Bind only ephemeral trace facts, without rewriting the prepared snapshot.
+
+    The Desktop Hook serializes the guard against other tools. The same function
+    is used by its pre-tool proposal, so the CLOSED cycle hashes this exact view.
+    """
+    try:
+        from lifecycle_hook import load_json, state_path
+    except ModuleNotFoundError:
+        from scripts.lifecycle_hook import load_json, state_path
+
+    if not repo or not str(controller_session or "").strip():
+        raise ValueError("runtime trace binding requires --repo and --controller-session")
+    owner = resolve_controller_trace_session(Path(repo), controller_session)
+    if not owner:
+        raise ValueError("runtime trace binding requires a registered controller")
+    state = load_json(state_path(owner))
+    if state.get("controller_host") != "desktop_codex":
+        raise ValueError("runtime trace binding requires the current Desktop lifecycle")
+    if state.get("user_halt") is True:
+        raise ValueError("runtime trace binding cannot override user halt")
+    inflight = state.get("inflight_tool_use_ids", [])
+    guard_id = str(state.get("control_receipt_inflight") or "").strip()
+    if not isinstance(inflight, list) or any(
+        not guard_id or str(tool_id) != guard_id for tool_id in inflight
+    ):
+        raise ValueError("runtime trace binding requires serialized control execution")
+    trace = observed_machine_trace_from_state(state)
+    effective = json.loads(json.dumps(snapshot))
+    effective["machine_trace"] = trace
+    return effective
+
+
 def canonical_controller_action_projection(
     repo: Path,
     *,
@@ -2498,6 +2546,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="registered controller session whose observed tool trace must match this receipt",
     )
     parser.add_argument(
+        "--bind-runtime-trace", action="store_true",
+        help="bind current Desktop runtime trace inside this serialized guard invocation",
+    )
+    parser.add_argument(
         "--affected-task",
         action="append",
         default=[],
@@ -2505,6 +2557,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        if args.bind_runtime_trace:
+            arguments = list(argv if argv is not None else sys.argv[1:])
+            validate_runtime_trace_binding_arguments(arguments)
         snapshot = load_snapshot(args.snapshot)
         ledger = Path(args.ledger).resolve()
         if not ledger.is_file():
@@ -2537,9 +2592,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             if repo_root is not None
             else str(args.controller_session or "").strip() or None
         )
-        expected_machine_trace = (
-            observed_machine_trace(trace_session) if trace_session else None
-        )
+        if args.bind_runtime_trace:
+            snapshot = runtime_trace_bound_snapshot(
+                snapshot, repo=repo_root, controller_session=args.controller_session
+            )
+            expected_machine_trace = snapshot["machine_trace"]
+        else:
+            expected_machine_trace = (
+                observed_machine_trace(trace_session) if trace_session else None
+            )
         expected_corrections = (
             open_controller_corrections(repo_root, trace_session)
             if repo_root is not None and trace_session
@@ -2601,6 +2662,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"ledger consistency: {error}"
         for error in validate_ledger(ledger.read_text(encoding="utf-8"))
     )
+    if args.bind_runtime_trace:
+        try:
+            fresh = runtime_trace_bound_snapshot(
+                snapshot, repo=repo_root, controller_session=args.controller_session
+            )
+            if fresh["machine_trace"] != expected_machine_trace:
+                errors.append("runtime machine trace changed during control validation")
+        except (OSError, ValueError) as error:
+            errors.append(f"runtime machine trace binding expired: {error}")
     for error in errors:
         print(f"control-event: blocked: {error}")
     if errors:
