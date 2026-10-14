@@ -298,9 +298,13 @@ def _expected_tool_error(receipt: dict[str, Any], event: dict[str, Any]) -> str 
     status = str(receipt.get("status", ""))
     expected_step = STEP_BY_STATUS.get(status)
     if expected_step is None:
+        if (status == "degraded" and receipt.get("reason") == "HOST_GOAL_NOT_PERSISTENT"
+                and _tool_kind(event.get("tool_name")) == "get_goal"
+                and isinstance(event.get("tool_input"), dict)):
+            return None
         if status == "degraded":
             return "Goal display sync host capability is degraded; host tools are unavailable."
-        return None
+        return "Goal display sync has an unsupported status; mutations remain fenced."
     kind = _tool_kind(event.get("tool_name"))
     tool_input = event.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -330,7 +334,12 @@ def _expected_tool_error(receipt: dict[str, Any], event: dict[str, Any]) -> str 
         valid = kind == "list_threads"
         expected_name = "list_threads Controller title readback"
     if not valid:
-        return f"Goal display sync requires {expected_name} next."
+        detail = ""
+        if expected_step == "create_goal":
+            detail = " Expected objective: " + json.dumps(receipt.get("objective"), ensure_ascii=False) + "."
+        elif expected_step == "set_thread_title":
+            detail = " Expected title: " + json.dumps(receipt.get("thread_title"), ensure_ascii=False) + "."
+        return f"Goal display sync requires {expected_name} next." + detail
     return None
 
 
@@ -345,6 +354,13 @@ def external_block_reason(receipt: Any) -> str | None:
     }:
         return str(reason)
     failure = receipt.get("last_failure")
+    if (receipt.get("status") == "degraded" and reason == "HOST_GOAL_NOT_PERSISTENT"
+            and receipt.get("goal_recovery_count") == 1
+            and any(isinstance(item, dict) and item.get("explicit_goal_absent") is True
+                    and item.get("step") == "get_goal_readback"
+                    and item.get("tool_use_id") and item.get("response_sha256")
+                    for item in receipt.get("goal_absence_observations", []))):
+        return str(reason)
     if (isinstance(failure, dict) and failure.get("explicit_host_error") is True
             and failure.get("tool_use_id") and failure.get("response_sha256")
             and failure.get("step") == STEP_BY_STATUS.get(str(receipt.get("status")))):
@@ -419,9 +435,16 @@ def authorize_goal_display_sync_tool(
         return receipt, "Goal display sync host tool requires a tool_use_id."
     if isinstance(receipt.get("inflight"), dict):
         return receipt, "Goal display sync already has an inflight host tool."
+    step = STEP_BY_STATUS.get(str(receipt.get("status")))
+    if (step is None and receipt.get("status") == "degraded"
+            and receipt.get("reason") == "HOST_GOAL_NOT_PERSISTENT"
+            and _tool_kind(event.get("tool_name")) == "get_goal"):
+        step = "get_goal_readback"
+    if step is None:
+        return receipt, "Goal display sync has an unsupported status; mutations remain fenced."
     next_receipt = copy.deepcopy(receipt)
     next_receipt["inflight"] = {
-        "step": STEP_BY_STATUS[str(receipt.get("status"))],
+        "step": step,
         "tool_use_id": tool_use_id,
         "turn_id": str(event.get("turn_id", "")).strip(),
         "input_sha256": _json_sha256(event.get("tool_input")),
@@ -477,6 +500,27 @@ def observe_goal_display_sync_result(
             else:
                 success = False
     elif success and step_name == "get_goal_readback":
+        explicit, goal = _explicit_goal_snapshot(response)
+        if explicit and goal is None:
+            # A matched Host query has proved absence; a previous create receipt
+            # cannot restore a Goal that disappeared between physical turns.
+            absence = {
+                "step": step_name, "tool_use_id": tool_use_id,
+                "turn_id": str(event.get("turn_id", "")),
+                "response_sha256": _json_sha256(response), "explicit_goal_absent": True,
+            }
+            observations = list(next_receipt.get("goal_absence_observations", []))
+            observations.append(absence)
+            next_receipt["goal_absence_observations"] = observations[-2:]
+            if next_receipt.get("goal_recovery_count", 0) == 0:
+                next_receipt["goal_recovery_count"] = 1
+                next_receipt["status"] = "pending_create_goal"
+                next_receipt["last_failure"] = {**absence, "reason": "HOST_GOAL_MISSING"}
+            else:
+                next_receipt["status"] = "degraded"
+                next_receipt["reason"] = "HOST_GOAL_NOT_PERSISTENT"
+                next_receipt["last_failure"] = {**absence, "reason": "HOST_GOAL_NOT_PERSISTENT"}
+            return next_receipt
         success = _goal_readback_matches(
             response, str(next_receipt.get("objective", "")),
             str(next_receipt.get("execution_target_session_id", "")),
@@ -518,7 +562,7 @@ def observe_goal_display_sync_result(
                 response.get("isError") is True or response.get("exit_code") not in (None, 0)
             ),
         }
-        if capability_unavailable:
+        if capability_unavailable and receipt.get("reason") != "HOST_GOAL_NOT_PERSISTENT":
             next_receipt["status"] = "degraded"
             next_receipt["reason"] = failure_reason
             next_receipt["host_capability_state"] = "unavailable"
@@ -532,6 +576,8 @@ def observe_goal_display_sync_result(
     if step_name != "existing_goal_readback":
         next_receipt["status"] = NEXT_STATUS[str(step["step"])]
     next_receipt.pop("last_failure", None)
+    if receipt.get("reason") == "HOST_GOAL_NOT_PERSISTENT":
+        next_receipt.pop("reason", None)
     if next_receipt["status"] == "completed":
         next_receipt["completed_turn_id"] = str(event.get("turn_id", "")).strip()
     return next_receipt

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import crypto from "node:crypto";
 import path from "node:path";
@@ -126,6 +126,31 @@ async function fakeInstalledSkill(directory) {
   }));
   return { root, adapter: await realpath(path.join(scripts, "run_external_agent.mjs")) };
 }
+
+test("Grok canonical resolver skips only the known disabled shell guard before any provider request", async () => {
+  const runtime = await import("../scripts/run_external_agent.mjs");
+  const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-disabled-guard-"));
+  const bin = path.join(root, "bin");
+  const official = path.join(root, "official", "grok");
+  await mkdir(bin);
+  await mkdir(path.dirname(official));
+  const wrapper = path.join(bin, "grok");
+  const guard = "#!/bin/sh\nprintf '%s\\n' 'RAW_GROK_CLI_FORBIDDEN: direct grok CLI is disabled; use Adaptive Agent Runtime canonical grok-build routing.' >&2\nexit 78\n";
+  await writeFile(wrapper, guard);
+  await chmod(wrapper, 0o755);
+  await writeFile(official, "#!/bin/sh\nif [ \"$1\" = version ]; then printf 'fake-official-version\\n'; else exit 93; fi\n");
+  await chmod(official, 0o755);
+  const route = { executable: "grok", fallbackPaths: [official, wrapper] };
+  assert.equal(runtime.resolveExecutable(route, { searchPath: bin }), official);
+  assert.equal(spawnSync(runtime.resolveExecutable(route, { searchPath: bin }), ["version"], { encoding: "utf8" }).stdout.trim(), "fake-official-version");
+  assert.throws(() => runtime.resolveExecutable({ ...route, fallbackPaths: [path.join(root, "missing"), wrapper] }, { searchPath: bin }), /official Grok CLI.*unavailable/i);
+  await writeFile(wrapper, "#!/bin/sh\nprintf 'ordinary-runner\\n'\n");
+  assert.equal(runtime.resolveExecutable(route, { searchPath: bin }), wrapper);
+  await writeFile(wrapper, "#!/bin/sh\n# RAW_GROK_CLI_FORBIDDEN\nprintf 'ordinary-runner\\n'\n");
+  assert.equal(runtime.resolveExecutable(route, { searchPath: bin }), wrapper);
+  assert.equal(runtime.resolveExecutable({ executable: "missing", fallbackPaths: [] }, { searchPath: bin }), "missing");
+  await rm(root, { recursive: true, force: true });
+});
 
 async function fakeRunner(bin, name, versionArgument) {
   const target = path.join(bin, name);

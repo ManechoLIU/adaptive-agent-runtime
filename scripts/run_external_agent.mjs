@@ -708,13 +708,41 @@ function xaiKeychainService() {
   return process.env.XAI_GROK_KEYCHAIN_SERVICE || XAI_KEYCHAIN_SERVICE;
 }
 
-function resolveExecutable(route) {
-  for (const directory of (process.env.PATH || "").split(path.delimiter)) {
+function isDisabledGrokGuard(candidate) {
+  try {
+    const stat = statSync(candidate);
+    if (!stat.isFile() || stat.size > 512) return false;
+    const text = readFileSync(candidate, "utf8").replace(/\r\n/g, "\n").trim();
+    return text === [
+      "#!/bin/sh",
+      "printf '%s\\n' 'RAW_GROK_CLI_FORBIDDEN: direct grok CLI is disabled; use Adaptive Agent Runtime canonical grok-build routing.' >&2",
+      "exit 78",
+    ].join("\n");
+  } catch {
+    return false;
+  }
+}
+
+export function resolveExecutable(route, { searchPath = process.env.PATH || "" } = {}) {
+  let selected;
+  for (const directory of searchPath.split(path.delimiter)) {
     if (!directory) continue;
     const candidate = path.join(directory, route.executable);
-    if (existsSync(candidate)) return candidate;
+    if (existsSync(candidate)) { selected = candidate; break; }
   }
-  return route.fallbackPaths.find((candidate) => existsSync(candidate)) || route.executable;
+  selected ||= route.fallbackPaths.find((candidate) => existsSync(candidate)) || route.executable;
+  if (route.executable !== "grok" || !isDisabledGrokGuard(selected)) return selected;
+  // This exact local policy guard is not a provider failure. Resolve the
+  // canonical official installation before any process or model request.
+  const official = route.fallbackPaths[0];
+  try {
+    const stat = statSync(official);
+    if (stat.isFile() && (stat.mode & 0o111) && !isDisabledGrokGuard(official)) return official;
+  } catch {}
+  throw new ExternalAgentExecutionError("LOCAL_PRECHECK_FAILED: official Grok CLI is unavailable behind the disabled raw CLI guard", {
+    failureClass: "local_precheck_failed", outcomeCode: "LOCAL_PRECHECK_FAILED", retrySafe: true,
+    details: { provider_started: false },
+  });
 }
 
 export function parseArgs(argv) {
@@ -2529,7 +2557,13 @@ export function runMonitoredGrokReview(executable, args, {
 export function checkExternalAgent({ cwd, engine, model, reasoningEffort, authMode }) {
   assertDirectory(cwd);
   const route = routes[engine];
-  const executable = resolveExecutable(route);
+  let executable;
+  try {
+    executable = resolveExecutable(route);
+  } catch (error) {
+    if (error?.outcomeCode !== "LOCAL_PRECHECK_FAILED") throw error;
+    return { available: false, engine, model, reasoningEffort, authMode, reason: error.message };
+  }
   const result = spawnSync(executable, route.versionArgs, { cwd, encoding: "utf8", env: process.env });
   if (result.error?.code === "ENOENT") {
     return { available: false, engine, model, reasoningEffort, authMode, reason: `${route.executable} executable not found` };

@@ -1031,6 +1031,10 @@ def _desktop_on_duty_source(event: dict[str, Any], state: dict[str, Any]) -> boo
     return bool(source_id) and source_id == duty_source
 
 
+def _goal_sync_wait_action(sync: dict[str, Any]) -> str:
+    return "Host Goal sync recovery required: " + str(sync.get("fingerprint") or sync.get("receipt_id") or "")
+
+
 def _pending_stop_output(
     state: dict[str, Any], event: dict[str, Any], *, reason: str
 ) -> dict[str, Any]:
@@ -1040,6 +1044,9 @@ def _pending_stop_output(
     if (external_reason
             and not state.get("inflight_tool_use_ids")
             and not state.get("control_receipt_inflight")):
+        if state.get("requires_user") is not True:
+            state["requires_user"] = True
+            state["next_action"] = _goal_sync_wait_action(sync)
         # End only this physical turn. Pending debt and mutation fences survive;
         # a later explicit recovery must still obtain the ordinary control receipt.
         message = reason + " 外部 Goal 同步阻塞：" + external_reason + "；保留未完成债务，报告并停止。"
@@ -4087,12 +4094,18 @@ def evaluate_event(
         pending_display_sync = state.get("goal_display_sync")
         if (
             isinstance(pending_display_sync, dict)
-            and pending_display_sync.get("status") not in {None, "completed", "degraded"}
+            and pending_display_sync.get("status") not in {None, "completed"}
         ):
             observed_sync = goal_display_sync.observe_goal_display_sync_result(
                 pending_display_sync, event
             )
             state["goal_display_sync"] = observed_sync
+            if (observed_sync.get("status") == "completed"
+                    and state.get("user_halt") is not True
+                    and state.get("requires_user") is True
+                    and state.get("next_action") == _goal_sync_wait_action(observed_sync)):
+                state["requires_user"] = False
+                state["next_action"] = ""
             if (
                 observed_sync.get("status") == "completed"
                 and observed_sync.get("sync_kind") == "target_goal_rebind"

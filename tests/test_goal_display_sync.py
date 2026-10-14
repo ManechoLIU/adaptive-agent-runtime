@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from scripts import goal_display_sync
 from scripts import lifecycle_hook
+from scripts import web_lifecycle_bridge
 
 
 class GoalDisplaySyncTests(unittest.TestCase):
@@ -388,12 +389,145 @@ class GoalDisplaySyncTests(unittest.TestCase):
             {"goal": {**base_goal, "objective": "another objective"}},
             {"goal": {**base_goal, "status": "complete"}},
             {"goal": None}, {"goal": None, "objective": objective},
-            {"arbitrary": {"goal": base_goal}},
+            {"arbitrary": {"goal": base_goal}}, {"goal": "malformed"}, {"remainingTokens": None},
         ]:
             with self.subTest(response=response):
                 denied = self.complete_step(receipt, self.event("get_goal", "bad-goal", {}), response=response)
-                self.assertEqual(denied["status"], "pending_goal_readback")
-                self.assertEqual(denied["last_failure"]["reason"], "HOST_READBACK_MISMATCH")
+                if response.get("goal", "not-null") is None:
+                    self.assertEqual(denied["status"], "pending_create_goal")
+                    self.assertEqual(denied["goal_recovery_count"], 1)
+                else:
+                    self.assertEqual(denied["status"], "pending_goal_readback")
+                    self.assertEqual(denied["last_failure"]["reason"], "HOST_READBACK_MISMATCH")
+
+    def test_explicit_goal_absence_has_one_persistent_recovery_then_bounded_stop(self) -> None:
+        receipt = self.start()
+        receipt["status"] = "pending_goal_readback"
+        receipt["steps"] = [{"step": "create_goal", "tool_use_id": "old-create", "turn_id": "old-turn"}]
+        first = self.complete_step(receipt, self.event("get_goal", "missing-1", {}), response={"goal": None})
+        self.assertEqual(first["status"], "pending_create_goal")
+        self.assertEqual(first["goal_recovery_count"], 1)
+        self.assertEqual(first["steps"], receipt["steps"])
+        resumed = goal_display_sync.start_goal_display_sync(
+            first, self.contract(), controller_id="controller-1", source_session_id="desktop-current",
+            host="desktop_codex", target_generation=4, turn_id="new-turn", host_capabilities=None)
+        self.assertIs(resumed, first)
+        self.assertEqual(resumed["goal_recovery_count"], 1)
+        _, denial = goal_display_sync.authorize_goal_display_sync_tool(
+            first, self.event("create_goal", "wrong", {"objective": "wrong"}))
+        self.assertIsNotNone(denial)
+        first = self.complete_step(first, self.event("create_goal", "recreated", {"objective": first["objective"]}))
+        first = self.complete_step(first, self.event("set_thread_title", "retitled", {"title": first["thread_title"]}))
+        restored = self.complete_step(first, self.event("get_goal", "restored", {}), response={
+            "goal": {"objective": first["objective"], "status": "active", "threadId": "desktop-current"}})
+        restored = self.complete_step(restored, self.event("list_threads", "title-restored", {}), response={
+            "threads": [{"id": "desktop-current", "title": first["thread_title"]}]})
+        self.assertEqual(restored["status"], "completed")
+        self.assertEqual(restored["goal_recovery_count"], 1)
+        later = {**self.event("get_goal", "missing-2", {}), "turn_id": "later-turn"}
+        second = self.complete_step(first, later, response={"goal": None})
+        self.assertEqual(second["status"], "degraded")
+        self.assertEqual(second["reason"], "HOST_GOAL_NOT_PERSISTENT")
+        self.assertEqual(second["goal_recovery_count"], 1)
+        state = {"goal_display_sync": second, "pending_control_event": True}
+        for _ in range(3):
+            self.assertNotEqual(lifecycle_hook._pending_stop_output(state, later, reason="blocked").get("decision"), "block")
+        self.assertTrue(state["pending_control_event"])
+        self.assertIsNone(goal_display_sync.authorize_goal_display_sync_tool(second, self.event("get_goal", "safe", {}))[1])
+        self.assertIsNotNone(goal_display_sync.authorize_goal_display_sync_tool(second, self.event("send_message_to_thread", "dispatch", {}))[1])
+        self.assertIsNotNone(goal_display_sync.authorize_goal_display_sync_tool(second, self.event("create_goal", "write", {"objective": second["objective"]}))[1])
+        self.assertIsNone(goal_display_sync.external_block_reason({"status": "degraded", "reason": "HOST_GOAL_NOT_PERSISTENT"}))
+
+    def test_wrong_binding_or_unmatched_absence_cannot_arm_recovery(self) -> None:
+        receipt = self.start()
+        receipt["status"] = "pending_goal_readback"
+        event = self.event("get_goal", "query", {})
+        inflight, denial = goal_display_sync.authorize_goal_display_sync_tool(receipt, event)
+        self.assertIsNone(denial)
+        for change in [{"tool_use_id": "wrong"}, {"controller_target_generation": 99}]:
+            observed = goal_display_sync.observe_goal_display_sync_result(inflight, {**event, **change, "tool_response": {"goal": None}})
+            self.assertIs(observed, inflight)
+            self.assertNotIn("goal_recovery_count", observed)
+
+    def test_unknown_sync_status_fences_mutations_and_reads_do_not_advance(self) -> None:
+        receipt = self.start()
+        receipt["status"] = "unexpected_status"
+        for kind, args in [("exec_command", {"cmd": "touch unauthorized"}),
+                           ("send_message_to_thread", {"threadId": "worker", "prompt": "dispatch"}),
+                           ("create_goal", {"objective": receipt["objective"]})]:
+            unchanged, denial = goal_display_sync.authorize_goal_display_sync_tool(receipt, self.event(kind, "unknown", args))
+            self.assertIs(unchanged, receipt)
+            self.assertIsNotNone(denial)
+        unchanged, denial = goal_display_sync.authorize_goal_display_sync_tool(receipt, self.event("get_goal", "safe", {}))
+        self.assertIsNone(denial)
+        self.assertIs(unchanged, receipt)
+        self.assertNotIn("inflight", unchanged)
+
+    def persistent_absence(self) -> dict[str, object]:
+        receipt = self.start()
+        receipt.update({"status": "pending_goal_readback", "goal_recovery_count": 1})
+        return self.complete_step(receipt, self.event("get_goal", "gone", {}), response={"goal": None})
+
+    def test_external_goal_stop_suspends_canonical_continuation_without_user_halt(self) -> None:
+        state = {"goal_display_sync": self.persistent_absence(), "pending_control_event": True,
+                 "requires_user": False, "active_turn_id": "turn-rollover"}
+        result = lifecycle_hook._pending_stop_output(state, {}, reason="blocked")
+        self.assertFalse(result["continue"])
+        self.assertTrue(state["requires_user"])
+        self.assertFalse(state.get("user_halt", False))
+        self.assertIn(state["goal_display_sync"]["fingerprint"], state["next_action"])
+        with patch.object(lifecycle_hook, "load_json", return_value=state), patch.object(
+                web_lifecycle_bridge, "resolve_controller_host", return_value="desktop_codex"):
+            health = web_lifecycle_bridge.controller_continuation_projection(
+                repo=Path("/nonexistent/read-only-fixture"), controller_id="controller-1",
+                registry=Path("/nonexistent/registry"))
+        self.assertFalse(health["should_continue"])
+        self.assertIn("pending_control_event", health["debt_ids"])
+
+    def test_degraded_probe_recovers_and_completion_clears_only_own_wait(self) -> None:
+        receipt = self.persistent_absence()
+        for wait in ["own", "foreign", "user_halt"]:
+            state = {"goal_display_sync": receipt, "pending_control_event": True,
+                     "active_turn_id": "turn-rollover"}
+            if wait == "foreign":
+                state.update({"requires_user": True, "next_action": "another human decision"})
+            lifecycle_hook._pending_stop_output(state, {}, reason="blocked")
+            waiting_action = state["next_action"]
+            probe = {**self.event("get_goal", "restored-probe", {}), "hook_event_name": "PreToolUse"}
+            _, state = lifecycle_hook.evaluate_event(probe, snapshot={"control_loop_required": False}, prior_state=state)
+            self.assertIn("inflight", state["goal_display_sync"])
+            _, state = lifecycle_hook.evaluate_event({**probe, "hook_event_name": "PostToolUse", "tool_response": {
+                "goal": {"threadId": "desktop-current", "objective": receipt["objective"], "status": "active"}}},
+                snapshot={"control_loop_required": False}, prior_state=state)
+            restored = state["goal_display_sync"]
+            self.assertEqual(restored["status"], "pending_title_readback")
+            self.assertEqual(restored["goal_recovery_count"], 1)
+            state["goal_display_sync"] = restored
+            event = {**self.event("list_threads", "restored-title", {}), "hook_event_name": "PreToolUse"}
+            _, state = lifecycle_hook.evaluate_event(event, snapshot={"control_loop_required": False}, prior_state=state)
+            if wait == "user_halt":
+                state.update({"user_halt": True, "requires_user": True})
+            _, state = lifecycle_hook.evaluate_event({**event, "hook_event_name": "PostToolUse",
+                "tool_response": {"threads": [{"id": "desktop-current", "title": receipt["thread_title"]}]}},
+                snapshot={"control_loop_required": False}, prior_state=state)
+            if wait == "own":
+                self.assertEqual(state["goal_display_sync"]["status"], "completed")
+                self.assertFalse(state["requires_user"])
+                self.assertEqual(state["next_action"], "")
+            else:
+                self.assertTrue(state["requires_user"])
+                self.assertEqual(state["next_action"], waiting_action)
+            if wait == "user_halt":
+                self.assertTrue(state["user_halt"])
+
+    def test_degraded_null_probes_keep_budget_and_evidence_bounded(self) -> None:
+        receipt = self.persistent_absence()
+        for i in range(5):
+            receipt = self.complete_step(receipt, self.event("get_goal", f"null-{i}", {}), response={"goal": None})
+        self.assertEqual(receipt["status"], "degraded")
+        self.assertEqual(receipt["goal_recovery_count"], 1)
+        self.assertEqual(len(receipt["goal_absence_observations"]), 2)
+        self.assertEqual(goal_display_sync.external_block_reason(receipt), "HOST_GOAL_NOT_PERSISTENT")
 
     def test_initial_explicit_goal_precedes_outer_legacy_fields(self) -> None:
         receipt = self.start_rebind()
