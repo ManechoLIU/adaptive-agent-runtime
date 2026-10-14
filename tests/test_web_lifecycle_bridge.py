@@ -12058,6 +12058,14 @@ def _hardened_recovery_preserves_desktop_target(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         repo, registry = _hardened_recovery_current_manual_fixture(root, with_desktop=True)
+        # A bound desktop target may remain in history, but recovery is only
+        # allowed when Web already owns execution; it is not a Host handoff.
+        payload = json.loads(registry.read_text())
+        payload["__controller_execution_ownership__"]["controller-1"] = {
+            "active_host": "web", "execution_target_session_id": "web-current",
+            "generation": 7, "provenance": "web_entry",
+        }
+        registry.write_text(json.dumps(payload), encoding="utf-8")
         with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=lambda **_kwargs: True):
             recovered = web_bridge.recover_same_controller_web_session(
                 repo=repo, web_session_id="web-current", registry_path=registry,
@@ -15259,6 +15267,34 @@ class WebMachineInvocationTurnBridgeTests(WebCurrentEntryDiscoveryTests):
             self.assertNotEqual(state["active_turn_id"], "web-ai-bridge")
             self.assertFalse(state["tool_trace_overflow"])
             self.assertEqual(state["tool_trace"], [])
+            self.assertEqual(state["web_turn_lease"]["status"], "active")
+
+    def test_session_start_desktop_codex_turn_does_not_block_runtime_web_lease(self) -> None:
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry = self.make_repo(Path(tmp))
+            state_path = Path(os.environ["AD_LIFECYCLE_STATE_DIR"]) / "controller-1.json"
+            state_path.write_text(json.dumps({
+                "active_turn_id": "01a0e6b9-2d2d-7822-90c9-4521d0599524",
+                "inflight_tool_use_ids": ["call-desktop-1"],
+                "inflight_tool_records": {
+                    "call-desktop-1": {"turn_id": "01a0e6b9-2d2d-7822-90c9-4521d0599524", "tool_name": "mcp__codex_app__read_thread_terminal"}
+                },
+            }), encoding="utf-8")
+            verifier, _ = self.verifier_with_current_entry(
+                "web-current", runtime_invocation_id=None
+            )
+            out = StringIO(); err = StringIO()
+            with patch.object(web_bridge, "_registered_peer_attestation_verifier", return_value=verifier), \
+                 redirect_stdout(out), redirect_stderr(err):
+                code = web_bridge.main(["session-start", "--repo", str(repo), "--registry", str(registry)])
+            self.assertEqual(code, 0, err.getvalue())
+            payload = json.loads(out.getvalue())
+            self.assertTrue(payload["lifecycle_turn_established"])
+            self.assertTrue(payload["runtime_web_turn_lease"]["lease_created"])
+            state = json.loads(state_path.read_text())
             self.assertEqual(state["web_turn_lease"]["status"], "active")
 
     def test_caller_turn_id_cannot_override_host_machine_turn(self) -> None:

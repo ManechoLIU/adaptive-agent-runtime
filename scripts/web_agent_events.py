@@ -55,9 +55,56 @@ def _verified_codex_session_path(value: str | Path) -> Path | None:
         return None
 
 
-def _trusted_machine_event_source_verifier():
-    """Return only an independently Host-owned verifier; unavailable in this Runtime build."""
+def _try_registered_web_host_verifier():
+    """Return the registered web Host verifier, or None when Host is unavailable."""
+    try:
+        try:
+            from scripts.web_lifecycle_bridge import _registered_peer_attestation_verifier
+        except ImportError:
+            from web_lifecycle_bridge import _registered_peer_attestation_verifier
+    except Exception:
+        return None
+    try:
+        return _registered_peer_attestation_verifier("web")
+    except Exception:
+        return None
+
+
+def _host_machine_event_source_attestation(host: Any) -> Any | None:
+    if host is None:
+        return None
+    attest = getattr(host, "attest_machine_event_source", None)
+    if callable(attest):
+        return attest
     return None
+
+
+def _trusted_machine_event_source_verifier():
+    """Return only an independently Host-owned verifier; unavailable without Host."""
+    host = _try_registered_web_host_verifier()
+    attest = _host_machine_event_source_attestation(host)
+    if attest is None:
+        return None
+
+    def verify(payload: dict[str, Any], receipt_path: Path) -> dict[str, Any]:
+        result = attest(receipt=dict(payload), receipt_path=str(receipt_path))
+        if not isinstance(result, dict):
+            raise PermissionError("registered Host machine event source result is invalid")
+        raw_paths = result.get("event_paths")
+        event_paths: list[str] = []
+        if isinstance(raw_paths, list):
+            for value in raw_paths:
+                if isinstance(value, str) and value.strip():
+                    event_paths.append(value)
+        return {
+            "verified": result.get("verified") is True,
+            "fresh": result.get("fresh") is True,
+            "replay": False if result.get("replay") is False else True,
+            "source": str(result.get("source") or ""),
+            "event_paths": event_paths,
+        }
+
+    return verify
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -152,10 +199,10 @@ def machine_event_source_status(
         return {"ready": False, "reason": "machine_event_source_verifier_failed"}
     if not isinstance(verified, dict):
         return {"ready": False, "reason": "machine_event_source_verifier_failed"}
+    # Host replay of a verified+fresh attestation is idempotent (bind re-checks paths).
     if (
         verified.get("verified") is not True
         or verified.get("fresh") is not True
-        or verified.get("replay") is not False
         or str(verified.get("source") or "") != source
     ):
         return {"ready": False, "reason": "machine_event_source_provenance_rejected"}

@@ -1282,10 +1282,58 @@ def discover_current_web_entry_for_logical_agent(
     return evidence
 
 
+def _execution_ownership_tuple(
+    registry_path: Path, *, controller_id: str
+) -> tuple[str | None, str | None, int]:
+    record = target_guard.execution_ownership_record(
+        load_json(registry_path), controller_id=controller_id
+    )
+    if record is None:
+        return None, None, 0
+    return target_guard.validate_execution_ownership_record(record)
+
+
+def _raise_if_foreign_execution_owner(*, registry_path: Path, controller_id: str) -> None:
+    host, target, generation = _execution_ownership_tuple(
+        registry_path, controller_id=controller_id
+    )
+    if host is not None and host != "web":
+        raise PermissionError(
+            "SAFE_HOST_HANDOFF_REQUIRED: execution owner "
+            f"{host} holds {target} generation {generation}; "
+            "Web identity discovery cannot claim Host ownership"
+        )
+
+
+def _deferred_safe_host_handoff(
+    *,
+    controller_id: str,
+    ownership_host: str | None,
+    ownership_target: str | None,
+    ownership_generation: int,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "result": "DEFERRED",
+        "state": "HOST_HANDOFF_REQUIRED",
+        "reason": "SAFE_HOST_HANDOFF_REQUIRED",
+        "controller_id": controller_id,
+        "active_host": ownership_host,
+        "execution_target_session_id": ownership_target,
+        "ownership_generation": ownership_generation,
+        "controller_actions_allowed": False,
+        "safe_control_actions_allowed": True,
+        "identity": identity,
+    }
+
+
 def discover_current_web_entry(
     *, repo: Path, controller_id: str, registry_path: Path
 ) -> dict[str, Any]:
     """Controller compatibility provider for generic logical-Agent target resolution."""
+    _raise_if_foreign_execution_owner(
+        registry_path=registry_path, controller_id=controller_id
+    )
     logical_agent = agent_target.logical_agent_identity(
         agent_type="controller", agent_id=controller_id
     )
@@ -1306,6 +1354,9 @@ def current_web_entry_from_host_identity_receipt(
     """Bind a supplied Host current-entry receipt to the current verified Controller target."""
     if not isinstance(host_identity_receipt, dict):
         raise ValueError("Host identity receipt JSON must decode to an object")
+    _raise_if_foreign_execution_owner(
+        registry_path=registry_path, controller_id=controller_id
+    )
     logical_agent = agent_target.logical_agent_identity(
         agent_type="controller", agent_id=controller_id
     )
@@ -1408,6 +1459,18 @@ def recover_same_controller_web_session(
             target_guard.validate_execution_ownership_record(ownership_record)
         )
 
+    # Session proof is not permission to take execution ownership from another
+    # Host. Recovery may resume a Web owner; a cross-Host transition must first
+    # complete the Host handoff protocol, never infer quiescence from silence.
+    if ownership_host is not None and ownership_host != "web":
+        return _deferred_safe_host_handoff(
+            controller_id=controller_id,
+            ownership_host=ownership_host,
+            ownership_target=ownership_target,
+            ownership_generation=ownership_generation,
+            identity=identity,
+        )
+
     validated_current_entry: dict[str, Any] | None = None
     if current_entry_evidence is not None:
         validated_current_entry = _validated_current_web_entry_evidence(
@@ -1459,27 +1522,53 @@ def recover_same_controller_web_session(
         raise PermissionError(
             "same-controller Web recovery cannot replace the canonical current target"
         )
+    elif ownership_host == "web" and ownership_target != web_session_id:
+        raise PermissionError(
+            "same-controller Web recovery cannot overwrite a mismatched Web ownership target"
+        )
 
     if (
         not strong_successor_rotation
         and binding.get("verification") == "VERIFIED"
         and validated_current_entry is None
     ):
-        ownership = target_guard.claim_controller_host(
-            repo=repo,
-            controller_id=controller_id,
-            requested_host="web",
-            requested_target_session_id=web_session_id,
-            expected_generation=ownership_generation,
-            registry_path=registry_path,
-            provenance="web_entry",
-        )
+        # Repeated resume is a read, not another ownership claim. Recheck the
+        # complete tuple under the same fence used by ownership mutations.
+        with target_guard.locked_registry(registry_path, exclusive=True) as registry:
+            if target_guard._matching_controller_ids_for_repo(repo, registry) != [controller_id]:
+                raise PermissionError("project Controller changed before Web resume")
+            target = target_guard.target_record(registry, controller_id=controller_id, host="web")
+            owner = target_guard.execution_ownership_record(registry, controller_id=controller_id)
+            owner_host: str | None = None
+            owner_target: str | None = None
+            owner_generation = 0
+            if owner is not None:
+                owner_host, owner_target, owner_generation = (
+                    target_guard.validate_execution_ownership_record(owner)
+                )
+                if owner_host != "web":
+                    return _deferred_safe_host_handoff(
+                        controller_id=controller_id,
+                        ownership_host=owner_host,
+                        ownership_target=owner_target,
+                        ownership_generation=owner_generation,
+                        identity=identity,
+                    )
+            if (
+                target is None or owner is None
+                or target_guard.validate_target_record(target, host="web")
+                != ("active", web_session_id, current_target_generation)
+                or (owner_host, owner_target, owner_generation)
+                != ("web", web_session_id, ownership_generation)
+            ):
+                raise PermissionError("Web target/ownership changed before resume")
         return {
             "result": "ALREADY_VERIFIED",
             "state": "VERIFIED",
             "controller_id": controller_id,
-            "active_host": ownership["active_host"],
-            "ownership_generation": ownership["generation"],
+            "active_host": "web",
+            "ownership_generation": ownership_generation,
+            "target_generation": current_target_generation,
             "resume_lease_rotated": False,
             "identity": target_guard.controller_identity_projection(
                 repo=repo,
@@ -1604,11 +1693,18 @@ def recover_same_controller_web_session(
                 owner_host_after, owner_target_after, owner_generation_after = (
                     target_guard.validate_execution_ownership_record(owner_after)
                 )
+                if owner_host_after != "web":
+                    return _deferred_safe_host_handoff(
+                        controller_id=controller_id,
+                        ownership_host=owner_host_after,
+                        ownership_target=owner_target_after,
+                        ownership_generation=owner_generation_after,
+                        identity=identity,
+                    )
                 if (
                     status_after != "active"
                     or target_after != web_session_id
                     or target_generation_after != prior_generation
-                    or owner_host_after != "web"
                     or owner_target_after != web_session_id
                     or owner_generation_after != ownership_generation
                 ):
@@ -1682,18 +1778,33 @@ def recover_same_controller_web_session(
             current_ownership_host, current_ownership_target, current_ownership_generation = (
                 target_guard.validate_execution_ownership_record(current_ownership)
             )
+            if current_ownership_host != "web":
+                return _deferred_safe_host_handoff(
+                    controller_id=controller_id,
+                    ownership_host=current_ownership_host,
+                    ownership_target=current_ownership_target,
+                    ownership_generation=current_ownership_generation,
+                    identity=identity,
+                )
             if current_ownership_generation != ownership_generation:
                 raise PermissionError(
                     "Web Controller ownership generation changed after identity attestation; "
                     "stale ownership cannot recover the session"
                 )
             if strong_successor_rotation and (
-                current_ownership_host != "web"
-                or current_ownership_target != current_target_session
+                current_ownership_target != current_target_session
             ):
                 raise PermissionError(
                     "Web Controller ownership target changed after identity attestation; "
                     "strong successor recovery requires the same current Web owner"
+                )
+            if (
+                not strong_successor_rotation
+                and current_ownership_target != web_session_id
+            ):
+                raise PermissionError(
+                    "Web Controller ownership target changed after identity attestation; "
+                    "stale ownership cannot recover the session"
                 )
 
             runtime_turn_prior: dict[str, Any] | None = None
@@ -5246,6 +5357,45 @@ def _loaded_external_peer_attestation_verifier(
     setattr(verify, "submit_reentry", submit_reentry)
     setattr(verify, "recover_reentry_result_unknown", recover_reentry_result_unknown)
     setattr(verify, "reconcile_reentry_result", reconcile_reentry_result)
+    def attest_machine_event_source(
+        *, receipt: object, receipt_path: str | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        if verifier_protocol != "runtime_host_verifier_cli_v2":
+            raise PermissionError(
+                "registered Host verifier v2 machine event source capability is unavailable"
+            )
+        if not isinstance(receipt, dict):
+            raise PermissionError("machine event source receipt must be an object")
+        payload = run_cli(
+            {
+                "protocol": "runtime_host_verifier_cli_v2",
+                "operation": "attest_machine_event_source",
+                "receipt": receipt,
+                "receipt_path": str(receipt_path or ""),
+            },
+            deadline_monotonic=deadline_monotonic,
+        )
+        if (
+            payload.get("protocol") != "runtime_host_verifier_cli_v2"
+            or payload.get("operation") != "attest_machine_event_source"
+        ):
+            raise PermissionError(
+                "registered Host verifier returned mismatched machine event source result"
+            )
+        raw_paths = payload.get("event_paths")
+        event_paths = [
+            str(value) for value in raw_paths
+            if isinstance(value, str) and value.strip()
+        ] if isinstance(raw_paths, list) else []
+        return {
+            "verified": payload.get("verified") is True,
+            "fresh": payload.get("fresh") is True,
+            "replay": payload.get("replay") is True,
+            "source": str(payload.get("source") or ""),
+            "event_paths": event_paths,
+        }
+
     setattr(verify, "delivery_fingerprint", delivery_fingerprint)
     setattr(verify, "manifest_identity", manifest_identity)
     setattr(verify, "verifier_protocol", verifier_protocol)
@@ -5263,6 +5413,7 @@ def _loaded_external_peer_attestation_verifier(
             verify, "verify_tool_terminal",
             lambda **kwargs: run_tool_receipt(phase="terminal", **kwargs),
         )
+        setattr(verify, "attest_machine_event_source", attest_machine_event_source)
     return verify
 
 
@@ -5333,7 +5484,7 @@ def _pinned_host_verifier_helper_main(argv: Sequence[str]) -> int:
             allowed_methods = {
                 "verify", "discover_current_entry", "verify_current_entry", "submit_reentry",
                 "recover_reentry_result_unknown", "reconcile_reentry_result",
-                "verify_tool_pre", "verify_tool_terminal",
+                "verify_tool_pre", "verify_tool_terminal", "attest_machine_event_source",
             }
             method = verifier if method_name == "verify" else getattr(verifier, method_name, None)
             if method_name not in allowed_methods or not callable(method):
@@ -5559,6 +5710,11 @@ def _external_peer_attestation_verifier(
     if protocol == "runtime_host_verifier_cli_v2":
         setattr(verify, "verify_tool_pre", lambda **kwargs: call("verify_tool_pre", **kwargs))
         setattr(verify, "verify_tool_terminal", lambda **kwargs: call("verify_tool_terminal", **kwargs))
+        setattr(
+            verify,
+            "attest_machine_event_source",
+            lambda **kwargs: call("attest_machine_event_source", **kwargs),
+        )
     return verify
 
 
@@ -7417,6 +7573,19 @@ def _new_runtime_web_turn_lease(
     return turn, lease
 
 
+
+def _is_runtime_web_turn_id(turn_id: str, lifecycle: Any | None = None) -> bool:
+    """True only for Web/AAR turn ids, not desktop Codex turn UUIDs sharing controller state."""
+    text = str(turn_id or "").strip()
+    if not text:
+        return False
+    legacy = {"web-ai-bridge"}
+    extra = getattr(lifecycle, "LEGACY_WEB_TURN_IDS", None) if lifecycle is not None else None
+    if extra:
+        legacy = set(extra) | legacy
+    return text in legacy or text.startswith("web-turn:")
+
+
 def runtime_web_turn_for_session_start(
     *, controller_id: str, current_entry: dict[str, Any], verified_target: object,
     session_recovery: object | None = None,
@@ -7468,11 +7637,12 @@ def runtime_web_turn_for_session_start(
     else:
         active_turn = str(state.get("active_turn_id") or "").strip()
         inflight = [str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)]
-        if active_turn and active_turn not in getattr(lifecycle, "LEGACY_WEB_TURN_IDS", {"web-ai-bridge"}):
+        legacy_ids = set(getattr(lifecycle, "LEGACY_WEB_TURN_IDS", {"web-ai-bridge"}))
+        if active_turn.startswith("web-turn:"):
             raise PermissionError(
                 "WEB_TURN_BOUNDARY_UNVERIFIED: existing Web turn has no Runtime lease or Host invocation identity"
             )
-        if active_turn and inflight:
+        if active_turn in legacy_ids and inflight:
             raise PermissionError(
                 "WEB_TURN_BOUNDARY_INFLIGHT: legacy Web turn cannot migrate while tool evidence is inflight"
             )
@@ -10353,6 +10523,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     source_session_id=None,
                     registry_path=registry_path,
                 )
+                reason = "HOST_SESSION_ID_UNAVAILABLE"
+                ownership_fields: dict[str, Any] = {}
+                try:
+                    owner_host, owner_target, owner_generation = _execution_ownership_tuple(
+                        registry_path, controller_id=controller_id
+                    )
+                    if owner_host is not None:
+                        ownership_fields = {
+                            "active_host": owner_host,
+                            "execution_target_session_id": owner_target,
+                            "ownership_generation": owner_generation,
+                        }
+                        if owner_host != "web":
+                            reason = "SAFE_HOST_HANDOFF_REQUIRED"
+                except (OSError, PermissionError, ValueError, TypeError):
+                    pass
+                if "SAFE_HOST_HANDOFF_REQUIRED" in str(exc):
+                    reason = "SAFE_HOST_HANDOFF_REQUIRED"
                 diagnostic = {
                     "message": (
                         "verified Web Controller Session identity required; "
@@ -10362,8 +10550,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "session_binding_state": identity["session_binding_state"],
                     "controller_actions_allowed": False,
                     "recovery": identity["session_binding_state"].get("recovery"),
-                    "reason": "HOST_SESSION_ID_UNAVAILABLE",
+                    "reason": reason,
                     "host_identity_error": str(exc),
+                    **ownership_fields,
                 }
                 print(json.dumps(diagnostic, ensure_ascii=False, sort_keys=True), file=sys.stderr)
                 return 78

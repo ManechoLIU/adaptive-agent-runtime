@@ -2282,3 +2282,554 @@ class WebSessionDelegationAuthorityTests(WebAgentExecutionTests):
         self.assertEqual(lease["delegation_owner_kind"], "session")
         self.assertEqual(lease["delegation_owner_id"], "ordinary-web-session-1")
         self.assertEqual(recovered["delegation_owner_id"], "ordinary-web-session-1")
+
+
+class HostAttestedWebAssignmentClosedLoopTests(unittest.TestCase):
+    """LAB-WEX-02: mock-Host prepare -> bind -> canonical lease -> terminal."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)], check=True)
+        (self.repo / "README.md").write_text("runtime\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "README.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "init"],
+            check=True,
+        )
+        self.registry = root / "controllers.json"
+        self.registry.write_text(json.dumps({"controller-1": str(self.repo.resolve())}), encoding="utf-8")
+        self.policy = root / "AGENTS.md"
+        self.policy.write_text(
+            "general 默认 provider=chatgpt_web、model=gpt-5.6-sol、auth_mode=host。\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def assignment(self, **extra):
+        value = {
+            "assignment_id": "A-1",
+            "task_id": "T-1",
+            "agent_id": "web-writer-1",
+            "provider": "chatgpt_web",
+            "model": "gpt-5.6-sol",
+            "agent_type": "default",
+            "worktree": str(self.repo),
+            "primary_goal": "finish bounded runtime task",
+            "success_criteria": ["tests pass"],
+            "owned_scope": ["README.md"],
+            "strategy": "chatgpt-web:gpt-5.6-sol",
+            "assignment_contract_version": 2,
+            "side_effect": False,
+            "attempt": 1,
+            "lease_id": "A-1:web:attempt:1",
+            "role": "writer",
+            "route": {
+                "decision": "default",
+                "policy_class": "general",
+                "provider": "chatgpt_web",
+                "model": "gpt-5.6-sol",
+                "auth_mode": "host",
+                "policy_source": {
+                    "path": str(self.policy.resolve()),
+                    "sha256": __import__("hashlib").sha256(self.policy.read_bytes()).hexdigest(),
+                },
+            },
+        }
+        value.update(extra)
+        return value
+
+    def _write_structured_session(self, path, records):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            chr(10).join(json.dumps(item) for item in records) + chr(10),
+            encoding="utf-8",
+        )
+        return path
+
+    def _spawn_and_started(
+        self,
+        *,
+        task_name,
+        conversation_id,
+        call_id,
+        started_at,
+        spawn_at=None,
+        model="gpt-5.6-sol",
+        agent_type="default",
+    ):
+        spawn_at = spawn_at or started_at
+        return [
+            {
+                "timestamp": spawn_at.isoformat(),
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "namespace": "collaboration",
+                    "name": "spawn_agent",
+                    "call_id": call_id,
+                    "arguments": json.dumps({
+                        "task_name": task_name,
+                        "agent_type": agent_type,
+                        "model": model,
+                    }),
+                },
+            },
+            {
+                "timestamp": started_at.isoformat(),
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "SubAgentActivity",
+                        "kind": "started",
+                        "id": call_id,
+                        "agent_thread_id": conversation_id,
+                        "agent_path": f"/root/{task_name}",
+                    },
+                },
+            },
+        ]
+
+    def _completed(self, *, conversation_id, observation_id, at):
+        return {
+            "timestamp": at.isoformat(),
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "SubAgentActivity",
+                    "kind": "completed",
+                    "id": observation_id,
+                    "agent_thread_id": conversation_id,
+                    "agent_path": "/root/wex02-child",
+                },
+            },
+        }
+
+    def _host_event_source(self, host_paths, local_receipt_paths=None):
+        import scripts.web_agent_events as events
+
+        receipt_path = Path(self.tmp.name) / "event-source.json"
+        local_receipt_paths = [
+            str(Path(item).expanduser().resolve(strict=False))
+            for item in (local_receipt_paths or [])
+        ]
+        attested = [
+            str(Path(item).expanduser().resolve(strict=False))
+            for item in host_paths
+        ]
+        receipt_path.write_text(json.dumps({
+            "schema_version": 1,
+            "state": "ready",
+            "source": "chatgpt_subagent_machine_events",
+            "events": [
+                "started", "completed", "failed", "interrupted", "cancelled", "disconnected",
+            ],
+            "observed_at": T0.isoformat(),
+            "event_paths": local_receipt_paths,
+            "provenance": "runtime_observed_local_session_files_not_authorization",
+        }), encoding="utf-8")
+
+        def verifier(_payload, _path):
+            return {
+                "verified": True,
+                "fresh": True,
+                "replay": False,
+                "source": "chatgpt_subagent_machine_events",
+                "event_paths": list(attested),
+            }
+
+        real_status = events.machine_event_source_status
+
+        def status(**kwargs):
+            kwargs.setdefault("path", receipt_path)
+            kwargs.setdefault("now", T0)
+            return real_status(**kwargs)
+
+        return (
+            attested,
+            patch(
+                "scripts.web_agent_events._trusted_machine_event_source_verifier",
+                return_value=verifier,
+            ),
+            patch(
+                "scripts.web_agent_events.machine_event_source_status",
+                side_effect=status,
+            ),
+        )
+
+    def test_prepare_bind_terminal_closed_loop_keeps_same_controller_assignment(self):
+        import scripts.web_agent_events as events
+        from scripts.web_agent_execution import (
+            apply_web_execution_event,
+            bind_web_assignment_dispatch,
+            ingest_structured_subagent_terminal,
+            prepare_web_assignment_dispatch,
+            _ingest_verified_structured_subagent_terminal,
+        )
+
+        host_session = Path(self.tmp.name) / "host-attested-session.jsonl"
+        local_journal = Path(self.tmp.name) / "local-diagnostic.jsonl"
+        attested, verifier_patch, status_patch = self._host_event_source(
+            [host_session],
+            local_receipt_paths=[local_journal],
+        )
+        assignment = self.assignment()
+        task_name = "wex02-closed-loop"
+        conversation_id = "wex02-child-1"
+        with verifier_patch, status_patch:
+            status = events.machine_event_source_status()
+            self.assertTrue(status["ready"])
+            self.assertEqual(status["event_paths"], attested)
+            self.assertNotIn(str(local_journal.resolve()), status["event_paths"])
+
+            prepared = prepare_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                task_name=task_name,
+                assignment=assignment,
+                now=T0,
+                health_probe=lambda: True,
+            )
+            self.assertEqual(prepared["controller_id"], "controller-1")
+            self.assertEqual(prepared["assignment"]["assignment_id"], "A-1")
+            self.assertEqual(prepared["assignment"]["provider"], "chatgpt_web")
+            self.assertNotIn("A-1", load_runtime_state(self.repo).get("leases", {}))
+            records = self._spawn_and_started(
+                task_name=task_name,
+                conversation_id=conversation_id,
+                call_id="spawn-before-ticket",
+                started_at=T0 - timedelta(seconds=5),
+                spawn_at=T0 - timedelta(seconds=6),
+            ) + self._spawn_and_started(
+                task_name=task_name,
+                conversation_id=conversation_id,
+                call_id="spawn-after-ticket",
+                started_at=T0 + timedelta(seconds=1),
+                spawn_at=T0 + timedelta(seconds=1),
+            )
+            self._write_structured_session(host_session, records)
+
+            bound = bind_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                dispatch_id=prepared["dispatch_id"],
+                event_paths=status["event_paths"],
+                now=T0 + timedelta(seconds=1),
+                health_probe=lambda: True,
+                watchdog_launcher=lambda **_: {"launched": False, "reason": "unit_test"},
+            )
+            leases = load_runtime_state(self.repo)["leases"]
+            self.assertEqual(set(leases), {"A-1"})
+            lease = leases["A-1"]
+            self.assertEqual(bound["controller_id"], "controller-1")
+            self.assertEqual(bound["conversation_id"], conversation_id)
+            self.assertEqual(bound["assignment_id"], "A-1")
+            self.assertEqual(lease["delegation_owner_kind"], "controller")
+            self.assertEqual(lease["delegation_owner_id"], "controller-1")
+            self.assertEqual(lease["session_id"], conversation_id)
+            self.assertNotEqual(lease["session_id"], "controller-1")
+            self.assertEqual(lease["execution_transport"], "web")
+            self.assertEqual(lease["provider"], "chatgpt_web")
+            self.assertIsNone(lease.get("terminal_state"))
+
+            with host_session.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(self._completed(
+                    conversation_id=conversation_id,
+                    observation_id="terminal-wex02",
+                    at=T0 + timedelta(minutes=2),
+                )) + chr(10))
+            terminal = _ingest_verified_structured_subagent_terminal(
+                repo=self.repo,
+                assignment_id="A-1",
+                event_path=status["event_paths"][0],
+                observation_id="terminal-wex02",
+                now=T0 + timedelta(minutes=2),
+            )
+            with self.assertRaisesRegex(PermissionError, "direct structured Web terminal ingest"):
+                ingest_structured_subagent_terminal(
+                    repo=self.repo,
+                    assignment_id="A-1",
+                    observation={"kind": "completed", "conversation_id": conversation_id},
+                    now=T0 + timedelta(minutes=2),
+                )
+            with self.assertRaisesRegex(PermissionError, "direct Web Host event ingest"):
+                apply_web_execution_event(
+                    repo=self.repo,
+                    registry_path=self.registry,
+                    event={
+                        "controller_id": "controller-1",
+                        "conversation_id": conversation_id,
+                        "state": "completed",
+                    },
+                    now=T0 + timedelta(minutes=2),
+                )
+
+        leases = load_runtime_state(self.repo)["leases"]
+        self.assertEqual(set(leases), {"A-1"})
+        lease = leases["A-1"]
+        self.assertEqual(lease["terminal_state"], "completed")
+        self.assertEqual(lease["delegation_owner_id"], "controller-1")
+        self.assertEqual(lease["session_id"], conversation_id)
+        self.assertEqual(terminal["assignment_id"], "A-1")
+        self.assertEqual(terminal["terminal_state"], "completed")
+
+    def test_local_json_dom_url_and_caller_self_reported_paths_cannot_bind(self):
+        import scripts.web_agent_events as events
+        from scripts.web_agent_execution import (
+            bind_web_assignment_dispatch,
+            prepare_web_assignment_dispatch,
+        )
+
+        host_session = Path(self.tmp.name) / "host-attested-session.jsonl"
+        local_json = Path(self.tmp.name) / "caller-local-events.jsonl"
+        dom_snapshot = Path(self.tmp.name) / "composer-dom.json"
+        wex01_journal = Path(self.tmp.name) / "events.jsonl"
+        attested, verifier_patch, status_patch = self._host_event_source([host_session])
+        task_name = "wex02-untrusted-paths"
+        conversation_id = "wex02-untrusted-child"
+        started = self._spawn_and_started(
+            task_name=task_name,
+            conversation_id=conversation_id,
+            call_id="spawn-untrusted",
+            started_at=T0 + timedelta(seconds=1),
+        )
+        self._write_structured_session(host_session, started)
+        self._write_structured_session(local_json, started)
+        dom_snapshot.write_text(json.dumps({
+            "source": "dom",
+            "url": "https://chatgpt.com/c/forged",
+            "composer_text": "started",
+        }), encoding="utf-8")
+        wex01_journal.write_text(json.dumps({
+            "type": "started",
+            "execution_id": "wex-01",
+            "conversation_id": conversation_id,
+            "timestamp": (T0 + timedelta(seconds=1)).isoformat(),
+        }) + chr(10), encoding="utf-8")
+
+        with verifier_patch, status_patch:
+            status = events.machine_event_source_status()
+            self.assertEqual(status["event_paths"], attested)
+            prepared = prepare_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                task_name=task_name,
+                assignment=self.assignment(),
+                now=T0,
+                health_probe=lambda: True,
+            )
+            rejected = [
+                local_json,
+                dom_snapshot,
+                "https://chatgpt.com/c/forged-conversation",
+                wex01_journal,
+                Path(self.tmp.name) / "caller-self-reported.jsonl",
+            ]
+            for event_path in rejected:
+                with self.assertRaisesRegex(
+                    (PermissionError, RuntimeError),
+                    "not attested|machine event source|event path",
+                ):
+                    bind_web_assignment_dispatch(
+                        repo=self.repo,
+                        registry_path=self.registry,
+                        controller_id="controller-1",
+                        dispatch_id=prepared["dispatch_id"],
+                        event_paths=[event_path],
+                        now=T0 + timedelta(seconds=1),
+                        health_probe=lambda: True,
+                        watchdog_launcher=lambda **_: {"launched": False, "reason": "unit_test"},
+                    )
+            self.assertNotIn("A-1", load_runtime_state(self.repo).get("leases", {}))
+
+            bound = bind_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                dispatch_id=prepared["dispatch_id"],
+                event_paths=status["event_paths"],
+                now=T0 + timedelta(seconds=1),
+                health_probe=lambda: True,
+                watchdog_launcher=lambda **_: {"launched": False, "reason": "unit_test"},
+            )
+        self.assertEqual(bound["controller_id"], "controller-1")
+        self.assertEqual(set(load_runtime_state(self.repo)["leases"]), {"A-1"})
+
+    def test_event_paths_must_come_from_host_machine_event_source_status(self):
+        import scripts.web_agent_events as events
+        from scripts.web_agent_execution import (
+            bind_web_assignment_dispatch,
+            prepare_web_assignment_dispatch,
+        )
+
+        host_session = Path(self.tmp.name) / "host-owned-session.jsonl"
+        receipt_local = Path(self.tmp.name) / "receipt-local-session.jsonl"
+        started = self._spawn_and_started(
+            task_name="wex02-host-paths",
+            conversation_id="wex02-host-child",
+            call_id="spawn-host-paths",
+            started_at=T0 + timedelta(seconds=1),
+        )
+        self._write_structured_session(host_session, started)
+        self._write_structured_session(receipt_local, started)
+        attested, verifier_patch, status_patch = self._host_event_source(
+            [host_session],
+            local_receipt_paths=[receipt_local],
+        )
+        with verifier_patch, status_patch:
+            status = events.machine_event_source_status()
+            self.assertEqual(status["event_paths"], attested)
+            self.assertEqual(status["event_paths"], [str(host_session.resolve())])
+            self.assertNotEqual(status["event_paths"], [str(receipt_local.resolve())])
+            prepared = prepare_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                task_name="wex02-host-paths",
+                assignment=self.assignment(),
+                now=T0,
+                health_probe=lambda: True,
+            )
+            with self.assertRaisesRegex(PermissionError, "not attested"):
+                bind_web_assignment_dispatch(
+                    repo=self.repo,
+                    registry_path=self.registry,
+                    controller_id="controller-1",
+                    dispatch_id=prepared["dispatch_id"],
+                    event_paths=[receipt_local],
+                    now=T0 + timedelta(seconds=1),
+                    health_probe=lambda: True,
+                    watchdog_launcher=lambda **_: {"launched": False, "reason": "unit_test"},
+                )
+            bound = bind_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                dispatch_id=prepared["dispatch_id"],
+                event_paths=status["event_paths"],
+                now=T0 + timedelta(seconds=1),
+                health_probe=lambda: True,
+                watchdog_launcher=lambda **_: {"launched": False, "reason": "unit_test"},
+            )
+        self.assertEqual(bound["conversation_id"], "wex02-host-child")
+        self.assertEqual(bound["controller_id"], "controller-1")
+
+    def test_prepare_and_bind_fail_closed_without_host(self):
+        from scripts.web_agent_events import machine_event_source_status
+        from scripts.web_agent_execution import (
+            bind_web_assignment_dispatch,
+            prepare_web_assignment_dispatch,
+        )
+
+        status = machine_event_source_status(
+            path=Path(self.tmp.name) / "missing-event-source.json",
+            now=T0,
+        )
+        self.assertFalse(status.get("ready"))
+        self.assertNotIn("event_paths", status)
+        local_json = Path(self.tmp.name) / "no-host-local.jsonl"
+        self._write_structured_session(local_json, self._spawn_and_started(
+            task_name="wex02-no-host",
+            conversation_id="wex02-no-host-child",
+            call_id="spawn-no-host",
+            started_at=T0 + timedelta(seconds=1),
+        ))
+        with self.assertRaisesRegex(RuntimeError, "machine event source"):
+            prepare_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                task_name="wex02-no-host",
+                assignment=self.assignment(),
+                now=T0,
+                health_probe=lambda: True,
+            )
+        with self.assertRaisesRegex(RuntimeError, "machine event source"):
+            bind_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                dispatch_id="missing-dispatch",
+                event_paths=[local_json],
+                now=T0 + timedelta(seconds=1),
+                health_probe=lambda: True,
+                watchdog_launcher=lambda **_: {"launched": False, "reason": "unit_test"},
+            )
+        self.assertEqual(load_runtime_state(self.repo).get("leases", {}), {})
+
+    def test_bind_requires_exactly_one_structured_started_after_ticket(self):
+        import scripts.web_agent_events as events
+        from scripts.web_agent_execution import (
+            bind_web_assignment_dispatch,
+            prepare_web_assignment_dispatch,
+        )
+
+        host_session = Path(self.tmp.name) / "host-attested-session.jsonl"
+        attested, verifier_patch, status_patch = self._host_event_source([host_session])
+        task_name = "wex02-exactly-one"
+        with verifier_patch, status_patch:
+            status = events.machine_event_source_status()
+            self.assertEqual(status["event_paths"], attested)
+            prepared = prepare_web_assignment_dispatch(
+                repo=self.repo,
+                registry_path=self.registry,
+                controller_id="controller-1",
+                task_name=task_name,
+                assignment=self.assignment(),
+                now=T0,
+                health_probe=lambda: True,
+            )
+            self._write_structured_session(host_session, self._spawn_and_started(
+                task_name=task_name,
+                conversation_id="too-early-child",
+                call_id="spawn-too-early",
+                started_at=T0 - timedelta(seconds=1),
+                spawn_at=T0 - timedelta(seconds=2),
+            ))
+            with self.assertRaisesRegex(ValueError, "exactly one structured machine started"):
+                bind_web_assignment_dispatch(
+                    repo=self.repo,
+                    registry_path=self.registry,
+                    controller_id="controller-1",
+                    dispatch_id=prepared["dispatch_id"],
+                    event_paths=status["event_paths"],
+                    now=T0 + timedelta(seconds=1),
+                    health_probe=lambda: True,
+                    watchdog_launcher=lambda **_: {"launched": False, "reason": "unit_test"},
+                )
+            self._write_structured_session(
+                host_session,
+                self._spawn_and_started(
+                    task_name=task_name,
+                    conversation_id="child-a",
+                    call_id="spawn-a",
+                    started_at=T0 + timedelta(seconds=1),
+                ) + self._spawn_and_started(
+                    task_name=task_name,
+                    conversation_id="child-b",
+                    call_id="spawn-b",
+                    started_at=T0 + timedelta(seconds=2),
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "exactly one structured machine started"):
+                bind_web_assignment_dispatch(
+                    repo=self.repo,
+                    registry_path=self.registry,
+                    controller_id="controller-1",
+                    dispatch_id=prepared["dispatch_id"],
+                    event_paths=status["event_paths"],
+                    now=T0 + timedelta(seconds=2),
+                    health_probe=lambda: True,
+                    watchdog_launcher=lambda **_: {"launched": False, "reason": "unit_test"},
+                )
+            self.assertNotIn("A-1", load_runtime_state(self.repo).get("leases", {}))

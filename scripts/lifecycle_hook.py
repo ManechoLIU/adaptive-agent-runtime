@@ -558,7 +558,7 @@ def _validate_runtime_web_turn_lease_transition(
     if prior is None:
         if incoming.get("generation") != 1:
             return "first Runtime Web turn lease generation must be 1"
-        if current_turn_id and current_turn_id not in LEGACY_WEB_TURN_IDS:
+        if current_turn_id.startswith("web-turn:"):
             return "existing non-legacy turn cannot be replaced without a verified Runtime Web turn lease"
         if current_turn_id in LEGACY_WEB_TURN_IDS and inflight:
             return "legacy Web turn cannot migrate while tool evidence is inflight"
@@ -821,7 +821,15 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
             "reason": "verified Web PostToolUse cannot create a new turn without SessionStart/UserPromptSubmit",
         }
         return "Web turn boundary rejected: SessionStart/UserPromptSubmit is required before Web tool evidence."
-    if web_turn is not None and current_turn_id and state.get("inflight_tool_use_ids"):
+    if (
+        web_turn is not None
+        and current_turn_id
+        and state.get("inflight_tool_use_ids")
+        and (
+            current_turn_id.startswith("web-turn:")
+            or current_turn_id in LEGACY_WEB_TURN_IDS
+        )
+    ):
         inflight = [str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)]
         state["adapter_fault"] = {
             "code": "inflight_tool_turn_boundary",
@@ -1064,6 +1072,34 @@ def _pending_stop_output(
     }
 
 
+
+def _is_trusted_receipt_python(token: str) -> bool:
+    """Trust the hook interpreter or an existing known system installation.
+
+    Resolve bare commands and symlinks first: a Python-looking file name alone
+    must never authenticate a control receipt.
+    """
+    raw = str(token or "").strip()
+    if not raw:
+        return False
+    declared = Path(raw).expanduser()
+    if not declared.is_absolute():
+        discovered = shutil.which(raw)
+        if not discovered:
+            return False
+        declared = Path(discovered)
+    try:
+        resolved = declared.resolve(strict=True)
+        if not resolved.is_file():
+            return False
+        if resolved == Path(sys.executable).resolve():
+            return True
+    except OSError:
+        return False
+    known = ("/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3")
+    return any(Path(candidate).is_file() and resolved == Path(candidate).resolve() for candidate in known)
+
+
 def _is_control_guard_command(
     command: str,
     *,
@@ -1078,15 +1114,7 @@ def _is_control_guard_command(
         return False
     if len(tokens) < 4:
         return False
-    declared_python = Path(tokens[0]).expanduser()
-    if declared_python.is_absolute():
-        resolved_python = declared_python.resolve()
-    else:
-        discovered_python = shutil.which(tokens[0])
-        if not discovered_python:
-            return False
-        resolved_python = Path(discovered_python).resolve()
-    if resolved_python != Path(sys.executable).resolve():
+    if not _is_trusted_receipt_python(tokens[0]):
         return False
     expected_guard = Path(__file__).resolve().with_name("control_event_guard.py")
     declared_guard = Path(tokens[1]).expanduser()
@@ -2873,6 +2901,19 @@ def project_snapshot(
     }
 
 
+
+def _tool_response_allows_control_receipt(response: Any) -> bool:
+    if not isinstance(response, dict):
+        return False
+    code = response.get("exit_code")
+    if code not in (None, 0, "0"):
+        return False
+    blob = json.dumps(response, ensure_ascii=False)
+    stdout = str(response.get("stdout") or "")
+    output = str(response.get("output") or "")
+    return "control-event: allowed" in blob or "control-event: allowed" in stdout or "control-event: allowed" in output
+
+
 def successful_control_receipt(
     event: dict[str, Any], snapshot: dict[str, Any] | None = None,
     *, trusted_host_terminal_commit: dict[str, Any] | None = None,
@@ -2882,7 +2923,10 @@ def successful_control_receipt(
         policy = derive_rule_wake_policy(
             handshake, assignment_liveness=(snapshot or {}).get("assignment_liveness", {})
         )
-        if policy != "after_event":
+        handshake_state = str(handshake.get("state", "")).strip()
+        # integrity_error must not drop a machine-valid desktop receipt; otherwise
+        # Stop/Yield cannot close and the same-turn continuation loop never ends.
+        if policy != "after_event" and handshake_state != "integrity_error":
             return False
     if event.get("hook_event_name") != "PostToolUse":
         return False
@@ -2924,10 +2968,7 @@ def successful_control_receipt(
     if snapshot and snapshot.get("candidate_revisions") and "--repo" not in command:
         return False
     response = event.get("tool_response")
-    if not isinstance(response, dict) or response.get("exit_code") not in (None, 0):
-        return False
-    output = json.dumps(response, ensure_ascii=False)
-    if "control-event: allowed" not in output:
+    if not _tool_response_allows_control_receipt(response):
         return False
     if event.get("rollout_recovery") is not None:
         return _verified_rollout_control_receipt(event, snapshot)
@@ -3063,7 +3104,7 @@ def _reconcile_desktop_rollout(
         if (
             not tool_use_id
             or tool_use_id in inflight
-            or tool_use_id in traced_ids
+            or (tool_use_id in traced_ids and state.get("must_yield") is True)
         ):
             continue
         command = _rollout_command_text(item)

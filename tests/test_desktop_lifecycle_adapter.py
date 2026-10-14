@@ -382,6 +382,76 @@ class DesktopLifecycleTurnGateTests(unittest.TestCase):
         self.assertTrue(state["pending_control_event"])
         self.assertFalse(state["must_yield"])
 
+    def test_bare_python3_receipt_is_accepted_when_path_differs_from_hook(self) -> None:
+        guard = Path(lifecycle_hook.__file__).resolve().with_name(
+            "control_event_guard.py"
+        )
+        _output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "controller-1",
+                "controller_session_id": "controller-1",
+                "controller_host": "desktop_codex",
+                "turn_id": "turn-1",
+                "tool_name": "Bash",
+                "tool_use_id": "receipt-python3",
+                "tool_input": {
+                    "command": (
+                        f"python3 {guard} receipt.json "
+                        "--ledger TASK_LEDGER.md --repo . "
+                        "--controller-session controller-1"
+                    )
+                },
+                "tool_response": {"output": "control-event: allowed", "exit_code": "0"},
+            },
+            snapshot=self.snapshot(),
+            prior_state={
+                "pending_control_event": True,
+                "triggers": ["ledger_changed", "main_worktree_changed"],
+                "active_turn_id": "turn-1",
+            },
+        )
+        self.assertTrue(state["must_yield"])
+        self.assertEqual(state["receipt_turn_id"], "turn-1")
+
+    def test_integrity_error_does_not_drop_a_valid_desktop_receipt(self) -> None:
+        guard = Path(lifecycle_hook.__file__).resolve().with_name(
+            "control_event_guard.py"
+        )
+        snapshot = self.snapshot()
+        snapshot["rule_handshake"] = {
+            "state": "integrity_error",
+            "blocking": True,
+            "installed_revision": "abc",
+        }
+        _output, state = lifecycle_hook.evaluate_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "controller-1",
+                "controller_session_id": "controller-1",
+                "controller_host": "desktop_codex",
+                "turn_id": "turn-1",
+                "tool_name": "Bash",
+                "tool_use_id": "receipt-integrity",
+                "tool_input": {
+                    "command": (
+                        f"{sys.executable} {guard} receipt.json "
+                        "--ledger TASK_LEDGER.md --repo . "
+                        "--controller-session controller-1"
+                    )
+                },
+                "tool_response": {"output": "control-event: allowed", "exit_code": 0},
+            },
+            snapshot=snapshot,
+            prior_state={
+                "pending_control_event": True,
+                "triggers": ["rule_install_integrity_error:abc"],
+                "active_turn_id": "turn-1",
+            },
+        )
+        self.assertTrue(state["must_yield"])
+        self.assertEqual(state["receipt_turn_id"], "turn-1")
+
     def test_locked_turn_without_turn_id_fails_closed(self) -> None:
         state = self.successful_receipt(
             {
