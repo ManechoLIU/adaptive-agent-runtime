@@ -207,6 +207,24 @@ class DesktopTurnRecoveryTests(unittest.TestCase):
         self.assertTrue(state["pending_control_event"])
         self.assertEqual(state["pending_terminal_receipts"], ["/tmp/result.json"])
 
+    def test_long_active_desktop_turn_recovers_from_host_start_beyond_legacy_tail(self):
+        with self.transcript.open("ab") as stream:
+            stream.write(b'{"type":"response_item","payload":{"type":"message","text":"')
+            stream.write(b"x" * (9 * 1024 * 1024))
+            stream.write(b'"}}\n')
+
+        output, state = lifecycle_hook.evaluate_event(
+            self.event(), snapshot=self.snapshot, prior_state=self.prior,
+        )
+
+        self.assertEqual(output, {})
+        self.assertEqual(state["active_turn_id"], "new")
+        self.assertEqual(
+            state["turn_start_evidence"]["source"],
+            "codex_rollout_task_started",
+        )
+        self.assertEqual(state["inflight_tool_use_ids"], ["new-call"])
+
     def test_turn_transition_archives_old_trace_before_replacing_it(self):
         path = self.root / "state.json"
         lifecycle_hook.write_json(path, self.prior)

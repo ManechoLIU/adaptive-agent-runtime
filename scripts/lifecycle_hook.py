@@ -72,6 +72,11 @@ CONTROLLER_SESSIONS_KEY = "__controller_sessions__"
 CONTROLLER_TARGETS_KEY = "__controller_targets__"
 DESKTOP_SESSION_HOST = "desktop_codex"
 MAX_TOOL_TRACE_ENTRIES = 128
+# A long-running Desktop controller turn can legitimately emit more than the
+# ordinary 8 MiB reconciliation window before its next Hook-observed tool.
+# Keep recovery bounded, but retain enough Host rollout history to attest that
+# the incoming native turn really started in this exact source session.
+DESKTOP_TURN_START_EVIDENCE_BYTES = 64 * 1024 * 1024
 # First Stop with Continuation Debt must block. A later Stop on a non-duty
 # host may end the physical Host turn only after same-controller Desktop
 # reentry is CONFIRMED. Desktop on-duty never uses that escape hatch.
@@ -355,7 +360,7 @@ def _desktop_turn_start(event: dict[str, Any]) -> dict[str, str] | None:
             if header.get("type") != "session_meta" or header.get("payload", {}).get("id") != source_id:
                 return None
             size = stream.seek(0, os.SEEK_END)
-            offset = max(0, size - 8 * 1024 * 1024)
+            offset = max(0, size - DESKTOP_TURN_START_EVIDENCE_BYTES)
             stream.seek(offset)
             if offset:
                 stream.readline()  # Drop the partial first record.
