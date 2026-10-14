@@ -1443,6 +1443,40 @@ test("assignment-bound external terminal receipt carries current attempt and lea
   assert.equal(receipt.lease_id, "lease-terminal-1");
 });
 
+test("default external terminal lease matches the canonical runtime identity", async () => {
+  const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-terminal-default-lease-"));
+  const repo = await makeAssignmentRepo(bin);
+  const grokHome = path.join(bin, "grok-home");
+  await mkdir(grokHome, { recursive: true });
+  await writeFile(path.join(grokHome, "auth.json"), "{}");
+  await fakeRunner(bin, "grok", "version");
+  const ack = await assignmentAckFile(bin, { assignment_id: "default-terminal" }, repo);
+  const terminalReceipt = path.join(bin, "terminal.json");
+  const helper = path.join(bin, "verify-terminal.py");
+  await writeFile(helper, [
+    "import json,sys",
+    "from pathlib import Path",
+    `sys.path.insert(0, ${JSON.stringify(skillRoot)})`,
+    `sys.path.insert(0, ${JSON.stringify(path.join(skillRoot, "scripts"))})`,
+    "from scripts.terminal_continuation import _verify_assignment_bound_receipt",
+    "repo = Path(sys.argv[sys.argv.index('--repo') + 1])",
+    "receipt = json.loads(Path(sys.argv[sys.argv.index('--receipt') + 1]).read_text())",
+    "_verify_assignment_bound_receipt(repo, receipt)",
+  ].join("\n") + "\n");
+  const result = spawnSync(process.execPath, [adapter,
+    "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
+    "--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", repo, "--work-type", "implementation",
+    "--assignment-id", "default-terminal", "--task-id", "T1", "--agent-id", "writer", "--session-id", "s1",
+    "--assignment-ack", ack, "--terminal-receipt", terminalReceipt,
+  ], { encoding: "utf8", input: "bounded contract", env: {
+    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}`, GROK_HOME: grokHome,
+    AD_TERMINAL_CONTINUATION_HELPER: helper,
+  } });
+  assert.equal(result.status, 0, result.stderr);
+  const receipt = JSON.parse(await readFile(terminalReceipt, "utf8"));
+  assert.equal(receipt.lease_id, "default-terminal:attempt:1");
+});
+
 test("Grok execution transports prompts through a private prompt file and removes it", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-grok-prompt-file-"));
   const repo = await makeAssignmentRepo(bin);

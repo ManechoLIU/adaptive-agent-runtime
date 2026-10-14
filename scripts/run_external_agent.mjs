@@ -913,6 +913,12 @@ function runtimeRepository(options) {
   return options.runtimeRepo || options.cwd;
 }
 
+function assignmentLeaseId(options) {
+  return options.assignmentId
+    ? options.leaseId || `${options.assignmentId}:attempt:${options.attempt}`
+    : null;
+}
+
 function validateRuntimeBinding(options) {
   if (!options.assignmentId) return;
   const executionCommon = gitFact(options.cwd, ["rev-parse", "--git-common-dir"], "execution git common-dir");
@@ -1252,7 +1258,7 @@ function buildRuntimeReceipt(options, eventType, eventSeq, extra = {}) {
     event_type: eventType, assignment_id: options.assignmentId, task_id: options.taskId,
     agent_id: options.agentId, provider: options.engine, session_id: options.sessionId,
     worktree: options.cwd, issued_at: new Date().toISOString(), attempt: options.attempt,
-    lease_id: options.leaseId || `${options.assignmentId}:attempt:${options.attempt}`, event_seq: eventSeq,
+    lease_id: assignmentLeaseId(options), event_seq: eventSeq,
     receipt_id: `${options.assignmentId}:${options.attempt}:${eventSeq}`,
     assignment_contract_version: options.assignmentContractVersion || 1,
     ...(Number(options.assignmentContractVersion || 1) >= 2 ? {
@@ -1323,7 +1329,7 @@ function persistExternalTerminalReceipt(options, {
     agent_id: options.agentId || null,
     session_id: options.sessionId || null,
     attempt: options.assignmentId ? options.attempt : null,
-    lease_id: options.assignmentId ? options.leaseId : null,
+    lease_id: assignmentLeaseId(options),
     ...(failureClass ? { failure_class: failureClass } : {}),
     ...(retryClass ? { retry_class: retryClass } : {}),
     ...(options.assignmentRole ? { execution_role: options.assignmentRole } : {}),
