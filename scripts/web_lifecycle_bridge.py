@@ -5391,7 +5391,7 @@ def _loaded_external_peer_attestation_verifier(
         return {
             "verified": payload.get("verified") is True,
             "fresh": payload.get("fresh") is True,
-            "replay": payload.get("replay") is True,
+            "replay": False if payload.get("replay") is False else True,
             "source": str(payload.get("source") or ""),
             "event_paths": event_paths,
         }

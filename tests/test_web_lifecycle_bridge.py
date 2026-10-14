@@ -1303,6 +1303,40 @@ class WebLifecycleBridgeTests(unittest.TestCase):
             self.assertEqual(entry["target_generation"], 4)
             self.assertEqual(entry["ownership_generation"], 9)
 
+    def test_registered_v2_machine_event_attestation_preserves_missing_replay_as_rejected(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runtime-verifier"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,sys\n"
+                "r=json.loads(sys.stdin.read())\n"
+                "assert r['operation']=='attest_machine_event_source', r\n"
+                "out={'ok':True,'protocol':'runtime_host_verifier_cli_v2',"
+                "'operation':'attest_machine_event_source','verified':True,'fresh':True,"
+                "'source':'chatgpt_subagent_machine_events','event_paths':['/tmp/host-events.jsonl']}\n"
+                "if r['receipt'].get('include_replay'):\n"
+                " out['replay']=False\n"
+                "print(json.dumps(out))\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            digest = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            config = root / "host-verifiers.json"
+            config.write_text(json.dumps({"schema_version":1,"verifiers":{"web":{
+                "protocol":"runtime_host_verifier_cli_v2","executable":str(executable),
+                "sha256":digest,"bundle_sha256":{str(executable):digest},
+            }}}), encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(web_bridge, "DEFAULT_PEER_ATTESTATION_VERIFIER_CONFIG", config, create=True):
+                verifier = web_bridge._registered_peer_attestation_verifier("web")
+                attest = getattr(verifier, "attest_machine_event_source")
+                missing = attest(receipt={}, receipt_path="/tmp/source.json")
+                explicit = attest(receipt={"include_replay": True}, receipt_path="/tmp/source.json")
+            self.assertIs(missing["replay"], True)
+            self.assertIs(explicit["replay"], False)
+
     def test_registered_v2_identity_evidence_consumes_signed_current_entry_without_reattest(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
