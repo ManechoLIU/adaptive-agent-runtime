@@ -84,19 +84,49 @@ def _structured_payloads(response: Any) -> list[dict[str, Any]]:
     return payloads
 
 
-def _goal_readback_matches(response: Any, objective: str) -> bool:
-    return any(payload.get("objective") == objective for payload in _structured_payloads(response))
+def _goal_target_matches(goal: dict[str, Any], expected_session_id: str | None) -> bool:
+    if expected_session_id is None:
+        return True
+    return all(
+        key not in goal or goal[key] == expected_session_id
+        for key in ("threadId", "thread_id")
+    )
+
+
+def _goal_readback_matches(
+    response: Any, objective: str, expected_session_id: str | None = None,
+) -> bool:
+    payloads = _structured_payloads(response)
+    # A declared Goal envelope takes precedence over legacy flat fields. Never
+    # turn goal:null or a different thread into success via an outer objective.
+    for payload in payloads:
+        if "goal" in payload:
+            goal = payload["goal"]
+            return (
+                isinstance(goal, dict) and goal.get("objective") == objective
+                and goal.get("status") == "active"
+                and _goal_target_matches(goal, expected_session_id)
+            )
+    return any(
+        payload.get("objective") == objective
+        and payload.get("status", "active") == "active"
+        and _goal_target_matches(payload, expected_session_id)
+        for payload in payloads
+    )
 
 
 def _explicit_goal_snapshot(response: Any) -> tuple[bool, dict[str, Any] | None]:
     """Return only an explicit Host Goal envelope; absence is not guessed."""
-    for payload in _structured_payloads(response):
+    payloads = _structured_payloads(response)
+    for payload in payloads:
         if "goal" in payload:
             goal = payload.get("goal")
             if goal is None:
                 return True, None
             if isinstance(goal, dict):
                 return True, goal
+            return False, None
+    for payload in payloads:
         if "objective" in payload and "status" in payload:
             return True, payload
     return False, None
@@ -425,6 +455,10 @@ def observe_goal_display_sync_result(
         explicit, goal = _explicit_goal_snapshot(response)
         if not explicit:
             success = False
+        elif goal is not None and not _goal_target_matches(
+            goal, str(next_receipt.get("execution_target_session_id", ""))
+        ):
+            success = False
         elif goal is None:
             next_receipt["status"] = "pending_create_goal"
         else:
@@ -444,7 +478,8 @@ def observe_goal_display_sync_result(
                 success = False
     elif success and step_name == "get_goal_readback":
         success = _goal_readback_matches(
-            response, str(next_receipt.get("objective", ""))
+            response, str(next_receipt.get("objective", "")),
+            str(next_receipt.get("execution_target_session_id", "")),
         )
     elif success and step_name == "thread_title_readback":
         success = _title_readback_matches(

@@ -373,6 +373,47 @@ class GoalDisplaySyncTests(unittest.TestCase):
         )
         self.assertIn("get_goal", denial or "")
 
+    def test_explicit_host_goal_envelope_readback_and_target_fences(self) -> None:
+        receipt = self.start()
+        receipt["status"] = "pending_goal_readback"
+        objective = receipt["objective"]
+        base_goal = {"threadId": "desktop-current", "objective": objective, "status": "active",
+                     "tokensUsed": 9385, "timeUsedSeconds": 196, "createdAt": 1791983350}
+        valid = self.complete_step(
+            receipt, self.event("get_goal", "explicit-goal", {}),
+            response={"goal": base_goal, "remainingTokens": None, "completionBudgetReport": None})
+        self.assertEqual(valid["status"], "pending_title_readback")
+        for response in [
+            {"goal": {**base_goal, "threadId": "another-thread"}},
+            {"goal": {**base_goal, "objective": "another objective"}},
+            {"goal": {**base_goal, "status": "complete"}},
+            {"goal": None}, {"goal": None, "objective": objective},
+            {"arbitrary": {"goal": base_goal}},
+        ]:
+            with self.subTest(response=response):
+                denied = self.complete_step(receipt, self.event("get_goal", "bad-goal", {}), response=response)
+                self.assertEqual(denied["status"], "pending_goal_readback")
+                self.assertEqual(denied["last_failure"]["reason"], "HOST_READBACK_MISMATCH")
+
+    def test_initial_explicit_goal_precedes_outer_legacy_fields(self) -> None:
+        receipt = self.start_rebind()
+        for goal in [None, {"objective": receipt["objective"], "status": "active", "threadId": "other-thread"}]:
+            with self.subTest(goal=goal):
+                observed = self.complete_step(
+                    receipt, self.rebind_event("get_goal", "wrapped-goal", {}),
+                    response={"objective": receipt["objective"], "status": "active",
+                              "structuredContent": {"goal": goal}})
+                self.assertEqual(observed["status"], "pending_create_goal" if goal is None else "pending_existing_goal_readback")
+                self.assertNotEqual(observed["status"], "pending_thread_title")
+
+    def test_initial_goal_envelope_wrong_thread_is_not_adopted(self) -> None:
+        receipt = self.start_rebind()
+        denied = self.complete_step(
+            receipt, self.rebind_event("get_goal", "wrong-thread", {}),
+            response={"goal": {"objective": receipt["objective"], "status": "active", "threadId": "other-thread"}})
+        self.assertEqual(denied["status"], "pending_existing_goal_readback")
+        self.assertEqual(denied["last_failure"]["reason"], "HOST_READBACK_MISMATCH")
+
     def test_host_readback_rejects_unrelated_objective_and_split_thread_match(self) -> None:
         receipt = self.start()
         for event in (
