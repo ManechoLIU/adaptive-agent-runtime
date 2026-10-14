@@ -5794,6 +5794,23 @@ def _desktop_outbound_request(
     return request
 
 
+def _verified_native_desktop_controller_source(
+    *, repo: Path, controller_id: str, source_session_id: str
+) -> dict[str, Any] | None:
+    try:
+        try:
+            from scripts.rule_handshake import validate_controller_action_source
+        except ModuleNotFoundError:
+            from rule_handshake import validate_controller_action_source
+        source = validate_controller_action_source(
+            repo, controller_id, execution_host=DESKTOP_SESSION_HOST,
+            source_session_id=source_session_id, registry_path=REGISTRY_PATH,
+        )
+        return source if source.get("identity_state") == "VERIFIED" else None
+    except (OSError, ValueError, PermissionError):
+        return None
+
+
 def run_hook() -> int:
     try:
         event = json.load(sys.stdin)
@@ -5874,6 +5891,7 @@ def run_hook() -> int:
                 return 0
         print(json.dumps(_pre_tool_denial(foreground_denial), ensure_ascii=False))
         return 0
+    native_dispatch_source = None
     outbound_lease_acquired = False
     post_outbound_request: tuple[str, str] | None = None
     if normalized_event.get("hook_event_name") == "PreToolUse":
@@ -5883,17 +5901,37 @@ def run_hook() -> int:
                 tool_input=normalized_event.get("tool_input"),
             )
             if spawn_contract is not None:
-                try:
-                    from scripts.web_agent_execution import require_prepared_web_dispatch
-                except ModuleNotFoundError:
-                    from web_agent_execution import require_prepared_web_dispatch
-                require_prepared_web_dispatch(
-                    repo=expected_root,
-                    controller_id=controller_id,
-                    task_name=spawn_contract["task_name"],
-                    expected_model=spawn_contract["model"],
-                    expected_agent_type=spawn_contract["agent_type"],
+                native_source = (
+                    normalized_event.get("controller_host") == DESKTOP_SESSION_HOST
+                    and _verified_native_desktop_controller_source(
+                        repo=expected_root, controller_id=controller_id,
+                        source_session_id=source_session_id,
+                    )
                 )
+                if native_source:
+                    native_dispatch_source = native_source
+                    try:
+                        from scripts.rule_handshake import launch_guard_errors
+                    except ModuleNotFoundError:
+                        from rule_handshake import launch_guard_errors
+                    native_errors = launch_guard_errors(expected_root)
+                    if native_errors:
+                        print(json.dumps(_pre_tool_denial(
+                            "Native Desktop agent dispatch blocked: " + "; ".join(native_errors)
+                        ), ensure_ascii=False))
+                        return 0
+                else:
+                    try:
+                        from scripts.web_agent_execution import require_prepared_web_dispatch
+                    except ModuleNotFoundError:
+                        from web_agent_execution import require_prepared_web_dispatch
+                    require_prepared_web_dispatch(
+                        repo=expected_root,
+                        controller_id=controller_id,
+                        task_name=spawn_contract["task_name"],
+                        expected_model=spawn_contract["model"],
+                        expected_agent_type=spawn_contract["agent_type"],
+                    )
         except (OSError, ValueError, PermissionError, subprocess.SubprocessError) as exc:
             print(json.dumps(_pre_tool_denial(
                 f"Web Agent dispatch gate rejected collaboration.spawn_agent: {exc}"
@@ -5935,11 +5973,30 @@ def run_hook() -> int:
         REGISTRY_PATH.expanduser().resolve()
     )
     with target_guard.locked_registry(REGISTRY_PATH) as registry:
+        if native_dispatch_source is not None:
+            try:
+                try:
+                    from scripts.rule_handshake import _revalidate_controller_action_source_fence_locked
+                except ModuleNotFoundError:
+                    from rule_handshake import _revalidate_controller_action_source_fence_locked
+                _revalidate_controller_action_source_fence_locked(
+                    registry, repo=expected_root, controller_session_id=controller_id,
+                    action_source=native_dispatch_source,
+                )
+            except (OSError, ValueError, PermissionError) as exc:
+                print(json.dumps(_pre_tool_denial(
+                    f"Native Desktop agent dispatch blocked: {exc}"
+                ), ensure_ascii=False))
+                return 0
         try:
             unique_controller_id = target_guard.unique_controller_id_for_repo_in_registry(
                 expected_root, registry
             )
-        except (OSError, ValueError, PermissionError):
+        except (OSError, ValueError, PermissionError) as exc:
+            if native_dispatch_source is not None:
+                print(json.dumps(_pre_tool_denial(
+                    f"Native Desktop agent dispatch blocked: {exc}"
+                ), ensure_ascii=False))
             return 0
         if unique_controller_id != controller_id or target_guard.active_source_controller_id(
             registry,
@@ -5948,6 +6005,10 @@ def run_hook() -> int:
         ) != controller_id or not registry_controller_root_matches(
             registry, controller_id=controller_id, expected_root=expected_root
         ):
+            if native_dispatch_source is not None:
+                print(json.dumps(_pre_tool_denial(
+                    "Native Desktop agent dispatch blocked: Controller source changed"
+                ), ensure_ascii=False))
             return 0
         target_record = target_guard.target_record(
             registry, controller_id=controller_id, host=DESKTOP_SESSION_HOST
