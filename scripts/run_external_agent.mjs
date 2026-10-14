@@ -1454,6 +1454,42 @@ export function buildGrokReviewArgs(model, promptFile, reasoningEffort) {
   ];
 }
 
+export function buildGrokAdvisoryArgs(model, promptFile, reasoningEffort, packet) {
+  const ids = packet.hypotheses.map(({ id }) => id);
+  const schema = {
+    type: "object", additionalProperties: false, required: ["hypotheses"],
+    properties: {
+      hypotheses: {
+        type: "array", minItems: ids.length, maxItems: ids.length,
+        items: {
+          type: "object", additionalProperties: false, required: ["id", "verdict", "rationale"],
+          properties: {
+            id: { type: "string", enum: ids },
+            verdict: { type: "string", enum: ["supported", "contradicted", "insufficient"] },
+            rationale: { type: "string", minLength: 1, maxLength: 2_000 },
+          },
+        },
+      },
+    },
+  };
+  return [
+    "--no-auto-update", "--no-subagents", "--no-memory", "--sandbox", "workspace",
+    "--no-plan", "--disable-web-search", "--tools", "",
+    "-m", model, "--prompt-file", promptFile,
+    "--json-schema", JSON.stringify(schema), "--output-format", "json",
+    "--max-turns", String(GROK_REVIEW_MAX_TURNS),
+    "--system-prompt-override", [
+      "You are a read-only pure-packet hypothesis evaluator.",
+      "The user prompt is the complete bounded packet and the only evidence source.",
+      "Do not inspect the repository, call tools, browse, plan, or make changes.",
+      "Evaluate only the supplied hypotheses against their supplied evidence; do not discover new causes.",
+      "Return the final structured hypotheses in the packet's exact id order, without narration.",
+      "Use supported, contradicted, or insufficient with a bounded evidence-based rationale; missing evidence means insufficient.",
+    ].join(" "),
+    "--verbatim", "--reasoning-effort", reasoningEffort,
+  ];
+}
+
 function reviewPacketError(message) {
   return new ExternalAgentExecutionError(`review_policy_invalid: ${message}`, {
     failureClass: "review_policy_invalid",
@@ -1655,6 +1691,40 @@ export function parseGrokReviewOutput(stdout, { candidateRevision = null } = {})
   return validateGrokReviewResult(value, { candidateRevision });
 }
 
+export function parseGrokAdvisoryOutput(stdout, { packet } = {}) {
+  const invalid = (message) => new ExternalAgentExecutionError(`result_parse_failed: ${message}`, {
+    outcomeCode: "RESULT_PARSE_FAILED", failureClass: "result_parse_failed", retrySafe: false,
+  });
+  let envelope;
+  try {
+    envelope = JSON.parse(String(stdout || "").trim());
+  } catch (error) {
+    throw invalid(`malformed Grok schema envelope: ${error.message}`);
+  }
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)
+      || envelope.stopReason !== "end_turn"
+      || !envelope.structuredOutput || typeof envelope.structuredOutput !== "object"
+      || Array.isArray(envelope.structuredOutput)) {
+    throw invalid("Grok advisory requires a completed json-schema envelope with structuredOutput");
+  }
+  if (typeof envelope.text === "string" && envelope.text.trim()) {
+    let textResult;
+    try {
+      textResult = JSON.parse(envelope.text);
+    } catch (error) {
+      throw invalid(`Grok schema envelope text is not matching result JSON: ${error.message}`);
+    }
+    if (canonicalReviewJson(textResult) !== canonicalReviewJson(envelope.structuredOutput)) {
+      throw invalid("Grok schema envelope structuredOutput conflicts with text result");
+    }
+  }
+  try {
+    return validateAdvisoryHypothesisResult(envelope.structuredOutput, { packet });
+  } catch (error) {
+    throw invalid(error.message);
+  }
+}
+
 function parseFinalResultEvent(stdout) {
   const records = String(stdout || "").split("\n").map((line) => line.trim()).filter(Boolean);
   for (let index = records.length - 1; index >= 0; index -= 1) {
@@ -1749,6 +1819,7 @@ export function runMonitoredGrok(executable, args, {
   cwd, env, progressDeadlineMinutes = null, onStructuredProgress = null,
   terminateGroup = terminateProcessGroup, spawnChild = spawn, parentProcess = process,
   validateFinalResult = null, returnProtocol = false,
+  finalEnvelopeOnly = false,
   providerName = "Grok", modelProgressKind = grokModelProgressKind,
 }) {
   const launchTimeoutMs = grokLaunchTimeoutMs();
@@ -1904,8 +1975,8 @@ export function runMonitoredGrok(executable, args, {
       const diagnostic = `${message}; cleanup=${cleanup.diagnostic}`;
       finish(reject, new ExternalAgentExecutionError(`${finalClass}: ${diagnostic}`, {
         failureClass: finalClass,
-        retrySafe: cleanup.confirmed && !parentCancelled,
-        resultUnknown: !cleanup.confirmed,
+        retrySafe: cleanup.confirmed && !parentCancelled && !(finalEnvelopeOnly && launchConfirmed),
+        resultUnknown: !cleanup.confirmed || (finalEnvelopeOnly && launchConfirmed),
         outcomeCode: finalOutcomeCode,
         phaseHistory: protocol.phaseHistory,
         cancellationSource,
@@ -1928,6 +1999,17 @@ export function runMonitoredGrok(executable, args, {
       const now = Date.now();
       if (!launchConfirmed && now - startedAt >= launchTimeoutMs) {
         void terminateFor("cli_launch_timeout", "PROVIDER_START_TIMEOUT", `${providerName} CLI launch was not confirmed within ${launchTimeoutMs}ms`);
+        return;
+      }
+      // JSON output is emitted once at completion, so it cannot attest startup
+      // or heartbeat. Bound this silent interval without fabricating progress.
+      if (finalEnvelopeOnly && launchConfirmed) {
+        const elapsed = now - (childSpawnedAt ?? startedAt);
+        if (elapsed >= absoluteTimeoutMs) {
+          void terminateFor("provider_timeout", "PROVIDER_TIMEOUT", `absolute provider deadline ${absoluteTimeoutMs}ms exceeded`);
+        } else if (firstStructuredOutputAt === null && elapsed >= firstOutputTimeoutMs) {
+          void terminateFor("first_output_timeout", "FIRST_TOKEN_TIMEOUT", `no completed ${providerName} envelope within ${firstOutputTimeoutMs}ms`);
+        }
         return;
       }
       if (launchConfirmed && !providerStarted && now - (childSpawnedAt ?? startedAt) >= launchTimeoutMs) {
@@ -2541,6 +2623,9 @@ async function executeExternalAgent({
   if (purePacketReview && (sideEffect === true || idempotencyKey)) {
     throw reviewPacketError("work_type=review must be read-only: side_effect and idempotency_key are forbidden");
   }
+  if (advisoryHypothesisReview && (sideEffect === true || idempotencyKey)) {
+    throw reviewPacketError("advisory_hypothesis_review must be read-only: side_effect and idempotency_key are forbidden");
+  }
   const reviewPacket = purePacketReview
     ? parseGrokReviewPacket(rawPrompt, { candidateRevision, reviewPhase: normalizedReviewPhase })
     : null;
@@ -2605,6 +2690,8 @@ async function executeExternalAgent({
       cleanups.push({ label: "grok_home", cleanup: () => removeDirectoryConfirmed(isolatedHome) });
       args = purePacketReview
         ? buildGrokReviewArgs(model, grokPrompt.path, reasoningEffort)
+        : advisoryHypothesisReview
+          ? buildGrokAdvisoryArgs(model, grokPrompt.path, reasoningEffort, advisoryPacket)
         : commonGrokArgs(model, grokPrompt.path, reasoningEffort);
       env = { ...process.env, GROK_HOME: isolatedHome, XAI_API_KEY: apiKey };
     } else {
@@ -2615,6 +2702,8 @@ async function executeExternalAgent({
       cleanups.push({ label: "prompt_file", cleanup: grokPrompt.cleanup });
       args = purePacketReview
         ? buildGrokReviewArgs(model, grokPrompt.path, reasoningEffort)
+        : advisoryHypothesisReview
+          ? buildGrokAdvisoryArgs(model, grokPrompt.path, reasoningEffort, advisoryPacket)
         : commonGrokArgs(model, grokPrompt.path, reasoningEffort);
       env = sanitizedEnvironment([], ["XAI_API_KEY"]);
     }
@@ -2647,7 +2736,8 @@ async function executeExternalAgent({
       const monitored = await runMonitoredGrok(executable, args, {
         cwd, env, progressDeadlineMinutes, onStructuredProgress, returnProtocol: true,
         ...(advisoryHypothesisReview ? {
-          validateFinalResult: (stdout) => validateAdvisoryHypothesisResult(parseFinalResultEvent(stdout), { packet: advisoryPacket }),
+          finalEnvelopeOnly: true,
+          validateFinalResult: (stdout) => parseGrokAdvisoryOutput(stdout, { packet: advisoryPacket }),
         } : {}),
       });
       const code = monitored.code;

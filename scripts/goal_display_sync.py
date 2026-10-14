@@ -10,6 +10,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import shlex
+import shutil
+import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -300,6 +304,73 @@ def _expected_tool_error(receipt: dict[str, Any], event: dict[str, Any]) -> str 
     return None
 
 
+def external_block_reason(receipt: Any) -> str | None:
+    """Only observed Goal-host faults authorize a physical stop, never prose."""
+    if not isinstance(receipt, dict) or receipt.get("inflight"):
+        return None
+    reason = receipt.get("reason")
+    if receipt.get("status") == "degraded" and reason in {
+        "HOST_GOAL_DISPLAY_CAPABILITY_UNAVAILABLE", "CURRENT_TARGET_GENERATION_UNAVAILABLE",
+        "HOST_GOAL_CONFLICT"
+    }:
+        return str(reason)
+    failure = receipt.get("last_failure")
+    if (isinstance(failure, dict) and failure.get("explicit_host_error") is True
+            and failure.get("tool_use_id") and failure.get("response_sha256")
+            and failure.get("step") == STEP_BY_STATUS.get(str(receipt.get("status")))):
+        return "HOST_TOOL_FAILED"
+    return None
+
+
+def is_recovery_read(event: dict[str, Any]) -> bool:
+    """Narrow control-plane reads; shell wrappers and arbitrary code stay fenced."""
+    kind = _tool_kind(event.get("tool_name"))
+    if kind in {"get_goal", "list_threads", "request_user_input", "request_user_input_async"}:
+        return True
+    if kind not in {"exec_command", "shell_command", "shell", "Bash"}:
+        return False
+    args = event.get("tool_input")
+    if not isinstance(args, dict):
+        return False
+    command = str(args.get("cmd", args.get("command", "")))
+    if any(character in command for character in ";&|<>`$\n\r"):
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    if tokens[0] == "cat":
+        return len(tokens) > 1 and all(
+            not item.startswith("-") and Path(item).name in {"TASK_LEDGER.md", "PROJECT_STATUS.md"}
+            for item in tokens[1:])
+    if len(tokens) < 3 or Path(tokens[0]).name not in {"python3", "python"}:
+        return False
+    interpreter = shutil.which(tokens[0])
+    if not interpreter or Path(interpreter).resolve() not in {
+        Path(sys.executable).resolve(), Path("/usr/bin/python3").resolve()
+    }:
+        return False
+    # identity uses an a+ registry lock internally: it is safe here only when
+    # both default files already exist. Reject argparse abbreviations/overrides.
+    options = tokens[3:]
+    if len(options) % 2 or any(
+        option not in {"--repo", "--host", "--session-id"}
+        for option in options[::2]
+    ):
+        return False
+    registry = Path.home() / ".codex" / "adaptive-delivery-controllers.json"
+    lock = registry.with_suffix(registry.suffix + ".lock")
+    if any(not path.is_file() or path.is_symlink() for path in (registry, lock)):
+        return False
+    cwd = Path(str(args.get("workdir", event.get("cwd", Path(__file__).parent.parent))))
+    script = Path(tokens[1])
+    script = script if script.is_absolute() else cwd / script
+    return (script.resolve() == Path(__file__).with_name("controller_target_guard.py").resolve()
+            and tokens[2] == "identity")
+
+
 def authorize_goal_display_sync_tool(
     receipt: dict[str, Any], event: dict[str, Any]
 ) -> tuple[dict[str, Any], str | None]:
@@ -307,8 +378,10 @@ def authorize_goal_display_sync_tool(
         return receipt, None
     binding_error = _binding_error(receipt, event)
     if binding_error:
-        return receipt, binding_error
+        return receipt, None if is_recovery_read(event) else binding_error
     expected_error = _expected_tool_error(receipt, event)
+    if expected_error and is_recovery_read(event):
+        return receipt, None
     if expected_error:
         return receipt, expected_error
     tool_use_id = str(event.get("tool_use_id", "")).strip()
@@ -406,6 +479,9 @@ def observe_goal_display_sync_result(
             "tool_use_id": tool_use_id,
             "response_sha256": _json_sha256(response),
             "reason": failure_reason,
+            "explicit_host_error": isinstance(response, dict) and (
+                response.get("isError") is True or response.get("exit_code") not in (None, 0)
+            ),
         }
         if capability_unavailable:
             next_receipt["status"] = "degraded"

@@ -1035,6 +1035,15 @@ def _pending_stop_output(
     state: dict[str, Any], event: dict[str, Any], *, reason: str
 ) -> dict[str, Any]:
     """Keep the Host turn alive until debt is cleared or a non-duty reentry is CONFIRMED."""
+    sync = state.get("goal_display_sync")
+    external_reason = goal_display_sync.external_block_reason(sync)
+    if (external_reason
+            and not state.get("inflight_tool_use_ids")
+            and not state.get("control_receipt_inflight")):
+        # End only this physical turn. Pending debt and mutation fences survive;
+        # a later explicit recovery must still obtain the ordinary control receipt.
+        message = reason + " 外部 Goal 同步阻塞：" + external_reason + "；保留未完成债务，报告并停止。"
+        return {"continue": False, "stopReason": message, "systemMessage": message}
     turn_id = _event_turn_id(event) or str(state.get("active_turn_id", "")).strip()
     prior_turn_id = str(state.get("stop_continuation_turn_id", "")).strip()
     prior_count = int(state.get("stop_continuations", 0) or 0)
@@ -1212,7 +1221,7 @@ def _session_goal_rollover_pretool_denial(
     pending = _session_goal_rollover_pending(state)
     if pending is None:
         return None
-    if _tool_kind_name(event) == "get_goal":
+    if goal_display_sync.is_recovery_read(event):
         return None
     tool_input = event.get("tool_input")
     if (

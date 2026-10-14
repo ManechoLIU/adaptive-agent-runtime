@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import goal_display_sync
 from scripts import lifecycle_hook
@@ -150,7 +151,8 @@ class GoalDisplaySyncTests(unittest.TestCase):
         )
 
         self.assertEqual(state["goal_display_sync"]["fingerprint"], later_rollover["fingerprint"])
-        self.assertIn("update_goal", output["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(output, {})
+        self.assertNotIn("inflight", state["goal_display_sync"])
 
     def contract(self, *, status: str = "rolled") -> dict[str, object]:
         return {
@@ -439,6 +441,112 @@ class GoalDisplaySyncTests(unittest.TestCase):
         changed["controller_target_generation"] = 5
         _receipt, denial = goal_display_sync.authorize_goal_display_sync_tool(receipt, changed)
         self.assertIn("target generation", denial or "")
+
+    def test_pending_sync_allows_recovery_reads_without_advancing_receipt(self) -> None:
+        receipt = self.start()
+        for kind, args in [("get_goal", {}), ("request_user_input", {}),
+                           ("exec_command", {"cmd": "cat TASK_LEDGER.md"}),
+                           ("Bash", {"command": "cat PROJECT_STATUS.md"})]:
+            with self.subTest(kind=kind, args=args):
+                unchanged, denial = goal_display_sync.authorize_goal_display_sync_tool(
+                    receipt, self.event(kind, "read-1", args))
+                self.assertIsNone(denial)
+                self.assertIs(unchanged, receipt)
+                self.assertNotIn("inflight", unchanged)
+
+    def test_pending_sync_denies_shell_writes_and_dispatch(self) -> None:
+        for command in ["cat TASK_LEDGER.md > stolen", "cat TASK_LEDGER.md; touch x",
+                        "python3 scripts/controller_target_guard.py bind --root .",
+                        "cat $(touch x)TASK_LEDGER.md"]:
+            _, denial = goal_display_sync.authorize_goal_display_sync_tool(
+                self.start(), self.event("exec_command", "write-1", {"cmd": command}))
+            self.assertIsNotNone(denial)
+
+    def test_external_goal_failure_can_end_turn_without_clearing_debt(self) -> None:
+        receipt = self.start()
+        receipt.update({"status": "degraded", "reason": "HOST_GOAL_CONFLICT"})
+        state = {"goal_display_sync": receipt, "pending_control_event": True,
+                 "active_turn_id": "turn-rollover"}
+        output = lifecycle_hook._pending_stop_output(
+            state, {"turn_id": "turn-rollover"}, reason="blocked")
+        self.assertNotEqual(output.get("decision"), "block")
+        self.assertTrue(state["pending_control_event"])
+        self.assertEqual(state["goal_display_sync"]["status"], "degraded")
+
+    def test_degraded_sync_keeps_reads_open_but_dispatch_fenced(self) -> None:
+        receipt = self.start()
+        receipt.update({"status": "degraded", "reason": "HOST_GOAL_CONFLICT"})
+        _, denial = goal_display_sync.authorize_goal_display_sync_tool(
+            receipt, self.event("get_goal", "read", {}))
+        self.assertIsNone(denial)
+        _, denial = goal_display_sync.authorize_goal_display_sync_tool(
+            receipt, self.event("send_message_to_thread", "dispatch", {}))
+        self.assertIsNotNone(denial)
+
+    def test_unknown_or_inflight_blocker_cannot_end_turn(self) -> None:
+        for reason, inflight in [("invented", []), ("HOST_GOAL_CONFLICT", ["live"] )]:
+            state = {"goal_display_sync": {"status": "degraded", "reason": reason},
+                     "inflight_tool_use_ids": inflight}
+            result = lifecycle_hook._pending_stop_output(state, {}, reason="blocked")
+            self.assertEqual(result.get("decision"), "block")
+
+    def test_degraded_sync_with_own_inflight_cannot_end_turn(self) -> None:
+        state = {"goal_display_sync": {"status": "degraded", "reason": "HOST_GOAL_CONFLICT",
+                                      "inflight": {"tool_use_id": "sync-live"}}}
+        result = lifecycle_hook._pending_stop_output(state, {}, reason="blocked")
+        self.assertEqual(result.get("decision"), "block")
+
+    def test_observed_host_error_can_report_and_stop_without_clearing_sync(self) -> None:
+        for response in [{"isError": True, "result": "connection failed"}, {"exit_code": 1}]:
+            receipt = self.complete_step(
+                self.start(), self.event("update_goal", "host-failed", {"status": "complete"}),
+                response=response)
+            self.assertEqual(receipt["status"], "pending_update_goal")
+            state = {"goal_display_sync": receipt, "pending_control_event": True}
+            result = lifecycle_hook._pending_stop_output(state, {}, reason="blocked")
+            self.assertNotEqual(result.get("decision"), "block")
+            self.assertTrue(state["pending_control_event"])
+            _, denial = goal_display_sync.authorize_goal_display_sync_tool(
+                receipt, self.event("send_message_to_thread", "dispatch", {}))
+            self.assertIsNotNone(denial)
+
+    def test_readback_mismatch_is_not_external_failure_stop_permission(self) -> None:
+        receipt = self.start_rebind()
+        receipt = self.complete_step(
+            receipt, self.rebind_event("get_goal", "malformed", {}), response={"result": "ok"})
+        state = {"goal_display_sync": receipt}
+        self.assertEqual(lifecycle_hook._pending_stop_output(state, {}, reason="blocked").get("decision"), "block")
+
+    def test_identity_registry_override_and_missing_default_are_not_read_only(self) -> None:
+        base = "python3 scripts/controller_target_guard.py identity --repo . --host desktop_codex"
+        for suffix in [" --registry /tmp/new/new.json", " --registry=/tmp/new.json", " --reg /tmp/new.json"]:
+            self.assertFalse(goal_display_sync.is_recovery_read(self.event("exec_command", "id", {"cmd": base + suffix})))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(goal_display_sync.Path, "home", return_value=Path(tmp)):
+            event = self.event("exec_command", "id", {"cmd": base})
+            self.assertFalse(goal_display_sync.is_recovery_read(event))
+            registry = Path(tmp) / ".codex" / "adaptive-delivery-controllers.json"
+            registry.parent.mkdir()
+            registry.write_text("{}")
+            self.assertFalse(goal_display_sync.is_recovery_read(event))
+            registry.with_suffix(".json.lock").write_text("")
+            self.assertTrue(goal_display_sync.is_recovery_read(event))
+            receipt = self.start()
+            unchanged, denial = goal_display_sync.authorize_goal_display_sync_tool(receipt, event)
+            self.assertIsNone(denial)
+            self.assertIs(unchanged, receipt)
+            self.assertNotIn("inflight", unchanged)
+
+    def test_generation_drift_permits_reads_without_mutation_authority(self) -> None:
+        receipt = self.start()
+        read = self.event("get_goal", "query", {})
+        read["controller_target_generation"] = 99
+        unchanged, denial = goal_display_sync.authorize_goal_display_sync_tool(receipt, read)
+        self.assertIsNone(denial)
+        self.assertIs(unchanged, receipt)
+        self.assertNotIn("inflight", unchanged)
+        write = {**read, "tool_name": "update_goal", "tool_input": {"status": "complete"}}
+        _, denial = goal_display_sync.authorize_goal_display_sync_tool(receipt, write)
+        self.assertIn("generation", denial)
 
     def test_unrelated_parallel_task_does_not_mutate_receipt(self) -> None:
         receipt = self.start()

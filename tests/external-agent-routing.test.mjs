@@ -143,9 +143,16 @@ if (process.argv[2] === ${JSON.stringify(versionArgument)}) {
   const promptFilePath = promptFileIndex >= 0 ? process.argv[promptFileIndex + 1] : null;
   const promptFileMode = promptFilePath ? (fs.statSync(promptFilePath).mode & 0o777) : null;
   if (process.env.FAKE_ADVISORY_RESULT) {
-    process.stdout.write(JSON.stringify({ type: "provider_started", provider: "grok-build", session_id: "fake-advisory" }) + "\\n");
-    process.stdout.write(JSON.stringify({ type: "text", data: "bounded hypothesis analysis" }) + "\\n");
-    process.stdout.write(JSON.stringify({ type: "final_result", result: JSON.parse(process.env.FAKE_ADVISORY_RESULT) }) + "\\n");
+    const args = process.argv.slice(2);
+    if (!args.includes("--json-schema") || !args.includes("--no-plan") || !args.includes("--disable-web-search")
+        || args[args.indexOf("--tools") + 1] !== "" || args.includes("--always-approve")) process.exit(91);
+    const schema = JSON.parse(args[args.indexOf("--json-schema") + 1]);
+    if (schema.properties.hypotheses.items.properties.verdict.enum.join("|") !== "supported|contradicted|insufficient") process.exit(92);
+    process.stdout.write(JSON.stringify({
+      text: process.env.FAKE_ADVISORY_RESULT, structuredOutput: JSON.parse(process.env.FAKE_ADVISORY_RESULT),
+      stopReason: "end_turn", sessionId: "fake-advisory", requestId: "fake-request", num_turns: 1,
+      usage: { input_tokens: 10, output_tokens: 10 }, modelUsage: { "grok-4.6-build": { modelCalls: 1 } },
+    }) + "\\n");
     if (process.env.SPAWN_MARKER) fs.appendFileSync(process.env.SPAWN_MARKER, "spawned\\n");
     process.exit(0);
   }
@@ -3045,7 +3052,7 @@ test("pre-spawn Reviewer failure also requires a new Controller route instead of
   assert.match(terminal.next_action, /new Controller route and Assignment/i);
 });
 
-test("advisory_hypothesis_review executes through CLI and persists bounded result plus local contradiction", async () => {
+test("advisory_hypothesis_review uses no tools and persists the Grok schema envelope plus local contradiction", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-advisory-hypothesis-cli-"));
   const repo = await makeAssignmentRepo(bin);
   const grokHome = path.join(bin, "grok-home");
@@ -3099,6 +3106,64 @@ test("advisory_hypothesis_review executes through CLI and persists bounded resul
   assert.deepEqual(receipt.advisory_hypothesis_result.hypotheses.map(({ verdict }) => verdict), ["supported", "contradicted", "insufficient"]);
   assert.equal(receipt.advisory, true);
   assert.equal(receipt.critical_path, false);
+});
+
+test("Grok advisory final envelope waits beyond launch deadline and keeps bounded unknown-result timeout", async () => {
+  const runtime = await import("../scripts/run_external_agent.mjs");
+  const keys = ["AD_GROK_LAUNCH_TIMEOUT_MS", "AD_GROK_FIRST_OUTPUT_TIMEOUT_MS", "AD_EXTERNAL_ATTEMPT_TIMEOUT_MS"];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  process.env.AD_GROK_LAUNCH_TIMEOUT_MS = "100";
+  process.env.AD_GROK_FIRST_OUTPUT_TIMEOUT_MS = "1000";
+  process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "1500";
+  const packet = { schema_version: 1, mode: "advisory_hypothesis_review", question: "Evaluate equation",
+    hypotheses: [{ id: "h1", statement: "Six times seven is forty two", evidence: ["6 * 7 = 42"] }] };
+  const result = { hypotheses: [{ id: "h1", verdict: "supported", rationale: "Equation agrees" }] };
+  const envelope = { structuredOutput: result, text: JSON.stringify(result), stopReason: "end_turn" };
+  const options = { cwd: os.tmpdir(), env: process.env, returnProtocol: true, finalEnvelopeOnly: true,
+    validateFinalResult: (stdout) => runtime.parseGrokAdvisoryOutput(stdout, { packet }) };
+  try {
+    const terminal = await runtime.runMonitoredGrok(process.execPath,
+      ["-e", `setTimeout(() => console.log(${JSON.stringify(JSON.stringify(envelope))}), 250)`], options);
+    assert.equal(terminal.outcome_code, "SUCCESS");
+    assert.deepEqual(terminal.result.hypotheses, result.hypotheses);
+    process.env.AD_EXTERNAL_ATTEMPT_TIMEOUT_MS = "150";
+    await assert.rejects(runtime.runMonitoredGrok(process.execPath,
+      ["-e", "setTimeout(() => {}, 2000)"], options), (error) => {
+      assert.equal(error.outcomeCode, "PROVIDER_TIMEOUT");
+      assert.equal(error.retrySafe, false);
+      assert.equal(error.resultUnknown, true);
+      return true;
+    });
+  } finally {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
+    }
+  }
+});
+
+test("Grok advisory schema envelope validates packet ids and rejects prose, conflicts and incomplete turns", async () => {
+  const runtime = await import("../scripts/run_external_agent.mjs");
+  const packet = {
+    schema_version: 1, mode: "advisory_hypothesis_review", question: "Evaluate the supplied evidence.",
+    hypotheses: [{ id: "h1", statement: "Six times seven is forty two.", evidence: ["6 * 7 = 42"] }],
+  };
+  const result = { hypotheses: [{ id: "h1", verdict: "supported", rationale: "The supplied equation agrees." }] };
+  const envelope = { text: JSON.stringify(result), structuredOutput: result, stopReason: "end_turn", sessionId: "s", requestId: "r", num_turns: 1 };
+  assert.deepEqual(runtime.parseGrokAdvisoryOutput(JSON.stringify(envelope), { packet }).hypotheses, result.hypotheses);
+  for (const invalid of [
+    "ordinary prose",
+    JSON.stringify({ type: "text", data: "6 * 7 = 42" }) + "\n" + JSON.stringify({ type: "end", stopReason: "end_turn", num_turns: 1 }),
+    JSON.stringify({ text: "6 * 7 = 42", stopReason: "end_turn" }),
+    JSON.stringify({ type: "final_result", result }),
+    JSON.stringify({ ...envelope, structuredOutput: null }),
+    JSON.stringify({ ...envelope, stopReason: "max_tokens" }),
+    JSON.stringify({ ...envelope, text: JSON.stringify({ hypotheses: [] }) }),
+    JSON.stringify({ ...envelope, structuredOutput: { hypotheses: [{ ...result.hypotheses[0], id: "unknown" }] }, text: "" }),
+    JSON.stringify({ ...envelope, structuredOutput: { hypotheses: [{ ...result.hypotheses[0], verdict: "PASS" }] }, text: "" }),
+    JSON.stringify({ ...envelope, structuredOutput: { hypotheses: [{ id: "h1", verdict: "supported" }] }, text: "" }),
+  ]) {
+    assert.throws(() => runtime.parseGrokAdvisoryOutput(invalid, { packet }), (error) => error.outcomeCode === "RESULT_PARSE_FAILED");
+  }
 });
 
 test("Kimi production execute applies provider heartbeat timeout and persists bounded cleanup outcome", async () => {
