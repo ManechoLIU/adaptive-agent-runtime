@@ -426,8 +426,63 @@ def _desktop_rollout_completed_items(
         started = False
         non_target_start_seen = False
         completed: list[dict[str, Any]] = []
+        collaboration_calls: dict[str, dict[str, Any] | None] = {}
+        collaboration_activities: dict[str, dict[str, Any]] = {}
+        returned_calls: set[str] = set()
+        ambiguous_calls: set[str] = set()
         for line in raw.splitlines():
             row = json.loads(line)
+            if row.get("type") == "response_item":
+                # Metadata cannot move a call across the native turn boundary.
+                # A truncated window without task_started retains the lock.
+                if not started:
+                    continue
+                payload = row.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                metadata = payload.get("internal_chat_message_metadata_passthrough")
+                if not isinstance(metadata, dict) or metadata.get("turn_id") != turn_id:
+                    continue
+                call_id = str(payload.get("call_id") or "").strip()
+                if not call_id:
+                    continue
+                kind = payload.get("type")
+                if kind == "function_call":
+                    if call_id in collaboration_calls:
+                        ambiguous_calls.add(call_id)
+                        completed = [item for item in completed if item.get("id") != call_id]
+                        continue
+                    collaboration_calls[call_id] = None
+                    # This recovery is for the observed Desktop send_message
+                    # terminal shape only, never arbitrary function outputs.
+                    if payload.get("namespace") != "collaboration" or payload.get("name") != "send_message":
+                        continue
+                    arguments = json.loads(payload.get("arguments", ""))
+                    if isinstance(arguments, dict):
+                        collaboration_calls[call_id] = {
+                            "arguments": arguments,
+                            "input_sha256": _json_sha256(arguments),
+                            "call_record_sha256": sha256_bytes(line),
+                        }
+                elif kind == "function_call_output":
+                    if call_id in returned_calls:
+                        ambiguous_calls.add(call_id)
+                        completed = [item for item in completed if item.get("id") != call_id]
+                        continue
+                    returned_calls.add(call_id)
+                    call = collaboration_calls.get(call_id)
+                    activity = collaboration_activities.get(call_id)
+                    if (call_id in ambiguous_calls or not isinstance(call, dict)
+                            or not isinstance(activity, dict) or not isinstance(payload.get("output"), str)):
+                        continue
+                    completed.append({
+                        **activity,
+                        "status": "returned",
+                        "collaboration_terminal": {
+                            **call, "return_record_sha256": sha256_bytes(line),
+                        },
+                    })
+                continue
             if row.get("type") != "event_msg":
                 continue
             payload = row.get("payload")
@@ -474,6 +529,18 @@ def _desktop_rollout_completed_items(
             elif goal_mcp and item_type == "McpToolCall":
                 if item.get("status") not in {"completed", "failed"}:
                     continue
+            elif item_type == "SubAgentActivity":
+                call_id = str(item["id"])
+                if (payload.get("thread_id") not in {None, source_id}
+                        or item.get("kind") != "interacted"
+                        or not isinstance(collaboration_calls.get(call_id), dict)):
+                    continue
+                if call_id in collaboration_activities:
+                    ambiguous_calls.add(call_id)
+                    completed = [value for value in completed if value.get("id") != call_id]
+                else:
+                    collaboration_activities[call_id] = dict(item)
+                continue
             elif item_type != "FileChange":
                 continue
             # Without a target start, a preceding non-target start proves this
@@ -882,7 +949,10 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
     if isinstance(prior_handoff, dict):
         state["last_host_turn_handoff"] = {
             **prior_handoff,
-            "state": "reentered",
+            "state": (
+                "reentered" if prior_handoff.get("state") in {"delegated", "reentry_confirmed"}
+                else prior_handoff.get("state")
+            ),
             "reentry_turn_id": turn_id,
         }
     state.pop("host_turn_handoff", None)
@@ -1068,6 +1138,16 @@ def _pending_stop_output(
     state: dict[str, Any], event: dict[str, Any], *, reason: str
 ) -> dict[str, Any]:
     """Keep the Host turn alive until debt is cleared or a non-duty reentry is CONFIRMED."""
+    handoff = state.get("host_turn_handoff") or state.get("last_host_turn_handoff")
+    if (isinstance(handoff, dict) and handoff.get("state") == "external_blocked"
+            and state.get("requires_user") is True
+            and handoff.get("controller_id") == event.get("controller_session_id")
+            and handoff.get("execution_target_session_id") == event.get("source_session_id")
+            and handoff.get("target_generation") == event.get("controller_target_generation")
+            and handoff.get("ownership_generation") == event.get("controller_ownership_generation")
+            and not state.get("inflight_tool_use_ids") and not state.get("control_receipt_inflight")):
+        message = reason + " 同一总控续接器未启动或未核实接管；保留债务，报告外部阻塞并停止。"
+        return {"continue": False, "stopReason": message, "systemMessage": message}
     sync = state.get("goal_display_sync")
     external_reason = goal_display_sync.external_block_reason(sync)
     if (external_reason
@@ -1088,6 +1168,51 @@ def _pending_stop_output(
     if turn_id:
         state["stop_continuation_turn_id"] = turn_id
     debt_fingerprint = continuation_debt_fingerprint(state)
+    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+    progress_fingerprint = _json_sha256({
+        "debt": debt_fingerprint,
+        "controller_id": event.get("controller_session_id"),
+        "source_session_id": event.get("source_session_id"),
+        "target_generation": event.get("controller_target_generation"),
+        "ownership_generation": event.get("controller_ownership_generation"),
+        "head": snapshot.get("head"),
+        "ledger_sha256": snapshot.get("ledger_sha256"),
+        "worktree_status_sha256": snapshot.get("worktree_status_sha256"),
+        "candidate_revisions": snapshot.get("candidate_revisions"),
+        "assignment_liveness": snapshot.get("assignment_liveness"),
+    })
+    prior_progress = state.get("stop_progress_fingerprint")
+    state["stop_progress_fingerprint"] = progress_fingerprint
+    target_generation = event.get("controller_target_generation")
+    ownership_generation = event.get("controller_ownership_generation")
+    verified_fences = all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (target_generation, ownership_generation)
+    )
+    if _desktop_on_duty_source(event, state) and verified_fences:
+        if prior_turn_id != turn_id or prior_progress != progress_fingerprint:
+            continuations = 1
+            state["stop_continuations"] = 1
+        if (turn_id and turn_id == state.get("active_turn_id")
+                and str(event.get("controller_session_id") or "").strip()
+                and continuations >= MIN_STOPS_BEFORE_CONFIRMED_HOST_END
+                and not state.get("inflight_tool_use_ids")
+                and not state.get("control_receipt_inflight")
+                and not _user_halt_active(state) and state.get("requires_user") is not True):
+            # End only the physical turn and delegate existing debt. This is
+            # neither a successful control receipt nor Goal/Controller closure.
+            state["host_turn_handoff"] = {
+                "schema_version": 1, "state": "requested", "turn_id": turn_id,
+                "controller_id": event["controller_session_id"],
+                "execution_target_session_id": event["source_session_id"],
+                "target_generation": target_generation,
+                "ownership_generation": ownership_generation,
+                "wake_generation": int(state.get("wake_generation", 0) or 0),
+                "debt_fingerprint": debt_fingerprint,
+                "progress_fingerprint": progress_fingerprint,
+            }
+            message = reason + " 当前桌面回合重复停止且无事实进展；交给同一总控续接，未完成债务保留。"
+            return {"continue": False, "stopReason": message, "systemMessage": message}
     # Web may end the physical turn after HMAC/desktop reentry CONFIRMED.
     # Desktop on-duty already is that entry; CONFIRMED must not idle it.
     confirmed = (
@@ -3223,6 +3348,14 @@ def _reconcile_desktop_rollout(
             if str(record.get("tool_name") or "").strip() != "apply_patch":
                 continue
             recovered_input = {}
+        elif item_type == "SubAgentActivity":
+            terminal = item.get("collaboration_terminal")
+            recorded_tool = re.sub(r"[^a-z0-9]", "", str(record.get("tool_name") or "").lower())
+            if (recorded_tool != "collaborationsendmessage" or not isinstance(terminal, dict)
+                    or terminal.get("input_sha256") != record.get("input_sha256")
+                    or not isinstance(terminal.get("arguments"), dict)):
+                continue
+            recovered_input = terminal["arguments"]
         else:
             continue
         proposal = state.get("control_receipt_proposal")
@@ -5322,6 +5455,39 @@ def persist_event_state(
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def _existing_same_controller_supervisor(
+    *, lifecycle_state: dict[str, Any], controller_id: str
+) -> bool:
+    try:
+        try:
+            from scripts import web_lifecycle_bridge as bridge
+        except ModuleNotFoundError:
+            import web_lifecycle_bridge as bridge
+        manager = bridge.load_json(bridge.default_auto_stop_state_path(controller_id))
+        handoff = lifecycle_state.get("host_turn_handoff", {})
+        expected_fence = (
+            handoff.get("execution_target_session_id"),
+            handoff.get("target_generation"), handoff.get("ownership_generation"),
+        )
+        receipt = str(manager.get("receipt_id") or "").strip()
+        return (
+            manager.get("state") in {
+                "RESUME_PENDING", "RESUME_REARMED", "RESUME_DEFERRED_ACTIVE_WRITER",
+                "RESUME_RETRY_BACKOFF", "WEB_REENTRY_SUBMITTED",
+                "WEB_REENTRY_MANUAL_FENCED_SUBMITTED", "WEB_REENTRY_DEFERRED_ACTIVE",
+            }
+            and not bridge._result_unknown_terminal_state(manager)
+            and manager.get("delivery_terminal_outcome") not in {"result_unknown", "retry_exhausted"}
+            and bool(receipt) and manager.get("supervisor_receipt_id") == receipt
+            and bool(manager.get("supervisor_token"))
+            and manager.get("last_lifecycle_fingerprint") == bridge._wake_event_fingerprint(lifecycle_state)
+            and bridge._delivery_controller_fence_identity(manager) == expected_fence
+            and bridge._pid_is_alive(manager.get("supervisor_pid"))
+        )
+    except (OSError, ValueError, PermissionError, TypeError):
+        return False
+
+
 def arm_host_turn_handoff(
     *,
     path: Path,
@@ -5330,6 +5496,7 @@ def arm_host_turn_handoff(
     repo: Path,
     registry: Path,
     supervisor_ensurer: Any = None,
+    supervisor_manager_probe: Any = None,
 ) -> dict[str, Any]:
     """Delegate durable debt before the current Host turn is allowed to terminate."""
     requested = lifecycle_state.get("host_turn_handoff")
@@ -5350,16 +5517,17 @@ def arm_host_turn_handoff(
             codex=None,
             delay_seconds=1.0,
         ))
-        delivery_state = (
-            "supervisor_started"
-            if supervisor_started
-            else "supervisor_already_managing_or_deferred"
-        )
-        handoff_state = "delegated"
-        failure_class = None
+        manager_probe = supervisor_manager_probe or _existing_same_controller_supervisor
+        managed = supervisor_started or bool(manager_probe(
+            lifecycle_state=lifecycle_state, controller_id=controller_id,
+        ))
+        delivery_state = ("supervisor_started" if supervisor_started else
+                          "existing_supervisor_verified" if managed else "supervisor_not_started_or_verified")
+        handoff_state = "delegated" if managed else "external_blocked"
+        failure_class = None if managed else "ContinuationSupervisorUnavailable"
     except (OSError, ValueError, PermissionError, RuntimeError, subprocess.SubprocessError) as exc:
         delivery_state = "supervisor_arm_failed"
-        handoff_state = "degraded"
+        handoff_state = "external_blocked"
         failure_class = type(exc).__name__
 
     expected_turn_id = str(requested.get("turn_id") or "")
@@ -5387,6 +5555,9 @@ def arm_host_turn_handoff(
             else:
                 recorded.pop("failure_class", None)
             current["host_turn_handoff"] = recorded
+            if handoff_state == "external_blocked":
+                current["requires_user"] = True
+                current["next_action"] = "Verify same-Controller continuation supervisor before recovery"
             write_json(path, current)
             return recorded
         finally:
