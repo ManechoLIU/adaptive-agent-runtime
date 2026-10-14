@@ -150,6 +150,40 @@ def codex_app_outbound_request(
     return action, target_session_id
 
 
+def is_cross_chat_coordination(
+    *, registry: dict[str, Any], controller_id: str, source_session_id: str,
+    tool_name: object, tool_input: object,
+) -> bool:
+    """Separate ordinary messages from actions against this Controller's entries."""
+    if str(tool_name or "").strip() != "mcp__codex_app__send_message_to_thread":
+        return False
+    if active_source_controller_id(
+        registry, source_session_id=source_session_id, host=DESKTOP_SESSION_HOST
+    ) != controller_id:
+        return False
+    record = target_record(registry, controller_id=controller_id, host=DESKTOP_SESSION_HOST)
+    ownership = execution_ownership_record(registry, controller_id=controller_id)
+    if record is None or ownership is None:
+        return False
+    status, target, _target_generation = validate_target_record(record, host=DESKTOP_SESSION_HOST)
+    ownership_host, ownership_target, _ownership_generation = validate_execution_ownership_record(ownership)
+    if (status != "active" or target != source_session_id
+            or ownership_host != DESKTOP_SESSION_HOST or ownership_target != source_session_id):
+        return False
+    request = codex_app_outbound_request(tool_name=tool_name, tool_input=tool_input)
+    if request is None:
+        return False
+    lineage = {controller_id}
+    for host in SUPPORTED_HOSTS:
+        lineage.update(host_sessions(registry, controller_id=controller_id, host=host))
+        record = target_record(registry, controller_id=controller_id, host=host)
+        if record is not None:
+            _status, target, _generation = validate_target_record(record, host=host)
+            if target:
+                lineage.add(target)
+    return request[1] not in lineage
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))

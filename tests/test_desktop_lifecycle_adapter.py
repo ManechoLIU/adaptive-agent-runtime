@@ -1261,6 +1261,73 @@ class DesktopOutboundLeaseHookTests(unittest.TestCase):
             expected_agent_type="default",
         )
 
+    def test_cross_chat_coordination_skips_entry_lease_but_keeps_goal_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            registry = root / "controllers.json"
+            registry.write_text(json.dumps({
+                "controller-1": str(repo.resolve()),
+                "__controller_sessions__": {"controller-1": {"desktop_codex": ["desktop-current"]}},
+                "__controller_targets__": {"controller-1": {"desktop_codex": {
+                    "status": "active", "session_id": "desktop-current", "generation": 4,
+                }}},
+                "__controller_execution_ownership__": {"controller-1": {
+                    "active_host": "desktop_codex",
+                    "execution_target_session_id": "desktop-current",
+                    "generation": 4,
+                }},
+            }), encoding="utf-8")
+            old_registry, old_state_root = lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT
+            lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = registry, root / "state"
+            try:
+                with patch.object(lifecycle_hook, "registered_controller_id", return_value="controller-1"), patch.object(lifecycle_hook, "registered_root", return_value=repo), patch.object(lifecycle_hook, "project_snapshot", return_value=self.snapshot(repo)), patch.object(lifecycle_hook, "controller_event_is_managed", return_value=True):
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "PreToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "message-1",
+                        "tool_input": {"threadId": "01a13a6c-78f0-7aa1-80fb-82e941d37914", "prompt": "报告原入口失败；不外呼不修改Demo"},
+                    })
+                    self.assertEqual(code, 0)
+                    self.assertEqual(output, "")
+                    self.assertFalse(controller_target_guard.has_active_outbound_lease(repo=repo, host="desktop_codex", registry_path=registry))
+                    duplicate = json.loads(registry.read_text())
+                    duplicate["controller-duplicate"] = str(repo.resolve())
+                    registry.write_text(json.dumps(duplicate))
+                    _, duplicate_denied = self.invoke_hook({
+                        "hook_event_name": "PreToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "duplicate-message",
+                        "tool_input": {"threadId": "ordinary-chat", "prompt": "report"},
+                    })
+                    self.assertIn("rejected outbound task action", duplicate_denied)
+                    duplicate.pop("controller-duplicate")
+                    registry.write_text(json.dumps(duplicate))
+                    state_path = lifecycle_hook.state_path("controller-1")
+                    state = lifecycle_hook.load_json(state_path)
+                    state["goal_display_sync"] = {
+                        "status": "pending_create_goal", "objective": "exact ledger goal",
+                        "controller_id": "controller-1", "execution_target_session_id": "desktop-current",
+                        "host": "desktop_codex", "target_generation": 4,
+                    }
+                    lifecycle_hook.write_json(state_path, state)
+                    _, denied = self.invoke_hook({
+                        "hook_event_name": "PreToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "pending-message",
+                        "tool_input": {"threadId": "01a13a6c-78f0-7aa1-80fb-82e941d37914", "prompt": "continue"},
+                    })
+                    self.assertIn("Goal display sync", denied)
+                    self.assertNotIn("rejected outbound task action", denied)
+                    code, output = self.invoke_hook({
+                        "hook_event_name": "PostToolUse", "session_id": "desktop-current", "turn_id": "turn-1",
+                        "tool_name": "mcp__codex_app__send_message_to_thread", "tool_use_id": "message-1",
+                        "tool_input": {"threadId": "01a13a6c-78f0-7aa1-80fb-82e941d37914", "prompt": "报告原入口失败；不外呼不修改Demo"}, "tool_response": {"isError": False},
+                    })
+                    self.assertFalse(controller_target_guard.has_active_outbound_lease(repo=repo, host="desktop_codex", registry_path=registry))
+            finally:
+                lifecycle_hook.REGISTRY_PATH, lifecycle_hook.STATE_ROOT = old_registry, old_state_root
+
+        self.assertEqual(code, 0)
+        self.assertFalse(output)
+
     def test_managed_outbound_pre_tool_holds_lease_until_matching_post_tool_use(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

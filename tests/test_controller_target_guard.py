@@ -1141,6 +1141,36 @@ class ControllerTargetGuardTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 78)
             self.assertIn("current desktop_codex target", completed.stderr)
 
+    def test_cross_chat_classification_keeps_controller_lineage_and_stale_sources_fenced(self) -> None:
+        guard = load_guard()
+        registry = {
+            "controller-1": "/repo",
+            "__controller_sessions__": {"controller-1": {
+                "desktop_codex": ["desktop-current", "desktop-old"], "web": ["web-old"]}},
+            "__controller_targets__": {"controller-1": {
+                "desktop_codex": {"status": "active", "session_id": "desktop-current", "generation": 4},
+                "web": {"status": "active", "session_id": "web-current", "generation": 3}}},
+        }
+        def coordination(target: str, source: str = "desktop-current", tool: str = "mcp__codex_app__send_message_to_thread") -> bool:
+            return guard.is_cross_chat_coordination(
+                registry=registry, controller_id="controller-1", source_session_id=source,
+                tool_name=tool, tool_input={"threadId": target, "coordination": True})
+        self.assertFalse(coordination("ordinary-chat"))  # missing ownership
+        registry["__controller_execution_ownership__"] = {"controller-1": {
+            "active_host": "web", "execution_target_session_id": "web-current", "generation": 99}}
+        self.assertFalse(coordination("ordinary-chat"))
+        registry["__controller_execution_ownership__"]["controller-1"] = {
+            "active_host": "desktop_codex", "execution_target_session_id": "desktop-current", "generation": 7}
+        self.assertTrue(coordination("ordinary-chat"))
+        for target in ["controller-1", "desktop-current", "desktop-old", "web-old", "web-current"]:
+            self.assertFalse(coordination(target))
+        self.assertFalse(coordination("ordinary-chat", source="desktop-old"))
+        self.assertFalse(coordination("ordinary-chat", source="unbound-source"))
+        self.assertFalse(coordination("ordinary-chat", tool="mcp__codex_app__navigate_to_codex_page"))
+        registry["__controller_targets__"]["controller-1"].pop("desktop_codex")
+        registry["__controller_sessions__"]["controller-1"]["desktop_codex"] = []
+        self.assertFalse(coordination("ordinary-chat", source="controller-1"))
+
     def test_open_in_codex_is_guarded_only_when_it_names_a_thread_target(self) -> None:
         guard = load_guard()
 

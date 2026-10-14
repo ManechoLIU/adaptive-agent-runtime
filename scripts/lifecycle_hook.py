@@ -5457,6 +5457,27 @@ def process_verified_host_tool_terminal(
     )
 
 
+def _desktop_outbound_request(
+    event: dict[str, Any], *, expected_root: Path, controller_id: str, source_session_id: str,
+) -> tuple[str, str] | None:
+    request = target_guard.codex_app_outbound_request(
+        tool_name=event.get("tool_name"), tool_input=event.get("tool_input"))
+    if request is not None and request[0] == "message":
+        with target_guard.locked_registry(REGISTRY_PATH) as registry:
+            if (target_guard._matching_controller_ids_for_repo(expected_root, registry) == [controller_id]
+                and registry_controller_root_matches(
+                    registry, controller_id=controller_id, expected_root=expected_root
+                ) and target_guard.is_cross_chat_coordination(
+                registry=registry, controller_id=controller_id,
+                source_session_id=source_session_id,
+                tool_name=event.get("tool_name"), tool_input=event.get("tool_input")
+            )):
+                # This skips only the execution-entry lease. The ordinary Goal,
+                # control-loop and tool authorization gates still evaluate it.
+                return None
+    return request
+
+
 def run_hook() -> int:
     try:
         event = json.load(sys.stdin)
@@ -5563,9 +5584,9 @@ def run_hook() -> int:
             ), ensure_ascii=False))
             return 0
         try:
-            outbound_request = target_guard.codex_app_outbound_request(
-                tool_name=normalized_event.get("tool_name"),
-                tool_input=normalized_event.get("tool_input"),
+            outbound_request = _desktop_outbound_request(
+                normalized_event, expected_root=expected_root, controller_id=controller_id,
+                source_session_id=source_session_id,
             )
             if outbound_request is not None:
                 action, target_session_id = outbound_request
@@ -5586,9 +5607,9 @@ def run_hook() -> int:
             return 0
     if normalized_event.get("hook_event_name") == "PostToolUse":
         try:
-            post_outbound_request = target_guard.codex_app_outbound_request(
-                tool_name=normalized_event.get("tool_name"),
-                tool_input=normalized_event.get("tool_input"),
+            post_outbound_request = _desktop_outbound_request(
+                normalized_event, expected_root=expected_root, controller_id=controller_id,
+                source_session_id=source_session_id,
             )
         except (OSError, ValueError, PermissionError, subprocess.SubprocessError):
             post_outbound_request = None
