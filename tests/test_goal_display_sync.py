@@ -1,4 +1,6 @@
 import unittest
+import copy
+import os
 import json
 import sys
 import tempfile
@@ -462,6 +464,100 @@ class GoalDisplaySyncTests(unittest.TestCase):
         self.assertIsNone(denial)
         self.assertIs(unchanged, receipt)
         self.assertNotIn("inflight", unchanged)
+
+    def reconcile_goal_mcp_fixture(self, *, item_changes=None, event_changes=None, closed=True, final_readback=False, wait="own"):
+        receipt = self.start()
+        receipt["status"] = "pending_title_readback" if final_readback else "pending_thread_title"
+        tool = "list_threads" if final_readback else "set_thread_title"
+        args = {"limit": 1} if final_readback else {"threadId": "desktop-current", "title": receipt["thread_title"]}
+        receipt["sync_kind"] = "target_goal_rebind"
+        receipt, denial = goal_display_sync.authorize_goal_display_sync_tool(
+            receipt, self.event(tool, "old-title-tool", args))
+        self.assertIsNone(denial)
+        state = {"goal_display_sync": receipt, "active_turn_id": "new-turn", "pending_control_event": True,
+                 "inflight_tool_use_ids": [], "inflight_tool_records": {}, "must_yield": False,
+                 "tool_trace": [{"turn_id": "new-turn", "tool_use_id": "current-evidence"}]}
+        if final_readback:
+            state.update({"requires_user": True, "user_halt": wait == "user_halt",
+                          "next_action": "foreign human decision" if wait == "foreign" else lifecycle_hook._goal_sync_wait_action(receipt)})
+        item = {"type": "McpToolCall", "id": "old-title-tool", "server": "codex_app", "tool": tool,
+                "arguments": args, "status": "completed", "result": {"isError": False,
+                "content": [{"type": "text", "text": json.dumps({"threadId": "desktop-current", "title": receipt["thread_title"]})}]}}
+        if final_readback:
+            item["result"]["content"][0]["text"] = json.dumps({"threads": [{"id": "desktop-current", "title": receipt["thread_title"]}]})
+        item.update(item_changes or {})
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = Path(tmp) / "sessions"
+            sessions.mkdir()
+            transcript = sessions / "rollout.jsonl"
+            rows = [
+                {"type": "session_meta", "payload": {"id": "desktop-current"}},
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-rollover"}},
+                {"type": "event_msg", "payload": {"type": "item_completed", "turn_id": "turn-rollover", "item": item}},
+            ]
+            if closed:
+                rows.append({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-rollover"}})
+            rows.append({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "new-turn"}})
+            transcript.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            event = {**self.event("get_goal", "current-query", {}), "hook_event_name": "PreToolUse",
+                     "turn_id": "new-turn", "transcript_path": str(transcript)}
+            event.update(event_changes or {})
+            with patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                observed = lifecycle_hook._reconcile_desktop_rollout(copy.deepcopy(state), event, {})
+        return state, observed
+
+    def test_goal_local_old_mcp_terminal_recovers_without_current_turn_receipt(self) -> None:
+        before, observed = self.reconcile_goal_mcp_fixture()
+        sync = observed["goal_display_sync"]
+        self.assertEqual(sync["status"], "pending_goal_readback")
+        self.assertNotIn("inflight", sync)
+        self.assertEqual(sync["last_rollout_terminal"]["source"], "codex_rollout_item_completed")
+        self.assertEqual(sync["last_rollout_terminal"]["turn_id"], "turn-rollover")
+        for key in ["active_turn_id", "inflight_tool_use_ids", "inflight_tool_records", "must_yield", "tool_trace", "pending_control_event"]:
+            self.assertEqual(observed[key], before[key])
+
+    def test_recovered_final_goal_readback_records_completion_and_preserves_foreign_wait(self) -> None:
+        for wait in ["own", "foreign", "user_halt"]:
+            before, observed = self.reconcile_goal_mcp_fixture(final_readback=True, wait=wait)
+            sync = observed["goal_display_sync"]
+            self.assertEqual(sync["status"], "completed")
+            self.assertIn(sync["fingerprint"], observed["goal_rebind_completed_fingerprints"])
+            self.assertEqual(observed["active_turn_id"], before["active_turn_id"])
+            self.assertFalse(observed["must_yield"])
+            self.assertEqual(observed["tool_trace"], before["tool_trace"])
+            if wait == "own":
+                self.assertFalse(observed["requires_user"])
+                self.assertEqual(observed["next_action"], "")
+            else:
+                self.assertTrue(observed["requires_user"])
+                self.assertEqual(observed["next_action"], before["next_action"])
+            if wait == "user_halt":
+                self.assertTrue(observed["user_halt"])
+
+    def test_goal_mcp_recovery_fences_untrusted_or_nonterminal_evidence(self) -> None:
+        for changes in [
+            {"id": "other-id"}, {"tool": "get_goal"}, {"server": "other-server"},
+            {"status": "in_progress"}, {"arguments": {"title": "wrong"}}, {"result": None},
+            {"result": {}}, {"result": {"isError": False, "content": []}},
+            {"result": {"content": [{"type": "text", "text": "ok"}]}},
+        ]:
+            with self.subTest(changes=changes):
+                before, observed = self.reconcile_goal_mcp_fixture(item_changes=changes)
+                self.assertEqual(observed["goal_display_sync"], before["goal_display_sync"])
+        for changes in [{"controller_target_generation": 99}, {"source_session_id": "other-source"}]:
+            before, observed = self.reconcile_goal_mcp_fixture(event_changes=changes)
+            self.assertEqual(observed["goal_display_sync"], before["goal_display_sync"])
+        before, observed = self.reconcile_goal_mcp_fixture(closed=False)
+        self.assertEqual(observed["goal_display_sync"], before["goal_display_sync"])
+
+    def test_goal_mcp_error_receipt_is_consumed_without_success(self) -> None:
+        _, observed = self.reconcile_goal_mcp_fixture(item_changes={"status": "failed", "result": {
+            "isError": True, "content": [{"type": "text", "text": "host operation failed"}]}})
+        sync = observed["goal_display_sync"]
+        self.assertEqual(sync["status"], "pending_thread_title")
+        self.assertNotIn("inflight", sync)
+        self.assertTrue(sync["last_failure"]["explicit_host_error"])
+        self.assertFalse(observed["must_yield"])
 
     def persistent_absence(self) -> dict[str, object]:
         receipt = self.start()

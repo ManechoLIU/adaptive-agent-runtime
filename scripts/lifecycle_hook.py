@@ -389,7 +389,8 @@ def _desktop_turn_start(event: dict[str, Any]) -> dict[str, str] | None:
 
 
 def _desktop_rollout_completed_items(
-    event: dict[str, Any], state: dict[str, Any], *, closed_turn: bool = False
+    event: dict[str, Any], state: dict[str, Any], *, closed_turn: bool = False,
+    goal_mcp: bool = False, require_closed_turn: bool = False,
 ) -> list[dict[str, Any]]:
     """Return only current-turn terminal recoverable items from a trusted rollout."""
     if event.get("controller_host") != DESKTOP_SESSION_HOST:
@@ -440,7 +441,7 @@ def _desktop_rollout_completed_items(
                     # completion has appeared, another turn start is later
                     # evidence and closes this recovery window.
                     if started or completed:
-                        return completed if closed_turn else []
+                        return completed if closed_turn and not require_closed_turn else []
                     # Before the target boundary, an observed non-target start
                     # may be an older turn. Retain that bounded state until a
                     # target start can establish a fresh boundary.
@@ -470,6 +471,9 @@ def _desktop_rollout_completed_items(
                 terminal = str(item.get("status") or "").strip().lower()
                 if terminal not in {"completed", "failed"}:
                     continue
+            elif goal_mcp and item_type == "McpToolCall":
+                if item.get("status") not in {"completed", "failed"}:
+                    continue
             elif item_type != "FileChange":
                 continue
             # Without a target start, a preceding non-target start proves this
@@ -478,7 +482,9 @@ def _desktop_rollout_completed_items(
                 return []
             completed.append(dict(item))
         if started:
-            return completed
+            return [] if require_closed_turn else completed
+        if require_closed_turn:
+            return []
         return completed if tail_was_truncated and not non_target_start_seen else []
     except (OSError, ValueError, TypeError, AttributeError):
         return []
@@ -1033,6 +1039,29 @@ def _desktop_on_duty_source(event: dict[str, Any], state: dict[str, Any]) -> boo
 
 def _goal_sync_wait_action(sync: dict[str, Any]) -> str:
     return "Host Goal sync recovery required: " + str(sync.get("fingerprint") or sync.get("receipt_id") or "")
+
+
+def _store_goal_sync_observation(state: dict[str, Any], observed_sync: dict[str, Any]) -> None:
+    state["goal_display_sync"] = observed_sync
+    if (observed_sync.get("status") == "completed"
+            and state.get("user_halt") is not True
+            and state.get("requires_user") is True
+            and state.get("next_action") == _goal_sync_wait_action(observed_sync)):
+        state["requires_user"] = False
+        state["next_action"] = ""
+    if (
+        observed_sync.get("status") == "completed"
+        and observed_sync.get("sync_kind") == "target_goal_rebind"
+    ):
+        completed = {
+            str(item)
+            for item in state.get("goal_rebind_completed_fingerprints", [])
+            if str(item).strip()
+        }
+        fingerprint = str(observed_sync.get("fingerprint") or "").strip()
+        if fingerprint:
+            completed.add(fingerprint)
+        state["goal_rebind_completed_fingerprints"] = sorted(completed)[-32:]
 
 
 def _pending_stop_output(
@@ -3025,6 +3054,58 @@ def _desktop_recovered_post_event(
     return recovered
 
 
+def _reconcile_desktop_goal_mcp(
+    state: dict[str, Any], event: dict[str, Any],
+) -> dict[str, Any]:
+    """Consume only a previously authorized Goal-local Host terminal receipt."""
+    sync = state.get("goal_display_sync")
+    if (event.get("controller_host") != DESKTOP_SESSION_HOST
+            or event.get("hook_event_name") not in {"PreToolUse", "Stop"}
+            or not isinstance(sync, dict) or goal_display_sync._binding_error(sync, event)):
+        return state
+    inflight = sync.get("inflight")
+    if not isinstance(inflight, dict):
+        return state
+    old_turn = str(inflight.get("turn_id") or "")
+    expected_tool = {"set_thread_title": "set_thread_title", "thread_title_readback": "list_threads"}.get(inflight.get("step"))
+    if not old_turn or expected_tool is None or not inflight.get("input_sha256"):
+        return state
+    recovery_event = {**event, "turn_id": old_turn}
+    recovery_state = {**state, "active_turn_id": old_turn}
+    items = _desktop_rollout_completed_items(
+        recovery_event, recovery_state, closed_turn=True, goal_mcp=True,
+        require_closed_turn=old_turn != str(state.get("active_turn_id") or ""),
+    )
+    for item in items:
+        args, result = item.get("arguments"), item.get("result")
+        if (item.get("type") != "McpToolCall" or item.get("id") != inflight.get("tool_use_id")
+                or item.get("server") != "codex_app" or item.get("tool") != expected_tool
+                or not isinstance(args, dict) or _json_sha256(args) != inflight["input_sha256"]
+                or not isinstance(result, dict) or not isinstance(result.get("isError"), bool)
+                or not result.get("content")
+                or (item.get("status") == "failed" and result["isError"] is not True)):
+            continue
+        recovered = {
+            **recovery_event, "hook_event_name": "PostToolUse",
+            "tool_name": "mcp__codex_app__" + expected_tool,
+            "tool_use_id": item["id"], "tool_input": args, "tool_response": result,
+        }
+        if goal_display_sync._expected_tool_error(sync, recovered):
+            continue
+        observed = goal_display_sync.observe_goal_display_sync_result(sync, recovered)
+        if observed is sync:
+            continue
+        observed["last_rollout_terminal"] = {
+            "source": "codex_rollout_item_completed", "source_session_id": event.get("source_session_id"),
+            "target_generation": event.get("controller_target_generation"),
+            "turn_id": old_turn, "tool_use_id": item["id"], "input_sha256": inflight["input_sha256"],
+            "terminal_sha256": _json_sha256(item), "transcript_path": event.get("transcript_path"),
+        }
+        _store_goal_sync_observation(state, observed)
+        break
+    return state
+
+
 def _reconcile_desktop_rollout(
     state: dict[str, Any],
     event: dict[str, Any],
@@ -3035,6 +3116,7 @@ def _reconcile_desktop_rollout(
     ] | None = None,
     closed_turn: bool = False,
 ) -> dict[str, Any]:
+    state = _reconcile_desktop_goal_mcp(state, event)
     inflight = {
         str(item) for item in state.get("inflight_tool_use_ids", []) if str(item)
     }
@@ -4099,26 +4181,7 @@ def evaluate_event(
             observed_sync = goal_display_sync.observe_goal_display_sync_result(
                 pending_display_sync, event
             )
-            state["goal_display_sync"] = observed_sync
-            if (observed_sync.get("status") == "completed"
-                    and state.get("user_halt") is not True
-                    and state.get("requires_user") is True
-                    and state.get("next_action") == _goal_sync_wait_action(observed_sync)):
-                state["requires_user"] = False
-                state["next_action"] = ""
-            if (
-                observed_sync.get("status") == "completed"
-                and observed_sync.get("sync_kind") == "target_goal_rebind"
-            ):
-                completed = {
-                    str(item)
-                    for item in state.get("goal_rebind_completed_fingerprints", [])
-                    if str(item).strip()
-                }
-                fingerprint = str(observed_sync.get("fingerprint") or "").strip()
-                if fingerprint:
-                    completed.add(fingerprint)
-                state["goal_rebind_completed_fingerprints"] = sorted(completed)[-32:]
+            _store_goal_sync_observation(state, observed_sync)
     _record_tool_trace(state, event)
     event_next_action = str(event.get("next_action") or "").strip()
     event_requires_user = event.get("requires_user")
