@@ -978,6 +978,7 @@ def _begin_turn(state: dict[str, Any], event: dict[str, Any]) -> str | None:
     state["inflight_tool_records"] = {}
     state.pop("control_receipt_inflight", None)
     state.pop("control_receipt_proposal", None)
+    state.pop("rule_acceptance_yield", None)
     state.pop("goal_block_authorization", None)
     state.pop("goal_block_inflight", None)
     state.pop("receipt_turn_id", None)
@@ -3468,6 +3469,7 @@ _PREVIOUS_TURN_LOCAL_KEYS = (
     "receipt_tool_use_id",
     "control_receipt_inflight",
     "control_receipt_proposal",
+    "rule_acceptance_yield",
     "adapter_fault",
     "inflight_tool_use_ids",
     "inflight_tool_records",
@@ -3983,6 +3985,115 @@ def _on_duty_unfinished_idle_reason(
     return "台账仍有未完成项：" + ", ".join(labels) + "。禁止 idle。"
 
 
+def _rule_acceptance_yield_facts(event: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    """Freeze the narrow, non-executable projection covered by a safe rule trial."""
+    handshake = snapshot.get("rule_handshake", {})
+    if (not isinstance(handshake, dict)
+            or event.get("controller_host") != DESKTOP_SESSION_HOST
+            or handshake.get("state") != "pending_live_e2e"
+            or handshake.get("blocking") is not True
+            or not handshake.get("installed_revision")
+            or handshake.get("loaded_revision") != handshake.get("installed_revision")):
+        return None
+    if (any(not isinstance(event.get(key), str) or not event[key].strip() for key in (
+            "controller_session_id", "source_session_id", "turn_id"))
+            or any(type(event.get(key)) is not int or event[key] <= 0 for key in (
+                "controller_target_generation", "controller_ownership_generation"))):
+        return None
+    if any(snapshot.get(key) for key in (
+        "ready_ids", "runnable_ids", "candidate_revisions", "controller_corrections", "ledger_errors",
+    )):
+        return None
+    if any(not label.startswith("VERIFY:") for label in _unfinished_idle_labels(snapshot)):
+        return None
+    live = snapshot.get("assignment_liveness", {})
+    if not isinstance(live, dict) or any(
+        not isinstance(value, dict)
+        or str(value.get("state", "")).lower() != "terminal"
+        for value in live.values()
+    ):
+        return None
+    return {
+        "binding": {key: event.get(key) for key in (
+            "controller_session_id", "source_session_id", "controller_target_generation",
+            "controller_ownership_generation", "turn_id",
+        )},
+        "projection": {key: snapshot.get(key) for key in (
+            "root", "head", "ledger_sha256", "worktree_status_sha256", "task_states",
+            "assignment_liveness", "controller_actions", "controller_corrections",
+        )},
+        "debt": sorted(_unfinished_debt_labels(snapshot)),
+        "revision": handshake["installed_revision"],
+    }
+
+
+def _rule_acceptance_yield_proof(
+    event: dict[str, Any], snapshot: dict[str, Any], proposal: object,
+) -> dict[str, Any] | None:
+    facts = _rule_acceptance_yield_facts(event, snapshot)
+    if facts is None or not _verified_bound_control_proposal(
+        proposal, tool_use_id=_tool_use_id(event),
+        controller_id=str(event.get("controller_session_id") or ""),
+        turn_id=_event_turn_id(event), snapshot=snapshot,
+    ):
+        return None
+    try:
+        contract = json.loads(Path(proposal["snapshot_path"]).read_bytes())
+        try:
+            from control_event_guard import HARD_DEFER_REASON_CODES, validate_control_loop_receipt
+        except ModuleNotFoundError:
+            from scripts.control_event_guard import HARD_DEFER_REASON_CODES, validate_control_loop_receipt
+        if (any(contract.get(key) != [] for key in (
+                "new_assignments", "ready_packages", "required_reviews", "candidate_packages", "correction_actions"))
+                or contract["event_contract"].get("allowed_actions") != ["recompute"]
+                or contract["event_contract"].get("allowed_files") != []
+                or not contract.get("event_actions")
+                or any(action.get("action") != "recompute" or action.get("files") != []
+                       for action in contract["event_actions"])
+                or contract["control_loop_receipt"].get("closure_proven") is not True
+                or contract["control_loop_receipt"].get("open_correction_ids") != []):
+            return None
+        actions = contract["controller_actions"]
+        if (not isinstance(actions, list) or any(
+                action.get("decision") not in {"blocked", "deferred"}
+                or action.get("reason_code") not in HARD_DEFER_REASON_CODES
+                or not str(action.get("wake_condition") or action.get("next_checkpoint") or "").strip()
+                for action in actions)):
+            return None
+        if validate_control_loop_receipt(
+            contract, expected_ledger_sha256=snapshot.get("ledger_sha256"),
+            expected_runnable_ids=set(), expected_candidate_revisions=set(),
+            expected_controller_action_ids={action["id"] for action in actions}, expected_corrections=[],
+        ):
+            return None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return json.loads(json.dumps({"facts": facts, "proposal": proposal}))
+
+
+def _allows_rule_acceptance_yield(event: dict[str, Any], state: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+    proof = state.get("rule_acceptance_yield")
+    if (not isinstance(proof, dict) or state.get("must_yield") is not True
+            or state.get("pending_control_event") is not True
+            or state.get("receipt_turn_id") != _event_turn_id(event)
+            or state.get("inflight_tool_use_ids") or state.get("pending_terminal_receipts")
+            or state.get("next_action")
+            or (isinstance(state.get("goal_display_sync"), dict)
+                and state["goal_display_sync"].get("status") != "completed")):
+        return False
+    proposal = proof.get("proposal", {})
+    if not isinstance(proposal, dict):
+        return False
+    receipt_event = {**event, "tool_use_id": proposal.get("tool_use_id")}
+    verified = _rule_acceptance_yield_proof(receipt_event, snapshot, proposal)
+    if verified is None or verified != proof:
+        return False
+    allowed = set(_unfinished_debt_labels(snapshot)) | {
+        "rule_live_e2e_pending:" + str(verified["facts"]["revision"])
+    }
+    return set(state.get("triggers", [])) == allowed
+
+
 def _observation_continuation_context(
     event: dict[str, Any],
     snapshot: dict[str, Any],
@@ -4253,6 +4364,7 @@ def evaluate_event(
         }
         return {"systemMessage": "Adaptive Agent Runtime: unmatched tool result; current turn evidence was not changed."}, state
     if event_name == "PreToolUse":
+        state.pop("rule_acceptance_yield", None)
         denial = _session_goal_rollover_pretool_denial(state, event)
         if denial:
             return _pre_tool_denial(denial), state
@@ -4521,6 +4633,10 @@ def evaluate_event(
     ):
         receipt_turn_id = _event_turn_id(event) or str(state.get("active_turn_id", ""))
         control_receipt_proposal = state.get("control_receipt_proposal")
+        safe_yield = _rule_acceptance_yield_proof(event, snapshot, control_receipt_proposal)
+        state.pop("rule_acceptance_yield", None)
+        if safe_yield is not None:
+            state["rule_acceptance_yield"] = safe_yield
         project_block_authorized = _verified_project_block_proposal(
             control_receipt_proposal, tool_use_id=_tool_use_id(event)
         )
@@ -4741,6 +4857,10 @@ def evaluate_event(
         )
         state["pending_control_event"] = True
         return _pending_stop_output(state, event, reason=reason), state
+    if event_name == "Stop" and _allows_rule_acceptance_yield(event, state, snapshot):
+        # The version trial may end so its official wake can run. Business debt
+        # remains pending and is still injected on the next control turn.
+        return {}, state
     idle_reason = _on_duty_unfinished_idle_reason(
         event,
         state,
