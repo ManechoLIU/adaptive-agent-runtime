@@ -14,7 +14,7 @@ from tests.test_rule_handshake import make_project, write_current_controller_reg
 
 
 class DesktopNativeDispatchTests(unittest.TestCase):
-    def invoke_spawn(self, *, registered=True, errors=None, ownership=None, pending_goal=False, rotate=False):
+    def invoke_spawn(self, *, registered=True, errors=None, ownership=None, pending_goal=False, rotate=False, desktop_entry=False, stale_alias=False, bad_turn=False, host_origin="codex_work_desktop", ended=False, registry_case=None):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             repo = make_project(base)
@@ -40,6 +40,43 @@ class DesktopNativeDispatchTests(unittest.TestCase):
             event = {'hook_event_name': 'PreToolUse', 'session_id': 'current', 'turn_id': 'turn',
                 'cwd': str(repo), 'tool_name': 'collaboration.spawn_agent', 'tool_use_id': 'spawn',
                 'tool_input': {'task_name': 'native-child', 'model': 'gpt-5.6-sol', 'agent_type': 'default'}}
+            if desktop_entry:
+                transcript = base / 'sessions' / 'probe.jsonl'
+                transcript.parent.mkdir()
+                transcript.write_text(json.dumps({'type': 'session_meta', 'payload': {
+                    'id': 'current', 'session_id': 'current', 'source': 'vscode',
+                    'thread_source': 'user', 'originator': host_origin,
+                }}) + '\n' + json.dumps({'type': 'event_msg', 'payload': {
+                    'type': 'task_started', 'turn_id': 'wrong' if bad_turn else 'turn',
+                }}) + '\n')
+                if ended:
+                    with transcript.open('a') as stream:
+                        stream.write(json.dumps({'type': 'event_msg', 'payload': {'type': 'task_complete'}}) + '\n')
+                event['transcript_path'] = str(transcript)
+            if stale_alias:
+                data = json.loads(registry.read_text())
+                data.setdefault('__controller_sessions__', {})['logical'] = {'desktop_codex': ['current']}
+                registry.write_text(json.dumps(data))
+            if registry_case:
+                data = json.loads(registry.read_text())
+                if registry_case == 'string_alias':
+                    data['__controller_sessions__'] = {'logical': {'desktop_codex': 'current'}}
+                elif registry_case == 'target_only':
+                    data['__controller_targets__'] = {'logical': {'desktop_codex': {'session_id': 'current'}}}
+                elif registry_case == 'ownership_only':
+                    data['__controller_execution_ownership__'] = {'logical': {'execution_target_session_id': 'current'}}
+                elif registry_case == 'invalid_target':
+                    data['logical'] = str(repo)
+                    data['__controller_targets__'] = {'logical': {'desktop_codex': {'status': 'active', 'generation': 1}}}
+                elif registry_case == 'invalid_ownership':
+                    data['logical'] = str(repo)
+                    data['__controller_execution_ownership__'] = {'logical': {'active_host': 'desktop_codex', 'generation': 1}}
+                elif registry_case == 'invalid_session_host':
+                    data['logical'] = str(repo)
+                    data['__controller_sessions__'] = {'logical': {'invalid_host': ['another']}}
+                elif registry_case == 'orphan_alias':
+                    data['__controller_sessions__'] = {'orphan': {'desktop_codex': ['another']}}
+                registry.write_text('broken JSON'  if registry_case == 'corrupt' else json.dumps(data))
             snapshot = {'root': str(repo), 'git_common_dir': str((repo / '.git').resolve()),
                         'control_loop_required': False, 'rule_handshake': {}}
             output = StringIO()
@@ -51,7 +88,7 @@ class DesktopNativeDispatchTests(unittest.TestCase):
                     changed['__controller_execution_ownership__']['logical']['generation'] += 1
                     registry.write_text(json.dumps(changed))
                 return result
-            with patch.object(hook, 'REGISTRY_PATH', registry), patch.object(hook, 'STATE_ROOT', state_root), \
+            with patch.dict(hook.os.environ, {'CODEX_HOME': str(base)}), patch.object(hook, 'REGISTRY_PATH', registry), patch.object(hook, 'STATE_ROOT', state_root), \
                  patch.object(hook, 'project_snapshot', return_value=snapshot), \
                  patch.object(rule_handshake, 'launch_guard_errors', return_value=errors or []), \
                  patch.object(rule_handshake, 'validate_controller_action_source', side_effect=validate), \
@@ -59,6 +96,38 @@ class DesktopNativeDispatchTests(unittest.TestCase):
                  patch.object(sys, 'stdin', StringIO(json.dumps(event))), redirect_stdout(output):
                 hook.run_hook()
             return web_gate.call_count, output.getvalue()
+
+    def test_host_attested_ordinary_desktop_spawn_does_not_require_web_ticket(self):
+        calls, output = self.invoke_spawn(registered=False, desktop_entry=True)
+        self.assertEqual(calls, 0)
+        self.assertNotIn('deny', output)
+
+    def test_stale_controller_alias_cannot_become_ordinary_desktop(self):
+        calls, output = self.invoke_spawn(registered=False, desktop_entry=True, stale_alias=True)
+        self.assertEqual(calls, 1)
+        self.assertIn('deny', output)
+
+    def test_wrong_host_turn_still_requires_web_ticket(self):
+        calls, output = self.invoke_spawn(registered=False, desktop_entry=True, bad_turn=True)
+        self.assertEqual(calls, 1)
+        self.assertIn('deny', output)
+
+    def test_non_desktop_origin_does_not_escape_web_gate(self):
+        calls, output = self.invoke_spawn(registered=False, desktop_entry=True, host_origin="web")
+        self.assertEqual(calls, 1)
+        self.assertIn('deny', output)
+
+    def test_completed_desktop_turn_cannot_authorize_new_spawn(self):
+        calls, output = self.invoke_spawn(registered=False, desktop_entry=True, ended=True)
+        self.assertEqual(calls, 1)
+        self.assertIn('deny', output)
+
+    def test_all_controller_lineage_and_corrupt_registry_fail_closed(self):
+        for case in ('string_alias', 'target_only', 'ownership_only', 'corrupt', 'invalid_target', 'invalid_ownership', 'orphan_alias', 'invalid_session_host'):
+            with self.subTest(case=case):
+                calls, output = self.invoke_spawn(registered=False, desktop_entry=True, registry_case=case)
+                self.assertEqual(calls, 1)
+                self.assertIn('deny', output)
 
     def test_verified_current_desktop_controller_does_not_enter_web_ticket_gate(self):
         calls, output = self.invoke_spawn()

@@ -5811,6 +5811,72 @@ def _verified_native_desktop_controller_source(
         return None
 
 
+def _ordinary_native_desktop_source(event: dict[str, Any]) -> bool:
+    """Scope ordinary Host turns without granting any Controller authority."""
+    source_id = str(event.get("session_id") or "").strip()
+    if not source_id:
+        return False
+    try:
+        registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8")) if REGISTRY_PATH.exists() else {}
+        if not isinstance(registry, dict):
+            return False
+        # A stale Controller entry cannot become an ordinary user chat.
+        if source_id in registry:
+            return False
+        sessions = registry.get(CONTROLLER_SESSIONS_KEY, {})
+        if not isinstance(sessions, dict):
+            return False
+        for controller, hosts in sessions.items():
+            if not isinstance(registry.get(controller), str) or not registry[controller].strip():
+                return False
+            if not isinstance(hosts, dict):
+                return False
+            for host in hosts:
+                if host not in target_guard.SUPPORTED_HOSTS:
+                    return False
+                if source_id in target_guard.host_sessions(registry, controller_id=controller, host=host):
+                    return False
+        targets = registry.get(target_guard.CONTROLLER_TARGETS_KEY, {})
+        if not isinstance(targets, dict):
+            return False
+        for controller, hosts in targets.items():
+            if not isinstance(registry.get(controller), str) or not registry[controller].strip():
+                return False
+            if not isinstance(hosts, dict):
+                return False
+            for host, target in hosts.items():
+                if host not in target_guard.SUPPORTED_HOSTS or not isinstance(target, dict):
+                    return False
+                _status, target_id, _generation = target_guard.validate_target_record(target, host=host)
+                if target_id == source_id:
+                    return False
+        ownership = registry.get(target_guard.CONTROLLER_EXECUTION_OWNERSHIP_KEY, {})
+        if not isinstance(ownership, dict):
+            return False
+        for controller, owner in ownership.items():
+            if not isinstance(registry.get(controller), str) or not registry[controller].strip():
+                return False
+            if not isinstance(owner, dict):
+                return False
+            _host, owner_id, _generation = target_guard.validate_execution_ownership_record(owner)
+            if owner_id == source_id:
+                return False
+    except (OSError, ValueError, TypeError, PermissionError):
+        return False
+    attested_event = {**event, "controller_host": DESKTOP_SESSION_HOST,
+                      "source_session_id": source_id}
+    if _desktop_turn_start(attested_event) is None:
+        return False
+    try:
+        with Path(event["transcript_path"]).resolve(strict=True).open("rb") as stream:
+            meta = json.loads(stream.readline(65536)).get("payload", {})
+        return (meta.get("originator") == "codex_work_desktop"
+                and meta.get("source") == "vscode"
+                and meta.get("thread_source") == "user")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
 def run_hook() -> int:
     try:
         event = json.load(sys.stdin)
@@ -5838,6 +5904,10 @@ def run_hook() -> int:
             if snapshot is None:
                 return 0
             session_repo = Path(str(snapshot["root"])).expanduser().resolve()
+            if _ordinary_native_desktop_source(event):
+                # Ordinary delegation is not a project Controller control event.
+                # Its Host turn has no authority to mutate Controller state.
+                return 0
             try:
                 from scripts.web_agent_execution import require_prepared_web_dispatch
             except ModuleNotFoundError:

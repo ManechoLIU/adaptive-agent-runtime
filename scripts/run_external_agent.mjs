@@ -1351,6 +1351,10 @@ function persistExternalTerminalReceipt(options, {
     critical_path: typeof criticalPath === "boolean" ? criticalPath : false,
     completed_at: new Date().toISOString(),
   });
+  // A standalone call has no canonical Assignment owner to resume. Persist
+  // its result without importing a project's Controller lifecycle (or waking
+  // an unrelated Controller merely because the cwd belongs to that project).
+  if (!options.assignmentId) return target;
   const helper = process.env.AD_TERMINAL_CONTINUATION_HELPER || fileURLToPath(new URL("./terminal_continuation.py", import.meta.url));
   const python = process.env.AD_PYTHON || "python3";
   const result = spawnSync(python, [helper, "consume", "--repo", runtimeRepository(options), "--receipt", target], { encoding: "utf8", env: process.env });

@@ -670,7 +670,7 @@ test("Grok execute fails closed before provider spawn without an explicit work t
   await assert.rejects(readFile(marker, "utf8"));
 });
 
-test("external execute persists terminal receipt and invokes controller continuation helper", async () => {
+test("unbound external execute persists terminal without controller continuation", async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), "adaptive-routing-terminal-continuation-"));
   const grokHome = path.join(bin, "grok-home");
   await mkdir(grokHome, { recursive: true });
@@ -702,8 +702,7 @@ open(os.environ["HELPER_MARKER"], "w", encoding="utf-8").write(json.dumps(sys.ar
   assert.equal(receipt.engine, "grok-build");
   assert.equal(receipt.exit_code, 0);
   assert.equal(receipt.result_path, resultPath);
-  const helperArgs = JSON.parse(await readFile(helperMarker, "utf8"));
-  assert.deepEqual(helperArgs, ["consume", "--repo", skillRoot, "--receipt", terminalReceipt]);
+  await assert.rejects(readFile(helperMarker, "utf8"), { code: "ENOENT" });
 });
 
 test("login mode delegates to the official CLI without a model request", async () => {
@@ -1453,6 +1452,7 @@ test("default external terminal lease matches the canonical runtime identity", a
   const ack = await assignmentAckFile(bin, { assignment_id: "default-terminal" }, repo);
   const terminalReceipt = path.join(bin, "terminal.json");
   const helper = path.join(bin, "verify-terminal.py");
+  const helperMarker = path.join(bin, "bound-consumed");
   await writeFile(helper, [
     "import json,sys",
     "from pathlib import Path",
@@ -1462,6 +1462,7 @@ test("default external terminal lease matches the canonical runtime identity", a
     "repo = Path(sys.argv[sys.argv.index('--repo') + 1])",
     "receipt = json.loads(Path(sys.argv[sys.argv.index('--receipt') + 1]).read_text())",
     "_verify_assignment_bound_receipt(repo, receipt)",
+    `Path(${JSON.stringify(helperMarker)}).write_text("verified")`,
   ].join("\n") + "\n");
   const result = spawnSync(process.execPath, [adapter,
     "--execute", "--authorized-external-call", "--engine", "grok-build", "--auth-mode", "oauth",
@@ -1475,6 +1476,7 @@ test("default external terminal lease matches the canonical runtime identity", a
   assert.equal(result.status, 0, result.stderr);
   const receipt = JSON.parse(await readFile(terminalReceipt, "utf8"));
   assert.equal(receipt.lease_id, "default-terminal:attempt:1");
+  assert.equal(await readFile(helperMarker, "utf8"), "verified");
 });
 
 test("Grok execution transports prompts through a private prompt file and removes it", async () => {
