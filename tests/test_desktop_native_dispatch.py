@@ -14,7 +14,7 @@ from tests.test_rule_handshake import make_project, write_current_controller_reg
 
 
 class DesktopNativeDispatchTests(unittest.TestCase):
-    def invoke_spawn(self, *, registered=True, errors=None, ownership=None, pending_goal=False, rotate=False, desktop_entry=False, stale_alias=False, bad_turn=False, host_origin="codex_work_desktop", ended=False, registry_case=None):
+    def invoke_spawn(self, *, registered=True, errors=None, ownership=None, pending_goal=False, rotate=False, desktop_entry=False, stale_alias=False, bad_turn=False, host_origin="codex_work_desktop", ended=False, registry_case=None, historical_entry=False, thread_source='user', web_replacement=False):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             repo = make_project(base)
@@ -45,7 +45,7 @@ class DesktopNativeDispatchTests(unittest.TestCase):
                 transcript.parent.mkdir()
                 transcript.write_text(json.dumps({'type': 'session_meta', 'payload': {
                     'id': 'current', 'session_id': 'current', 'source': 'vscode',
-                    'thread_source': 'user', 'originator': host_origin,
+                    'thread_source': thread_source, 'originator': host_origin,
                 }}) + '\n' + json.dumps({'type': 'event_msg', 'payload': {
                     'type': 'task_started', 'turn_id': 'wrong' if bad_turn else 'turn',
                 }}) + '\n')
@@ -53,6 +53,19 @@ class DesktopNativeDispatchTests(unittest.TestCase):
                     with transcript.open('a') as stream:
                         stream.write(json.dumps({'type': 'event_msg', 'payload': {'type': 'task_complete'}}) + '\n')
                 event['transcript_path'] = str(transcript)
+            if historical_entry:
+                data = json.loads(registry.read_text())
+                data['__controller_sessions__']['logical']['desktop_codex'].append('retired')
+                registry.write_text(json.dumps(data))
+                event['session_id'] = 'retired'
+                transcript.write_text(transcript.read_text().replace('"current"', '"retired"'))
+                if web_replacement:
+                    data['__controller_targets__']['logical']['desktop_codex']['session_id'] = 'retired'
+                    data['__controller_targets__']['logical']['web'] = {
+                        'status': 'active', 'session_id': 'web-current', 'generation': 5}
+                    data['__controller_execution_ownership__']['logical'] = {
+                        'active_host': 'web', 'execution_target_session_id': 'web-current', 'generation': 7}
+                    registry.write_text(json.dumps(data))
             if stale_alias:
                 data = json.loads(registry.read_text())
                 data.setdefault('__controller_sessions__', {})['logical'] = {'desktop_codex': ['current']}
@@ -76,10 +89,15 @@ class DesktopNativeDispatchTests(unittest.TestCase):
                     data['__controller_sessions__'] = {'logical': {'invalid_host': ['another']}}
                 elif registry_case == 'orphan_alias':
                     data['__controller_sessions__'] = {'orphan': {'desktop_codex': ['another']}}
+                elif registry_case == 'missing_target':
+                    data['__controller_targets__'] = {}
+                elif registry_case == 'replacement_mismatch':
+                    data['__controller_targets__']['logical']['desktop_codex']['session_id'] = 'other'
                 registry.write_text('broken JSON'  if registry_case == 'corrupt' else json.dumps(data))
             snapshot = {'root': str(repo), 'git_common_dir': str((repo / '.git').resolve()),
                         'control_loop_required': False, 'rule_handshake': {}}
             output = StringIO()
+            registry_before = registry.read_bytes()
             original = rule_handshake.validate_controller_action_source
             def validate(*args, **kwargs):
                 result = original(*args, **kwargs)
@@ -95,12 +113,49 @@ class DesktopNativeDispatchTests(unittest.TestCase):
                  patch.object(web_agent_execution, 'require_prepared_web_dispatch', side_effect=PermissionError('Web unavailable')) as web_gate, \
                  patch.object(sys, 'stdin', StringIO(json.dumps(event))), redirect_stdout(output):
                 hook.run_hook()
+            if historical_entry:
+                self.assertEqual(registry.read_bytes(), registry_before)
+                self.assertFalse(list(state_root.iterdir()))
             return web_gate.call_count, output.getvalue()
 
     def test_host_attested_ordinary_desktop_spawn_does_not_require_web_ticket(self):
         calls, output = self.invoke_spawn(registered=False, desktop_entry=True)
         self.assertEqual(calls, 0)
         self.assertNotIn('deny', output)
+
+    def test_historical_chat_can_delegate_without_reclaiming_controller(self):
+        calls, output = self.invoke_spawn(desktop_entry=True, historical_entry=True)
+        self.assertEqual(calls, 0)
+        self.assertNotIn('deny', output)
+
+    def test_host_created_and_forked_chats_delegate_without_controller(self):
+        for source in ('user', 'agent_created_thread', 'agent_forked_thread', 'chatgpt_handoff'):
+            with self.subTest(source=source):
+                calls, output = self.invoke_spawn(registered=False, desktop_entry=True, thread_source=source)
+                self.assertEqual(calls, 0)
+                self.assertNotIn('deny', output)
+
+    def test_historical_desktop_chat_can_delegate_after_web_ownership_transfer(self):
+        calls, output = self.invoke_spawn(desktop_entry=True, historical_entry=True, web_replacement=True)
+        self.assertEqual(calls, 0)
+        self.assertNotIn('deny', output)
+
+    def test_historical_chat_requires_a_complete_consistent_replacement(self):
+        for case in ('missing_target', 'replacement_mismatch'):
+            with self.subTest(case=case):
+                calls, output = self.invoke_spawn(desktop_entry=True, historical_entry=True, registry_case=case)
+                self.assertEqual(calls, 1)
+                self.assertIn('deny', output)
+        calls, output = self.invoke_spawn(desktop_entry=True, historical_entry=True, ownership={})
+        self.assertEqual(calls, 1)
+        self.assertIn('deny', output)
+
+    def test_unknown_thread_provenance_does_not_bypass_dispatch_gate(self):
+        for source in ('unknown', 'automation', ''):
+            with self.subTest(source=source):
+                calls, output = self.invoke_spawn(registered=False, desktop_entry=True, thread_source=source)
+                self.assertEqual(calls, 1)
+                self.assertIn('deny', output)
 
     def test_stale_controller_alias_cannot_become_ordinary_desktop(self):
         calls, output = self.invoke_spawn(registered=False, desktop_entry=True, stale_alias=True)

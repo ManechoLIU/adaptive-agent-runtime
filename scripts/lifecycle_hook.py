@@ -391,6 +391,7 @@ def _desktop_turn_start(event: dict[str, Any]) -> dict[str, str] | None:
 def _desktop_rollout_completed_items(
     event: dict[str, Any], state: dict[str, Any], *, closed_turn: bool = False,
     goal_mcp: bool = False, require_closed_turn: bool = False,
+    cua_mcp: bool = False,
 ) -> list[dict[str, Any]]:
     """Return only current-turn terminal recoverable items from a trusted rollout."""
     if event.get("controller_host") != DESKTOP_SESSION_HOST:
@@ -430,6 +431,7 @@ def _desktop_rollout_completed_items(
         collaboration_activities: dict[str, dict[str, Any]] = {}
         returned_calls: set[str] = set()
         ambiguous_calls: set[str] = set()
+        seen_mcp_ids: set[str] = set()
         for line in raw.splitlines():
             row = json.loads(line)
             if row.get("type") == "response_item":
@@ -526,7 +528,16 @@ def _desktop_rollout_completed_items(
                 terminal = str(item.get("status") or "").strip().lower()
                 if terminal not in {"completed", "failed"}:
                     continue
-            elif goal_mcp and item_type == "McpToolCall":
+            elif (goal_mcp or cua_mcp) and item_type == "McpToolCall":
+                if cua_mcp and not goal_mcp:
+                    call_id = str(item["id"])
+                    if call_id in seen_mcp_ids:
+                        completed = [value for value in completed if value.get("id") != call_id]
+                        continue
+                    seen_mcp_ids.add(call_id)
+                    if (not started or payload.get("thread_id") != source_id
+                            or item.get("server") != "cua_repl" or item.get("tool") != "js"):
+                        continue
                 if item.get("status") not in {"completed", "failed"}:
                     continue
             elif item_type == "SubAgentActivity":
@@ -3321,7 +3332,7 @@ def _reconcile_desktop_rollout(
     records = state.get("inflight_tool_records")
     records = records if isinstance(records, dict) else {}
     completed_items = _desktop_rollout_completed_items(
-        event, state, closed_turn=closed_turn
+        event, state, closed_turn=closed_turn, cua_mcp=True
     )
     for item in completed_items:
         tool_use_id = str(item.get("id") or "").strip()
@@ -3356,6 +3367,22 @@ def _reconcile_desktop_rollout(
                     or not isinstance(terminal.get("arguments"), dict)):
                 continue
             recovered_input = terminal["arguments"]
+        elif item_type == "McpToolCall":
+            arguments, result = item.get("arguments"), item.get("result")
+            # A failed Host terminal releases the call, not the control debt.
+            # Match the original authorized input; never infer completion from
+            # an arbitrary MCP output or another tool with a similar name.
+            if (item.get("server") != "cua_repl" or item.get("tool") != "js"
+                    or record.get("tool_name") != "mcp__cua_repl__js"
+                    or not isinstance(arguments, dict)
+                    or _json_sha256(arguments) != record.get("input_sha256")
+                    or not isinstance(result, dict)
+                    or not isinstance(result.get("isError"), bool)
+                    or not isinstance(result.get("content"), list) or not result["content"]
+                    or item.get("status") not in {"completed", "failed"}
+                    or result["isError"] != (item["status"] == "failed")):
+                continue
+            recovered_input = arguments
         else:
             continue
         proposal = state.get("control_receipt_proposal")
@@ -3373,6 +3400,8 @@ def _reconcile_desktop_rollout(
             "source": "codex_rollout_item_completed",
             "tool_use_id": tool_use_id,
         }
+        if item_type == "McpToolCall":
+            recovered["tool_response"] = item["result"]
         input_sha256 = str(record.get("input_sha256") or "").strip()
         if input_sha256:
             recovered["recovered_input_sha256"] = input_sha256
@@ -5820,9 +5849,11 @@ def _ordinary_native_desktop_source(event: dict[str, Any]) -> bool:
         registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8")) if REGISTRY_PATH.exists() else {}
         if not isinstance(registry, dict):
             return False
-        # A stale Controller entry cannot become an ordinary user chat.
+        lineage_controllers: set[str] = set()
         if source_id in registry:
-            return False
+            if not isinstance(registry[source_id], str) or not registry[source_id].strip():
+                return False
+            lineage_controllers.add(source_id)
         sessions = registry.get(CONTROLLER_SESSIONS_KEY, {})
         if not isinstance(sessions, dict):
             return False
@@ -5835,7 +5866,7 @@ def _ordinary_native_desktop_source(event: dict[str, Any]) -> bool:
                 if host not in target_guard.SUPPORTED_HOSTS:
                     return False
                 if source_id in target_guard.host_sessions(registry, controller_id=controller, host=host):
-                    return False
+                    lineage_controllers.add(controller)
         targets = registry.get(target_guard.CONTROLLER_TARGETS_KEY, {})
         if not isinstance(targets, dict):
             return False
@@ -5849,7 +5880,7 @@ def _ordinary_native_desktop_source(event: dict[str, Any]) -> bool:
                     return False
                 _status, target_id, _generation = target_guard.validate_target_record(target, host=host)
                 if target_id == source_id:
-                    return False
+                    lineage_controllers.add(controller)
         ownership = registry.get(target_guard.CONTROLLER_EXECUTION_OWNERSHIP_KEY, {})
         if not isinstance(ownership, dict):
             return False
@@ -5860,6 +5891,21 @@ def _ordinary_native_desktop_source(event: dict[str, Any]) -> bool:
                 return False
             _host, owner_id, _generation = target_guard.validate_execution_ownership_record(owner)
             if owner_id == source_id:
+                return False
+        # Historical chats retain ordinary delegation, not Controller powers.
+        # Only a complete, consistent replacement fence can establish that a
+        # former Controller entry no longer owns the project control plane.
+        for controller in lineage_controllers:
+            owner = target_guard.execution_ownership_record(registry, controller_id=controller)
+            if owner is None:
+                return False
+            owner_host, owner_id, _ = target_guard.validate_execution_ownership_record(owner)
+            target = target_guard.target_record(registry, controller_id=controller, host=owner_host)
+            if target is None:
+                return False
+            status, target_id, _ = target_guard.validate_target_record(target, host=owner_host)
+            if (status != "active" or not target_id or target_id == source_id
+                    or owner_id != target_id):
                 return False
     except (OSError, ValueError, TypeError, PermissionError):
         return False
@@ -5872,7 +5918,8 @@ def _ordinary_native_desktop_source(event: dict[str, Any]) -> bool:
             meta = json.loads(stream.readline(65536)).get("payload", {})
         return (meta.get("originator") == "codex_work_desktop"
                 and meta.get("source") == "vscode"
-                and meta.get("thread_source") == "user")
+                and meta.get("thread_source") in {
+                    "user", "agent_created_thread", "agent_forked_thread", "chatgpt_handoff"})
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return False
 
@@ -5888,6 +5935,16 @@ def run_hook() -> int:
         return 0
     source_session_id = str(event.get("session_id", "")).strip()
     cwd = Path(str(event.get("cwd", "."))).expanduser().resolve()
+    if event.get("hook_event_name") == "PreToolUse":
+        try:
+            ordinary_spawn = target_guard.collaboration_spawn_contract(
+                tool_name=event.get("tool_name"), tool_input=event.get("tool_input"))
+            if ordinary_spawn is not None and _ordinary_native_desktop_source(event):
+                # No project lease, ACK, wake, or Controller state mutation is
+                # needed for a chat to delegate its own work.
+                return 0
+        except (OSError, ValueError, PermissionError):
+            pass  # Unknown sources retain the existing managed dispatch gate.
     controller_id = registered_controller_id(source_session_id)
     expected_root = registered_root(source_session_id)
     if controller_id is None or expected_root is None:
@@ -5904,10 +5961,6 @@ def run_hook() -> int:
             if snapshot is None:
                 return 0
             session_repo = Path(str(snapshot["root"])).expanduser().resolve()
-            if _ordinary_native_desktop_source(event):
-                # Ordinary delegation is not a project Controller control event.
-                # Its Host turn has no authority to mutate Controller state.
-                return 0
             try:
                 from scripts.web_agent_execution import require_prepared_web_dispatch
             except ModuleNotFoundError:
