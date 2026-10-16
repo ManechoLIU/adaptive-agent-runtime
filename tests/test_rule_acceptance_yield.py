@@ -59,7 +59,8 @@ class RuleAcceptanceYieldTests(unittest.TestCase):
         if mutate:
             mutate(self.fixture.snapshot)
             self.fixture.write_snapshot()
-        with patch.object(guard, 'runtime_trace_bound_snapshot',
+        with patch.dict(sys.modules, {'control_event_guard': guard}), \
+                patch.object(guard, 'runtime_trace_bound_snapshot',
                           side_effect=lambda contract, **kwargs: {
                               **contract, 'machine_trace': hook.machine_trace_projection(self.prior)}):
             out, state = hook.evaluate_event({**self.event, 'hook_event_name': 'PreToolUse'},
