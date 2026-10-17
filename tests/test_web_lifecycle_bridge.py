@@ -3865,7 +3865,7 @@ class WebLifecycleAuditTests(unittest.TestCase):
             self.assertEqual(schedule.call_args.kwargs["receipt_id"], "pending-click-1")
             self.assertEqual(schedule.call_args.kwargs["session_id"], "controller-1")
 
-    def test_auto_native_stop_confirms_host_observed_canonical_target_already_foreground(self) -> None:
+    def test_auto_native_stop_defers_active_writer_without_claiming_wake(self) -> None:
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3919,15 +3919,12 @@ class WebLifecycleAuditTests(unittest.TestCase):
                     codex="codex", delay_seconds=0, state_path=state,
                 )
             self.assertEqual(code, 0)
-            rearm.assert_not_called()
-            wake = json.loads(
-                web_bridge.default_wake_receipt_path(repo).read_text(encoding="utf-8")
-            )
-            self.assertEqual(wake["result"], "CONFIRMED")
-            self.assertEqual(wake["operation"], "native_resume_already_foreground")
-            self.assertEqual(wake["execution_target_session_id"], "desktop-current")
-            self.assertEqual(wake["target_generation"], 4)
-            self.assertEqual(wake["ownership_generation"], 7)
+            rearm.assert_called_once()
+            self.assertFalse(web_bridge.default_wake_receipt_path(repo).exists())
+            persisted = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["state"], "RESUME_DEFERRED_ACTIVE_WRITER")
+            self.assertTrue(persisted["pending_control_event"])
+            self.assertEqual(persisted["retry_count"], 1)
 
     def test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required(self) -> None:
         import hashlib
@@ -4242,6 +4239,20 @@ class WebLifecycleAuditTests(unittest.TestCase):
                     app_candidates=[],
                     environ={},
                 )
+
+    def test_desktop_codex_resolution_finds_current_app_layout_without_path_fallback(self) -> None:
+        from unittest.mock import patch
+
+        for app in ("ChatGPT.app", "Codex.app"):
+            for suffix in ("codex-cli/CodexCLI.app/Contents/MacOS/codex", "codex-cli/bin/codex"):
+                expected = Path("/Applications") / app / "Contents/Resources" / suffix
+                with self.subTest(app=app, suffix=suffix), patch.object(
+                    Path, "is_file", lambda candidate: candidate == expected
+                ), patch.object(web_bridge.os, "access", side_effect=lambda path, mode: path == expected), patch.object(
+                    web_bridge.shutil, "which", return_value="/opt/homebrew/bin/codex"
+                ) as path_lookup:
+                    self.assertEqual(web_bridge.resolve_desktop_codex_executable(environ={}), str(expected))
+                    path_lookup.assert_not_called()
 
     def test_rule_wake_uses_desktop_host_adapter_without_resolving_cli(self) -> None:
         from unittest.mock import patch

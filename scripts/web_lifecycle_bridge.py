@@ -115,8 +115,15 @@ AI_BRIDGE_EXECUTABLE = "/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge"
 DEFAULT_RUNTIME_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 DESKTOP_CODEX_EXECUTABLE_ENV = "AD_DESKTOP_CODEX_EXECUTABLE"
 DEFAULT_DESKTOP_CODEX_APP_CANDIDATES = (
-    Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
-    Path("/Applications/Codex.app/Contents/Resources/codex"),
+    *(
+        Path("/Applications") / app / "Contents/Resources" / suffix
+        for app in ("ChatGPT.app", "Codex.app")
+        for suffix in (
+            "codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "codex-cli/bin/codex",
+            "codex",
+        )
+    ),
 )
 DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
 DEFAULT_DESKTOP_CANARY = (
@@ -4111,7 +4118,7 @@ def confirm_host_observed_desktop_foreground(
     ownership_fence: dict[str, Any] | None,
     host_reload_required: bool = False,
 ) -> dict[str, Any]:
-    """Confirm an exact Desktop wake when the Host reports its writer is already active."""
+    """Preserve an active-writer deferral; ownership never proves turn delivery."""
     if (
         lifecycle_state.get("pending_control_event") is not True
         or lifecycle_state.get("requires_user") is True
@@ -4156,24 +4163,9 @@ def confirm_host_observed_desktop_foreground(
         })
         return deferred
 
-    confirmed = dict(attempt)
-    confirmed.update({
-        "operation": "native_resume_already_foreground",
-        "result": "CONFIRMED",
-        "state": "RESUME_CONFIRMED_ALREADY_FOREGROUND",
-        "pending_control_event": True,
-        "host_returncode": attempt.get("returncode"),
-        "returncode": 0,
-        "ownership_generation": ownership_generation,
-    })
-    for key in (
-        "error_code",
-        "failure_class",
-        "fallback_eligible",
-        "replacement_eligible",
-    ):
-        confirmed.pop(key, None)
-    return confirmed
+    # Desktop retains its writer even when the model turn is idle. No prompt
+    # was submitted in this case, so only the existing deferred retry may run.
+    return attempt
 
 
 

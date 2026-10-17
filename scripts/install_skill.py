@@ -452,7 +452,7 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
-    "test_auto_native_stop_confirms_host_observed_canonical_target_already_foreground",
+    "test_auto_native_stop_defers_active_writer_without_claiming_wake",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_mocked_active_writer_without_host_observation_still_rearms",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
@@ -465,6 +465,8 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_desktop_codex_resolution_prefers_the_app_bundled_runtime",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_desktop_codex_resolution_finds_current_app_layout_without_path_fallback",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_desktop_codex_resolution_rejects_an_invalid_explicit_override",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."

@@ -1146,6 +1146,25 @@ def _store_goal_sync_observation(state: dict[str, Any], observed_sync: dict[str,
         state["goal_rebind_completed_fingerprints"] = sorted(completed)[-32:]
 
 
+def _request_desktop_turn_handoff(
+    state: dict[str, Any], event: dict[str, Any], *, reason: str,
+    progress_fingerprint: str,
+) -> dict[str, Any]:
+    """End this physical turn only after requesting the existing supervisor."""
+    state["host_turn_handoff"] = {
+        "schema_version": 1, "state": "requested",
+        "turn_id": _event_turn_id(event) or str(state.get("active_turn_id", "")),
+        "controller_id": event["controller_session_id"],
+        "execution_target_session_id": event["source_session_id"],
+        "target_generation": event["controller_target_generation"],
+        "ownership_generation": event["controller_ownership_generation"],
+        "wake_generation": int(state.get("wake_generation", 0) or 0),
+        "debt_fingerprint": continuation_debt_fingerprint(state),
+        "progress_fingerprint": progress_fingerprint,
+    }
+    return {"continue": False, "stopReason": reason, "systemMessage": reason}
+
+
 def _pending_stop_output(
     state: dict[str, Any], event: dict[str, Any], *, reason: str
 ) -> dict[str, Any]:
@@ -1213,18 +1232,10 @@ def _pending_stop_output(
                 and not _user_halt_active(state) and state.get("requires_user") is not True):
             # End only the physical turn and delegate existing debt. This is
             # neither a successful control receipt nor Goal/Controller closure.
-            state["host_turn_handoff"] = {
-                "schema_version": 1, "state": "requested", "turn_id": turn_id,
-                "controller_id": event["controller_session_id"],
-                "execution_target_session_id": event["source_session_id"],
-                "target_generation": target_generation,
-                "ownership_generation": ownership_generation,
-                "wake_generation": int(state.get("wake_generation", 0) or 0),
-                "debt_fingerprint": debt_fingerprint,
-                "progress_fingerprint": progress_fingerprint,
-            }
             message = reason + " 当前桌面回合重复停止且无事实进展；交给同一总控续接，未完成债务保留。"
-            return {"continue": False, "stopReason": message, "systemMessage": message}
+            return _request_desktop_turn_handoff(
+                state, event, reason=message, progress_fingerprint=progress_fingerprint
+            )
     # Web may end the physical turn after HMAC/desktop reentry CONFIRMED.
     # Desktop on-duty already is that entry; CONFIRMED must not idle it.
     confirmed = (
@@ -4858,9 +4869,13 @@ def evaluate_event(
         state["pending_control_event"] = True
         return _pending_stop_output(state, event, reason=reason), state
     if event_name == "Stop" and _allows_rule_acceptance_yield(event, state, snapshot):
-        # The version trial may end so its official wake can run. Business debt
-        # remains pending and is still injected on the next control turn.
-        return {}, state
+        # A bare allow ends the turn but never arms a wake. Reuse the ordinary
+        # same-Controller supervisor handoff; preserve all pending business debt.
+        return _request_desktop_turn_handoff(
+            state, event,
+            reason="版本安全控制收据已闭合；交给同一总控续接器完成唤醒验收，业务债务保留。",
+            progress_fingerprint=_json_sha256(state["rule_acceptance_yield"]),
+        ), state
     idle_reason = _on_duty_unfinished_idle_reason(
         event,
         state,

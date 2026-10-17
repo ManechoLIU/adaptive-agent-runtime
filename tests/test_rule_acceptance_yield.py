@@ -88,11 +88,16 @@ class RuleAcceptanceYieldTests(unittest.TestCase):
     def test_pending_version_safe_receipt_yields_without_erasing_business_debt(self):
         state = self.receipt()
         out, stopped = self.stop(state)
-        self.assertEqual(out, {})
+        self.assertIs(out.get('continue'), False)
+        handoff = stopped['host_turn_handoff']
+        self.assertEqual(handoff['state'], 'requested')
+        self.assertEqual(handoff['execution_target_session_id'], 'source')
+        self.assertEqual(handoff['target_generation'], 4)
+        self.assertEqual(handoff['ownership_generation'], 6)
         self.assertTrue(stopped['pending_control_event'])
         self.assertIn('VERIFY:VERIFY-1', stopped['triggers'])
         self.assertEqual(stopped['snapshot']['task_states'], {'VERIFY-1': 'VERIFY'})
-        self.assertEqual(self.stop(stopped)[0], {})
+        self.assertIs(self.stop(stopped)[0].get('continue'), False)
 
     def test_unresolved_or_unbounded_contract_cannot_authorize_safe_yield(self):
         for case in ('assignment', 'executed', 'capacity', 'no_wake', 'open_debt', 'business_action', 'open_correction'):

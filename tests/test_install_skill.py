@@ -1145,13 +1145,14 @@ class InstallMigrationContractTests(unittest.TestCase):
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_unbound_chat_cannot_recover_even_with_trusted_verifier",
             "tests.test_web_lifecycle_bridge.WebLifecycleBridgeTests.test_zshenv_exit_bridge_executes_and_preserves_exit_precedence",
             "tests.test_web_lifecycle_bridge.WebLifecycleComputerLeaseTests.test_audit_once_never_uses_manual_resume_lease_as_caller_identity",
-            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_auto_native_stop_confirms_host_observed_canonical_target_already_foreground",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_auto_native_stop_defers_active_writer_without_claiming_wake",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_mocked_active_writer_without_host_observation_still_rearms",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_serialized_active_writer_claim_cannot_confirm_already_foreground",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_execute_native_resume_marks_host_observed_active_writer_process_locally",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_desktop_codex_resolution_prefers_the_app_bundled_runtime",
+            "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_desktop_codex_resolution_finds_current_app_layout_without_path_fallback",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_desktop_codex_resolution_rejects_an_invalid_explicit_override",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_rule_wake_uses_desktop_host_adapter_without_resolving_cli",
             "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests.test_codex_app_server_turn_uses_official_protocol_and_waits_for_completion",
@@ -1547,13 +1548,14 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership(self): self.assertTrue(True)\n"
                 "    def test_audit_once_rule_update_uses_guarded_scheduler_and_never_direct_scheduler(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof(self): self.assertTrue(True)\n"
-                "    def test_auto_native_stop_confirms_host_observed_canonical_target_already_foreground(self): self.assertTrue(True)\n"
+                "    def test_auto_native_stop_defers_active_writer_without_claiming_wake(self): self.assertTrue(True)\n"
                 "    def test_mocked_active_writer_without_host_observation_still_rearms(self): self.assertTrue(True)\n"
                 "    def test_serialized_active_writer_claim_cannot_confirm_already_foreground(self): self.assertTrue(True)\n"
                 "    def test_execute_native_resume_marks_host_observed_active_writer_process_locally(self): self.assertTrue(True)\n"
                 "    def test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required(self): self.assertTrue(True)\n"
                 "    def test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary(self): self.assertTrue(True)\n"
                 "    def test_desktop_codex_resolution_prefers_the_app_bundled_runtime(self): self.assertTrue(True)\n"
+                "    def test_desktop_codex_resolution_finds_current_app_layout_without_path_fallback(self): self.assertTrue(True)\n"
                 "    def test_desktop_codex_resolution_rejects_an_invalid_explicit_override(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_uses_desktop_host_adapter_without_resolving_cli(self): self.assertTrue(True)\n"
                 "    def test_codex_app_server_turn_uses_official_protocol_and_waits_for_completion(self): self.assertTrue(True)\n"
@@ -2130,13 +2132,14 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_rule_wake_rejects_explicit_target_without_canonical_execution_ownership(self): self.assertTrue(True)\n"
                 "    def test_audit_once_rule_update_uses_guarded_scheduler_and_never_direct_scheduler(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_rejects_legacy_recovery_target_without_trusted_host_origin_proof(self): self.assertTrue(True)\n"
-                "    def test_auto_native_stop_confirms_host_observed_canonical_target_already_foreground(self): self.assertTrue(True)\n"
+                "    def test_auto_native_stop_defers_active_writer_without_claiming_wake(self): self.assertTrue(True)\n"
                 "    def test_mocked_active_writer_without_host_observation_still_rearms(self): self.assertTrue(True)\n"
                 "    def test_serialized_active_writer_claim_cannot_confirm_already_foreground(self): self.assertTrue(True)\n"
                 "    def test_execute_native_resume_marks_host_observed_active_writer_process_locally(self): self.assertTrue(True)\n"
                 "    def test_auto_native_stop_yields_external_wait_when_desktop_host_reload_is_required(self): self.assertTrue(True)\n"
                 "    def test_desktop_host_reload_gate_requires_exact_armed_zero_sequence_canary(self): self.assertTrue(True)\n"
                 "    def test_desktop_codex_resolution_prefers_the_app_bundled_runtime(self): self.assertTrue(True)\n"
+                "    def test_desktop_codex_resolution_finds_current_app_layout_without_path_fallback(self): self.assertTrue(True)\n"
                 "    def test_desktop_codex_resolution_rejects_an_invalid_explicit_override(self): self.assertTrue(True)\n"
                 "    def test_rule_wake_uses_desktop_host_adapter_without_resolving_cli(self): self.assertTrue(True)\n"
                 "    def test_codex_app_server_turn_uses_official_protocol_and_waits_for_completion(self): self.assertTrue(True)\n"
