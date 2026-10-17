@@ -262,6 +262,41 @@ for line in sys.stdin:
             invoke("eof")
         invoke("timeout", force_timeout=True)
 
+    def test_desktop_codex_resolver_falls_back_only_when_resolver_module_is_absent(self) -> None:
+        explicit = self.root / "explicit-codex"
+        with patch("builtins.__import__", side_effect=AssertionError("must not import")), patch.object(
+            install_skill.shutil, "which", side_effect=AssertionError("must not search PATH")
+        ):
+            self.assertEqual(install_skill._desktop_codex_path(explicit), explicit)
+
+        original_import = __import__
+
+        def dependency_failure(name, globals=None, locals=None, fromlist=(), level=0):
+            if name in {"web_lifecycle_bridge", "scripts.web_lifecycle_bridge"}:
+                raise ModuleNotFoundError(
+                    "No module named 'resolver_internal_dependency'",
+                    name="resolver_internal_dependency",
+                )
+            return original_import(name, globals, locals, fromlist, level)
+
+        with patch("builtins.__import__", side_effect=dependency_failure), patch.object(
+            install_skill.shutil, "which", return_value="/wrong/path/codex"
+        ) as which:
+            self.assertIsNone(install_skill._desktop_codex_path(None))
+            which.assert_not_called()
+
+        def resolver_absent(name, globals=None, locals=None, fromlist=(), level=0):
+            if name in {"web_lifecycle_bridge", "scripts.web_lifecycle_bridge"}:
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+            return original_import(name, globals, locals, fromlist, level)
+
+        fallback = self.root / "path-codex"
+        with patch("builtins.__import__", side_effect=resolver_absent), patch.object(
+            install_skill.shutil, "which", return_value=str(fallback)
+        ) as which:
+            self.assertEqual(install_skill._desktop_codex_path(None), fallback)
+            which.assert_called_once_with("codex")
+
 
 if __name__ == "__main__":
     unittest.main()

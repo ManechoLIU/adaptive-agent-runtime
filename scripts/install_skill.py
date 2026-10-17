@@ -1790,15 +1790,24 @@ def _desktop_codex_path(explicit: str | Path | None) -> Path | None:
     if explicit is not None:
         return Path(explicit).expanduser()
     try:
+        from web_lifecycle_bridge import resolve_desktop_codex_executable
+    except ModuleNotFoundError as error:
+        if error.name != "web_lifecycle_bridge":
+            return None
         try:
-            from web_lifecycle_bridge import resolve_desktop_codex_executable
-        except ModuleNotFoundError:
             from scripts.web_lifecycle_bridge import resolve_desktop_codex_executable
+        except ModuleNotFoundError as error:
+            if error.name not in {"scripts", "scripts.web_lifecycle_bridge"}:
+                return None
+            discovered = shutil.which("codex")
+            return Path(discovered) if discovered else None
+        except ImportError:
+            return None
+    except ImportError:
+        return None
+    try:
         return Path(resolve_desktop_codex_executable())
-    except ModuleNotFoundError:
-        discovered = shutil.which("codex")
-        return Path(discovered) if discovered else None
-    except ValueError:
+    except (ValueError, ImportError):
         return None
 
 
