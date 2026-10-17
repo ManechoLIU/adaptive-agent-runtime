@@ -3311,7 +3311,9 @@ def execute_codex_app_server_turn(
                             or not any(isinstance(item, dict) and item.get("type") == "userMessage"
                                        and item.get("clientId") == client_id for item in turn.get("items", []))):
                         continue
-                    if turn.get("status") in {"completed", "failed", "interrupted"}:
+                    completed_at = turn.get("completedAt")
+                    if (turn.get("status") in {"completed", "failed", "interrupted"}
+                            and type(completed_at) in {int, float} and completed_at > 0):
                         journal.update(phase="completed", turn_id=turn["id"], turn_status=turn["status"])
                         queue_journal(journal)
                         return {"status": turn["status"], "turn_id": turn["id"],

@@ -80,24 +80,54 @@ for line in sys.stdin:
                 {
                     "id":"turn-unrelated",
                     "status":"completed",
+                    "completedAt":1792200000000,
                     "items":[{"type":"userMessage","clientId":"delivery-other"}],
                 },
                 {
                     "id":"turn-queued-1",
                     "status":"completed",
+                    "completedAt":1792200000001,
                     "items":[{"type":"userMessage","clientId":client_id}],
                 },
             ]
+        elif scenario == "failed":
+            turns = [{
+                "id":"turn-queued-failed",
+                "status":"failed",
+                "completedAt":1792200000002,
+                "error":{"message":"fixture terminal failure"},
+                "items":[{"type":"userMessage","clientId":client_id}],
+            }]
+        elif scenario in {
+            "false_terminal_interrupted",
+            "false_terminal_failed",
+            "invalid_completed_at_bool",
+            "invalid_completed_at_zero",
+            "invalid_completed_at_string",
+        }:
+            completed_at = {
+                "invalid_completed_at_bool": True,
+                "invalid_completed_at_zero": 0,
+                "invalid_completed_at_string": "1792200000003",
+            }.get(scenario)
+            turns = [{
+                "id":"turn-still-running",
+                "status":"interrupted" if scenario == "false_terminal_interrupted" else "failed",
+                "completedAt":completed_at,
+                "items":[{"type":"userMessage","clientId":client_id}],
+            }]
         else:
             turns = [
                 {
                     "id":"turn-unrelated",
                     "status":"completed",
+                    "completedAt":1792200000000,
                     "items":[{"type":"userMessage","clientId":"delivery-other"}],
                 },
                 {
                     "id":"turn-wrong-client",
                     "status":"completed",
+                    "completedAt":1792200000001,
                     "items":[{"type":"userMessage","clientId":"delivery-near-match"}],
                 },
             ]
@@ -237,6 +267,37 @@ class DesktopQueueReentryTests(unittest.TestCase):
         )
         self.assertFalse(any(event.get("phase") == "completed" for event in self.journal))
         self.assertIn("thread/turns/list", self.methods())
+
+    def test_failed_turn_requires_durable_completion_timestamp(self) -> None:
+        result = self.execute("failed")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["turn_id"], "turn-queued-failed")
+        self.assertEqual(
+            [event["phase"] for event in self.journal],
+            ["submitting", "queued", "completed"],
+        )
+        self.assertEqual(self.journal[-1]["turn_status"], "failed")
+
+    def test_status_without_positive_numeric_completed_at_is_not_terminal(self) -> None:
+        for scenario in (
+            "false_terminal_interrupted",
+            "false_terminal_failed",
+            "invalid_completed_at_bool",
+            "invalid_completed_at_zero",
+            "invalid_completed_at_string",
+        ):
+            with self.subTest(scenario=scenario):
+                self.journal.clear()
+                self.log_path.unlink(missing_ok=True)
+                self.sentinel_path.unlink(missing_ok=True)
+                with self.assertRaises(bridge.CodexAppServerResultUnknown):
+                    self.execute(scenario)
+                self.assertEqual(
+                    [event["phase"] for event in self.journal],
+                    ["submitting", "queued", "result_unknown"],
+                )
+                self.assertFalse(any(event.get("turn_id") for event in self.journal))
 
     def test_queue_add_response_loss_is_result_unknown_and_is_not_retried(self) -> None:
         with self.assertRaises(bridge.CodexAppServerResultUnknown):
