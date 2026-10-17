@@ -55,6 +55,8 @@ MANIFEST_NAME = ".adaptive-delivery-install.json"
 IMPACTS = {"none", "live_assignments"}
 RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_rule_acceptance_yield",
+    "tests.test_native_continuation_handoff",
+    "tests.test_desktop_queue_reentry",
     "tests.test_desktop_cua_recovery",
     "tests.test_desktop_native_dispatch",
     "tests.test_assignment_runtime.ExternalFailureEvidencePersistenceTests."

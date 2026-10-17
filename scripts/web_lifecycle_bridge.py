@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from collections import deque
 from contextlib import contextmanager
 import fcntl
@@ -3143,6 +3144,8 @@ def execute_codex_app_server_turn(
     env: dict[str, str],
     max_runtime_seconds: float,
     request_timeout_seconds: float = CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS,
+    queue_delivery_id: str | None = None,
+    queue_journal: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run one existing task turn through the bundled official app-server protocol."""
     command = [codex, "-c", "mcp_servers={}", "app-server", "--stdio"]
@@ -3260,12 +3263,67 @@ def execute_codex_app_server_turn(
         await_response(initialize_id, request_timeout_seconds)
         send("initialized", {}, notification=True)
 
-        resume_id = send(
-            "thread/resume",
-            {"threadId": execution_target, "excludeTurns": True},
-        )
-        assert resume_id is not None
-        resumed = await_response(resume_id, request_timeout_seconds)
+        try:
+            resume_id = send(
+                "thread/resume", {"threadId": execution_target, "excludeTurns": True},
+            )
+            assert resume_id is not None
+            resumed = await_response(resume_id, request_timeout_seconds)
+        except CodexAppServerActiveWriter:
+            # Desktop retains the writer lease while idle. Its official durable
+            # queue lets that same Host consume input without stealing ownership.
+            if queue_journal is None or not queue_delivery_id:
+                raise
+            client_id = queue_delivery_id
+            journal = {"phase": "submitting", "client_user_message_id": client_id,
+                       "execution_target_session_id": execution_target}
+            with submit_fence() as fence_receipt:
+                if fence_receipt is None:
+                    return {"status": "superseded", "command": command}
+                queue_journal(journal)
+                submit_attempted = True
+                queued_id = send("thread/queue/add", {
+                    "threadId": execution_target, "clientUserMessageId": client_id,
+                    "input": [{"type": "text", "text": prompt}],
+                })
+                assert queued_id is not None
+                queued = await_response(queued_id, request_timeout_seconds).get("queuedSubmission")
+                if (not isinstance(queued, dict) or not queued.get("id")
+                        or queued.get("clientUserMessageId") != client_id):
+                    raise CodexAppServerError("Codex queue did not confirm the exact client message")
+                journal.update(phase="queued", queued_submission_id=queued["id"])
+                queue_journal(journal)
+            deadline = time.monotonic() + max_runtime_seconds
+            while time.monotonic() < deadline:
+                request_id = send("thread/turns/list", {
+                    "threadId": execution_target, "limit": 8,
+                    "sortDirection": "desc", "itemsView": "summary",
+                })
+                assert request_id is not None
+                turns = await_response(request_id, min(request_timeout_seconds, max(.01, deadline - time.monotonic())))
+                data = turns.get("data")
+                if not isinstance(data, list):
+                    raise CodexAppServerError("Codex turn list returned invalid data")
+                for turn in data:
+                    if not isinstance(turn, dict) or not isinstance(turn.get("items"), list):
+                        raise CodexAppServerError("Codex turn list returned invalid turn items")
+                    if (not turn.get("id")
+                            or not any(isinstance(item, dict) and item.get("type") == "userMessage"
+                                       and item.get("clientId") == client_id for item in turn.get("items", []))):
+                        continue
+                    if turn.get("status") in {"completed", "failed", "interrupted"}:
+                        journal.update(phase="completed", turn_id=turn["id"], turn_status=turn["status"])
+                        queue_journal(journal)
+                        return {"status": turn["status"], "turn_id": turn["id"],
+                                "turn_error": turn.get("error"), "command": command,
+                                "queued_submission_id": queued["id"],
+                                "client_user_message_id": client_id,
+                                "stderr_tail": bounded_tail("".join(stderr_lines))}
+                try:
+                    receive(min(1.0, max(.01, deadline - time.monotonic())))
+                except TimeoutError:
+                    pass
+            raise TimeoutError("Codex queued turn completion timed out")
         thread = resumed.get("thread")
         if not isinstance(thread, dict) or thread.get("id") != execution_target:
             raise CodexAppServerError("Codex app-server resumed the wrong task")
@@ -3337,6 +3395,11 @@ def execute_codex_app_server_turn(
                 continue
     except (TimeoutError, CodexAppServerError, OSError) as exc:
         if submit_attempted:
+            if "journal" in locals() and queue_journal is not None:
+                try:
+                    queue_journal({**journal, "phase": "result_unknown"})
+                except OSError:
+                    pass  # The fsynced pre-submit intent still prevents replay.
             if isinstance(exc, CodexAppServerResultUnknown):
                 raise
             raise CodexAppServerResultUnknown(
@@ -3485,6 +3548,7 @@ def execute_desktop_host_resume(
                     raise PermissionError(
                         "Desktop Host target or ownership generation changed before turn submit"
                     )
+                reject_existing_queue_delivery()
                 if (
                     supervisor_state_path is not None
                     and supervisor_receipt_id is not None
@@ -3499,6 +3563,48 @@ def execute_desktop_host_resume(
                 else:
                     yield current
 
+        delivery_identity = {
+            "receipt_id": supervisor_receipt_id or secrets.token_hex(16),
+            "controller_id": session_id, **target_receipt,
+        }
+        delivery_id = "aar-desktop-" + hashlib.sha256(
+            json.dumps(delivery_identity, sort_keys=True).encode()
+        ).hexdigest()
+        journal_path = _git_common_dir(repo) / "adaptive-delivery" / "desktop-reentry" / f"{delivery_id}.json"
+        def reject_existing_queue_delivery() -> None:
+            for previous_path in journal_path.parent.glob("aar-desktop-*.json"):
+                previous = load_json(previous_path)
+                if not previous or previous_path == journal_path:
+                    raise CodexAppServerResultUnknown("Desktop queue journal requires reconciliation")
+                if previous.get("controller_id") != session_id:
+                    continue
+                if previous.get("phase") != "completed":
+                    # A different receipt/generation cannot bypass an unknown
+                    # submit, including a crash before supervisor persistence.
+                    raise CodexAppServerResultUnknown(
+                        "Desktop queue delivery already journaled; reconciliation required"
+                    )
+
+        reject_existing_queue_delivery()
+
+        def record_queue_delivery(value: dict[str, Any]) -> None:
+            if value.get("phase") == "submitting":
+                # Called under the canonical registry submit fence. Repeat the
+                # read here so two callers cannot both pass an earlier preflight.
+                reject_existing_queue_delivery()
+                journal_path.parent.mkdir(parents=True, exist_ok=True)
+                with journal_path.open("x", encoding="utf-8") as handle:
+                    json.dump({**delivery_identity, **value}, handle, ensure_ascii=False)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                directory_fd = os.open(journal_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            else:
+                _write_json_atomic_file(journal_path, {**delivery_identity, **value})
+
         response = execute_codex_app_server_turn(
             codex=codex,
             execution_target=execution_target,
@@ -3510,6 +3616,8 @@ def execute_desktop_host_resume(
             submit_fence=submit_fence,
             env=native_runtime_env(runtime_path),
             max_runtime_seconds=max_runtime_seconds,
+            queue_delivery_id=delivery_id,
+            queue_journal=record_queue_delivery,
         )
     except CodexAppServerActiveWriter as exc:
         return {
@@ -3605,6 +3713,8 @@ def execute_desktop_host_resume(
         "state": "RESUME_SUCCEEDED",
         "returncode": 0,
         "turn_id": response.get("turn_id"),
+        "queued_submission_id": response.get("queued_submission_id"),
+        "client_user_message_id": response.get("client_user_message_id"),
         "stderr_tail": response.get("stderr_tail"),
         "host_transport": "codex_app_server_stdio",
         "command": response.get("command", []),
@@ -5885,8 +5995,8 @@ def _durable_original_reentry_receipt(
 def _result_unknown_terminal_state(supervisor_state: dict[str, Any]) -> bool:
     return (
         str(supervisor_state.get("delivery_terminal_outcome") or "") == "result_unknown"
-        or str(supervisor_state.get("state") or "") == "WEB_REENTRY_RESULT_UNKNOWN"
-        or str(supervisor_state.get("failure_class") or "") == "web_reentry_result_unknown"
+        or str(supervisor_state.get("state") or "") in {"WEB_REENTRY_RESULT_UNKNOWN", "DESKTOP_HOST_REENTRY_RESULT_UNKNOWN"}
+        or str(supervisor_state.get("failure_class") or "") in {"web_reentry_result_unknown", "desktop_host_result_unknown"}
     )
 
 
@@ -7343,6 +7453,9 @@ def persist_confirmed_auto_native_wake(
                         ownership_generation=ownership_generation,
                         target_mode=attempt.get("target_mode"),
                     )
+                    for key in ("turn_id", "queued_submission_id", "client_user_message_id"):
+                        if attempt.get(key):
+                            receipt[key] = attempt[key]
                     _write_json_atomic_file(wake_path, receipt)
                     return True
         finally:
@@ -8819,6 +8932,55 @@ def continuation_supervisor_needs_bootstrap(
     )
 
 
+def _desktop_handoff_delivery_receipt(
+    lifecycle_state: dict[str, Any], session_id: str, canonical_fence: dict[str, Any] | None,
+) -> str | None:
+    """Identify a verified rule trial by stable facts, never by its physical turn."""
+    if lifecycle_state.get("controller_host") != target_guard.DESKTOP_SESSION_HOST:
+        return None
+    handoff = lifecycle_state.get("host_turn_handoff")
+    proof = lifecycle_state.get("rule_acceptance_yield")
+    if (not isinstance(handoff, dict) or handoff.get("state") not in {"requested", "delegated"}
+            or not isinstance(proof, dict) or not isinstance(canonical_fence, dict)
+            or handoff.get("controller_id") != session_id
+            or not handoff.get("turn_id") or handoff.get("turn_id") != lifecycle_state.get("active_turn_id")
+            or _controller_delivery_fence_identity(handoff) != _controller_delivery_fence_identity(canonical_fence)
+            or _controller_delivery_fence_identity(canonical_fence) is None
+            or any(not isinstance(handoff.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", handoff[key]) is None
+                   for key in ("progress_fingerprint", "debt_fingerprint"))):
+        return None
+    snapshot = lifecycle_state.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    event = {
+        "controller_host": target_guard.DESKTOP_SESSION_HOST,
+        "controller_session_id": session_id,
+        "source_session_id": handoff["execution_target_session_id"],
+        "controller_target_generation": handoff["target_generation"],
+        "controller_ownership_generation": handoff["ownership_generation"],
+        "turn_id": handoff["turn_id"],
+    }
+    try:
+        from scripts import lifecycle_hook as lifecycle
+    except ModuleNotFoundError:
+        import lifecycle_hook as lifecycle
+    facts = lifecycle._rule_acceptance_yield_facts(event, snapshot)
+    if facts is None or proof.get("facts") != facts:
+        return None
+    generation = lifecycle_state.get("wake_generation")
+    if type(generation) is not int or generation < 0 or handoff.get("wake_generation") != generation:
+        return None
+    stable = {
+        "controller_id": session_id,
+        "fence": _controller_delivery_fence_identity(canonical_fence),
+        "projection": facts["projection"], "debt": facts["debt"], "revision": facts["revision"],
+        "wake_generation": generation,
+    }
+    digest = hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":"),
+                                       ensure_ascii=False).encode()).hexdigest()[:24]
+    return f"bootstrap:{generation}:handoff-{digest}"
+
+
 def ensure_continuation_supervisor(
     *,
     lifecycle_state: dict[str, Any],
@@ -8986,6 +9148,16 @@ def ensure_continuation_supervisor(
         return scheduled
     generation = int(lifecycle_state.get("wake_generation", 0) or 0)
     receipt_id = f"bootstrap:{generation}"
+    if lifecycle_state.get("controller_host") == target_guard.DESKTOP_SESSION_HOST and lifecycle_state.get("host_turn_handoff"):
+        try:
+            canonical_fence = _canonical_auto_stop_fence(repo=repo, registry=registry, session_id=session_id)
+        except (OSError, ValueError, PermissionError, TypeError):
+            canonical_fence = None
+        handoff_receipt = _desktop_handoff_delivery_receipt(lifecycle_state, session_id, canonical_fence)
+        if handoff_receipt is not None:
+            receipt_id = handoff_receipt
+        elif lifecycle_state.get("rule_acceptance_yield"):
+            return False
     current_delivery_key = _lifecycle_delivery_key(
         lifecycle_state,
         host_delivery_fingerprint=current_host_delivery_fingerprint,
@@ -9017,7 +9189,7 @@ def ensure_continuation_supervisor(
             )
             if fence_fingerprint:
                 receipt_id += f":fence-{fence_fingerprint[:16]}"
-    schedule_auto_native_stop(
+    scheduled = schedule_auto_native_stop(
         session_id=session_id,
         repo=repo,
         receipt_id=receipt_id,
@@ -9027,7 +9199,7 @@ def ensure_continuation_supervisor(
         state_path=state_path,
         runtime_path=runtime_path,
     )
-    return True
+    return bool(scheduled)
 
 
 def _canonical_auto_stop_fence(
@@ -9079,6 +9251,9 @@ def _schedule_auto_native_stop_locked(
 ) -> bool:
     """Schedule while the caller holds the supervisor lock."""
     prior = load_json(state_path)
+    if (str(prior.get("state") or "") == "DESKTOP_HOST_REENTRY_RESULT_UNKNOWN"
+            or prior.get("failure_class") == "desktop_host_result_unknown"):
+        return False
     same_receipt = prior.get("receipt_id") == receipt_id
     try:
         current_fence = _canonical_auto_stop_fence(

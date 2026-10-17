@@ -6615,7 +6615,7 @@ class WebAutoStopSupervisorCoalescingTests(unittest.TestCase):
             t1=threading.Thread(target=ensure); t2=threading.Thread(target=ensure)
             with patch.object(web_bridge,"default_auto_stop_state_path",return_value=state), patch.object(web_bridge.subprocess,"Popen",return_value=Mock(pid=1111)) as popen, patch.object(web_bridge,"_pid_is_alive",return_value=True):
                 t1.start(); t2.start(); gate.wait(); t1.join(2); t2.join(2)
-            self.assertEqual(popen.call_count,1); self.assertEqual(sum(bool(x) for x in results),2)
+            self.assertEqual(popen.call_count,1); self.assertEqual(sum(bool(x) for x in results),1)
             final=json.loads(state.read_text()); self.assertEqual(final["receipt_id"],"bootstrap:7"); self.assertEqual(final["supervisor_pid"],1111); self.assertTrue(final["supervisor_token"])
 
     def test_stale_supervisor_token_exits_without_running_impl(self) -> None:

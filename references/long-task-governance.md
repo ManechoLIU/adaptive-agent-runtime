@@ -210,6 +210,8 @@ Durable terminal receipt 的“首次注入”和“Controller 消费已登记 d
 
 调度偏差优先从最近可运行 checkpoint 纠正：更新控制面、收缩范围、补派互斥 `READY` 或回收单个失效握手。一次候选失败、一次 ACK 迟到、一个 clean 工作树或一次调度失误都不足以更换总控。只有同一总控在收到纠偏要求后**连续两次**仍违反调度闭环，或发生必须立即止损的严重安全、数据或授权事故，才从当前主线与台账恢复点更换总控；新总控接管后旧总控停止，始终只保留一个。
 
+Desktop continuation 使用 bundled official app-server。独立 app-server 的 `thread/resume` 若返回 active writer，表示原 Desktop Host 仍持有会话，不能据此认定原会话正在执行或续接成功；Runtime 在 exact target/ownership fence 下使用官方 `thread/queue/add`，由原 Host 消费。投递前须先 fsync 持久化唯一 client message id；仅 queue 接受不算完成，必须从 `thread/turns/list` 回读精确 `userMessage.clientId` 所属 turn 的成功终态才确认。已投递但超时/崩溃/响应丢失保持 UNKNOWN，保留 journal，并阻止同 receipt 或新 generation 绕过未决投递。安全规则验收退出的 continuation receipt 由已验证的 stable projection、debt、revision、wake generation 和 canonical fence 派生；物理 turn、proposal、记录时间不得制造新派发，旧 bootstrap terminal 不得吞掉新的有效交接。调度返回值必须反映实际启动结果。
+
 ## 开工前候选与共享环境对账
 
 开始新实现前先固定当前仓库、`HEAD`、分支和未提交 diff。只有项目实际存在多个 worktree、相关候选或共享运行环境，且它们可能与当前范围重叠时，再检查：

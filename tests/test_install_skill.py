@@ -1274,6 +1274,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             tests_dir.mkdir()
             for module_name in (
                 "test_rule_acceptance_yield.py",
+                "test_native_continuation_handoff.py",
+                "test_desktop_queue_reentry.py",
                 "test_desktop_cua_recovery.py",
                 "test_desktop_native_dispatch.py",
             ):
@@ -1930,6 +1932,8 @@ class InstallMigrationContractTests(unittest.TestCase):
             tests_dir.mkdir()
             for module_name in (
                 "test_rule_acceptance_yield.py",
+                "test_native_continuation_handoff.py",
+                "test_desktop_queue_reentry.py",
                 "test_desktop_cua_recovery.py",
                 "test_desktop_native_dispatch.py",
             ):
