@@ -8,7 +8,7 @@ import fcntl
 import hashlib
 import json
 import os
-import queue
+import selectors
 import secrets
 import signal
 import shutil
@@ -3128,20 +3128,9 @@ def _app_server_error_text(error: object) -> str:
 
 
 def _terminate_app_server(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=3)
+    # The session leader can exit while descendants still own its pipes.
+    # Reap the owned process group even after the leader has exited.
+    _terminate_process_group(process, grace_seconds=3.0)
 
 
 def execute_codex_app_server_turn(
@@ -3171,25 +3160,16 @@ def execute_codex_app_server_turn(
         _terminate_app_server(process)
         raise CodexAppServerError("Codex app-server stdio is unavailable")
 
-    stdout_queue: queue.Queue[str | None] = queue.Queue()
+    # No reader thread may hold a buffered stream lock during cleanup. A
+    # detached descendant can keep a write end open indefinitely; select/read
+    # lets the caller honor its deadline and close only its own descriptors.
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    stdout_buffer = bytearray()
+    stdout_eof = False
     stderr_lines: deque[str] = deque(maxlen=80)
     notifications: deque[dict[str, Any]] = deque()
-
-    def read_stdout() -> None:
-        try:
-            for line in process.stdout:
-                stdout_queue.put(line)
-        finally:
-            stdout_queue.put(None)
-
-    def read_stderr() -> None:
-        for line in process.stderr:
-            stderr_lines.append(line)
-
-    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
-    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
     next_request_id = 1
 
     def send(method: str, params: dict[str, Any], *, notification: bool = False) -> int | None:
@@ -3208,19 +3188,40 @@ def execute_codex_app_server_turn(
         return request_id
 
     def receive(timeout_seconds: float) -> dict[str, Any]:
-        try:
-            line = stdout_queue.get(timeout=max(0.01, timeout_seconds))
-        except queue.Empty as exc:
-            raise TimeoutError("Codex app-server response timed out") from exc
-        if line is None:
-            detail = bounded_tail("".join(stderr_lines))
-            raise CodexAppServerError(
-                "Codex app-server exited before a terminal response"
-                + (f": {detail}" if detail else "")
-            )
+        nonlocal stdout_eof
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while True:
+            newline = stdout_buffer.find(b"\n")
+            if newline >= 0:
+                line = bytes(stdout_buffer[:newline])
+                del stdout_buffer[:newline + 1]
+                break
+            if stdout_eof:
+                if stdout_buffer:
+                    line = bytes(stdout_buffer)
+                    stdout_buffer.clear()
+                    break
+                detail = bounded_tail("".join(stderr_lines))
+                raise CodexAppServerError(
+                    "Codex app-server exited before a terminal response"
+                    + (f": {detail}" if detail else "")
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Codex app-server response timed out")
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    if key.data == "stdout":
+                        stdout_eof = True
+                elif key.data == "stdout":
+                    stdout_buffer.extend(chunk)
+                else:
+                    stderr_lines.append(bounded_tail(chunk.decode("utf-8", errors="replace")))
         try:
             message = json.loads(line)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise CodexAppServerError("Codex app-server returned invalid JSON") from exc
         if not isinstance(message, dict):
             raise CodexAppServerError("Codex app-server returned a non-object message")
@@ -3243,7 +3244,7 @@ def execute_codex_app_server_turn(
                 if not isinstance(result, dict):
                     raise CodexAppServerError("Codex app-server returned an invalid result")
                 return result
-            if isinstance(message.get("method"), str):
+            if message.get("method") == "turn/completed":
                 notifications.append(message)
 
     submit_attempted = False
@@ -3305,7 +3306,8 @@ def execute_codex_app_server_turn(
 
         deadline = time.monotonic() + max_runtime_seconds
         while True:
-            for message in list(notifications):
+            while notifications:
+                message = notifications.popleft()
                 if message.get("method") != "turn/completed":
                     continue
                 params = message.get("params")
@@ -3328,10 +3330,12 @@ def execute_codex_app_server_turn(
             if remaining <= 0:
                 raise TimeoutError("Codex app-server turn completion timed out")
             try:
-                notifications.append(receive(min(remaining, 5.0)))
+                message = receive(min(remaining, 5.0))
+                if message.get("method") == "turn/completed":
+                    notifications.append(message)
             except TimeoutError:
                 continue
-    except (TimeoutError, CodexAppServerError) as exc:
+    except (TimeoutError, CodexAppServerError, OSError) as exc:
         if submit_attempted:
             if isinstance(exc, CodexAppServerResultUnknown):
                 raise
@@ -3341,8 +3345,7 @@ def execute_codex_app_server_turn(
         raise
     finally:
         _terminate_app_server(process)
-        stdout_thread.join(timeout=1)
-        stderr_thread.join(timeout=1)
+        selector.close()
         for stream in (process.stdin, process.stdout, process.stderr):
             try:
                 stream.close()

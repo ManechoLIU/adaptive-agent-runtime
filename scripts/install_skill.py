@@ -480,6 +480,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_codex_app_server_eof_after_turn_start_confirmation_is_result_unknown",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_app_server_completion_timeout_is_bounded_with_detached_pipe_holder",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
+    "test_app_server_cleanup_terminates_descendants_after_leader_exit",
+    "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_desktop_host_resume_uses_app_server_under_target_and_ownership_fence",
     "tests.test_web_lifecycle_bridge.WebLifecycleAuditTests."
     "test_desktop_host_resume_missing_app_server_fails_closed_without_cli_fallback",

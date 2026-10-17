@@ -4459,6 +4459,72 @@ class WebLifecycleAuditTests(unittest.TestCase):
                     max_runtime_seconds=5,
                 )
 
+    def test_app_server_completion_timeout_is_bounded_with_detached_pipe_holder(self) -> None:
+        self._assert_app_server_pipe_holder_timeout(detached=True)
+
+    def test_app_server_cleanup_terminates_descendants_after_leader_exit(self) -> None:
+        self._assert_app_server_pipe_holder_timeout(detached=False)
+
+    def _assert_app_server_pipe_holder_timeout(self, *, detached: bool) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "holder-pid"
+            fake_codex = root / "fake-codex"
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, subprocess, sys\n"
+                "for line in sys.stdin:\n"
+                "    message = json.loads(line)\n"
+                "    method = message.get('method')\n"
+                "    if method == 'initialize':\n"
+                "        result = {}\n"
+                "    elif method == 'thread/resume':\n"
+                "        result = {'thread': {'id':message['params']['threadId'],'status':{'type':'idle'},'canAcceptDirectInput':True}}\n"
+                "    elif method == 'turn/start':\n"
+                f"        holder = subprocess.Popen([sys.executable, '-c', 'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(15)'], start_new_session={detached!r})\n"
+                f"        pathlib.Path({str(marker)!r}).write_text(str(holder.pid))\n"
+                "        result = {'turn':{'id':'turn-1','status':'inProgress'}}\n"
+                "    else:\n"
+                "        continue\n"
+                "    print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':result}), flush=True)\n"
+                "    if method == 'turn/start':\n"
+                "        os._exit(0)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o700)
+
+            @contextmanager
+            def submit_fence():
+                yield {"generation": 4, "ownership_generation": 7}
+
+            started = time.monotonic()
+            try:
+                with self.assertRaises(web_bridge.CodexAppServerResultUnknown):
+                    web_bridge.execute_codex_app_server_turn(
+                        codex=str(fake_codex), execution_target="desktop-current",
+                        repo=root, prompt="safe transport test", submit_fence=submit_fence,
+                        env=dict(os.environ), max_runtime_seconds=0.05,
+                    )
+                self.assertLess(time.monotonic() - started, 10.0)
+                if not detached:
+                    pid = int(marker.read_text())
+                    # SIGKILL delivery/reaping is asynchronous after the leader exits.
+                    deadline = time.monotonic() + 1.0
+                    while True:
+                        try:
+                            os.kill(pid, 0)
+                        except ProcessLookupError:
+                            break
+                        if time.monotonic() >= deadline:
+                            self.fail("owned descendant survived cleanup")
+                        time.sleep(0.01)
+            finally:
+                if marker.exists():
+                    try:
+                        os.kill(int(marker.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_desktop_host_resume_uses_app_server_under_target_and_ownership_fence(self) -> None:
         from unittest.mock import patch
 
