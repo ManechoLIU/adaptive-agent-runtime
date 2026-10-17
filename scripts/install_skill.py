@@ -10,12 +10,15 @@ import math
 import os
 import plistlib
 import re
+import selectors
+import signal
 import shutil
 import subprocess
 import tempfile
 import shlex
 import stat
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -57,6 +60,7 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_rule_acceptance_yield",
     "tests.test_native_continuation_handoff",
     "tests.test_desktop_queue_reentry",
+    "tests.test_desktop_hook_trust",
     "tests.test_desktop_cua_recovery",
     "tests.test_desktop_native_dispatch",
     "tests.test_assignment_runtime.ExternalFailureEvidencePersistenceTests."
@@ -1782,6 +1786,161 @@ def _installed_controller_identity_capability(
     }
 
 
+def _desktop_codex_path(explicit: str | Path | None) -> Path | None:
+    if explicit is not None:
+        return Path(explicit).expanduser()
+    try:
+        try:
+            from web_lifecycle_bridge import resolve_desktop_codex_executable
+        except ModuleNotFoundError:
+            from scripts.web_lifecycle_bridge import resolve_desktop_codex_executable
+        return Path(resolve_desktop_codex_executable())
+    except ModuleNotFoundError:
+        discovered = shutil.which("codex")
+        return Path(discovered) if discovered else None
+    except ValueError:
+        return None
+
+
+def _read_codex_hooks(codex_path: Path, cwd: Path) -> dict[str, Any]:
+    """Read effective Hook trust from the public bundled app-server protocol."""
+    process = subprocess.Popen(
+        [str(codex_path), "-c", "mcp_servers={}", "app-server", "--stdio"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    selector = selectors.DefaultSelector()
+    buffer = bytearray()
+    deadline = time.monotonic() + 10
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        selector.register(process.stdout, selectors.EVENT_READ)
+
+        def call(request_id: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            process.stdin.write((json.dumps({"id": request_id, "method": method,
+                                           "params": params}) + "\n").encode())
+            process.stdin.flush()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Codex hooks/list timed out")
+                if b"\n" not in buffer:
+                    if not selector.select(remaining):
+                        raise TimeoutError("Codex hooks/list timed out")
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if not chunk:
+                        raise ValueError("Codex hooks/list transport closed")
+                    buffer.extend(chunk)
+                    if len(buffer) > 1024 * 1024:
+                        raise ValueError("Codex hooks/list response exceeds limit")
+                    continue
+                line, _, rest = buffer.partition(b"\n")
+                buffer[:] = rest
+                message = json.loads(line)
+                if not isinstance(message, dict):
+                    raise ValueError("Codex hooks/list returned a non-object")
+                if message.get("id") != request_id:
+                    continue
+                if "error" in message or not isinstance(message.get("result"), dict):
+                    raise ValueError("Codex hooks/list request was rejected")
+                return message["result"]
+
+        call(1, "initialize", {"clientInfo": {"name": "aar-hook-preflight", "version": "1"},
+                               "capabilities": {"experimentalApi": True}})
+        process.stdin.write(b'{"method":"initialized","params":{}}\n')
+        process.stdin.flush()
+        return call(2, "hooks/list", {"cwds": [str(cwd)]})
+    finally:
+        selector.close()
+        # Own only this short-lived probe, never the Desktop writer process.
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except OSError:
+            if process.poll() is None:
+                process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                process.kill()
+            process.wait(timeout=1)
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+def probe_codex_hook_trust(
+    *, codex_path: Path, hooks_path: Path, skill_root: Path | None,
+) -> dict[str, Any]:
+    """Configuration presence and an old canary cannot authorize modified Hooks."""
+    unavailable = {"status": "unavailable", "hooks": [],
+                   "reason": "effective Codex Hook trust could not be verified"}
+    if skill_root is None:
+        return unavailable
+    try:
+        source = hooks_path.expanduser().resolve()
+        scripts = {(skill_root / "scripts" / name).resolve() for name in (
+            "lifecycle_hook.py", "controller_scoring_hook.py", "project_context_guard.py")}
+        expected: dict[str, str] = {}
+        required_roles = {
+            *((event, "lifecycle_hook.py") for event in (
+                "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SubagentStop", "Stop")),
+            *((event, "controller_scoring_hook.py") for event in ("UserPromptSubmit", "Stop")),
+            *((event, "project_context_guard.py") for event in ("SessionStart", "UserPromptSubmit", "Stop")),
+        }
+        roles = []
+        source_hash = _sha256(source)
+        config = _read_hooks_config(source)
+        for event, groups in config["hooks"].items():
+            event_key = re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
+            for group_index, group in enumerate(groups):
+                for handler_index, handler in enumerate(group.get("hooks", [])):
+                    command = handler.get("command", "")
+                    tokens = shlex.split(command)
+                    if len(tokens) >= 2 and Path(tokens[1]).expanduser().resolve() in scripts:
+                        expected[f"{source}:{event_key}:{group_index}:{handler_index}"] = command
+                        roles.append((event, Path(tokens[1]).name))
+        if len(roles) != len(required_roles) or set(roles) != required_roles:
+            return {"status": "review_required", "hooks": [],
+                    "reason": "Runtime Hook configuration must contain the complete eleven event/handler roles"}
+        cwd = skill_root.expanduser().resolve()
+        report = _read_codex_hooks(codex_path, cwd)
+        entries = report.get("data")
+        if not isinstance(entries, list) or len(entries) != 1:
+            return unavailable
+        entry = entries[0]
+        if (not isinstance(entry, dict) or entry.get("errors") or entry.get("cwd") != str(cwd)
+                or not isinstance(entry.get("hooks"), list)):
+            return unavailable
+        observed = entry["hooks"]
+        evidence = []
+        for key, command in expected.items():
+            matches = [hook for hook in observed if isinstance(hook, dict) and hook.get("key") == key]
+            hook = matches[0] if len(matches) == 1 else {}
+            valid = (hook.get("sourcePath") == str(source) and hook.get("command") == command
+                     and hook.get("enabled") is True
+                     and isinstance(hook.get("currentHash"), str)
+                     and re.fullmatch(r"sha256:[0-9a-f]{64}", hook["currentHash"]) is not None
+                     and (hook.get("trustStatus") == "trusted"
+                          or (hook.get("trustStatus") == "managed" and hook.get("isManaged") is True)))
+            evidence.append({"key": key, "trust_status": hook.get("trustStatus", "missing_or_duplicate"),
+                             "enabled": hook.get("enabled"), "ready": valid,
+                             "current_hash": hook.get("currentHash")})
+        ready = all(hook["ready"] for hook in evidence)
+        if _sha256(source) != source_hash:
+            return unavailable
+        return {"status": "ready" if ready else "review_required", "hooks": evidence,
+                "reason": "all Runtime Hooks are enabled and trusted" if ready else
+                "Runtime Hooks are skipped until the user reviews/trusts their current definitions in /hooks"}
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+        return unavailable
+
+
 def detect_host_capabilities(
     *,
     codex_executable: str | Path | None = None,
@@ -1795,10 +1954,7 @@ def detect_host_capabilities(
     runtime_supervisor_heartbeat: str | Path = DEFAULT_CONTROLLER_RUNTIME_HEARTBEAT,
     controller_registry: str | Path = DEFAULT_CONTROLLER_REGISTRY,
 ) -> dict[str, dict[str, Any]]:
-    codex_path = Path(codex_executable).expanduser() if codex_executable else None
-    if codex_path is None:
-        discovered = shutil.which("codex")
-        codex_path = Path(discovered) if discovered else None
+    codex_path = _desktop_codex_path(codex_executable)
     bridge_path = Path(ai_bridge_executable).expanduser()
     hooks_path = Path(hooks_file).expanduser()
     zshenv_path = Path(zshenv_file).expanduser()
@@ -1856,10 +2012,19 @@ def detect_host_capabilities(
         skill_root=skill_root_path,
         controller_registry_path=controller_registry_path,
     )
+    hook_trust = (probe_codex_hook_trust(
+        codex_path=codex_path, hooks_path=hooks_path, skill_root=skill_root_path,
+    ) if codex_available else {"status": "unavailable", "hooks": [], "reason": "codex executable not detected"})
+    hooks_ready = hook_trust["status"] == "ready"
     if not codex_available:
         desktop = {
             "status": "blocked", "adapter": "codex-native", "configured": False,
             "reason": "codex executable not detected",
+        }
+    elif lifecycle_configured and scoring_configured and project_context_configured and not hooks_ready:
+        desktop = {
+            "status": "degraded", "adapter": "codex-native", "configured": True,
+            "reason": hook_trust["reason"],
         }
     elif lifecycle_configured and scoring_configured and project_context_configured and canary_valid:
         desktop = {
@@ -1878,14 +2043,15 @@ def detect_host_capabilities(
         }
     desktop["background_continuation"] = (
         "ready"
-        if health_service_configured and runtime_supervisor_ready
+        if health_service_configured and runtime_supervisor_ready and hooks_ready
         else "configured_unverified"
         if health_service_configured
         else "not_configured"
     )
     desktop["background_continuation_ready"] = bool(
-        health_service_configured and runtime_supervisor_ready
+        health_service_configured and runtime_supervisor_ready and hooks_ready
     )
+    desktop["hook_trust"] = hook_trust
     desktop["continuation_independent_of_ai_bridge"] = health_service_configured
     goal_display_sync_ready = bool(
         lifecycle_configured
@@ -2212,10 +2378,7 @@ def configure_host_adapters(
     controller_registry: str | Path = DEFAULT_CONTROLLER_REGISTRY,
 ) -> dict[str, dict[str, Any]]:
     target_path = Path(target).expanduser().resolve()
-    codex_path = Path(codex_executable).expanduser() if codex_executable else None
-    if codex_path is None:
-        discovered = shutil.which("codex")
-        codex_path = Path(discovered) if discovered else None
+    codex_path = _desktop_codex_path(codex_executable)
     if codex_path is not None and codex_path.is_file() and os.access(codex_path, os.X_OK):
         install_codex_hooks(hooks_file, target_path, python_executable=python_executable)
     bridge = Path(ai_bridge_executable).expanduser()

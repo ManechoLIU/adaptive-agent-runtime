@@ -27,6 +27,8 @@ Skill 选择证据层级，不替项目重造测试框架、CI/CD 或发布平�
 
 Web 与 Desktop 共享同一控制语义，但由各自适配器归一化真实宿主事件；不得把任一宿主的事件形态当成 Core 默认。修改 lifecycle、wake、receipt、identity 或宿主适配器时，固定发布门必须覆盖受影响宿主的真实事件回放与跨宿主契约回归；Web 缺少可信身份时只让 Web 身份动作 fail closed，不得阻断已验证 Desktop 目标的本地原生事件。
 
+Desktop Hook 配置存在不等于会执行。安装能力检测必须通过官方 `hooks/list` 核对每项 AAR Hook 的精确 key、来源、命令、enabled 和当前定义信任状态；任一项 `modified / untrusted / disabled / missing` 或探测不可用时，适配器保持 degraded，后台续接不得标为 ready，旧 canary 不能覆盖当前信任失败。用户须在 Codex Hooks 页面或 CLI `/hooks` 审核并信任当前定义；安装器不写 `trusted_hash`、不自动批准或绕过信任门。代码发布回归通过与真实宿主验收分别报告。
+
 Git 项目可使用 Skill 自带的机械守卫；它只在 `.git/adaptive-delivery/` 保存命令摘要和内容收据，不进入项目文档或提交：
 
 ```bash

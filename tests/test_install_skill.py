@@ -6,6 +6,16 @@ from scripts.install_skill import detect_host_capabilities
 
 
 class InstallCapabilityTests(unittest.TestCase):
+    def setUp(self):
+        # These fixtures exercise canary validation, not the separate public
+        # Hook trust probe (covered by test_desktop_hook_trust).
+        from unittest.mock import patch
+        probe = patch("scripts.install_skill.probe_codex_hook_trust", return_value={
+            "status": "ready", "hooks": [], "reason": "fixture Hook trust verified",
+        })
+        probe.start()
+        self.addCleanup(probe.stop)
+
     def test_desktop_adapter_is_enabled_only_by_an_exact_live_canary_receipt(self):
         import hashlib
         import json
@@ -1276,6 +1286,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test_rule_acceptance_yield.py",
                 "test_native_continuation_handoff.py",
                 "test_desktop_queue_reentry.py",
+                "test_desktop_hook_trust.py",
                 "test_desktop_cua_recovery.py",
                 "test_desktop_native_dispatch.py",
             ):
@@ -1934,6 +1945,7 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "test_rule_acceptance_yield.py",
                 "test_native_continuation_handoff.py",
                 "test_desktop_queue_reentry.py",
+                "test_desktop_hook_trust.py",
                 "test_desktop_cua_recovery.py",
                 "test_desktop_native_dispatch.py",
             ):
@@ -2575,6 +2587,14 @@ class ProjectContextHookInstallationTests(unittest.TestCase):
 
 
 class HostAdapterInstallationTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        probe = patch("scripts.install_skill.probe_codex_hook_trust", return_value={
+            "status": "ready", "hooks": [], "reason": "fixture Hook trust verified",
+        })
+        probe.start()
+        self.addCleanup(probe.stop)
+
     def test_codex_hook_install_preserves_existing_hooks_and_is_idempotent(self):
         import json
         from scripts.install_skill import install_codex_hooks
@@ -2942,6 +2962,14 @@ class HostAdapterInstallationTests(unittest.TestCase):
 
 
 class WebAgentHealthServiceInstallationTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        probe = patch("scripts.install_skill.probe_codex_hook_trust", return_value={
+            "status": "ready", "hooks": [], "reason": "fixture Hook trust verified",
+        })
+        probe.start()
+        self.addCleanup(probe.stop)
+
     def test_health_service_plist_is_keepalive_and_runs_host_neutral_controller_supervisor(self):
         import plistlib
         from scripts.install_skill import install_web_agent_health_service_plist
@@ -3143,8 +3171,11 @@ class WebAgentHealthServiceInstallationTests(unittest.TestCase):
                 runtime_supervisor_heartbeat=heartbeat,
             )
             self.assertEqual(
-                live_report["desktop_adapter"]["background_continuation"], "ready"
+                live_report["desktop_adapter"]["background_continuation"], "configured_unverified"
             )
+            # A live host-neutral scheduler cannot prove missing Desktop hooks
+            # are trusted or even available.
+            self.assertFalse(live_report["desktop_adapter"]["background_continuation_ready"])
 
     def test_web_agent_execution_capability_requires_matching_health_service(self):
         from scripts.install_skill import (
