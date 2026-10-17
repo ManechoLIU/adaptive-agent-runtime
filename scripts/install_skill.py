@@ -610,6 +610,10 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "tests.test_governance.GovernanceTests."
     "test_same_controller_deviation_fingerprint_escalates_on_recurrence",
     "tests.test_governance.GovernanceTests."
+    "test_correction_epoch_resets_only_explicitly_resolved_fingerprint",
+    "tests.test_governance.GovernanceTests."
+    "test_correction_bookkeeping_does_not_recursively_escalate",
+    "tests.test_governance.GovernanceTests."
     "test_direct_cycle_persistence_cannot_fabricate_generic_correction_closure",
     "tests.test_governance.GovernanceTests."
     "test_reviewer_pass_integration_has_mandatory_verify_converge_recompute_successors",

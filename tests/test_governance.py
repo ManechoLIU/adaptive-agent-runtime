@@ -5605,6 +5605,94 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
                 second["correction"]["requires_unique_controller_handoff"]
             )
 
+    def test_correction_epoch_resets_only_explicitly_resolved_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            evidence_dir = root / ".git/adaptive-delivery/controller-cycle-evidence"
+            evidence_dir.mkdir(parents=True)
+            error = "Goal rollover is required"
+            first = control_event_guard.classify_controller_deviations(root, "controller-1", [error])[0]
+            other = control_event_guard.classify_controller_deviations(root, "controller-1", [
+                "continuation debt remains open: integration:deadbeef"
+            ])[0]
+            records = [
+                {"terminal_status": "FAILED", "validation_errors": [error, *other["validation_errors"]],
+                 "controller_deviations": [first, other]},
+                {"terminal_status": "CLOSED", "resolved_correction_fingerprints": [first["fingerprint"]]},
+                {"terminal_status": "FAILED", "validation_errors": [error],
+                 "controller_deviations": [{**first, "level": "L4", "recurrence_count": 8}]},
+            ]
+            for index, record in enumerate(records):
+                record.update(record_kind="controller_cycle_evidence", controller_id="controller-1",
+                              recorded_at=f"2026-10-17T00:00:0{index}Z", evidence_id=str(index))
+                (evidence_dir / f"{index}.json").write_text(json.dumps(record))
+            before = {p.name: p.read_bytes() for p in evidence_dir.glob("*.json")}
+            current = {item["fingerprint"]: item for item in control_event_guard.open_controller_corrections(root, "controller-1")}
+            self.assertEqual(current[first["fingerprint"]]["level"], "L2")
+            self.assertEqual(current[first["fingerprint"]]["recurrence_count"], 1)
+            repeated = control_event_guard.classify_controller_deviations(root, "controller-1", other["validation_errors"])[0]
+            self.assertEqual(repeated["recurrence_count"], 2)
+            self.assertEqual(repeated["level"], "L4")
+            self.assertEqual(before, {p.name: p.read_bytes() for p in evidence_dir.glob("*.json")})
+            legacy = {"record_kind": "controller_cycle_evidence", "controller_id": "controller-1",
+                      "recorded_at": "2026-10-17T00:00:03Z", "evidence_id": "legacy",
+                      "terminal_status": "FAILED", "controller_deviations": [
+                          {**first, "level": "L4", "recurrence_count": 8}]}
+            (evidence_dir / "legacy.json").write_text(json.dumps(legacy))
+            legacy_open = {item["fingerprint"]: item for item in control_event_guard.open_controller_corrections(root, "controller-1")}
+            self.assertEqual(legacy_open[first["fingerprint"]]["level"], "L4")
+            self.assertEqual(control_event_guard.classify_controller_deviations(root, "controller-1", [error])[0]["recurrence_count"], 9)
+            for invalid in [None, [], [{}], [{**first, "deviation_code": "wrong-code"}],
+                            [{**first, "correction": {"mandatory": True, "action": "anything"}}]]:
+                legacy["controller_deviations"] = invalid
+                (evidence_dir / "legacy.json").write_text(json.dumps(legacy))
+                with self.assertRaisesRegex(ValueError, "evidence integrity failure"):
+                    control_event_guard.open_controller_corrections(root, "controller-1")
+
+
+
+    def test_correction_bookkeeping_does_not_recursively_escalate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            snapshot = self.complete_event_receipt()
+            failed, _ = control_event_guard.persist_controller_cycle_evidence(
+                root, snapshot, controller_id="controller-1", ledger_sha256="a", main_revision="a",
+                terminal_status="FAILED", validation_errors=["Goal rollover is required"])
+            first = failed["controller_deviations"][0]
+            fp = first["fingerprint"]
+            debt = f"correction:{fp}"
+            errors = [f"mandatory correction {fp} is not completed",
+                      f"control cycle omitted controller actions: {debt}",
+                      f"continuation debt remains open: {debt}"]
+            for field, context in [("controller_action_ids", "canonical project projection"),
+                                   ("continuation_debt_ids", "canonical mandatory successors"),
+                                   ("open_continuation_debt_ids", "unresolved actions")]:
+                errors.append(f"control_loop_receipt {field} does not match {context}: expected {[debt]}, got []")
+            for suffix in ["action does not match derived correction", "requires execution evidence",
+                           "requires independent verification evidence", "requires distinct execution and verification actors",
+                           "L4 requires existing unique-Controller handoff evidence"]:
+                errors.append(f"mandatory correction {fp} {suffix}")
+            errors.append(f"control_loop_receipt correction_fingerprints does not match canonical project projection: expected {[fp]}, got []")
+            errors.append(f"control_loop_receipt controller_action_ids does not match canonical project projection: expected {[debt, 'open_child:worker']}, got {['open_child:worker']}")
+            self.assertEqual(control_event_guard.classify_controller_deviations(root, "controller-1", errors), [])
+            snapshot["event_contract"]["event_id"] = "correction-attempt"
+            receipt, _ = control_event_guard.persist_controller_cycle_evidence(
+                root, snapshot, controller_id="controller-1", ledger_sha256="b", main_revision="a",
+                terminal_status="FAILED", validation_errors=errors)
+            self.assertEqual(receipt["validation_errors"], errors)
+            self.assertEqual(receipt["controller_deviations"], [])
+            current = control_event_guard.open_controller_corrections(root, "controller-1")
+            self.assertEqual(len(current), 1)
+            self.assertEqual(current[0]["level"], "L2")
+            self.assertEqual(current[0]["recurrence_count"], 1)
+            self.assertTrue(control_event_guard.validate_correction_actions({}, current))
+            for error in [f"continuation debt remains open: {debt}, integration:deadbeef",
+                          "continuation debt remains open: correction:000000000000000000000000",
+                          f"control_loop_receipt controller_action_ids does not match canonical project projection: expected {[debt, 'integration:deadbeef']}, got []"]:
+                self.assertTrue(control_event_guard.classify_controller_deviations(root, "controller-1", [error]), error)
+
     def test_open_correction_enters_lifecycle_projection_and_blocks_stop(self) -> None:
         snapshot = {
             "head": "abc",

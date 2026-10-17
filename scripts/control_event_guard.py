@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -593,29 +594,48 @@ def _deviation_fingerprint(code: str, responsibility: str) -> str:
     return hashlib.sha256(encoded).hexdigest()[:24]
 
 
-def classify_controller_deviations(
-    root: Path,
-    controller_id: str,
-    validation_errors: Sequence[str],
-) -> list[dict[str, Any]]:
-    historical: dict[str, int] = {}
-    for record in _controller_cycle_records(root, controller_id):
-        if str(record.get("terminal_status", "")).upper() != "FAILED":
-            continue
-        deviations = record.get("controller_deviations")
-        if not isinstance(deviations, list):
-            continue
-        for deviation in deviations:
-            if not isinstance(deviation, dict):
-                continue
-            fingerprint = str(deviation.get("fingerprint", "")).strip()
-            if fingerprint:
-                historical[fingerprint] = historical.get(fingerprint, 0) + 1
+def _correction_bookkeeping_error(error: str, active: set[str]) -> bool:
+    """Suppress derived correction debt only; validation and immutable audit stay intact."""
+    mandatory = re.fullmatch(
+        r"mandatory correction ([0-9a-f]{24}) (?:is not completed|must be corrected before closure|"
+        r"action does not match derived correction|requires execution evidence|"
+        r"requires independent verification evidence|requires distinct execution and verification actors|"
+        r"L4 requires existing unique-Controller handoff evidence)",
+        error,
+    )
+    if mandatory:
+        return mandatory.group(1) in active
+    known_debts = {f"correction:{fp}" for fp in active}
+    for prefix in ("control cycle omitted controller actions: ", "continuation debt remains open: "):
+        if error.startswith(prefix):
+            debts = {item.strip() for item in error[len(prefix):].split(",")}
+            return bool(debts) and debts <= known_debts
+    projection = re.fullmatch(
+        r"control_loop_receipt (?P<field>controller_action_ids|continuation_debt_ids|open_continuation_debt_ids|correction_fingerprints) "
+        r"does not match (?:canonical project projection|canonical mandatory successors|unresolved actions): "
+        r"expected (\[.*\]), got (\[.*\])", error,
+    )
+    if projection:
+        try:
+            expected, actual = (ast.literal_eval(value) for value in projection.groups()[1:])
+        except (ValueError, SyntaxError):
+            return False
+        if not all(isinstance(value, list) and all(isinstance(item, str) for item in value)
+                   for value in (expected, actual)):
+            return False
+        delta = set(expected) ^ set(actual)
+        known = active if projection.group("field") == "correction_fingerprints" else known_debts
+        return bool(delta) and delta <= known
+    return False
 
+
+def _classify_deviation_errors(
+    validation_errors: Sequence[str], historical: dict[str, int], active: set[str],
+) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for raw_error in validation_errors:
         error = str(raw_error).strip()
-        if not error:
+        if not error or _correction_bookkeeping_error(error, active):
             continue
         code, base_level, responsibility, action = _deviation_rule(error)
         fingerprint = _deviation_fingerprint(code, responsibility)
@@ -659,14 +679,40 @@ def classify_controller_deviations(
     return output
 
 
-def open_controller_corrections(
-    root: Path, controller_id: str
-) -> list[dict[str, Any]]:
+def _controller_correction_state(
+    root: Path, controller_id: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
     open_by_fingerprint: dict[str, dict[str, Any]] = {}
+    counts: dict[str, int] = {}
     for record in _controller_cycle_records(root, controller_id):
         status = str(record.get("terminal_status", "")).upper()
         if status == "FAILED":
-            deviations = record.get("controller_deviations")
+            errors = record.get("validation_errors")
+            replayable = isinstance(errors, list) and bool(errors) and all(isinstance(error, str) and bool(error.strip()) for error in errors)
+            if replayable:
+                deviations = _classify_deviation_errors(errors, counts, set(open_by_fingerprint))
+            else:
+                # Older records without raw errors cannot be safely reinterpreted.
+                deviations = record.get("controller_deviations")
+                if not isinstance(deviations, list) or not deviations or not all(
+                    isinstance(item, dict)
+                    and re.fullmatch(r"[0-9a-f]{24}", str(item.get("fingerprint", "")))
+                    and bool(str(item.get("deviation_code", "")).strip())
+                    and bool(str(item.get("responsibility", "")).strip())
+                    and item["fingerprint"] == _deviation_fingerprint(item["deviation_code"], item["responsibility"])
+                    and type(item.get("recurrence_count")) is int and item["recurrence_count"] > 0
+                    and str(item.get("level", "")) in DEVIATION_LEVEL_NUMBER
+                    and isinstance(item.get("correction"), dict)
+                    and item["correction"].get("mandatory") is True
+                    and item["correction"].get("executable") is True
+                    and item["correction"].get("projection") == "canonical_project_control"
+                    and bool(str(item["correction"].get("action", "")).strip())
+                    for item in deviations
+                ):
+                    raise ValueError(
+                        "controller correction evidence integrity failure: legacy FAILED record "
+                        + str(record.get("evidence_id", "unknown"))
+                    )
             if isinstance(deviations, list):
                 for deviation in deviations:
                     if not isinstance(deviation, dict):
@@ -674,12 +720,35 @@ def open_controller_corrections(
                     fingerprint = str(deviation.get("fingerprint", "")).strip()
                     if fingerprint:
                         open_by_fingerprint[fingerprint] = dict(deviation)
+                        count = counts.get(fingerprint, 0) + 1
+                        if not replayable:
+                            try:
+                                count = max(count, int(deviation.get("recurrence_count", count)))
+                            except (ValueError, TypeError):
+                                pass
+                        counts[fingerprint] = count
         elif status == "CLOSED":
             resolved = record.get("resolved_correction_fingerprints")
             if isinstance(resolved, list):
                 for fingerprint in resolved:
-                    open_by_fingerprint.pop(str(fingerprint).strip(), None)
-    return [open_by_fingerprint[key] for key in sorted(open_by_fingerprint)]
+                    fingerprint = str(fingerprint).strip()
+                    open_by_fingerprint.pop(fingerprint, None)
+                    counts.pop(fingerprint, None)
+    return open_by_fingerprint, counts
+
+
+def classify_controller_deviations(
+    root: Path, controller_id: str, validation_errors: Sequence[str],
+) -> list[dict[str, Any]]:
+    active, counts = _controller_correction_state(root, controller_id)
+    return _classify_deviation_errors(validation_errors, counts, set(active))
+
+
+def open_controller_corrections(
+    root: Path, controller_id: str,
+) -> list[dict[str, Any]]:
+    active, _ = _controller_correction_state(root, controller_id)
+    return [active[key] for key in sorted(active)]
 
 
 def _resolved_correction_fingerprints(snapshot: dict[str, Any]) -> list[str]:
