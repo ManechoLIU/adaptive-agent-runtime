@@ -321,7 +321,13 @@ def current_goal_ledger_ids(ledger: Path, open_ids: set[str] | None = None) -> s
 
 
 GOAL_WORD = re.compile(r"(?:\bgoal\b|里程碑|当前\s*Goal|目标)", re.I)
-GOAL_CLOSE_WORD = re.compile(r"(?:close(?:d|ure)?|complete(?:d)?|done|结束|完成|闭合|关闭|收口)", re.I)
+GOAL_CLOSE_WORD = re.compile(
+    r"(?:\b(?:close|closed|closure|complete|completed|done)\b|结束|完成|闭合|关闭|收口)", re.I
+)
+GOAL_CLOSE_NEGATION = re.compile(
+    r"(?:\b(?:not|never|without)(?:\s+(?:yet|been|being|fully|already|be))*\s+"
+    r"|(?:尚未|并未|未|没有|还没|不是|不得|不能|无需|不)(?:被|已)?\s*)$", re.I
+)
 
 
 def event_closes_goal(snapshot: dict[str, Any]) -> bool:
@@ -340,8 +346,17 @@ def event_closes_goal(snapshot: dict[str, Any]) -> bool:
             value = action.get("action")
             if isinstance(value, str):
                 chunks.append(value.replace("_", " ").replace("-", " "))
-    text = " ".join(chunks)
-    return bool(GOAL_WORD.search(text) and GOAL_CLOSE_WORD.search(text))
+    # Evidence prose cannot combine a Goal mention in one field/sentence with
+    # an unrelated completion in another. Negation applies to each close word,
+    # never to the whole event: an explicit Goal closure action still wins.
+    for chunk in chunks:
+        for sentence in re.split(r"[.!?;。！？；\n]+", chunk):
+            if not GOAL_WORD.search(sentence):
+                continue
+            for match in GOAL_CLOSE_WORD.finditer(sentence):
+                if not GOAL_CLOSE_NEGATION.search(sentence[:match.start()]):
+                    return True
+    return False
 
 
 def validate_goal_rollover(

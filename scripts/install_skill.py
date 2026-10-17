@@ -573,6 +573,12 @@ RUNTIME_RELEASE_REGRESSION_TESTS = (
     "test_identity_degraded_cannot_authorize_stop_while_project_runnable_exists",
     "tests.test_governance.GovernanceTests."
     "test_pending_live_e2e_allows_safe_control_cycle_but_no_new_assignment",
+    "tests.test_governance.GovernanceTests."
+    "test_goal_closure_does_not_infer_completion_from_negative_or_unrelated_evidence",
+    "tests.test_governance.GovernanceTests."
+    "test_goal_closure_never_combines_unrelated_contract_fields",
+    "tests.test_governance.GovernanceTests."
+    "test_goal_closure_affirmative_contract_and_actions_still_require_rollover",
     "tests.test_web_agent_health_supervisor.WebAgentHealthSupervisorTests."
     "test_canonical_runnable_reopens_continuation_without_user_message",
     "tests.test_governance.GovernanceTests."

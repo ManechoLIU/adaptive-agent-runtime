@@ -1272,6 +1272,17 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
             tests_dir = source / "tests"
             tests_dir.mkdir()
+            for module_name in (
+                "test_rule_acceptance_yield.py",
+                "test_desktop_cua_recovery.py",
+                "test_desktop_native_dispatch.py",
+            ):
+                (tests_dir / module_name).write_text(
+                    "import unittest\n"
+                    "class RequiredRuntimeModuleTests(unittest.TestCase):\n"
+                    "    def test_required_runtime_module_is_present(self): self.assertTrue(True)\n",
+                    encoding="utf-8",
+                )
             (tests_dir / "test_provider_health.py").write_text(
                 "import unittest\n"
                 "class ProviderHealthCliTests(unittest.TestCase):\n"
@@ -1562,6 +1573,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_codex_app_server_active_writer_fails_before_turn_submit(self): self.assertTrue(True)\n"
                 "    def test_codex_app_server_turn_start_response_timeout_is_result_unknown(self): self.assertTrue(True)\n"
                 "    def test_codex_app_server_eof_after_turn_start_confirmation_is_result_unknown(self): self.assertTrue(True)\n"
+                "    def test_app_server_completion_timeout_is_bounded_with_detached_pipe_holder(self): self.assertTrue(True)\n"
+                "    def test_app_server_cleanup_terminates_descendants_after_leader_exit(self): self.assertTrue(True)\n"
                 "    def test_desktop_host_resume_uses_app_server_under_target_and_ownership_fence(self): self.assertTrue(True)\n"
                 "    def test_desktop_host_resume_missing_app_server_fails_closed_without_cli_fallback(self): self.assertTrue(True)\n"
                 "    def test_desktop_host_resume_web_ownership_never_starts_app_server(self): self.assertTrue(True)\n"
@@ -1706,6 +1719,12 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_registered_host_nonretryable_failure_persists_quiet_fence(self): self.assertTrue(True)\n"
                 "    def test_registered_host_result_unknown_persists_quiet_fence(self): self.assertTrue(True)\n"
                 "    def test_confirmed_web_reentry_clears_stale_nonretryable_block_evidence(self): self.assertTrue(True)\n"
+                "    def test_legacy_result_unknown_quarantine_schedules_distinct_recompute_after_host_upgrade(self): self.assertTrue(True)\n"
+                "    def test_legacy_recovery_predispatch_failure_rearms_same_successor_after_strong_handoff(self): self.assertTrue(True)\n"
+                "    def test_persisted_successor_result_unknown_recovers_host_receipt_then_reconciles(self): self.assertTrue(True)\n"
+                "    def test_result_unknown_successor_promotes_new_receipt_and_archives_prior_chain(self): self.assertTrue(True)\n"
+                "    def test_tampered_legacy_recovery_successor_fails_before_host_submit(self): self.assertTrue(True)\n"
+                "    def test_result_unknown_unresolved_retries_reconciliation_only_after_host_fingerprint_change(self): self.assertTrue(True)\n"
                 "class WebReentryDebounceTests(unittest.TestCase):\n"
                 "    def test_web_confirmed_wake_is_not_debounced_after_same_target_ownership_reclaim(self): self.assertTrue(True)\n",
                 encoding="utf-8",
@@ -1743,6 +1762,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_local_hard_defer_still_fills_other_nonconflicting_capacity(self): self.assertTrue(True)\n"
                 "    def test_identity_degraded_cannot_authorize_stop_while_project_runnable_exists(self): self.assertTrue(True)\n"
                 "    def test_pending_live_e2e_allows_safe_control_cycle_but_no_new_assignment(self): self.assertTrue(True)\n"
+                "    def test_goal_closure_does_not_infer_completion_from_negative_or_unrelated_evidence(self): self.assertTrue(True)\n"
+                "    def test_goal_closure_never_combines_unrelated_contract_fields(self): self.assertTrue(True)\n"
+                "    def test_goal_closure_affirmative_contract_and_actions_still_require_rollover(self): self.assertTrue(True)\n"
                 "    def test_project_wide_projection_web_active_verify_do_not_starve_mini_runnables(self): self.assertTrue(True)\n"
                 "    def test_project_wide_projection_mini_active_does_not_starve_server_or_web(self): self.assertTrue(True)\n"
                 "    def test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists(self): self.assertTrue(True)\n"
@@ -1904,6 +1926,17 @@ class InstallMigrationContractTests(unittest.TestCase):
             )
             tests_dir = source / "tests"
             tests_dir.mkdir()
+            for module_name in (
+                "test_rule_acceptance_yield.py",
+                "test_desktop_cua_recovery.py",
+                "test_desktop_native_dispatch.py",
+            ):
+                (tests_dir / module_name).write_text(
+                    "import unittest\n"
+                    "class RequiredRuntimeModuleTests(unittest.TestCase):\n"
+                    "    def test_required_runtime_module_is_present(self): self.assertTrue(True)\n",
+                    encoding="utf-8",
+                )
             (tests_dir / "test_provider_health.py").write_text(
                 "import unittest\n"
                 "class ProviderHealthCliTests(unittest.TestCase):\n"
@@ -2146,6 +2179,8 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_codex_app_server_active_writer_fails_before_turn_submit(self): self.assertTrue(True)\n"
                 "    def test_codex_app_server_turn_start_response_timeout_is_result_unknown(self): self.assertTrue(True)\n"
                 "    def test_codex_app_server_eof_after_turn_start_confirmation_is_result_unknown(self): self.assertTrue(True)\n"
+                "    def test_app_server_completion_timeout_is_bounded_with_detached_pipe_holder(self): self.assertTrue(True)\n"
+                "    def test_app_server_cleanup_terminates_descendants_after_leader_exit(self): self.assertTrue(True)\n"
                 "    def test_desktop_host_resume_uses_app_server_under_target_and_ownership_fence(self): self.assertTrue(True)\n"
                 "    def test_desktop_host_resume_missing_app_server_fails_closed_without_cli_fallback(self): self.assertTrue(True)\n"
                 "    def test_desktop_host_resume_web_ownership_never_starts_app_server(self): self.assertTrue(True)\n"
@@ -2191,7 +2226,13 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "    def test_retry_exhausted_persists_host_delivery_fingerprint(self): self.assertTrue(True)\n"
                 "    def test_registered_host_nonretryable_failure_persists_quiet_fence(self): self.assertTrue(True)\n"
                 "    def test_registered_host_result_unknown_persists_quiet_fence(self): self.assertTrue(True)\n"
-                "    def test_confirmed_web_reentry_clears_stale_nonretryable_block_evidence(self): self.assertTrue(True)\n",
+                "    def test_confirmed_web_reentry_clears_stale_nonretryable_block_evidence(self): self.assertTrue(True)\n"
+                "    def test_legacy_result_unknown_quarantine_schedules_distinct_recompute_after_host_upgrade(self): self.assertTrue(True)\n"
+                "    def test_legacy_recovery_predispatch_failure_rearms_same_successor_after_strong_handoff(self): self.assertTrue(True)\n"
+                "    def test_persisted_successor_result_unknown_recovers_host_receipt_then_reconciles(self): self.assertTrue(True)\n"
+                "    def test_result_unknown_successor_promotes_new_receipt_and_archives_prior_chain(self): self.assertTrue(True)\n"
+                "    def test_tampered_legacy_recovery_successor_fails_before_host_submit(self): self.assertTrue(True)\n"
+                "    def test_result_unknown_unresolved_retries_reconciliation_only_after_host_fingerprint_change(self): self.assertTrue(True)\n",
                 encoding="utf-8",
             )
             (tests_dir / "test_evaluation_transaction.py").write_text(
@@ -2222,6 +2263,9 @@ class InstallMigrationContractTests(unittest.TestCase):
                 "import unittest\n"
                 "class GovernanceTests(unittest.TestCase):\n"
                 "    def test_web_stdout_marker_never_closes_without_private_terminal_commit(self): self.assertTrue(True)\n"
+                "    def test_goal_closure_does_not_infer_completion_from_negative_or_unrelated_evidence(self): self.assertTrue(True)\n"
+                "    def test_goal_closure_never_combines_unrelated_contract_fields(self): self.assertTrue(True)\n"
+                "    def test_goal_closure_affirmative_contract_and_actions_still_require_rollover(self): self.assertTrue(True)\n"
                 "    def test_project_wide_projection_web_active_verify_do_not_starve_mini_runnables(self): self.assertTrue(True)\n"
                 "    def test_project_wide_projection_mini_active_does_not_starve_server_or_web(self): self.assertTrue(True)\n"
                 "    def test_project_wide_fairness_requires_parallel_dispatch_when_capacity_exists(self): self.assertTrue(True)\n"

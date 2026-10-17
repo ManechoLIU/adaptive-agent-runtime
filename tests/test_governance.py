@@ -3278,6 +3278,40 @@ module.persist_event_state(Path(sys.argv[2]), {"trigger": sys.argv[3]}, {})
 
             self.assertEqual(result, 1)
 
+    def test_goal_closure_does_not_infer_completion_from_negative_or_unrelated_evidence(self) -> None:
+        for receipt in (
+            "Goal readback usageLimited, not completed, so no rollover and no new Goal.",
+            "Goal has not yet been completed.",
+            "Goal is incomplete; transport completed.",
+            "Goal evidence disclosed.",
+            "Goal 尚未完成，不切换目标。",
+            "当前目标并未关闭。",
+            "Goal checked. Runtime ACK completed.",
+        ):
+            with self.subTest(receipt=receipt):
+                snapshot = {"event_contract": {"event_type": "dispatch", "primary_task": "R15", "terminal_receipt": receipt}, "event_actions": [{"action": "recompute"}]}
+                self.assertFalse(control_event_guard.event_closes_goal(snapshot))
+                self.assertEqual(control_event_guard._cycle_outcome_level(snapshot, terminal_status="CLOSED", integrated_revisions=set()), "L2")
+                self.assertEqual(control_event_guard.validate_goal_rollover(snapshot, ledger_open_ids={"R15"}, ledger_goal_ids={"R15"}), [])
+
+    def test_goal_closure_never_combines_unrelated_contract_fields(self) -> None:
+        snapshot = {"event_contract": {"event_type": "Goal observation", "primary_task": "R15", "terminal_receipt": "Runtime ACK completed"}, "event_actions": [{"action": "recompute"}]}
+        self.assertFalse(control_event_guard.event_closes_goal(snapshot))
+
+    def test_goal_closure_affirmative_contract_and_actions_still_require_rollover(self) -> None:
+        for contract, actions in (
+            ({"event_type": "Goal closure", "terminal_receipt": "Goal not completed"}, []),
+            ({"event_type": "dispatch", "terminal_receipt": "Goal closed"}, []),
+            ({"event_type": "dispatch", "terminal_receipt": "当前 Goal 已完成并关闭"}, []),
+            ({"event_type": "dispatch", "terminal_receipt": "Goal not completed"}, [{"action": "close_goal"}]),
+            ({"event_type": "dispatch", "terminal_receipt": "Goal not completed; Goal closed"}, []),
+            ({"event_type": "dispatch", "terminal_receipt": "Goal was not completed before but is now closed"}, []),
+        ):
+            with self.subTest(contract=contract, actions=actions):
+                snapshot = {"event_contract": contract, "event_actions": actions}
+                self.assertTrue(control_event_guard.event_closes_goal(snapshot))
+                self.assertTrue(control_event_guard.validate_goal_rollover(snapshot, ledger_open_ids={"R15"}, ledger_goal_ids={"R15"}))
+
     def test_control_event_guard_requires_goal_rollover_on_goal_close(self) -> None:
         snapshot = {
             **self.complete_event_receipt(),
