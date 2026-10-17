@@ -409,6 +409,49 @@ class NativeContinuationHandoffTests(unittest.TestCase):
             self.assertFalse(started)
             schedule.assert_called_once()
 
+    def test_live_same_fence_supervisor_keeps_old_receipt_and_token_when_new_receipt_arrives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, registry, state_path = self.make_runtime(Path(tmp))
+            old_receipt = "handoff-old-receipt"
+            old_token = "old-supervisor-token"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "receipt_id": old_receipt,
+                        "supervisor_receipt_id": old_receipt,
+                        "supervisor_token": old_token,
+                        "supervisor_pid": 15406,
+                        "session_id": self.controller_id,
+                        "repo": str(repo.resolve()),
+                        "state": "RESUME_PENDING",
+                        "pending_control_event": True,
+                        **self.fence,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                bridge, "_pid_is_alive", return_value=True
+            ), patch.object(bridge.subprocess, "Popen", return_value=Mock(pid=9002)) as popen:
+                scheduled = bridge.schedule_auto_native_stop(
+                    session_id=self.controller_id,
+                    repo=repo,
+                    receipt_id="handoff-new-receipt",
+                    registry=registry,
+                    codex=None,
+                    delay_seconds=1,
+                    state_path=state_path,
+                    expected_controller_fence=self.fence,
+                )
+
+            self.assertFalse(scheduled)
+            popen.assert_not_called()
+            preserved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(preserved["receipt_id"], old_receipt)
+            self.assertEqual(preserved["supervisor_receipt_id"], old_receipt)
+            self.assertEqual(preserved["supervisor_token"], old_token)
+
     def test_result_unknown_for_current_handoff_delivery_is_never_rescheduled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, registry, state_path = self.make_runtime(Path(tmp))

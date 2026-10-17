@@ -3996,13 +3996,16 @@ def _on_duty_unfinished_idle_reason(
     return "台账仍有未完成项：" + ", ".join(labels) + "。禁止 idle。"
 
 
+AUTHORIZATION_WAIT_NEXT_ACTION = "Await explicit business continuation authorization; unfinished debt retained."
+
+
 def _rule_acceptance_yield_facts(event: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any] | None:
-    """Freeze the narrow, non-executable projection covered by a safe rule trial."""
+    """Freeze the exact non-executable trial or authorization-wait projection."""
     handshake = snapshot.get("rule_handshake", {})
     if (not isinstance(handshake, dict)
             or event.get("controller_host") != DESKTOP_SESSION_HOST
-            or handshake.get("state") != "pending_live_e2e"
-            or handshake.get("blocking") is not True
+            or not ((handshake.get("state") == "pending_live_e2e" and handshake.get("blocking") is True)
+                    or (handshake.get("state") == "current" and handshake.get("blocking") is False))
             or not handshake.get("installed_revision")
             or handshake.get("loaded_revision") != handshake.get("installed_revision")):
         return None
@@ -4015,7 +4018,9 @@ def _rule_acceptance_yield_facts(event: dict[str, Any], snapshot: dict[str, Any]
         "ready_ids", "runnable_ids", "candidate_revisions", "controller_corrections", "ledger_errors",
     )):
         return None
-    if any(not label.startswith("VERIFY:") for label in _unfinished_idle_labels(snapshot)):
+    labels = _unfinished_idle_labels(snapshot)
+    authorization_wait = handshake.get("state") == "current"
+    if (authorization_wait and not labels) or any(not label.startswith("VERIFY:") for label in labels):
         return None
     live = snapshot.get("assignment_liveness", {})
     if not isinstance(live, dict) or any(
@@ -4035,6 +4040,7 @@ def _rule_acceptance_yield_facts(event: dict[str, Any], snapshot: dict[str, Any]
         )},
         "debt": sorted(_unfinished_debt_labels(snapshot)),
         "revision": handshake["installed_revision"],
+        **({"mode": "authorization_wait"} if authorization_wait else {}),
     }
 
 
@@ -4065,6 +4071,12 @@ def _rule_acceptance_yield_proof(
                 or contract["control_loop_receipt"].get("open_correction_ids") != []):
             return None
         actions = contract["controller_actions"]
+        if facts.get("mode") == "authorization_wait" and (
+            not actions or any(not isinstance(action, dict)
+                               or action.get("decision") != "blocked"
+                               or action.get("reason_code") != "authorization" for action in actions)
+        ):
+            return None
         if (not isinstance(actions, list) or any(
                 action.get("decision") not in {"blocked", "deferred"}
                 or action.get("reason_code") not in HARD_DEFER_REASON_CODES
@@ -4084,11 +4096,18 @@ def _rule_acceptance_yield_proof(
 
 def _allows_rule_acceptance_yield(event: dict[str, Any], state: dict[str, Any], snapshot: dict[str, Any]) -> bool:
     proof = state.get("rule_acceptance_yield")
+    proof_facts = proof.get("facts") if isinstance(proof, dict) else None
+    waiting_for_authorization = (
+        isinstance(proof_facts, dict)
+        and proof_facts.get("mode") == "authorization_wait"
+        and state.get("requires_user") is True
+        and state.get("next_action") == AUTHORIZATION_WAIT_NEXT_ACTION
+    )
     if (not isinstance(proof, dict) or state.get("must_yield") is not True
             or state.get("pending_control_event") is not True
             or state.get("receipt_turn_id") != _event_turn_id(event)
             or state.get("inflight_tool_use_ids") or state.get("pending_terminal_receipts")
-            or state.get("next_action")
+            or (state.get("next_action") and not waiting_for_authorization)
             or (isinstance(state.get("goal_display_sync"), dict)
                 and state["goal_display_sync"].get("status") != "completed")):
         return False
@@ -4099,9 +4118,9 @@ def _allows_rule_acceptance_yield(event: dict[str, Any], state: dict[str, Any], 
     verified = _rule_acceptance_yield_proof(receipt_event, snapshot, proposal)
     if verified is None or verified != proof:
         return False
-    allowed = set(_unfinished_debt_labels(snapshot)) | {
-        "rule_live_e2e_pending:" + str(verified["facts"]["revision"])
-    }
+    allowed = set(_unfinished_debt_labels(snapshot))
+    if verified["facts"].get("mode") != "authorization_wait":
+        allowed.add("rule_live_e2e_pending:" + str(verified["facts"]["revision"]))
     return set(state.get("triggers", [])) == allowed
 
 
@@ -4869,6 +4888,17 @@ def evaluate_event(
         state["pending_control_event"] = True
         return _pending_stop_output(state, event, reason=reason), state
     if event_name == "Stop" and _allows_rule_acceptance_yield(event, state, snapshot):
+        if state["rule_acceptance_yield"]["facts"].get("mode") == "authorization_wait":
+            # A current version has no further wake trial to run. The exact
+            # CLOSED projection proves every remaining action needs human
+            # authorization; retain the debt without requeueing the Controller.
+            state.pop("host_turn_handoff", None)
+            state["requires_user"] = True
+            state["next_action"] = AUTHORIZATION_WAIT_NEXT_ACTION
+            return {
+                "continue": False,
+                "stopReason": "当前投影无可执行工作，未完成控制动作均有授权阻塞收据；保留债务并等待明确授权。",
+            }, state
         # A bare allow ends the turn but never arms a wake. Reuse the ordinary
         # same-Controller supervisor handoff; preserve all pending business debt.
         return _request_desktop_turn_handoff(

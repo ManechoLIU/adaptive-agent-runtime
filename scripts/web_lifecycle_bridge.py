@@ -9302,8 +9302,9 @@ def _schedule_auto_native_stop_locked(
     current_receipt = str(prior.get("supervisor_receipt_id") or "").strip()
     current_live = (
         bool(current_token)
-        and current_receipt == receipt_id
         and _pid_is_alive(prior.get("supervisor_pid"))
+        and (current_receipt == receipt_id
+             or (prior_fence is not None and prior_fence == current_fence_identity))
     )
     if force_rearm:
         if (
