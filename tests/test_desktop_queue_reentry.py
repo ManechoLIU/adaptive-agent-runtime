@@ -169,7 +169,6 @@ class DesktopQueueReentryTests(unittest.TestCase):
             submit_fence=self.superseded_fence if superseded else self.submit_fence,
             env=self.env(scenario),
             max_runtime_seconds=0.25,
-            request_timeout_seconds=2.0,
             queue_delivery_id=self.delivery_id,
             queue_journal=self.queue_journal,
         )
